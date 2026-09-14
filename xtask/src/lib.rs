@@ -99,6 +99,7 @@ pub const RULES: &[&str] = &[
     "size-probe-reach",
     "storage-conformance",
     "storage-contract",
+    "storage-shapes",
     "swap-discipline",
     "timer-capability",
     "timer-record-fields",
@@ -309,8 +310,18 @@ fn check_source_rules(inputs: &WorkspaceInputs) -> Vec<Violation> {
         &inputs.driver_sources,
     ));
     violations.extend(source::check_effect_protocol(&inputs.driver_sources));
+    // `waymaker-facade-demo` is `no_std_support_sources`' too, alongside `waymaker-rig`,
+    // `waymaker-conformance` and `waymaker-drive` itself; `ctx-facade`'s authority ban is
+    // about the one crate that holds `Bridge`, so it reads only that slice of it.
+    let facade_demo_sources: Vec<size::LayerSource> = inputs
+        .no_std_support_sources
+        .iter()
+        .filter(|source| source.crate_name == "waymaker-facade-demo")
+        .cloned()
+        .collect();
     violations.extend(source::check_ctx_facade(
         &inputs.layer_sources,
+        &facade_demo_sources,
         &inputs.driver_sources,
     ));
     violations.extend(source::check_dispatch_wiring(&inputs.layer_sources));
@@ -338,6 +349,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(graph::check_dependency_direction(&graph));
     violations.extend(graph::check_kernel_has_no_dependencies(&graph));
     violations.extend(graph::check_embassy_stays_above_flash(&graph));
+    violations.extend(graph::check_driver_reaches_no_embassy(&graph));
     violations.extend(graph::check_empty_default_features(&graph));
     violations.extend(graph::check_workspace_membership(&graph));
     violations.extend(graph::check_layers_are_local(&graph));
@@ -359,6 +371,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     ));
     violations.extend(size::check_probe_reach(
         &inputs.layer_sources,
+        &graph,
         inputs.probe_source.as_deref(),
     ));
     violations.extend(emulate::check_emulation_boot(
@@ -705,6 +718,7 @@ fn collect_docs_inputs(
         adrs,
         spec_obligations: read_optional(&root.join(docs::SPEC_OBLIGATIONS_PATH))?,
         storage_clauses: read_optional(&root.join(docs::STORAGE_CLAUSES_PATH))?,
+        storage_shapes: read_optional(&root.join(docs::STORAGE_SHAPES_PATH))?,
         failure_rows: read_optional(&root.join(docs::FAILURE_ROWS_PATH))?,
         wire_format_spec: read_optional(&root.join(docs::WIRE_FORMAT_SPEC_PATH))?,
         wire_format_corpus: read_corpus(&root.join(docs::WIRE_FORMAT_CORPUS_DIR))?,
@@ -966,6 +980,10 @@ mod tests {
                 // two of its three halves for the same reason: the suite's own table is
                 // unreadable, and the record has no ADR for the conformance suite.
                 storage_clauses: None,
+                // Nor issue #130's shape table, so `storage-shapes` fires the same way:
+                // the suite's own table is unreadable, and the record has no ADR for the
+                // catalogue.
+                storage_shapes: None,
                 // Nor the failure matrix's three files, so `failure-matrix` fires.
                 failure_rows: None,
                 // Nor the byte-by-byte format document, so `wire-format` fires.
@@ -1042,6 +1060,7 @@ mod tests {
             "size-probe-reach",
             "storage-conformance",
             "storage-contract",
+            "storage-shapes",
             "swap-discipline",
             "timer-capability",
             "timer-record-fields",
@@ -1590,12 +1609,19 @@ mod tests {
           "dependencies": [{ "name": "waymaker-core", "kind": null },
                            { "name": "waymaker-flash", "kind": null }],
           "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/drive/src/lib.rs" }] },
+        { "id": "facade-demo", "name": "waymaker-facade-demo", "source": null,
+          "manifest_path": "/w/facade-demo/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-core", "kind": null },
+                           { "name": "waymaker-flash", "kind": null },
+                           { "name": "waymaker-drive", "kind": null },
+                           { "name": "waymaker-embassy", "kind": null }],
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/facade-demo/src/lib.rs" }] },
         { "id": "embedded-storage", "name": "embedded-storage",
           "source": "registry+https://github.com/rust-lang/crates.io-index",
           "dependencies": [], "features": {},
           "targets": [{ "kind": ["lib"], "src_path": "/r/embedded-storage/src/lib.rs" }] }
       ],
-      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig", "drive"],
+      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig", "drive", "facade-demo"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
@@ -1606,6 +1632,7 @@ mod tests {
         { "id": "conformance", "deps": [{ "pkg": "flash" }, { "pkg": "embedded-storage" }] },
         { "id": "rig", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
         { "id": "drive", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
+        { "id": "facade-demo", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "drive" }, { "pkg": "embassy" }] },
         { "id": "embedded-storage", "deps": [] }
       ] }
     }"#;

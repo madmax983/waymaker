@@ -2125,7 +2125,7 @@ fn ctx_facade() -> usize {
 
 /// Issue #36's dispatch table, driven once per public function.
 ///
-/// It exists here because `waymaker-drive`'s OTA example implements
+/// It exists here because `waymaker-facade-demo`'s OTA example implements
 /// [`ActivityDispatcher`](waymaker_embassy::ActivityDispatcher) by hand, so nothing else in
 /// the workspace monomorphises the table — and a `facade` row that charged for a generic
 /// nobody names would be charging for nothing. `size-probe-reach` is what makes that a

@@ -88,6 +88,20 @@ enum Ending {
     Refused,
 }
 
+/// Why a run has no boundaries left.
+///
+/// One flag, owned by [`Ctx`]. Issue #107: `TerminalFuture` and `ContinueFuture` kept this
+/// flag in a field of their own. A dropped future took the flag with it. A second future
+/// could then re-decide the run. `Continued` is not an [`Ending`]: a continued run has no
+/// terminal record. [`Ctx::conclusion`] must not answer as though it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Closed {
+    /// The run ended. [`Ending`] says how.
+    Ended(Ending),
+    /// `continue_as_new` retired this run.
+    Continued,
+}
+
 /// Copies as much of `src` into `dst` as fits, and says how much that was.
 fn copy(src: &[u8], dst: &mut [u8]) -> usize {
     let taken = src.len().min(dst.len());
@@ -109,7 +123,7 @@ pub struct Ctx<'a, D: ActivityDispatcher, J: Journal> {
     dispatcher: &'a mut D,
     out: &'a mut [u8],
     payload: usize,
-    conclusion: Option<Ending>,
+    closed: Option<Closed>,
 }
 
 impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
@@ -126,7 +140,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             dispatcher,
             out,
             payload: 0,
-            conclusion: None,
+            closed: None,
         }
     }
 
@@ -144,7 +158,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             dispatcher: self.dispatcher,
             out: self.out,
             payload: &mut self.payload,
-            concluded: &self.conclusion,
+            concluded: &self.closed,
             kind,
             input,
             stage: Stage::Scheduling,
@@ -170,7 +184,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     ) -> TimerFuture<'b, J> {
         TimerFuture {
             journal: self.journal,
-            concluded: &self.conclusion,
+            concluded: &self.closed,
             spec,
             alarm,
             ended: false,
@@ -185,9 +199,8 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     pub const fn continue_as_new<'b>(&'b mut self, input: &'b [u8]) -> ContinueFuture<'b, J> {
         ContinueFuture {
             journal: self.journal,
-            concluded: &self.conclusion,
+            closed: &mut self.closed,
             input,
-            asked: false,
         }
     }
 
@@ -212,10 +225,9 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     fn ending<'b, E>(&'b mut self, bytes: &'b [u8], failed: bool) -> TerminalFuture<'b, E> {
         TerminalFuture {
             out: self.out,
-            conclusion: &mut self.conclusion,
+            closed: &mut self.closed,
             bytes,
             failed,
-            ended: false,
             error: PhantomData,
         }
     }
@@ -224,15 +236,19 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     ///
     /// A refused payload answers [`Conclusion::Refused`] and never [`None`]. The two are
     /// different runs: one did not finish, the other asked to finish with bytes the caller
-    /// cannot carry.
+    /// cannot carry. A continued run also answers [`None`]. It has no terminal record. A
+    /// caller reads this the same way as a run that has not reached a boundary yet.
     #[must_use]
     pub fn conclusion(&self) -> Option<Conclusion<'_>> {
-        match self.conclusion? {
-            Ending::Completed(len) => {
+        match self.closed? {
+            Closed::Ended(Ending::Completed(len)) => {
                 Some(Conclusion::Ended(Outcome::Completed(self.out.get(..len)?)))
             }
-            Ending::Failed(len) => Some(Conclusion::Ended(Outcome::Failed(self.out.get(..len)?))),
-            Ending::Refused => Some(Conclusion::Refused),
+            Closed::Ended(Ending::Failed(len)) => {
+                Some(Conclusion::Ended(Outcome::Failed(self.out.get(..len)?)))
+            }
+            Closed::Ended(Ending::Refused) => Some(Conclusion::Refused),
+            Closed::Continued => None,
         }
     }
 
@@ -269,7 +285,7 @@ pub struct ActivityFuture<'b, T, D: ActivityDispatcher, J: Journal> {
     dispatcher: &'b mut D,
     out: &'b mut [u8],
     payload: &'b mut usize,
-    concluded: &'b Option<Ending>,
+    concluded: &'b Option<Closed>,
     kind: ActivityKind,
     input: &'b [u8],
     stage: Stage,
@@ -399,7 +415,7 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
 /// Not [`Debug`](core::fmt::Debug): `alarm` is a trait object with no `Debug` bound.
 pub struct TimerFuture<'b, J: Journal> {
     journal: &'b mut J,
-    concluded: &'b Option<Ending>,
+    concluded: &'b Option<Closed>,
     spec: TimerSpec,
     alarm: &'b mut dyn Alarm,
     ended: bool,
@@ -433,12 +449,15 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 ///
 /// [`Infallible`] has no value, so the code after the `.await` is unreachable rather than
 /// merely unlikely. That is the shape of the operation: the run that asked is replaced.
+///
+/// It holds `closed` by `&mut`, not `&`. A dropped-then-repolled future must not ask the
+/// journal twice. The flag that stops it must survive the drop. So it lives in the `Ctx`,
+/// not here. Issue #107.
 #[derive(Debug)]
 pub struct ContinueFuture<'b, J: Journal> {
     journal: &'b mut J,
-    concluded: &'b Option<Ending>,
+    closed: &'b mut Option<Closed>,
     input: &'b [u8],
-    asked: bool,
 }
 
 impl<J: Journal> Future for ContinueFuture<'_, J> {
@@ -446,9 +465,9 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if !me.asked && me.concluded.is_none() {
-            me.asked = true;
+        if me.closed.is_none() {
             let Halted = me.journal.continue_as_new(me.input);
+            *me.closed = Some(Closed::Continued);
         }
         Poll::Pending
     }
@@ -468,13 +487,19 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 /// terminal payload. §08 has no edge from a terminal record to another boundary either, so
 /// stopping here is the protocol rather than a guard over it. Codex round 2 found the
 /// version that resolved.
+///
+/// # Why `closed` is shared
+///
+/// It was a field of this future alone. Poll `complete`, then drop it. Poll `fail`. The
+/// second future has no memory of the first. It overwrites the first conclusion. The flag
+/// now lives in the `Ctx`. A new future cannot overwrite a dropped future's decision.
+/// Issue #107.
 #[derive(Debug)]
 pub struct TerminalFuture<'b, E> {
     out: &'b mut [u8],
-    conclusion: &'b mut Option<Ending>,
+    closed: &'b mut Option<Closed>,
     bytes: &'b [u8],
     failed: bool,
-    ended: bool,
     error: PhantomData<fn() -> E>,
 }
 
@@ -483,18 +508,17 @@ impl<E> Future for TerminalFuture<'_, E> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if !me.ended {
-            me.ended = true;
+        if me.closed.is_none() {
             // Refused rather than truncated when it does not fit: a short terminal record
             // replays for ever. The refusal is recorded, so the caller cannot read it as a
             // run that never ended and complete it with nothing.
-            *me.conclusion = Some(if me.bytes.len() > me.out.len() {
+            *me.closed = Some(Closed::Ended(if me.bytes.len() > me.out.len() {
                 Ending::Refused
             } else if me.failed {
                 Ending::Failed(copy(me.bytes, me.out))
             } else {
                 Ending::Completed(copy(me.bytes, me.out))
-            });
+            }));
         }
         // The run is over. Nothing after this runs, so nothing can overwrite the buffer the
         // ending points into. The caller that drove the boot reads

@@ -14,7 +14,7 @@ use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, KernelError, RecordKind, RecordRef, RunId};
-use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
+use waymaker_drive::demo::{DELAYED_BOUNDS, DOWNLOADED, Delayed, World};
 use waymaker_drive::{
     Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
@@ -135,6 +135,40 @@ fn a_deadline_already_past_fires_in_the_same_boot() {
         "{progress:?}"
     );
     assert!(kinds(&mut device).contains(&RecordKind::TIMER_FIRED));
+}
+
+#[test]
+fn a_completed_delayed_run_remembers_what_it_downloaded() {
+    // `Delayed::downloaded()` is the workflow's own accessor over what `DOWNLOAD` answered,
+    // read back after the boot that produced it. `boot()` drops the workflow on return, so
+    // this test builds one by hand to keep it. `Delayed::default()` rather than `::new()`,
+    // for the same reason: both are one value, and a test should use each at least once.
+    let mut device = Device::new(geometry());
+    let mut world = world_at(DEADLINE + 1);
+    let mut workflow = Delayed::default();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
+    assert_eq!(workflow.downloaded(), DOWNLOADED);
 }
 
 #[test]

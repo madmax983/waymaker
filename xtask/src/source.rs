@@ -4,7 +4,7 @@
 //! delete without anything on the host noticing. Checking for them here means the deletion
 //! fails a pull request rather than surfacing later as a firmware build error.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Violation;
 use crate::policy::LAYERS;
@@ -1041,6 +1041,20 @@ pub const TIMER_TYPE_METHODS: &[(&str, &[&str])] = &[
 /// `DurableIntent`, and for the same reason: a public field is a constructor.
 pub const TIMER_BRACED_STRUCTS: &[&str] = &["Timer"];
 
+/// `ClockKind`'s two constants, name and value both.
+///
+/// `ClockKind` is a `u8` newtype, not an enum: [`TIMER_TYPE_METHODS`] pins methods and
+/// [`TIMER_TYPES`] pins enum members, and neither reads a constant. §11 says a persistent
+/// timer record carries its clock kind "so recovery cannot silently reinterpret one policy
+/// as another", and issue [#33](https://github.com/madmax983/waymaker/issues/33) spends
+/// these two numbers on media for the life of the format. A renumbering passes every
+/// round-trip test in this repository and means something else to a device that already
+/// wrote the old byte — issue [#99](https://github.com/madmax983/waymaker/issues/99).
+///
+/// Sorted, so the comparison can be a set comparison.
+pub const CLOCK_KIND_CONSTANTS: &[(&str, &str)] =
+    &[("AFTER_BOOT", "Self(1)"), ("AT_PERSISTENT_TIME", "Self(2)")];
+
 /// The one way `waymaker-embassy`'s clock module may name a `TimerSpec`.
 ///
 /// An identifier blacklist closes one spelling at a time, and review of this change walked
@@ -1208,6 +1222,7 @@ pub fn check_timer_capability(
             violations.extend(check_boundary_type(&pin, &code, pinned));
         }
         violations.extend(check_timer_types(&code));
+        violations.extend(check_clock_kind_constants(&code));
     }
     violations.extend(check_timer_root_reexport(sources));
 
@@ -1620,6 +1635,113 @@ fn check_timer_types(code: &str) -> Vec<Violation> {
         }
     }
 
+    violations
+}
+
+/// `ClockKind` declares exactly [`CLOCK_KIND_CONSTANTS`], name and value both.
+///
+/// A wire-format pin rather than a "no constant" one, because these two are legitimate:
+/// they are the byte a `TimerScheduled` record carries. A missing name, an extra one, or a
+/// renumbered value are three ways to give issue #33's "recovery cannot silently
+/// reinterpret one policy as another" back, and all three are reported.
+fn check_clock_kind_constants(code: &str) -> Vec<Violation> {
+    const RULE: &str = "timer-capability";
+    const KERNEL: &str = "waymaker-core";
+    const CLOCK_KIND: &str = "ClockKind";
+
+    let blocks = inherent_impl_bodies(code, CLOCK_KIND);
+    if blocks.is_empty() {
+        return vec![Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "{TIMER_SEMANTICS_PATH} declares no inherent `impl` for `{CLOCK_KIND}`, so \
+                 its two constants are pinned against nothing"
+            ),
+        )];
+    }
+    let body = blocks.join("\n");
+
+    // Grouped by name first, because a name declared twice — even under mutually exclusive
+    // `#[cfg]` attributes this scan does not evaluate — is ambiguous rather than resolved by
+    // whichever value a `BTreeMap::collect` happens to keep. Codex found that a target-gated
+    // `Self(0)` beside the pinned `Self(1)` sorted to the pinned value winning, with the
+    // build-time renumbering unreported.
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in declared_associated_constant_values(&body) {
+        grouped.entry(name).or_default().push(value);
+    }
+    let mut violations = Vec::new();
+    let mut declared: BTreeMap<String, String> = BTreeMap::new();
+    for (name, mut values) in grouped {
+        values.dedup();
+        if let [value] = values.as_slice() {
+            declared.insert(name, value.clone());
+        } else {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}` declares `{name}` {} times ({values:?}), not once; a name \
+                     declared twice is ambiguous, whatever gates each declaration, and cannot \
+                     be the one byte a `TimerScheduled` record carries",
+                    values.len()
+                ),
+            ));
+        }
+    }
+
+    for (name, value) in CLOCK_KIND_CONSTANTS {
+        match declared.get(*name) {
+            None => violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}` no longer declares `{name}`, which `CLOCK_KIND_CONSTANTS` \
+                     pins; a persistent timer record carries this byte for the life of the \
+                     format"
+                ),
+            )),
+            Some(found) if found != value => violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}::{name}` is `{found}` rather than `{value}`: a renumbering \
+                     passes every round-trip test here and means something else to a device \
+                     that already wrote the old byte"
+                ),
+            )),
+            _ => {}
+        }
+    }
+    let pinned: BTreeSet<&str> = CLOCK_KIND_CONSTANTS.iter().map(|(name, _)| *name).collect();
+    for name in declared.keys() {
+        if !pinned.contains(name.as_str()) {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}` declares `{name}`, which `CLOCK_KIND_CONSTANTS` does not \
+                     pin; a third clock kind is a number spent on media for the life of the \
+                     format"
+                ),
+            ));
+        }
+    }
+    // A trait `impl` can carry an associated constant of its own, invisible to the scan
+    // above because it reads only inherent `impl` blocks. Codex found this route on this
+    // change's own PR: `impl SomeTrait for ClockKind { const RTC2: Self = Self(3); }` names
+    // a third clock kind with the constant pin above still reading only two.
+    if implements_trait_for(code, CLOCK_KIND) {
+        violations.push(Violation::new(
+            RULE,
+            KERNEL,
+            format!(
+                "`{CLOCK_KIND}` implements a trait: a trait `impl` can carry an associated \
+                 constant that is invisible to the constant pin above"
+            ),
+        ));
+    }
     violations
 }
 
@@ -3014,12 +3136,18 @@ fn next_impl_line(code: &str) -> Option<usize> {
     None
 }
 
-/// The type an inherent `impl` header names, with its generics stripped.
+/// The type an inherent `impl` header names, with its generics and its path stripped.
 ///
 /// `impl<'a, C: IntegrityCheck> Sealable<'a, C>` is a block for `Sealable`, and the two
 /// angle-bracket groups mean different things: the first declares parameters and the second
 /// applies them. So the leading one is skipped by matching brackets rather than by taking
 /// the last whitespace-separated word, which reads `C>` out of exactly that header.
+///
+/// `impl crate::timer::ClockKind` names the same type as a bare `impl ClockKind` — nothing
+/// about a path-qualified self type changes which constants `ClockKind::` reaches. Codex
+/// found this on issue #99's own PR: the character scan below stopped at the first `:` and
+/// read `crate`, which matches no pinned type, so a second `impl` reached this way was
+/// invisible to every pin built on `inherent_impl_bodies`.
 fn implemented_type(header: &str) -> Option<String> {
     let after_keyword = header.strip_prefix("impl")?.trim_start();
     let rest = if after_keyword.starts_with('<') {
@@ -3042,11 +3170,24 @@ fn implemented_type(header: &str) -> Option<String> {
     } else {
         after_keyword
     };
-    let name: String = rest
+    let path: String = rest
         .chars()
-        .take_while(|character| character.is_alphanumeric() || *character == '_')
+        .take_while(|character| {
+            character.is_alphanumeric() || *character == '_' || *character == ':'
+        })
         .collect();
-    (!name.is_empty()).then_some(name)
+    let name = last_path_segment(&path)?;
+    Some(name.to_owned())
+}
+
+/// The last `::`-separated segment of a type path, empty segments skipped.
+///
+/// `crate::timer::ClockKind` and `ClockKind` name the same type; a bare name has exactly one
+/// segment and is returned unchanged. Shared by [`implemented_type`] and
+/// [`implements_trait_for`], which both used to compare a path against a bare pinned name and
+/// never match.
+fn last_path_segment(path: &str) -> Option<&str> {
+    path.rsplit("::").find(|segment| !segment.is_empty())
 }
 
 /// Whether `code` declares `header` as a struct with a braced body.
@@ -3097,13 +3238,15 @@ fn implements_trait_for(code: &str, type_name: &str) -> bool {
             continue;
         };
         // The bare name, with any generic arguments cut off: `DurableIntent` and
-        // `Dispatchable<C>` are the same type here.
+        // `Dispatchable<C>` are the same type here. And with any path stripped: `impl Forge
+        // for crate::timer::ClockKind` names `ClockKind` too, which Codex found on issue
+        // #99's own PR — the comparison below used to read the whole path and never match.
         let named = implemented
             .trim()
             .split(['<', ' ', '\n'])
             .next()
             .unwrap_or_default();
-        if named == type_name {
+        if last_path_segment(named) == Some(type_name) {
             return true;
         }
     }
@@ -3121,7 +3264,7 @@ fn implements_trait_for(code: &str, type_name: &str) -> bool {
 /// execution, and `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has
 /// no braces at all: three pinned calls, in order, at brace depth zero, in a closure nothing
 /// runs.
-fn nesting_depth_at(code: &str, index: usize) -> usize {
+pub(crate) fn nesting_depth_at(code: &str, index: usize) -> usize {
     let before = code.get(..index).unwrap_or_default();
     let opened = before.matches(['{', '(', '[']).count();
     let closed = before.matches(['}', ')', ']']).count();
@@ -3147,7 +3290,7 @@ fn declared_function_names(body: &str) -> Vec<String> {
     names
 }
 
-/// The associated constants an `impl` body declares, at any visibility.
+/// The associated constants an `impl` body declares, at any visibility, name and value both.
 ///
 /// [`declared_function_names`]'s twin, and it exists because that one reads `fn`. A
 /// `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 };` on `impl TimerSpec` adds no
@@ -3156,36 +3299,66 @@ fn declared_function_names(body: &str) -> Vec<String> {
 ///
 /// Depth-zero lines only, for [`declared_function_names`]'s reason: a `const` inside a
 /// function body is a local, not a door.
-fn declared_associated_constants(body: &str) -> Vec<String> {
+///
+/// The value is text on the same line, after the first `=`. A right-hand side that wraps to
+/// a second line reports an empty value rather than none: the name is still caught, because
+/// [`declared_associated_constants`] needs only that, and a caller that pins a value —
+/// [`check_clock_kind_constants`] — meets a mismatch rather than a silent pass.
+///
+/// A leading attribute is stripped before the line is read, [`next_impl_line`]'s reason:
+/// `#[rustfmt::skip] pub const BEST_EFFORT: Self = ..;` survives `cargo fmt` on one line, and
+/// a scan for a line starting `pub ` or `const ` does not see it. Codex found the same
+/// blindness here on this file's own PR.
+fn declared_associated_constant_values(body: &str) -> Vec<(String, String)> {
     let mut depth = 0_i32;
-    let mut names = Vec::new();
+    let mut values = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim();
+        let bare = crate::size::without_leading_attributes(trimmed);
         if depth == 0
-            && let Some(rest) = trimmed
+            && let Some(rest) = bare
                 .strip_prefix("pub ")
                 .or_else(|| {
-                    trimmed
-                        .split_once(") ")
+                    bare.split_once(") ")
                         .filter(|(head, _)| head.starts_with("pub("))
                         .map(|(_, rest)| rest)
                 })
-                .or(Some(trimmed))
+                .or(Some(bare))
             && let Some(declaration) = rest.strip_prefix("const ")
             // `const fn` is a function, and `declared_function_names` owns those.
             && !declaration.starts_with("fn ")
-            && let Some(name) = declaration.split([':', ' ']).next()
+            && let Some(raw_name) = declaration.split([':', ' ']).next()
+            // `r#BEST_EFFORT` and `BEST_EFFORT` name the same constant: Rust's raw-identifier
+            // marker is never part of the name. Codex found this on issue #99's own PR — a
+            // raw name failed the character check below and the whole line was dropped,
+            // which for `check_clock_kind_constants` is a third clock kind nobody reported.
+            && let name = raw_name.strip_prefix("r#").unwrap_or(raw_name)
             && !name.is_empty()
             && name.chars().all(|c| c.is_alphanumeric() || c == '_')
         {
-            names.push(name.to_owned());
+            let value = declaration
+                .split_once('=')
+                .map(|(_, value)| value.trim().trim_end_matches(';').trim().to_owned())
+                .unwrap_or_default();
+            values.push((name.to_owned(), value));
         }
         let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
         let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
         depth = depth.saturating_add(opens).saturating_sub(closes);
     }
-    names.sort_unstable();
-    names
+    values.sort_unstable();
+    values
+}
+
+/// The associated constants an `impl` body declares, at any visibility.
+///
+/// [`declared_associated_constant_values`]'s name-only half, for a caller that only asks
+/// whether one exists.
+fn declared_associated_constants(body: &str) -> Vec<String> {
+    declared_associated_constant_values(body)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// The file whose `EffectScheduled` field set [`EFFECT_SCHEDULED_FIELDS`] pins.
@@ -6679,26 +6852,21 @@ pub const CTX_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
 
 /// The driver files that may name the façade.
 ///
-/// Issue #35's second "done when" is that removing the Embassy crate leaves the protocol
-/// fully usable through the synchronous driver. Every *other* module of `waymaker-drive` is
-/// held to naming no façade, and the list is the exemptions rather than the modules held —
-/// so a module added tomorrow is covered without anyone remembering to add a row.
-///
-/// `lib.rs` is here because a crate root declares its modules and re-exports a name from
-/// them. Its own honesty is the `drive-facadeless` build's rather than this scan's.
-pub const FACADE_DRIVER_MODULES: &[&str] = &[
-    "waymaker-drive/src/facade.rs",
-    "waymaker-drive/src/lib.rs",
-    "waymaker-drive/src/ota.rs",
-    "waymaker-drive/src/provisioning.rs",
-];
+/// Empty. Issue [#106](https://github.com/madmax983/waymaker/issues/106) moved the façade
+/// edge — `facade`, `ota` and `provisioning` — into `waymaker-facade-demo`, a crate above
+/// `waymaker-drive` rather than inside it, so no `waymaker-drive` module needs an exemption
+/// any more. The list stays rather than being deleted: it is what
+/// `check_facade_free_driver` iterates, and an empty list read by a live rule is a
+/// stronger statement than a rule with nothing to hold.
+pub const FACADE_DRIVER_MODULES: &[&str] = &[];
 
 /// What a driver module outside [`FACADE_DRIVER_MODULES`] may not name, and why.
 ///
-/// The crate itself, and the three source-level routes to it that name no crate: the two
-/// modules that hold the edge, and the type they re-export. Review of this change reached
-/// the façade with `use crate::facade::Bridge;` while a ban on the crate name alone stayed
-/// green.
+/// The façade crate, and four source-level routes to it that name no crate directly: the
+/// bridge that once held the edge, design document §06's two examples, and the type the
+/// bridge exports. `waymaker-drive` has no dependency on any of these — issue #106 — so
+/// this is a floor under a regression rather than a description of what the crate does
+/// today.
 pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
     (
         "waymaker_embassy",
@@ -6746,12 +6914,16 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 ///
 /// And **no hidden global state**: a `static` in either module is the other half of the
 /// must-not-own cell, and a façade with one is a façade two runs on a device would share.
+/// The vocabulary and static bans, and the future-set and macro bans beside them, read every
+/// file of `waymaker-facade-demo` too — `Bridge` is the one other caller of this boundary,
+/// and the must-not-own cell binds it exactly as it binds `waymaker-embassy`.
 ///
-/// The fourth half is the driver's. Every `waymaker-drive` module but the three in
-/// [`FACADE_DRIVER_MODULES`] is held to naming none of [`FACADE_FREE_VOCABULARY`], so a
-/// module added tomorrow is covered without anyone remembering a row. That is the fast half
-/// of "removing the Embassy crate leaves the protocol fully usable"; the `drive-facadeless`
-/// pipeline stage is the half a compiler decides.
+/// The fourth half is the driver's. Every `waymaker-drive` module — [`FACADE_DRIVER_MODULES`]
+/// is empty, since issue #106 moved the edge above the crate rather than exempting a file
+/// inside it — is held to naming none of [`FACADE_FREE_VOCABULARY`], so a module added
+/// tomorrow is covered without anyone remembering a row. That is the fast half of "removing
+/// the Embassy crate leaves the protocol fully usable"; `cargo metadata` saying
+/// `waymaker-drive` has no dependency on `waymaker-embassy` is the half nothing can fake.
 ///
 /// # What it cannot see
 ///
@@ -6762,6 +6934,7 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 #[must_use]
 pub fn check_ctx_facade(
     sources: &[crate::size::LayerSource],
+    facade_demo: &[crate::size::LayerSource],
     driver: &[crate::size::LayerSource],
 ) -> Vec<Violation> {
     const RULE: &str = "ctx-facade";
@@ -6790,19 +6963,29 @@ pub fn check_ctx_facade(
     // `pub static ATTEMPTS: AtomicUsize` and a `macro_rules!` expanding a tenth public
     // method into `impl Ctx` in `dispatch.rs` — one file over from the two the surface pins
     // read — and watched the gate stay green on all three.
-    for source in sources.iter().filter(|source| source.crate_name == FACADE) {
+    //
+    // `waymaker-facade-demo` reads the same way, for the same must-not-own cell: it holds
+    // `Bridge`, the one other place a caller reaches this boundary, and Codex's review of
+    // issue #106 found that the crate split moved the edge without moving this ban — a
+    // `facade.rs` naming `StableStorage` directly would have passed every check here.
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == FACADE)
+        .chain(facade_demo)
+    {
+        let subject = source.crate_name.as_str();
         let path = source.path.replace('\\', "/");
         let code = without_test_modules(&code_only(&source.contents));
         for (forbidden, why) in CTX_FORBIDDEN_VOCABULARY {
             if names_identifier(&code, forbidden) {
                 violations.push(Violation::new(
                     RULE,
-                    FACADE,
+                    subject,
                     format!("{path} names `{forbidden}`, which {why}"),
                 ));
             }
         }
-        violations.extend(check_no_hidden_state(RULE, FACADE, &path, &code));
+        violations.extend(check_no_hidden_state(RULE, subject, &path, &code));
         // And the future set, for the same reason: a fifth future whose `impl Future` lives
         // one file over is a fifth thing a workflow can `.await` that the count in `ctx.rs`
         // cannot see. Review of this change declared one in `dispatch.rs`.
@@ -6819,7 +7002,7 @@ pub fn check_ctx_facade(
                     if !CTX_FUTURES.contains(&future.as_str()) {
                         violations.push(Violation::new(
                             RULE,
-                            FACADE,
+                            subject,
                             format!(
                                 "{path} implements `Future` for `{future}`, which `CTX_FUTURES` \
                                  does not name: a fifth thing a workflow can `.await` is a \
@@ -6831,7 +7014,7 @@ pub fn check_ctx_facade(
             }
             Err(error) => violations.push(Violation::new(
                 RULE,
-                FACADE,
+                subject,
                 format!(
                     "{path} does not parse, so its `Future` implementors cannot be checked: {error}"
                 ),
@@ -6842,7 +7025,7 @@ pub fn check_ctx_facade(
         if names_identifier(&code, "macro_rules") {
             violations.push(Violation::new(
                 RULE,
-                FACADE,
+                subject,
                 format!(
                     "{path} declares a `macro_rules!`, which can expand a public method into \
                      a pinned `impl`, or a future's `poll`, where no pin can read it"
@@ -7068,6 +7251,9 @@ fn check_module_functions(
 }
 
 /// One module declares exactly the public functions its pin lists.
+///
+/// Reads through `public_functions`, not `public_functions_reachable` — see
+/// [`check_pinned_surface`]'s doc for what that leaves open.
 fn check_dispatch_surface(
     rule: &'static str,
     subject: &str,
@@ -7299,12 +7485,14 @@ fn count_declarations(code: &str, header: &str) -> usize {
         .count()
 }
 
-/// Every `waymaker-drive` module but the three that hold the façade edge names no façade.
+/// Every `waymaker-drive` module names no façade.
 ///
 /// Discovered from the sources rather than listed, so a module added tomorrow is covered.
-/// A scanner is not the whole of this claim and does not have to be: the `drive-facadeless`
-/// pipeline stage builds the crate with `without-facade`, which a `use crate::facade::Bridge`
-/// and a dependency renamed in a manifest both fail. This is the fast, local half.
+/// A scanner is not the whole of this claim and does not have to be: `cargo metadata` says
+/// `waymaker-drive` has no dependency on `waymaker-embassy` at all, in any table, which a
+/// `use waymaker_embassy::...` or a dependency renamed in a manifest both fail to resolve.
+/// This is the fast, local half. See issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106).
 fn check_facade_free_driver(
     rule: &'static str,
     subject: &str,
@@ -7329,8 +7517,7 @@ fn check_facade_free_driver(
                     subject.to_owned(),
                     format!(
                         "{path} names `{forbidden}`, which {why}; the edge belongs in \
-                         waymaker-drive/src/facade.rs, waymaker-drive/src/ota.rs or \
-                         waymaker-drive/src/provisioning.rs"
+                         waymaker-facade-demo"
                     ),
                 ));
             }
@@ -7340,8 +7527,8 @@ fn check_facade_free_driver(
         violations.push(Violation::new(
             rule,
             subject.to_owned(),
-            "no waymaker-drive module outside the façade edge is in the workspace, so \
-             nothing says the synchronous driver still compiles with the façade removed"
+            "no waymaker-drive module is in the workspace, so nothing says the synchronous \
+             driver still compiles with the façade removed"
                 .to_owned(),
         ));
     }
@@ -7729,6 +7916,36 @@ fn check_effect_methods(
             ),
         ));
     }
+    // An associated constant is neither a function nor a member, so the pin above is blind
+    // to it — the same shape `TimerSpec::BEST_EFFORT` used against `timer-capability`
+    // (issue #99). None of the three types has an honest one: every value they carry comes
+    // from a barrier that returned, and a constant is a value any caller reaches without one.
+    for constant in declared_associated_constants(&joined) {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{type_name}` declares the associated constant `{constant}`, which the \
+                 method pin cannot see; a proof of durable intent should come from a \
+                 barrier, not from a value any caller can reach"
+            ),
+        ));
+    }
+    // `DurableIntent` and `Dispatchable` already refuse a trait `impl` outright, below. This
+    // is the same refusal for `Effect`, the one type here that check does not cover, and it
+    // exists for the constant ban just above rather than for the construction pin: a trait
+    // `impl` can carry an associated constant of its own, which is invisible to both the
+    // method pin and the loop above it — Codex found this route on issue #99's own PR.
+    if !EFFECT_NO_SELF_LITERAL.contains(&type_name) && implements_trait_for(code, type_name) {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{type_name}` implements a trait: a trait `impl` can carry an associated \
+                 constant that is invisible to the method pin and to the constant ban above it"
+            ),
+        ));
+    }
     if EFFECT_NO_SELF_LITERAL.contains(&type_name) && implements_trait_for(code, type_name) {
         violations.push(Violation::new(
             RULE,
@@ -8067,6 +8284,7 @@ pub fn check_kernel_boundary(
             };
             for pinned in BOUNDARY_TYPES {
                 violations.extend(check_boundary_type(&pin, &code, pinned));
+                violations.extend(check_boundary_type_has_no_constant(&pin, &code, pinned));
             }
         }
     }
@@ -8211,6 +8429,57 @@ fn check_boundary_type(pin: &MemberPin<'_>, code: &str, pinned: &BoundaryType) -
                 "`{}` no longer declares `{removed}`, which {table} pins; a member the pin \
                  cannot find means the type was renamed and the pin has stopped checking it",
                 pinned.header
+            ),
+        ));
+    }
+    violations
+}
+
+/// One pinned boundary type declares no associated constant.
+///
+/// `check_boundary_type` pins members; it reads no `impl`, so a constant is invisible to it
+/// the same way one is invisible to a method pin — `TimerSpec::BEST_EFFORT`'s shape, against
+/// `timer-capability` (issue #99). None of §06's boundary types has an honest one: every
+/// value that crosses this boundary comes from replaying a record, not from a name a caller
+/// reaches on its own.
+///
+/// A type with no inherent `impl` at all is not reported: there is nothing to pin against,
+/// and `check_boundary_type` above already answers whether the type itself still exists.
+fn check_boundary_type_has_no_constant(
+    pin: &MemberPin<'_>,
+    code: &str,
+    pinned: &BoundaryType,
+) -> Vec<Violation> {
+    let MemberPin { rule, subject, .. } = *pin;
+    let Some(name) = pinned.header.rsplit(' ').next() else {
+        return Vec::new();
+    };
+    let body = inherent_impl_bodies(code, name).join("\n");
+
+    let mut violations: Vec<Violation> = declared_associated_constants(&body)
+        .into_iter()
+        .map(|constant| {
+            Violation::new(
+                rule,
+                subject,
+                format!(
+                    "`{name}` declares the associated constant `{constant}`, which no method \
+                     pin can see; a value that crosses \u{a7}06's boundary comes from \
+                     replaying a record, not from a name any caller can reach"
+                ),
+            )
+        })
+        .collect();
+    // A trait `impl` can carry an associated constant of its own, invisible to the scan
+    // above because it reads only inherent `impl` blocks. Codex found this route on issue
+    // #99's own PR, against `ClockKind`; none of `BOUNDARY_TYPES` has any backstop for it.
+    if implements_trait_for(code, name) {
+        violations.push(Violation::new(
+            rule,
+            subject,
+            format!(
+                "`{name}` implements a trait: a trait `impl` can carry an associated \
+                 constant that is invisible to the constant ban above"
             ),
         ));
     }
@@ -8610,7 +8879,7 @@ pub(crate) fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
 /// by `use ...::Step as S;`, and it fires on an unrelated `BootStep::`. This compares both
 /// sides, so `Step` matches the type and nothing else.
 #[must_use]
-fn names_identifier(code: &str, identifier: &str) -> bool {
+pub(crate) fn names_identifier(code: &str, identifier: &str) -> bool {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
     code.match_indices(identifier).any(|(index, _)| {
         let before = code
@@ -8631,7 +8900,7 @@ fn names_identifier(code: &str, identifier: &str) -> bool {
 /// `impl` "declared twice — a decoy above the real one is what a first-match scan reads",
 /// and the pin here is the same shape and needs the same guard.
 #[must_use]
-fn declaration_count(code: &str, header: &str) -> usize {
+pub(crate) fn declaration_count(code: &str, header: &str) -> usize {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
     code.match_indices(header)
         .filter(|(index, _)| {
@@ -8922,6 +9191,12 @@ pub(crate) fn without_test_modules(code: &str) -> String {
 ///
 /// Scanned with the same reader `size-probe-reach` uses, so `#[cfg(test)]` helpers are
 /// skipped and a trait method counts even without `pub` on it.
+///
+/// It reads through `crate::size::public_functions`, not
+/// `crate::size::public_functions_reachable`: this call has no `PackageGraph` in hand. So
+/// a private trait here can still hide a live impl of a real dependency's trait, the same
+/// gap issue [#141](https://github.com/madmax983/waymaker/issues/141) closed for
+/// `size-probe-reach`. No pin in this workspace declares a private trait today.
 #[must_use]
 fn check_pinned_surface(
     rule: &'static str,
@@ -10809,6 +11084,36 @@ mod deferred_answer_pins {
         vec![layer(EFFECT_PROTOCOL_PATH, contents)]
     }
 
+    /// The real `effect.rs`, so a check is proved against what ships and not only against a
+    /// fixture built from the same table it is pinned by.
+    fn real_effect_module() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("crates")
+            .join(EFFECT_PROTOCOL_PATH);
+        std::fs::read_to_string(&path).expect("the effect module should exist")
+    }
+
+    /// The real `timer.rs`, `clock.rs` and kernel root, so a check is proved against what
+    /// ships and not only against a fixture built from the same table it is pinned by.
+    fn real_timer_capability_sources() -> Vec<crate::size::LayerSource> {
+        fn read(path: &str) -> String {
+            let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("crates")
+                .join(path);
+            std::fs::read_to_string(&full).unwrap_or_else(|_| panic!("{path} should exist"))
+        }
+        vec![
+            layer(TIMER_SEMANTICS_PATH, &read(TIMER_SEMANTICS_PATH)),
+            layer(CLOCK_CAPABILITY_PATH, &read(CLOCK_CAPABILITY_PATH)),
+            layer(
+                "waymaker-core/src/lib.rs",
+                &read("waymaker-core/src/lib.rs"),
+            ),
+        ]
+    }
+
     /// The three layer files `timer-capability` reads, with one of them replaced.
     fn timer_sources(path: &str, contents: &str) -> Vec<crate::size::LayerSource> {
         let clean: [(&str, String); 3] = [
@@ -10892,11 +11197,21 @@ mod deferred_answer_pins {
     fn facade_details(path: &str, contents: &str) -> Vec<String> {
         check_ctx_facade(
             &facade_sources(path, contents),
+            &[],
             &facade_free_driver_sources("", ""),
         )
         .into_iter()
         .map(|violation| violation.detail)
         .collect()
+    }
+
+    /// A clean `waymaker-facade-demo/src/facade.rs`, with `contents` in place of it.
+    fn facade_demo_sources(contents: &str) -> Vec<crate::size::LayerSource> {
+        vec![crate::size::LayerSource {
+            crate_name: "waymaker-facade-demo".to_owned(),
+            path: "waymaker-facade-demo/src/facade.rs".to_owned(),
+            contents: contents.to_owned(),
+        }]
     }
 
     /// The two wiring files `dispatch-wiring` reads, with one of them replaced.
@@ -11155,6 +11470,7 @@ mod deferred_answer_pins {
     fn facade_driver_details(path: &str, contents: &str) -> Vec<String> {
         check_ctx_facade(
             &facade_sources("", ""),
+            &[],
             &facade_free_driver_sources(path, contents),
         )
         .into_iter()
@@ -11176,6 +11492,28 @@ mod deferred_answer_pins {
             tests_support::clean_ctx_facade()
         );
         let details = facade_details(CTX_FACADE_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("StableStorage")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_moved_bridge_is_held_to_the_same_authority_ban() {
+        // Issue #106 moved `Bridge` into `waymaker-facade-demo`; Codex's review found that
+        // the authority ban still read only `waymaker-embassy`'s files, so a `facade.rs`
+        // reaching a `StableStorage` directly would have passed every check here.
+        let module = "pub fn record(storage: &mut impl StableStorage) { let _ = storage; }\n";
+        let details: Vec<String> = check_ctx_facade(
+            &facade_sources("", ""),
+            &facade_demo_sources(module),
+            &facade_free_driver_sources("", ""),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect();
         assert!(
             details
                 .iter()
@@ -11389,6 +11727,144 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_quote_inside_a_raw_string_is_not_the_end_of_the_string() {
+        // Codex round 6, issue #108. `"` opens and closes an ordinary string, but a raw
+        // string ends only at `"` plus its own hash count. `r#"a"]b"#]` read as ending at
+        // the quote inside it, so the scan landed on `b"#] #[rustfmt::skip] impl` and never
+        // reached the real item.
+        let fixture = "#[doc = r#\"a\"]b\"#] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
+    fn a_bracket_inside_a_raw_string_survives_any_hash_count() {
+        // A reader that only knows one hash is the obvious half-fix. Zero hashes and two
+        // hashes must both close on a real raw-string rule — first quote for zero hashes,
+        // first quote plus the matching hash run for two — and not on a quote-toggle that
+        // treats a backslash as an escape, which a raw string never does.
+        let no_hash = "#[doc = r\"a\\\"] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(no_hash).contains(&"raw".to_owned()), "{no_hash}");
+        let two_hash = "#[doc = r##\"a\\\"##] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(two_hash).contains(&"raw".to_owned()), "{two_hash}");
+    }
+
+    #[test]
+    fn a_raw_string_closes_on_its_own_hash_count_not_on_any_quote_hash_pair() {
+        // Separates "count the hashes" from "look for any `\"#`". A raw string opened
+        // with two hashes may hold a bare `"#` — one hash — as plain content.
+        let fixture = "#[doc = r##\"a\"#b\"##] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
+    fn a_bracket_inside_a_character_literal_is_not_the_end_of_the_attribute() {
+        // A `'…'` character literal is a fourth quoted state, and it must not be told
+        // apart from a lifetime by breaking `impl<'a>`. Issue #108.
+        let literal = "#[foo(bar = ']')] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(literal).contains(&"raw".to_owned()), "{literal}");
+        let lifetime = "#[foo(bar = \"x\")] impl<'a> Bank<'a> { pub fn raw() {} }\n";
+        assert!(counted(lifetime).contains(&"raw".to_owned()), "{lifetime}");
+    }
+
+    #[test]
+    fn an_escaped_quote_inside_a_character_literal_is_still_one_literal() {
+        // `'\''` holds an escaped quote, so its closing `'` is the *fourth* character, not
+        // the third. A scan that stops at the first `'` after the backslash reads the
+        // escaped quote itself as the close, leaves the real close unread, and then misreads
+        // a bracket right after the literal as loose text instead of real syntax.
+        let literal = "#[foo(a = '\\'')] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(literal).contains(&"raw".to_owned()), "{literal}");
+        // The same literal beside a real array, so an unread quote left over from the bug
+        // above has a real bracket next to it to mis-scan.
+        let beside_array = "#[foo(seps = ['\\'', 'x'])] impl Bank { pub fn raw() {} }\n";
+        assert!(
+            counted(beside_array).contains(&"raw".to_owned()),
+            "{beside_array}"
+        );
+    }
+
+    #[test]
+    fn a_hex_or_unicode_escape_in_a_character_literal_is_still_one_literal() {
+        // Codex review of #164. `'\x41'` and `'\u{41}'` take more than one character after
+        // the `\`, so a scan that always takes exactly one leaves each literal's real
+        // closing `'` unread. That leftover quote can then pair with the *next* literal's
+        // opening quote, swallowing it and leaving that literal's own bracket unprotected.
+        let hex = "#[foo(seps = ['\\x41', ']'])] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(hex).contains(&"raw".to_owned()), "{hex}");
+        // Codex's own fixture, byte for byte: no spaces, two attributes, and no braces
+        // needed to trigger it.
+        let codex = "#[rustfmt::skip] #[foo(seps=['\\x41',']'])] pub fn raw(){}\n";
+        assert!(counted(codex).contains(&"raw".to_owned()), "{codex}");
+        let unicode = "#[foo(seps = ['\\u{41}', ']'])] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(unicode).contains(&"raw".to_owned()), "{unicode}");
+    }
+
+    #[test]
+    fn a_unicode_escape_with_digit_separators_is_still_one_literal() {
+        // Codex's second round on #164. Rust allows `_` between a `\u{...}` escape's hex
+        // digits, so its width has no fixed cap — only the closing `}` marks the end. A
+        // reader that stops looking after a few characters meets the same fate as one that
+        // never widened its `\x`/`\u` support at all.
+        let separated = "#[foo(seps=['\\u{1_0_F_F_F_F}',']'])] pub fn raw(){}\n";
+        assert!(
+            counted(separated).contains(&"raw".to_owned()),
+            "{separated}"
+        );
+    }
+
+    #[test]
+    fn a_block_comment_hides_the_syntax_it_quotes() {
+        // Codex's third round on #164. A comment showing example syntax —
+        // `/* r#"x" */` — is not a real raw string, and the old quote-toggle scanner read
+        // it as inert text by accident. Recognizing real raw strings without also
+        // recognizing comments turned that accident into a regression: the fake opener
+        // never closes, so the scan fails and the real item is lost.
+        let fixture = "#[allow(/* r#\"x\" */ dead_code)] pub fn raw() {}\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+        // Nested block comments close on their own inner pair first.
+        let nested = "#[allow(/* outer /* inner */ still-outer */ dead_code)] pub fn raw() {}\n";
+        assert!(counted(nested).contains(&"raw".to_owned()), "{nested}");
+    }
+
+    #[test]
+    fn an_unterminated_raw_string_leaves_the_item_unclassified() {
+        // Same fail-closed direction as an unterminated ordinary string: no `"` plus the
+        // right hash count ever closes it, so the scan never finds the real `]` and leaves
+        // the line untouched.
+        let unterminated = "#[doc = r#\"unterminated] impl Bank { pub fn raw() {} }\n";
+        assert!(!counted(unterminated).contains(&"raw".to_owned()));
+    }
+
+    #[test]
+    fn a_byte_or_c_string_raw_prefix_still_opens_a_raw_string() {
+        // `br"..."` and `cr"..."` are raw strings too, and the `b`/`c` in front is an
+        // identifier character — the same guard that keeps `for` and `bar` from being read
+        // as a raw-string prefix would also block a real one here unless it looks one
+        // character past the `b`/`c`.
+        let byte_raw = "#[doc = br#\"a\"]b\"#] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(byte_raw).contains(&"raw".to_owned()), "{byte_raw}");
+        let c_raw = "#[doc = cr#\"a\"]b\"#] #[rustfmt::skip] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(c_raw).contains(&"raw".to_owned()), "{c_raw}");
+    }
+
+    #[test]
+    fn an_unterminated_character_literal_falls_back_to_plain_text() {
+        // No closing `'` follows within the literal's own reach, so the opening `'` is not
+        // a character literal. It falls through as an ordinary character, and the real `]`
+        // after it still closes the attribute.
+        let fixture = "#[foo(bar = 'x)] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
+    fn a_raw_string_and_a_character_literal_both_nest_inside_a_bracket_group() {
+        // `#[cfg(all(a, b))]` proves nested nested brackets alone; this proves a literal
+        // survives inside one too, with a real `]` right after it in the same group.
+        let fixture = "#[cfg(all(a, r#\"]\"#, ']'))] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
     fn a_same_line_attribute_does_not_hide_an_impl_block_from_the_method_pin() {
         // The reader beside `public_functions` had the same blindness, and it is what
         // `ctx-facade` pins `Ctx`'s methods with — so a `pub(crate)` escape hatch behind a
@@ -11579,6 +12055,43 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_future_renamed_through_a_second_alias_is_still_a_fifth_future() {
+        // Issue #109 checklist item: a re-export of an alias, not a direct alias.
+        // Example: `use .. as Pollable;` then `pub use Pollable as Awaitable;`.
+        // The old code resolved only the first hop. It read `Awaitable`,
+        // not `Future`. So it missed `Sneaky`.
+        let sneaky = format!(
+            "{}\nuse core::future::Future as Pollable;\npub use Pollable as Awaitable;\nimpl \
+             Awaitable for Sneaky {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &sneaky);
+        assert!(
+            details.iter().any(|detail| detail.contains("Sneaky")),
+            "a future renamed through a second alias went unreported: {details:?}"
+        );
+    }
+
+    #[test]
+    fn a_sibling_modules_own_alias_is_not_a_fifth_future() {
+        // Codex review of this fix (PR #160): a chain resolves inside its own
+        // module only. Module `a` renames `Future` to `Awaitable`. Module `b`
+        // renames its own, unrelated trait to the same local name and
+        // implements it. `b`'s `impl` must not resolve through `a`'s chain.
+        let module = format!(
+            "{}\nmod a {{\n    use core::future::Future as Pollable;\n    pub use Pollable as \
+             Awaitable;\n}}\nmod b {{\n    trait Unrelated {{}}\n    use Unrelated as \
+             Awaitable;\n    struct Innocent;\n    impl Awaitable for Innocent {{}}\n}}\n",
+            tests_support::clean_ctx_journal()
+        );
+        let details = facade_details(CTX_JOURNAL_PATH, &module);
+        assert!(
+            !details.iter().any(|detail| detail.contains("Innocent")),
+            "a sibling module's own alias was misread as a fifth future: {details:?}"
+        );
+    }
+
+    #[test]
     fn a_raw_future_trait_name_is_still_a_fifth_future() {
         // Issue #90: `r#Future` and `Future` name the same trait. This rule must
         // catch a fifth future written with the raw spelling.
@@ -11612,7 +12125,7 @@ mod deferred_answer_pins {
     fn a_facade_module_that_is_gone_is_reported() {
         // Fails closed, for `timer-capability`'s reason: a pin that cannot find its file is
         // a pin that has stopped checking.
-        let details: Vec<String> = check_ctx_facade(&[], &[])
+        let details: Vec<String> = check_ctx_facade(&[], &[], &[])
             .into_iter()
             .map(|violation| violation.detail)
             .collect();
@@ -11629,7 +12142,7 @@ mod deferred_answer_pins {
     #[test]
     fn a_driver_module_that_names_the_facade_is_reported() {
         // Issue #35's second "done when": removing the façade must leave the protocol
-        // usable, so the edge belongs in the two files that exist to hold it.
+        // usable, so the edge belongs in `waymaker-facade-demo` and not here.
         let module = "//! A driver module.\nuse waymaker_embassy::Journal;\n";
         let details = facade_driver_details("waymaker-drive/src/drive.rs", module);
         assert!(
@@ -11653,6 +12166,179 @@ mod deferred_answer_pins {
     fn the_clean_timer_capability_passes() {
         assert!(
             timer_details(TIMER_SEMANTICS_PATH, &tests_support::clean_timer_module()).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_real_timer_capability_files_satisfy_the_rule_they_are_pinned_by() {
+        // Issue #99: the clean fixture is generated from `CLOCK_KIND_CONSTANTS` itself, so it
+        // cannot show that the check reads the real `impl ClockKind` the same way.
+        let violations = check_timer_capability(
+            &real_timer_capability_sources(),
+            &board_clock_sources("", ""),
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_associated_constant_on_a_timer_type_is_reported() {
+        // Issue #99's own example: `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0
+        // };` on `impl TimerSpec` is neither a function nor a member, so the surface pin and
+        // the member pin are both blind to it. Checked for every type `TIMER_TYPE_METHODS`
+        // pins, not only `TimerSpec`.
+        for (name, _) in TIMER_TYPE_METHODS {
+            let anchor = format!("impl {name} {{\n");
+            let module = tests_support::clean_timer_module().replacen(
+                &anchor,
+                &format!("{anchor}    pub const FORGE: usize = 0;\n"),
+                1,
+            );
+            let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+            assert!(
+                details.iter().any(|detail| detail.contains("FORGE")),
+                "{name}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_renumbered_clock_kind_constant_is_reported() {
+        // Issue #99: `ClockKind` is a `u8` newtype, not an enum, so no member pin and no
+        // method pin sees its two constants. A renumbering passes every round-trip test and
+        // means something else to a device that already wrote the old byte.
+        let module = tests_support::clean_timer_module().replace("Self(2)", "Self(9)");
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("AT_PERSISTENT_TIME") && detail.contains("Self(9)")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_clock_kind_constant_is_reported() {
+        let module = tests_support::clean_timer_module()
+            .replace("    pub const AFTER_BOOT: Self = Self(1);\n", "");
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("no longer declares `AFTER_BOOT`")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_extra_clock_kind_constant_is_reported() {
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n",
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n    \
+             pub const BEST_EFFORT: Self = Self(1);\n",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("BEST_EFFORT")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_identifier_clock_kind_constant_is_reported() {
+        // Codex, on this change's own PR: `r#BEST_EFFORT` failed the character check and the
+        // whole line was dropped, so a third clock kind under a raw name went unreported.
+        // Rust resolves `r#BEST_EFFORT` and `BEST_EFFORT` to the same name.
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n",
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n    \
+             pub const r#BEST_EFFORT: Self = Self(1);\n",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("BEST_EFFORT")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_trait_impl_on_clock_kind_is_reported() {
+        // Codex, on this change's own PR: a trait `impl` can carry an associated constant
+        // of its own, invisible to a scan that reads only inherent `impl` blocks.
+        let module = tests_support::clean_timer_module()
+            + "impl Forge for ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("implements a trait")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_clock_kind_constant_declaration_is_reported() {
+        // Codex, on this change's own PR: two declarations of one name, even gated by
+        // mutually exclusive `#[cfg]` attributes this scan does not evaluate, must not
+        // silently resolve to whichever one a map collect happens to keep.
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n",
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n    \
+             pub const AT_PERSISTENT_TIME: Self = Self(0);\n",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("AT_PERSISTENT_TIME") && detail.contains("2 times")
+            }),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_attribute_on_the_same_line_does_not_hide_a_renumbered_clock_kind_constant() {
+        // Codex, on this change's own PR: `#[rustfmt::skip] pub const X: Self = ..;` on one
+        // line does not start with `pub ` or `const `, so the old scan saw nothing here at
+        // all — not even a mismatch.
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);",
+            "    #[rustfmt::skip] pub const AT_PERSISTENT_TIME: Self = Self(9);",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("AT_PERSISTENT_TIME") && detail.contains("Self(9)")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_qualified_inherent_impl_is_not_a_second_clock_kind() {
+        // Codex, on this change's own PR: `impl crate::timer::ClockKind { .. }` names the
+        // same type as a bare `impl ClockKind { .. }`, and the character scan used to stop
+        // at the first `:` and read `crate` — a name that matches no pinned type, so this
+        // second block was invisible to `inherent_impl_bodies` and everything built on it.
+        let module = tests_support::clean_timer_module()
+            + "impl crate::timer::ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| detail.contains("RTC2")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_qualified_trait_impl_on_clock_kind_is_reported() {
+        // Codex, on this change's own PR: `impl Forge for crate::timer::ClockKind` names
+        // `ClockKind` too, and the old comparison read the whole path and never matched.
+        let module = tests_support::clean_timer_module()
+            + "impl Forge for crate::timer::ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("implements a trait")),
+            "{details:?}"
         );
     }
 
@@ -11956,6 +12642,15 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn the_real_effect_protocol_satisfies_the_rule_it_is_pinned_by() {
+        // Issue #99: the clean fixture is generated from `EFFECT_TYPE_METHODS` itself, so it
+        // cannot show that the new constant ban reads the real `impl` blocks the same way —
+        // every real method here is a `const fn`, which the ban must not mistake for a
+        // constant.
+        assert!(effect_details(&real_effect_module()).is_empty());
+    }
+
+    #[test]
     fn an_aliased_proof_type_does_not_evade_the_construction_pin() {
         // Issue #99, the effect-protocol end: `use crate::DurableIntent as Proof;`
         // followed by `Proof { .. }` inside `schedule` and `redelivering` — the textual
@@ -12089,6 +12784,68 @@ mod deferred_answer_pins {
                 "{opaque}: {details:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_associated_constant_on_a_proof_type_is_reported() {
+        // Issue #99: an associated constant is neither a function nor a member, so the
+        // method pin above is blind to it — the same shape as `TimerSpec::BEST_EFFORT`
+        // against `timer-capability`.
+        for (opaque, anchor) in [
+            (
+                "DurableIntent",
+                "    /// The identity step 4 dispatches under.",
+            ),
+            ("Effect", "    /// The protocol over a writer."),
+            ("Dispatchable", "    /// What step 4 dispatches under."),
+        ] {
+            let source = tests_support::clean_effect_module().replacen(
+                anchor,
+                &format!("    pub const FORGE: usize = 0;\n\n{anchor}"),
+                1,
+            );
+            let details = effect_details(&source);
+            assert!(
+                details.iter().any(|detail| detail.contains("FORGE")),
+                "{opaque}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_associated_constant_at_any_visibility_on_a_proof_type_is_reported() {
+        // The hole review found for methods applies to a constant too: a `pub(crate)` one is
+        // reach enough for a downgrade, because `waymaker-drive` is the crate that forges.
+        for visibility in ["pub", "pub(crate)", ""] {
+            let anchor = "    /// The identity step 4 dispatches under.";
+            let source = tests_support::clean_effect_module().replacen(
+                anchor,
+                &format!("    {visibility} const FORGE: usize = 0;\n\n{anchor}"),
+                1,
+            );
+            let details = effect_details(&source);
+            assert!(
+                details.iter().any(|detail| detail.contains("FORGE")),
+                "{visibility}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trait_impl_on_effect_is_reported() {
+        // Codex, on this change's own PR: `DurableIntent` and `Dispatchable` already refuse
+        // a trait `impl` outright, but `Effect` did not — and a trait `impl` can carry an
+        // associated constant invisible to the scan above, which reads only inherent `impl`
+        // blocks.
+        let source = tests_support::clean_effect_module()
+            + "impl<C: IntegrityCheck> Forge for Effect<C> {\n    const RTC2: usize = 0;\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("implements a trait")),
+            "{details:?}"
+        );
     }
 
     #[test]
@@ -12750,6 +13507,84 @@ mod deferred_answer_pins {
             "a conforming decoy `fn {}` nested in another module went unreported: \
              {violations:?}",
             SCAN_STEP.0
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_string_literal_is_not_a_call() {
+        // A string literal's content is data to `rustc`, never a call. The old
+        // `block_text` kept a literal's exact source text. A callee name spelled
+        // inside a string then read as a real call. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = \"route via {callee}(input)\
+             .into() for humans\";\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a string literal was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_c_string_literal_is_not_a_call() {
+        // A C-string literal (`c"..."`, stable since Rust 1.77) is a string form too.
+        // Codex found it missing from `is_string_literal` on review of the fix above:
+        // the same exploit, spelled with a `c` prefix instead of none. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = c\"route via {callee}(input)\
+             .into() for humans\";\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a C-string literal was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_macro_argument_is_not_a_call() {
+        // `syn` does not expand macros. `stringify!` never runs its argument; it turns
+        // the argument's tokens into a string at compile time. Codex found this on
+        // review of the fix above: the callee's name inside a macro argument rendered
+        // the same as a real call. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = stringify!({callee}(input)\
+             .into());\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a macro argument was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_local_macro_rules_body_is_not_a_call() {
+        // `macro_rules! spoof { .. }` is a different token shape from a macro call:
+        // identifier, `!`, a second identifier (the macro's own name), then the group.
+        // Codex found the earlier fix missed it: the group's tokens rendered even
+        // though nothing runs them unless the macro is invoked. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    macro_rules! spoof {{\n        () \
+             => {{ {callee}(input).into() }};\n    }}\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a local macro_rules! body was read as a real \
+             call: {violations:?}"
         );
     }
 
@@ -13577,6 +14412,57 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|one| one.detail.contains("no longer declares `EndOfHistory`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_associated_constant_on_a_boundary_type_is_reported() {
+        // Issue #99: an associated constant is neither a function nor a member, so
+        // `check_boundary_type` above is blind to it — the same shape as
+        // `TimerSpec::BEST_EFFORT` against `timer-capability`.
+        let mutant = format!(
+            "{}\nimpl Resolve<'_> {{\n    pub const FORGE: usize = 0;\n}}\n",
+            real_transition_module()
+        );
+        let violations = boundary_violations(&mutant, &real_driver_module());
+        assert!(
+            violations.iter().any(|one| one.detail.contains("FORGE")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_associated_constant_at_any_visibility_on_a_boundary_type_is_reported() {
+        // The hole review found for methods applies to a constant too: a `pub(crate)` one is
+        // reach enough for a downgrade, because `waymaker-drive` lands in the same workspace.
+        for visibility in ["pub", "pub(crate)", ""] {
+            let mutant = format!(
+                "{}\nimpl Resolve<'_> {{\n    {visibility} const FORGE: usize = 0;\n}}\n",
+                real_transition_module()
+            );
+            let violations = boundary_violations(&mutant, &real_driver_module());
+            assert!(
+                violations.iter().any(|one| one.detail.contains("FORGE")),
+                "{visibility}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trait_impl_on_a_boundary_type_is_reported() {
+        // Codex, on this change's own PR: none of `BOUNDARY_TYPES` refuses a trait `impl`,
+        // and one can carry an associated constant invisible to the scan above, which reads
+        // only inherent `impl` blocks.
+        let mutant = format!(
+            "{}\nimpl Forge for Resolve<'_> {{\n    const RTC2: usize = 0;\n}}\n",
+            real_transition_module()
+        );
+        let violations = boundary_violations(&mutant, &real_driver_module());
+        assert!(
+            violations
+                .iter()
+                .any(|one| one.detail.contains("implements a trait")),
             "{violations:?}"
         );
     }
@@ -14935,17 +15821,17 @@ pub mod tests_support {
         APPEND_ROUTING_STEPS, APPEND_SURFACE, APPEND_TYPESTATE, BANK_ROUTING_PATH,
         BANK_SEALING_FUNCTIONS, BOUNDARY_DECISIONS, BOUNDARY_TYPES, CAPACITY_ADMISSION_CALL,
         CAPACITY_DELEGATION, CAPACITY_GATE, CAPACITY_SURFACE, CHECKSUM_MODULE,
-        CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE, CTX_FUTURES, CTX_JOURNAL_SURFACE,
-        CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE, DIGEST_FUNCTION, DISPATCH_SURFACE,
-        EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
-        INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
-        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
-        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
-        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
-        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, VERSION_GATE_SURFACE,
-        VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE, VERSION_RANGE_METHODS,
-        VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE, WIRING_TYPE_FIELDS,
-        WIRING_TYPE_METHODS,
+        CLOCK_KIND_CONSTANTS, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE, CTX_FUTURES,
+        CTX_JOURNAL_SURFACE, CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE, DIGEST_FUNCTION,
+        DISPATCH_SURFACE, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
+        INTEGRITY_CHECK_PARAMETERS, INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS,
+        RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
+        STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL, SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS,
+        SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TIMER_BRACED_STRUCTS,
+        TIMER_RECORD_FIELDS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
+        VERSION_GATE_SURFACE, VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE,
+        VERSION_RANGE_METHODS, VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE,
+        WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -15021,6 +15907,11 @@ pub mod tests_support {
             }
             source.push_str("}\n");
         }
+        source.push_str("impl ClockKind {\n");
+        for (name, value) in CLOCK_KIND_CONSTANTS {
+            let _ = writeln!(source, "    pub const {name}: Self = {value};");
+        }
+        source.push_str("}\n");
         source
     }
 
