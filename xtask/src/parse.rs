@@ -1366,13 +1366,165 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
     Some(value.value())
 }
 
+/// True if `text` is a string, byte-string, or C-string literal.
+///
+/// The six forms this function matches:
+/// - `"..."` — a string
+/// - `r"..."` or `r#"..."#` — a raw string
+/// - `b"..."` — a byte string
+/// - `br"..."` or `br#"..."#` — a raw byte string
+/// - `c"..."` — a C string (stable since Rust 1.77)
+/// - `cr"..."` or `cr#"..."#` — a raw C string
+///
+/// A char literal (`'x'`) or a byte literal (`b'x'`) holds one character. It cannot
+/// spell a callee name. This function does not match these two forms.
+fn is_string_literal(text: &str) -> bool {
+    let text = text
+        .strip_prefix('b')
+        .or_else(|| text.strip_prefix('c'))
+        .unwrap_or(text);
+    text.strip_prefix('r').map_or_else(
+        || text.starts_with('"'),
+        |rest| rest.trim_start_matches('#').starts_with('"'),
+    )
+}
+
+/// Replaces each string or byte-string literal in `stream` with an empty one.
+///
+/// Every other token stays the same. This includes a literal's own quote marks.
+///
+/// A literal token's rendered text keeps the exact text from the source file (issue
+/// #158). The text `"route via crc32(input)"` still shows the callee's name after
+/// rendering. A text scan cannot tell this mention from a real call to `crc32`. But to
+/// `rustc`, a string's content is data, not a call. This function removes the content
+/// so the scan cannot see it.
+fn blank_string_literals(stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    stream.into_iter().map(blank_string_literal_tree).collect()
+}
+
+/// The one-token step for [`blank_string_literals`].
+///
+/// A group keeps its own delimiters and span. Only the tokens inside it change.
+fn blank_string_literal_tree(tree: proc_macro2::TokenTree) -> proc_macro2::TokenTree {
+    match tree {
+        proc_macro2::TokenTree::Group(group) => {
+            let mut replaced =
+                proc_macro2::Group::new(group.delimiter(), blank_string_literals(group.stream()));
+            replaced.set_span(group.span());
+            proc_macro2::TokenTree::Group(replaced)
+        }
+        proc_macro2::TokenTree::Literal(literal) if is_string_literal(&literal.to_string()) => {
+            let mut blanked = proc_macro2::Literal::string("");
+            blanked.set_span(literal.span());
+            proc_macro2::TokenTree::Literal(blanked)
+        }
+        other => other,
+    }
+}
+
+/// True if `tree` is the identifier `macro_rules`.
+fn is_macro_rules_keyword(tree: &proc_macro2::TokenTree) -> bool {
+    matches!(tree, proc_macro2::TokenTree::Ident(ident) if ident == "macro_rules")
+}
+
+/// Drops every macro invocation's argument tokens, and every local macro definition's
+/// body, from `stream`.
+///
+/// `syn` does not expand macros (this module's own header states the limit). Neither a
+/// macro argument nor a macro definition's body runs as code on its own:
+/// `stringify!(crc32(input))` does not call `crc32`, and a local
+/// `macro_rules! spoof { () => { crc32(input) } }` does not either unless something
+/// invokes `spoof!()`. A call-boundary scan cannot tell either case from a real call, so
+/// this function drops both instead of rendering them. A macro's own name, and its `!`,
+/// stay — so a real call right after a macro in the same statement still renders at its
+/// own token boundary.
+///
+/// Both shapes are matched by their tokens alone, and each is the only construct Rust
+/// grammar has with that shape:
+///
+/// - **A macro invocation**: an identifier, then `!`, then a delimited group. A bare `!`
+///   never follows an identifier with nothing between them except as a macro call — the
+///   logical-not `!` is a prefix operator and always needs an operator, a delimiter, or
+///   the start of an expression before it, never an identifier.
+/// - **A macro definition**: the identifier `macro_rules`, then `!`, then the macro's
+///   own name, then a delimited group holding its rules.
+fn blank_macro_arguments(stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let tokens: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
+    let mut kept: Vec<proc_macro2::TokenTree> = Vec::with_capacity(tokens.len());
+    let mut rest: &[proc_macro2::TokenTree] = &tokens;
+    loop {
+        if let [
+            keyword,
+            proc_macro2::TokenTree::Punct(bang),
+            name @ proc_macro2::TokenTree::Ident(_),
+            proc_macro2::TokenTree::Group(group),
+            after @ ..,
+        ] = rest
+            && bang.as_char() == '!'
+            && is_macro_rules_keyword(keyword)
+        {
+            kept.push(keyword.clone());
+            kept.push(proc_macro2::TokenTree::Punct(bang.clone()));
+            kept.push(name.clone());
+            kept.push(blanked_group(group));
+            rest = after;
+            continue;
+        }
+        if let [
+            name @ proc_macro2::TokenTree::Ident(_),
+            proc_macro2::TokenTree::Punct(bang),
+            proc_macro2::TokenTree::Group(group),
+            after @ ..,
+        ] = rest
+            && bang.as_char() == '!'
+        {
+            kept.push(name.clone());
+            kept.push(proc_macro2::TokenTree::Punct(bang.clone()));
+            kept.push(blanked_group(group));
+            rest = after;
+            continue;
+        }
+        let Some((first, after)) = rest.split_first() else {
+            break;
+        };
+        kept.push(blank_macro_argument_tree(first.clone()));
+        rest = after;
+    }
+    kept.into_iter().collect()
+}
+
+/// An empty group with `group`'s own delimiter and span.
+fn blanked_group(group: &proc_macro2::Group) -> proc_macro2::TokenTree {
+    let mut emptied = proc_macro2::Group::new(group.delimiter(), proc_macro2::TokenStream::new());
+    emptied.set_span(group.span());
+    proc_macro2::TokenTree::Group(emptied)
+}
+
+/// [`blank_macro_arguments`], one token at a time, for a token that does not start a
+/// macro invocation. A group recurses, so a macro call nested inside an `if` or a
+/// block is still found.
+fn blank_macro_argument_tree(tree: proc_macro2::TokenTree) -> proc_macro2::TokenTree {
+    match tree {
+        proc_macro2::TokenTree::Group(group) => {
+            let mut replaced =
+                proc_macro2::Group::new(group.delimiter(), blank_macro_arguments(group.stream()));
+            replaced.set_span(group.span());
+            proc_macro2::TokenTree::Group(replaced)
+        }
+        other => other,
+    }
+}
+
 /// The body of a function or method block as text the token-based scans understand.
 ///
 /// The statements rendered without the outer braces — the way `braced_body` returned
 /// them — with `quote`'s spaces around `::` collapsed again: the call scans look for
-/// `C::name(` and `name::<`, and the spaced rendering would hide both. What the scans
-/// do with the text is unchanged; this is only the bridge from the resolved item back
-/// to the textual analyses.
+/// `C::name(` and `name::<`, and the spaced rendering would hide both. String and
+/// byte-string literals are blanked first (issue #158), and so is every macro
+/// invocation's argument list. A literal or a macro argument is the only rendered text
+/// that can spell a callee's name without a real call to it. What the scans do with the
+/// text is otherwise unchanged; this is only the bridge from the resolved item back to
+/// the textual analyses.
 ///
 /// A raw marker is not stripped here (issue #90). It does not need to be: every
 /// consumer matches a substring at a token boundary, and `#` is such a boundary, so
@@ -1381,7 +1533,8 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
 fn block_text(block: &syn::Block) -> String {
     let mut body = String::new();
     for stmt in &block.stmts {
-        body.push_str(&stmt.to_token_stream().to_string());
+        let blanked = blank_macro_arguments(blank_string_literals(stmt.to_token_stream()));
+        body.push_str(&blanked.to_string());
         body.push(' ');
     }
     body.replace(" :: ", "::")

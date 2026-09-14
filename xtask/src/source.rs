@@ -12735,6 +12735,84 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_callee_name_inside_a_string_literal_is_not_a_call() {
+        // A string literal's content is data to `rustc`, never a call. The old
+        // `block_text` kept a literal's exact source text. A callee name spelled
+        // inside a string then read as a real call. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = \"route via {callee}(input)\
+             .into() for humans\";\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a string literal was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_c_string_literal_is_not_a_call() {
+        // A C-string literal (`c"..."`, stable since Rust 1.77) is a string form too.
+        // Codex found it missing from `is_string_literal` on review of the fix above:
+        // the same exploit, spelled with a `c` prefix instead of none. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = c\"route via {callee}(input)\
+             .into() for humans\";\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a C-string literal was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_macro_argument_is_not_a_call() {
+        // `syn` does not expand macros. `stringify!` never runs its argument; it turns
+        // the argument's tokens into a string at compile time. Codex found this on
+        // review of the fix above: the callee's name inside a macro argument rendered
+        // the same as a real call. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = stringify!({callee}(input)\
+             .into());\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a macro argument was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_local_macro_rules_body_is_not_a_call() {
+        // `macro_rules! spoof { .. }` is a different token shape from a macro call:
+        // identifier, `!`, a second identifier (the macro's own name), then the group.
+        // Codex found the earlier fix missed it: the group's tokens rendered even
+        // though nothing runs them unless the macro is invoked. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    macro_rules! spoof {{\n        () \
+             => {{ {callee}(input).into() }};\n    }}\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a local macro_rules! body was read as a real \
+             call: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_path_qualified_delegation_is_reported() {
         // `count_tokens(body, "crc32") == 1` is satisfied by `fast::crc32(bytes)` calling a
         // Castagnoli loop in a sibling module, with `crc.rs` untouched so the other half of
