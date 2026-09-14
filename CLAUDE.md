@@ -3192,12 +3192,22 @@ of this change found the first three by trying them against the real file, which
 all five are swept rather than argued. `waymaker-fault`'s and `waymaker-flash`'s own tests
 never called `.clone()` on a `Recovery`, so nothing needed to change beside the type and
 the three places that documented it — `recovery.rs`'s own doc and `append.rs`'s two.
-Fourteen further review rounds hardened `recovery-surface`'s Clone-detection scanner
+Sixteen further review rounds hardened `recovery-surface`'s Clone-detection scanner
 against a raw identifier, a `super`-qualified or capped alias, a bare macro invocation at
 any nesting depth (item, statement, or an out-of-line submodule reached through a
 function-body `#[path]` declaration), a chained trait alias, a local type alias on a
 self-type, and a parenthesized self-type — each verified against the real crate with an
-actual compiling bypass before being closed.
+actual compiling bypass before being closed. Rounds 15 and 16 closed five more of the same
+shape, each again verified against a real, compiling bypass before being closed: an `impl`
+declared as a local item inside a function body, which `collect_trait_implementors` did not
+descend into; a `mod` declared one control-flow block deeper than a function's own
+statements, which `child_modules`' function-body descent still could not see; a `#[path]`
+reached only through a `cfg_attr`, which the old scan read as no `#[path]` at all and fell
+back to a harmless natural sibling; a parenthesized type-alias target (`type R =
+(super::Recovery);`), the alias-declaration side of the parenthesizing round 14 had already
+closed on the self-type side; and a self-type reached through a type-position macro
+invocation, which `declares_item_macro` now flags alongside the item- and
+statement-position macros it already caught.
 
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four

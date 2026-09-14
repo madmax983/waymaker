@@ -11063,6 +11063,192 @@ mod tests {
     }
 
     #[test]
+    fn an_impl_declared_as_a_local_item_inside_a_function_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 15: a reached child
+        // file can declare an `impl` as a local item inside an ordinary function —
+        // `#[allow(non_local_definitions)] fn install() { impl Clone for
+        // super::Recovery { .. } }` — and Rust's own `non_local_definitions` lint
+        // documents that such an `impl` is never actually scoped to the function,
+        // however it looks written down. The old recursion over a reached file's
+        // items read only `syn::Item::Impl` and `syn::Item::Mod`, never descending
+        // into a function body at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "fn install() {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_path_module_declared_inside_a_nested_control_flow_block_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 15: a `mod` can sit
+        // one control-flow block deeper than a method's own body —
+        // `if true { #[path = "..."] mod clone_impl; }` — which the round 14 fix's
+        // function-body descent, reading only the body's own immediate statements,
+        // still could not see.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated_method() {\n",
+            "        if true {\n",
+            "            #[path = \"recovery/clone_impl.rs\"]\n",
+            "            mod clone_impl;\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_cfg_attr_nested_path_module_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 16: this scan does
+        // not evaluate a `cfg`'s condition, so a `#[cfg_attr(all(), path =
+        // "recovery/clone_impl.rs")] mod child;` is a build under which `rustc`
+        // really does load `clone_impl.rs` — and the old scan, reading only a direct
+        // `#[path]`, saw no unconditional attribute and fell back to the natural
+        // directory pair alone, never scanning the file the `cfg_attr` names.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[cfg_attr(all(), path = \"recovery/clone_impl.rs\")]\n",
+            "mod child;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_for_a_parenthesized_type_alias_of_recovery_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 16: a child module
+        // can write `#[allow(unused_parens)] type R = (super::Recovery); impl Clone
+        // for R { .. }` — legal Rust whose alias target is `Type::Paren` rather than
+        // `Type::Path`, on the *alias declaration* side of the same parenthesizing
+        // round 14 had already closed on the self-type side. The old scan silently
+        // omitted `R` from the alias table, so the implementation scan recorded only
+        // the never-matching name `R`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(unused_parens)]\n",
+                "type R = (super::Recovery);\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_expanded_self_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 16: a child module
+        // can write `impl Clone for identity_ty!(super::Recovery)`, using a type
+        // macro this scan cannot expand — `declares_item_macro` now flags a
+        // type-position macro invocation anywhere in the file, failing the whole
+        // file closed the same way an item- or statement-position one already does.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for identity_ty!(super::Recovery) {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

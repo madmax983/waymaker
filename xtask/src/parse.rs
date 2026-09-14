@@ -533,6 +533,11 @@ pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String
 /// `R` is a local alias of the real type — the same shape of miss `every_resolution`
 /// already closes for a derive path and a handwritten impl's *trait* name, just on the
 /// other side of the `impl`.
+///
+/// `unwrap_type_parens` on `TARGET` too: round 16 found
+/// `#[allow(unused_parens)] type R = (super::Recovery);` is legal Rust whose target is
+/// `Type::Paren` rather than `Type::Path`, on the *alias declaration* side of the same
+/// parenthesizing that round 14 had already closed on the self-type side.
 fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
     for item in items {
         if has_cfg_test(item_attrs(item)) {
@@ -540,7 +545,7 @@ fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
         }
         match item {
             syn::Item::Type(type_item) => {
-                if let syn::Type::Path(target) = type_item.ty.as_ref() {
+                if let syn::Type::Path(target) = unwrap_type_parens(type_item.ty.as_ref()) {
                     aliases.push(UseAlias {
                         local: ident_name(&type_item.ident),
                         target: target
@@ -576,8 +581,8 @@ fn unwrap_type_parens(mut ty: &syn::Type) -> &syn::Type {
     ty
 }
 
-fn collect_trait_implementors(
-    items: &[syn::Item],
+fn collect_trait_implementors<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
     aliases: &[UseAlias],
     trait_name: &str,
     implementors: &mut Vec<String>,
@@ -605,22 +610,88 @@ fn collect_trait_implementors(
                         // finding), and `syn` parses the parenthesized form as
                         // `Type::Paren`, not `Type::Path` — a bare `if let` on the
                         // unwrapped variant alone would silently skip it.
-                        if let syn::Type::Path(self_type) =
-                            unwrap_type_parens(implementation.self_ty.as_ref())
-                        {
+                        let self_ty = unwrap_type_parens(implementation.self_ty.as_ref());
+                        if let syn::Type::Path(self_type) = self_ty {
                             // `every_resolution` again: the self-type can be a local
                             // type alias (round 13's first finding), and an
                             // `UNRESOLVED_DERIVE` here is pushed through unchanged so
                             // the caller can fail closed on it the same way
                             // `struct_derives`'s caller already does.
                             implementors.extend(every_resolution(&self_type.path, aliases));
+                        } else if matches!(self_ty, syn::Type::Macro(_)) {
+                            // Round 16: `impl Clone for identity_ty!(super::Recovery)`
+                            // is legal Rust whose self-type is a macro invocation this
+                            // module cannot expand — `declares_item_macro` fails the
+                            // whole file closed on a type-position macro too (see its
+                            // own `visit_type_macro`), and this is the second half of
+                            // the same finding: even if that check were bypassed, a
+                            // self-type this scan cannot resolve must not be silently
+                            // dropped from `implementors`.
+                            implementors.push(UNRESOLVED_DERIVE.to_owned());
                         }
+                    }
+                }
+                // An `impl` block's own methods can themselves declare a further
+                // `impl` as a local item (round 15's finding, below) — an `impl`
+                // block is not only a place a trait implementation is checked, it is
+                // also a place a function body starts. `implementation.attrs` is not
+                // re-checked: the loop's own top-of-body `has_cfg_test` already
+                // excluded this arm entirely when the `impl` itself is `#[cfg(test)]`.
+                for member in &implementation.items {
+                    if let syn::ImplItem::Fn(method) = member {
+                        if has_cfg_test(&method.attrs) {
+                            continue;
+                        }
+                        collect_trait_implementors(
+                            block_items(&method.block),
+                            aliases,
+                            trait_name,
+                            implementors,
+                        );
                     }
                 }
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     collect_trait_implementors(nested, aliases, trait_name, implementors);
+                }
+            }
+            // Round 15 of Codex review on this change (PR #143): a reached child file
+            // can write `#[allow(non_local_definitions)] fn install() { impl Clone for
+            // super::Recovery { .. } }` — an `impl` declared as a local item inside a
+            // function body, which Rust's own `non_local_definitions` lint documents as
+            // never actually scoped to the function, however it looks written down.
+            // The old recursion here read only `syn::Item::Impl` and `syn::Item::Mod` at
+            // whatever level it was called with, never descending into a function,
+            // method, or default trait-method body at all — mirroring
+            // `collect_child_modules`'s three function-like shapes, and reusing
+            // `block_items`, which round 15's *other* finding already teaches to reach
+            // any control-flow nesting depth within one.
+            syn::Item::Fn(function) => {
+                // `function.attrs` is not re-checked, for the reason given above.
+                collect_trait_implementors(
+                    block_items(&function.block),
+                    aliases,
+                    trait_name,
+                    implementors,
+                );
+            }
+            syn::Item::Trait(trait_item) => {
+                // `trait_item.attrs` is not re-checked, for the reason given above.
+                for member in &trait_item.items {
+                    if let syn::TraitItem::Fn(method) = member {
+                        if has_cfg_test(&method.attrs) {
+                            continue;
+                        }
+                        if let Some(block) = &method.default {
+                            collect_trait_implementors(
+                                block_items(block),
+                                aliases,
+                                trait_name,
+                                implementors,
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -743,17 +814,28 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
 /// item-granting shapes is precise rather than merely convenient — a version that also
 /// flagged `Expr::Macro` would reject `recovery.rs`'s own compile-time assertions.
 ///
-/// This module cannot expand a macro (see the module doc's residual limits), so either
-/// shape could expand to anything — a `#[derive(Clone)]`, a handwritten `impl Clone`, or
-/// nothing at all — and neither [`struct_derives`] nor [`trait_implementors`] can tell
-/// which. Found by Codex review of this change (PR #143): round 9 added `Item::Macro` at
-/// the top level, round 10 corrected it to recurse into nested `mod`s the way a
-/// declaration cannot, and round 11 added `Stmt::Macro`, the position a hand-rolled
-/// recursion over `syn::Item` alone cannot reach at all — a visitor is what closes it
-/// rather than a fourth case bolted onto the same recursion. This generalizes the ban
-/// `names_identifier(&code, "macro_rules")` already places on a **declared** macro
-/// elsewhere in this file to any invocation, because the macro doing the expanding does
-/// not have to be declared in the file it expands into.
+/// A third shape counts too, in a different part of the grammar: `Type::Macro` is a
+/// macro invoked where a type is expected, and `impl Clone for identity_ty!(super::
+/// Recovery)` is legal Rust whose self-type this scan cannot expand — round 16 of
+/// Codex review on this change found it, right after [`trait_implementors`]'s own
+/// self-type match, which reads what a macro in that position would otherwise expand
+/// to. Flagging it fails the whole file closed the same way an item- or
+/// statement-position macro already does, which is simpler than resolving what a type
+/// macro expands to and correct for the same reason: this module cannot expand a
+/// macro at all.
+///
+/// This module cannot expand a macro (see the module doc's residual limits), so any of
+/// the three shapes could expand to anything — a `#[derive(Clone)]`, a handwritten `impl
+/// Clone`, or nothing at all — and neither [`struct_derives`] nor [`trait_implementors`]
+/// can tell which. Found by Codex review of this change (PR #143): round 9 added
+/// `Item::Macro` at the top level, round 10 corrected it to recurse into nested `mod`s
+/// the way a declaration cannot, round 11 added `Stmt::Macro`, the position a
+/// hand-rolled recursion over `syn::Item` alone cannot reach at all — a visitor is what
+/// closes it rather than a fourth case bolted onto the same recursion — and round 16
+/// added `Type::Macro`. This generalizes the ban `names_identifier(&code,
+/// "macro_rules")` already places on a **declared** macro elsewhere in this file to any
+/// invocation, because the macro doing the expanding does not have to be declared in the
+/// file it expands into.
 ///
 /// # Errors
 ///
@@ -778,6 +860,10 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         }
 
         fn visit_stmt_macro(&mut self, _node: &'ast syn::StmtMacro) {
+            self.found = true;
+        }
+
+        fn visit_type_macro(&mut self, _node: &'ast syn::TypeMacro) {
             self.found = true;
         }
     }
@@ -1744,23 +1830,28 @@ fn normalize_path(path: &str) -> String {
 /// relative the same way, so `#[path = "crc/tbl.rs"]` in `src/crc.rs` reads
 /// `src/crc/tbl.rs`.
 ///
-/// A `#[path]` attribute names exactly the file `rustc` reads (issue #59): no natural
-/// directory fallback is offered, because a fallback would scan a file the compiler
-/// never reads. Each candidate is lexically normalized, so `#[path = "../shared.rs"]`
-/// matches the `shared.rs` beside the parent directory.
+/// A `#[path]` attribute names exactly the file `rustc` reads (issue #59): an
+/// unconditional one offers no natural directory fallback, because a fallback would
+/// scan a file the compiler never reads. Each candidate is lexically normalized, so
+/// `#[path = "../shared.rs"]` matches the `shared.rs` beside the parent directory.
+///
+/// A `#[cfg_attr(.., path = "...")]` is different: this module does not evaluate a
+/// `cfg`'s condition, so a build under which the condition is false really does resolve
+/// the module naturally, and one under which it is true really does load the named
+/// file instead. Round 16 of Codex review on this change (PR #143) found exactly that
+/// pair — a harmless natural `recovery/child.rs` sitting beside a
+/// `#[cfg_attr(all(), path = "recovery/clone_impl.rs")]`, with `rustc` loading the
+/// latter — so both the natural pair and every `cfg_attr`-nested `path` are scanned as
+/// candidates, at any nesting depth of `cfg_attr`.
 ///
 /// Inline modules have no file and are not returned, but the walk descends into them: a
 /// `mod data;` inside `mod tests { ... }` lives under `tests/`, and inherits the outer
 /// module's test-gating. The walk also descends into a function, method, or default
-/// trait-method body one level, because a `mod` declared as a local item there resolves
-/// to a file the same way a module-scope one does (issue #77's PR #143, round 14: Codex
-/// found `#[path = "recovery/clone_impl.rs"] mod clone_impl;` written inside an ordinary
-/// method, reaching a file the old function-body blind spot let go unscanned).
-///
-/// Residual limit: a `mod` nested one block deeper than that — inside an `if`, a `match`
-/// arm, or a loop within a function body — is not descended into. Legal Rust, and
-/// unlike the case above, not a shape review of this change found a working example of;
-/// the enclosing file's own array scan still reads whatever such a module declares.
+/// trait-method body, at any nesting depth of `if`, `match`, a loop, or a bare block —
+/// not only the body's own immediate statements — because a `mod` declared as a local
+/// item anywhere in there resolves to a file the same way a module-scope one does
+/// (issue #77's PR #143: round 14 found one written directly in an ordinary method's
+/// body, and round 15 found one a control-flow block deeper still).
 ///
 /// # Errors
 ///
@@ -1788,12 +1879,45 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
 }
 
 /// The items a block declares as local items — `Stmt::Item`, the shape `mod`, `fn` and
-/// `struct` all take when written inside a function or method body — in source order.
-fn block_items(block: &syn::Block) -> impl Iterator<Item = &syn::Item> {
-    block.stmts.iter().filter_map(|stmt| match stmt {
-        syn::Stmt::Item(item) => Some(item),
-        _ => None,
-    })
+/// `struct` all take when written inside a function or method body — reached at any
+/// nesting depth of `if`, `else`, `match`, `loop`, `while`, `for`, a bare `{ .. }`, or a
+/// closure body, not only the block's own immediate statements.
+///
+/// Round 15 of Codex review on this change (PR #143) found
+/// `if true { #[path = "recovery/clone_impl.rs"] mod clone_impl; }` written inside an
+/// ordinary method: a local item one control-flow block deeper than the method's own
+/// body, which an earlier version of this function — reading only `block.stmts`
+/// directly — could not see, exactly the residual limit this function's doc used to
+/// state as "legal Rust, and ... not a shape review of this change found a working
+/// example of". A [`syn::visit::Visit`] is what closes it, the same way
+/// [`resolved_path_uses`] and [`declares_item_macro`] already use one to reach a nesting
+/// depth a hand-rolled recursion over one enum's variants cannot enumerate ahead of
+/// time: the default `visit_block` walks into every expression's own nested blocks for
+/// free, so this only needs to say what to do with a `Stmt::Item` once it is reached.
+///
+/// The traversal stops at a `Stmt::Item` rather than descending into it — a nested
+/// `fn`'s own body, for instance — because every caller of this function already
+/// recurses into a found `Item::Fn`/`Item::Impl`/`Item::Trait` itself, calling this
+/// function again on its body; visiting through the item here as well would walk that
+/// same nested body twice.
+fn block_items(block: &syn::Block) -> Vec<&syn::Item> {
+    struct BlockItemVisitor<'ast> {
+        items: Vec<&'ast syn::Item>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for BlockItemVisitor<'ast> {
+        fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+            if let syn::Stmt::Item(item) = stmt {
+                self.items.push(item);
+                return;
+            }
+            syn::visit::visit_stmt(self, stmt);
+        }
+    }
+
+    let mut visitor = BlockItemVisitor { items: Vec::new() };
+    visitor.visit_block(block);
+    visitor.items
 }
 
 /// The out-of-line `mod`s in `items`, appending to `found` in source order.
@@ -1823,15 +1947,34 @@ fn collect_child_modules<'a>(
                         found,
                     );
                 } else {
-                    let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
+                    let direct_path = module.attrs.iter().find_map(path_attr_value);
+                    let candidates = direct_path.map_or_else(
                         || {
-                            vec![
+                            // No unconditional `#[path]`, but a `#[cfg_attr(.., path =
+                            // "...")]` may still choose one under some build — round
+                            // 16 found `#[cfg_attr(all(), path =
+                            // "recovery/clone_impl.rs")] mod child;` beside a
+                            // harmless natural `recovery/child.rs`, where `rustc`
+                            // loads the `cfg_attr` target and the old scan, reading
+                            // only a direct `#[path]`, found neither: it fell back to
+                            // the natural pair and saw only the harmless decoy. This
+                            // module does not evaluate a `cfg`'s condition, so every
+                            // build's candidate — the natural pair *and* every path a
+                            // `cfg_attr` could select, at any nesting depth — is
+                            // scanned.
+                            let mut candidates = vec![
                                 format!("{child_dir}{name}.rs"),
                                 format!("{child_dir}{name}/mod.rs"),
-                            ]
+                            ];
+                            for attr in &module.attrs {
+                                for path in cfg_attr_path_values(attr) {
+                                    candidates.push(normalize_path(&format!("{parent_dir}{path}")));
+                                }
+                            }
+                            candidates
                         },
-                        // `rustc` consults exactly this one path (see above): no
-                        // fallback.
+                        // An unconditional `#[path = "..."]`: `rustc` consults
+                        // exactly this one path (see above), so no fallback.
                         |path| vec![normalize_path(&format!("{parent_dir}{path}"))],
                     );
                     found.push(ChildModule {
@@ -1896,12 +2039,18 @@ fn collect_child_modules<'a>(
 
 /// The string value of a `#[path = "..."]` attribute, if present.
 fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
-    if !path_is_ident(attr.path(), "path") {
-        return None;
-    }
-    let syn::Meta::NameValue(named) = &attr.meta else {
+    path_meta_value(&attr.meta)
+}
+
+/// [`path_attr_value`], over one `syn::Meta` rather than a whole `syn::Attribute` — the
+/// shape a `cfg_attr`'s own arguments come in.
+fn path_meta_value(meta: &syn::Meta) -> Option<String> {
+    let syn::Meta::NameValue(named) = meta else {
         return None;
     };
+    if !path_is_ident(&named.path, "path") {
+        return None;
+    }
     let syn::Expr::Lit(lit) = &named.value else {
         return None;
     };
@@ -1909,6 +2058,50 @@ fn path_attr_value(attr: &syn::Attribute) -> Option<String> {
         return None;
     };
     Some(value.value())
+}
+
+/// Every `path = "..."` value reachable by expanding `attr` as a
+/// `#[cfg_attr(.., path = "...")]`, however many levels deep, regardless of what the
+/// condition at each level is.
+///
+/// Round 16 of Codex review on this change (PR #143): this module does not evaluate a
+/// `cfg`'s condition (see the module doc's residual limits), so a `#[cfg_attr(all(),
+/// path = "recovery/clone_impl.rs")] mod child;` beside a harmless natural
+/// `recovery/child.rs` is a case where `rustc` really does load `clone_impl.rs` under
+/// that build, and [`collect_child_modules`] has to scan it as a candidate rather than
+/// only the natural pair a version reading only a direct `#[path]` would fall back to.
+/// The recursion mirrors [`meta_introduces_cfg`]'s: `#[cfg_attr(a, cfg_attr(b, path =
+/// "..."))]` is valid Rust that reaches its `path` two levels down.
+fn cfg_attr_path_values(attr: &syn::Attribute) -> Vec<String> {
+    if !path_is_ident(attr.path(), "cfg_attr") {
+        return Vec::new();
+    }
+    let Ok(metas) = attr.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return Vec::new();
+    };
+    metas.iter().skip(1).flat_map(meta_path_values).collect()
+}
+
+/// [`cfg_attr_path_values`], over one `cfg_attr` argument rather than over a whole
+/// attribute — a `path = "..."` directly, or another `cfg_attr` nested inside it.
+fn meta_path_values(meta: &syn::Meta) -> Vec<String> {
+    if let Some(value) = path_meta_value(meta) {
+        return vec![value];
+    }
+    let syn::Meta::List(list) = meta else {
+        return Vec::new();
+    };
+    if !path_is_ident(&list.path, "cfg_attr") {
+        return Vec::new();
+    }
+    let Ok(nested) = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return Vec::new();
+    };
+    nested.iter().skip(1).flat_map(meta_path_values).collect()
 }
 
 /// The body of a function or method block as text the token-based scans understand.
