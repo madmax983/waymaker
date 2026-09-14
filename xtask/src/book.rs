@@ -2495,6 +2495,8 @@ mod tests {
             "#[ignore]",
             "#[ignore = \"why\"]",
             "#[cfg(feature = \"never\")]",
+            // Issue #97: `#[cfg_attr(..)]` must skip the test the same way.
+            "#[cfg_attr(all(), ignore)]",
         ] {
             let mut inputs = good_book();
             inputs.samples[0].1 = inputs.samples[0].1.replace(
