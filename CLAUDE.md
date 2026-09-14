@@ -427,7 +427,9 @@ All 10 failure rows, with the id to cite when a change touches one:
 Row 5 now holds as §14 writes it. It says "redeliver": no writer starts a record before the
 one ahead of it has sealed, so a torn completion's own reserved slot is the whole of what an
 interrupted attempt touched, and issue [#95](https://github.com/madmax983/waymaker/issues/95)
-teaches recovery to look — if every byte of it is erased, the record is ignored and the slot
+teaches recovery to look — if every byte from the frame's own unpadded length to the end of
+that slot is erased (the padding and the seal, never the frame body itself, which a
+checksum-valid unsealed frame always has programmed), the record is ignored and the slot
 becomes the append point, so the same run redelivers the effect under its own identity rather
 than being forced into §10's `continue_as_new`. The effect already ran by the time a
 completion record is written, so nothing about `durable-intent-before-effect` changes; what

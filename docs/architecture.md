@@ -228,10 +228,12 @@ unit, and the cleared bit is what makes the promise checkable. No byte of a seal
 `0xFF`, so an erased program unit is never a seal and a seal interrupted part-way through its
 own program always ends in erased bytes. `waymaker-flash`'s `append` module is the writer
 that cannot take the two steps out of order. A reader that meets a frame with no seal over it
-ignores it and reports `Ending::Clean` past the frame's reserved slot when every byte of that
-slot is erased — issue #95, since no writer ever starts the next record before this one has
-sealed — and `Ending::Unsealed` otherwise, when a byte in the slot is neither erased nor a
-real seal and an interrupted append cannot be told from damage.
+ignores it and reports `Ending::Clean` past the frame's reserved slot when every byte from the
+frame's own unpadded length to the end of that slot — the padding and the seal, never the
+frame body, which a checksum-valid unsealed frame always has programmed — is erased, issue
+#95, since no writer ever starts the next record before this one has sealed — and
+`Ending::Unsealed` otherwise, when a byte in that range is neither erased nor a real seal and
+an interrupted append cannot be told from damage.
 
 Between the frame and its seal is padding, up to the device's program granularity from §12's
 `Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never
@@ -480,10 +482,13 @@ flowchart TB
   len -- "sound" --> frame["read the record · decode_with"]
   frame -- "malformed · integrity-failed" --> damaged
   frame -- "a sound frame" --> seal["commit_seal_holds · the program unit after the padding"]
-  seal -- "no seal, a torn one, or another frame's" --> unsealed(["Unsealed · no append offset"])
   seal -- "unknown record kind" --> damaged
   seal -- "a committed record" --> yield["yield it · offset += padded stride + one seal"]
   yield --> read
+  seal -- "no seal, a torn one, or another frame's" --> slot["[frame_len, stride) erased? · issue #95"]
+  slot -- "yes · nothing past the frame body was ever touched" --> ignore["ignore it, offset += stride"]
+  ignore --> read
+  slot -- "no · a byte is neither erased nor a real seal" --> unsealed(["Unsealed · no append offset"])
   read -- "read failed" --> incomplete
 ```
 
@@ -491,11 +496,20 @@ Out-of-sequence is the one of §09's four stop conditions that is not drawn here
 is not a fact about the bytes: `waymaker_core::ReplayCursor` owns it, a caller pairs the two,
 and a caller that stops pumping gets no append offset because an unfinished scan has none.
 The other three are all in the picture, and *unsealed* is the one issue
-[#24](https://github.com/madmax983/waymaker/issues/24) added: a frame body with no commit
-seal over it is a frame whose writer never reached §07 step 3, so the record was never
-committed and never dispatched. Before the seal existed a torn tail and a damaged frame
+[#24](https://github.com/madmax983/waymaker/issues/24) added: a frame with no commit seal
+over it is a frame whose writer never reached §07 step 3, so the record was never *committed*
+— but for a schedule record that is also never dispatched, where for a completion record the
+effect had already run by the time this write was attempted (§07 dispatches at step 4, the
+completion write is steps 5 to 7). Before the seal existed a torn tail and a damaged frame
 stopped the scan in the same place, which is what §14 requires either way — what the seal
-adds is the ability to say which of the two happened.
+adds is the ability to say which of the two happened. Issue
+[#95](https://github.com/madmax983/waymaker/issues/95) then split *unsealed* itself in two: a
+clean `[frame_len, stride)` is an interrupted attempt that touched nothing past its own
+reserved slot, so the record is ignored and the slot becomes the append point rather than a
+dead end — the same run redelivers under its original identity. Only a slot with a real,
+programmed byte in that range — neither erased nor a whole seal — is still `Unsealed` with no
+append offset, exactly as before: recovery genuinely cannot tell an interrupted append from
+damage there.
 
 ## Crash injection
 
