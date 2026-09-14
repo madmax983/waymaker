@@ -3307,3 +3307,31 @@ The row 8 test now asserts `rig.verify(0, ..)` reports `Outcome::Passed` at ever
 crash points, beside the assertion that `resume` refuses them; verified failing with
 `Breached(LostAcknowledgedRecord { .. })` against the prior single check before this split
 existed.
+
+A further round found two more, again the shape of an instrument answering a question the
+previous round made reachable for the first time. The first is in the pair of fixes above:
+`Rig::new` sizes the bank and the witness for `self.effects` alone, and `resume_declaring`'s
+`declared` can share this rig's seed and iteration — so it matches the recovered prefix —
+while naming more effects than either was ever provisioned for. Left as the earlier round
+left it, that call ran past its own provisioning until an unrelated capacity error
+(`AppendError::NoRoom`, `WitnessError::Full`) stopped it, rather than the refusal-before-
+mutation `resume`'s own postcondition promises. `resume_as` now refuses any workload wider
+than `self.effects` before touching the device at all, ahead of the recovery this rig's own
+authority check already gates on. Reproduced first from the same crash point the earlier
+round used — both of the rig's own effects durably completed, `RunCompleted` not yet begun —
+where the prior code durably appended and dispatched the extra effect's schedule record
+before this refusal existed.
+
+The second found that `rollover_sweep`'s combined run never called `Installed::reclaim` at
+all: `Installed::recovery` and `Installed::reclaim` both consume the value `commit` returns,
+and the sweep took the former to keep writing into the bank it installed, so the crash
+injector never produced a point during the retiring bank's own erase or its barrier — even
+though row 8 held authoritative throughout that window exactly as it does after `commit`,
+and the row was published as fully swept regardless. `drive_rollover_swap` now reclaims
+first and re-derives the installed bank's journal region by hand — the same read
+`iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past` already does —
+so the erase is under the injector and the caller still gets a writer for the bank it
+installed. Row 8's own count moved from 167 to 175 crash points, the eight new ones all
+inside the erase and its barrier; row 7's count did not move, because reclaiming the
+retiring bank can only ever lose it `bank::select`'s vote, never regain it ahead of the
+bank the swap already installed.

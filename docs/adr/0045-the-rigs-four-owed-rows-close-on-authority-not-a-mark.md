@@ -108,9 +108,11 @@ injector's own census covers, and `CLAUDE.md`'s table follows.
 
 ## Consequences
 
-**The numbers.** `rollover_sweep` classifies 228 crash points of the combined sequence into
-row 7 or row 8: 61 in `during-inactive-bank-erase-or-write`, 167 in
-`after-new-bank-seal-barrier`. Rows 9 and 10 are driven once each, as they are on the model.
+**The numbers.** `rollover_sweep` classifies 236 crash points of the combined sequence into
+row 7 or row 8: 61 in `during-inactive-bank-erase-or-write`, 175 in
+`after-new-bank-seal-barrier` — the second figure moved from its original 167 once review
+found the sweep never reclaimed the retiring bank at all; see below. Rows 9 and 10 are
+driven once each, as they are on the model.
 All ten rows are now pinned in one table by
 `every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned`, and the six pre-existing
 counts — 86, 84, 2, 42, 84, 138 — did not move.
@@ -142,6 +144,23 @@ stays authority-gated for `resume` and `recover_prefix`; `judge` moves to a new
 which bank is authoritative now — a retired bank's own history does not change when a swap
 moves authority away from it. Both were verified failing against the prior code before their
 fixes landed.
+
+**A later round found two more of the same shape.** First, `resume_declaring`'s `declared`
+can share this rig's seed and iteration — so it matches the recovered prefix exactly — while
+naming more effects than `Rig::new` provisioned the bank and the witness for. Left
+ungated, review found `resume_as` running past that provisioning until an unrelated capacity
+error stopped it, rather than refusing before any write or dispatch as `resume`'s own
+postcondition promises; `resume_as` now refuses a workload wider than `self.effects` before
+touching the device. Second, `rollover_sweep`'s combined run never called
+`Installed::reclaim`, because `Installed::recovery` and `Installed::reclaim` both consume
+the value `commit` returns and the sweep took the former to keep writing into the bank it
+installed — so the crash injector never produced a point during the retiring bank's own
+erase or its barrier, and row 8 was published as fully swept regardless. `drive_rollover_swap`
+now reclaims first and re-derives the installed bank's journal region by hand, which is
+where row 8's count above moved from 167 to 175; row 7's count did not move, because
+reclaiming the retiring bank can only lose it `bank::select`'s vote, never regain one ahead
+of the bank already installed. Both were verified failing against the prior code before
+their fixes landed.
 
 **What is still owed.** The two bank rows are swept at one `effects_before_swap` value and
 one declared next-run input; unlike `waymaker-fault`'s own swap sweep, this one does not vary

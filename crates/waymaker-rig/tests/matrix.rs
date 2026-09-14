@@ -609,9 +609,22 @@ fn drive_rollover_prefix(session: &mut waymaker_fault::Session) -> Result<(), St
 }
 
 /// §10's seven-step swap from the retiring bank into the other one, driven directly the
-/// way [`row_nine`]'s explicit exit is. Returns the engine window and the installed
-/// bank's journal, positioned after whatever [`Journal::after`] found there. The window
-/// still borrows `session`, so the caller can keep writing into the bank it installed.
+/// way [`row_nine`]'s explicit exit is — all seven steps, [`Installed::reclaim`] included.
+/// Returns the engine window and the installed bank's journal, positioned after whatever
+/// [`Journal::after`] found there. The window still borrows `session`, so the caller can
+/// keep writing into the bank it installed.
+///
+/// Review found this stopping at step 6, because [`Installed::recovery`] and
+/// [`Installed::reclaim`] both consume the value `commit` returns and a caller can only
+/// take one — so the crash injector never produced a point during the retiring bank's own
+/// erase or its barrier, even though row 8 held authoritative throughout it exactly as it
+/// does after `commit`. Reclaiming first and then re-deriving the installed bank's journal
+/// region by hand — the same read [`iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past`]
+/// already does — gets both: the erase is under the injector, and the caller still gets a
+/// writer for the bank it installed.
+///
+/// [`Installed::recovery`]: waymaker_flash::swap::Installed::recovery
+/// [`Installed::reclaim`]: waymaker_flash::swap::Installed::reclaim
 fn drive_rollover_swap(
     session: &mut waymaker_fault::Session,
 ) -> Result<(Window<'_, waymaker_fault::Session>, Journal), String> {
@@ -652,7 +665,11 @@ fn drive_rollover_swap(
     let installed = sealable
         .commit()
         .map_err(|error| format!("swap commit: {error:?}"))?;
-    let mut new_recovery = installed.recovery();
+    installed
+        .reclaim()
+        .map_err(|error| format!("swap reclaim: {error:?}"))?;
+    let new_region = try_bank_region(&rig, Rig::BANK.other(), &mut engine, &mut page)?;
+    let mut new_recovery = Recovery::new(new_region, &mut engine);
     while let Some(step) = new_recovery.next(&mut page) {
         step.map_err(|error| format!("new recovery: {error:?}"))?;
     }
@@ -797,8 +814,8 @@ fn classify_rollover(
         bank::Authority::Bank { .. } => Some(Row::AfterNewBankSealBarrier),
         bank::Authority::Unsealed | bank::Authority::Ambiguous { .. } => {
             unreachable!(
-                "the retiring bank is never erased in this sweep, so exactly one bank is \
-                 always a candidate"
+                "the installed bank's own seal is untouched by reclaiming the retiring one, \
+                 so exactly one bank is always a candidate even while that erase is under way"
             )
         }
     }
@@ -1438,7 +1455,7 @@ fn every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned() {
             (Row::DuringCompletionWrite, 84),
             (Row::AfterCompletionBarrier, 138),
             (Row::DuringInactiveBankEraseOrWrite, 61),
-            (Row::AfterNewBankSealBarrier, 167),
+            (Row::AfterNewBankSealBarrier, 175),
             (Row::HistoryCapacityReached, 1),
             (Row::ReplayDivergence, 1),
         ]
@@ -2325,17 +2342,27 @@ fn iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past()
 /// Round 5, review finding B: `perform` used to rebuild its own workload from the iteration
 /// number instead of using the one `resume_as` was auditing against, so `resume_declaring`
 /// could durably append a schedule record its own narrower workload could not answer for.
+/// `perform` now takes the caller's `workload` directly, which is what makes the refusal
+/// below possible at all: without it, the extra effect's schedule record would land durably
+/// before the narrower `self.workload(iteration)` refused to dispatch it.
+///
+/// Round 6, review finding C: a `declared` workload wider than [`Rig::effects`](Rig) has the
+/// same run id as this rig's own workload whenever it shares its seed and iteration, so it
+/// can match the recovered prefix exactly — but the bank and witness were only ever
+/// provisioned for `Rig::effects`. Left ungated, review found this would run past that
+/// provisioning until an unrelated capacity error (`AppendError::NoRoom`,
+/// `WitnessError::Full`) stopped it, which is not the failure `resume`'s own postcondition
+/// promises: a refusal *before* any write or dispatch. `resume_as` now refuses any workload
+/// wider than `self.effects` before touching the device at all.
 ///
 /// This finds a crash point that leaves both of the rig's two effects durably completed and
 /// `RunCompleted` not yet begun, then resumes it declaring a workload with one more effect
-/// than the rig has. The declared workload's extra effect matches the recovered prefix, so
-/// the resume writes its schedule record and dispatches it — from the *declared* workload's
-/// wider effect range. Reverting the fix reproduces the review finding directly: the extra
-/// effect's schedule record lands durably and the dispatch that follows it fails, because
-/// `self.workload(iteration)`'s narrower range refuses an effect index the declared workload
-/// would have served.
+/// than the rig was provisioned for. Reverting the capacity check reproduces the review
+/// finding directly: the extra effect's schedule record lands durably and is dispatched
+/// (finding B's own fix serves it, since the declared workload's extra effect matches the
+/// recovered prefix) — exactly the mutation-before-refusal finding C flags.
 #[test]
-fn resume_declaring_dispatches_the_extra_effect_from_the_declared_workload() {
+fn resume_declaring_refuses_a_workload_wider_than_the_rig_was_provisioned_for() {
     let harness = Harness::new(geometry());
     let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
     let Ok(runs) = harness.run(|session| {
@@ -2363,7 +2390,8 @@ fn resume_declaring_dispatches_the_extra_effect_from_the_declared_workload() {
         };
         // Both of the rig's own effects durably completed, and `RunCompleted` not yet
         // begun: the sharpest case, because the recovered prefix agrees with the declared
-        // workload exactly and the only disagreement is what comes after it.
+        // workload exactly and the only disagreement is what comes after it — which is
+        // exactly the state from which the unfixed code would proceed to mutate.
         if !matches!(
             (evidence.attempted, evidence.activity, evidence.recovered_it),
             (Role::Completion(1), Activity::Returned, true)
@@ -2372,24 +2400,20 @@ fn resume_declaring_dispatches_the_extra_effect_from_the_declared_workload() {
         }
         let mut page = [0_u8; Rig::PAGE_BYTES];
         let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
         let outcome = {
             let mut metered = Metered::new(&mut device);
             rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
         };
+        assert!(matches!(outcome, Err(RigError::Workload)), "{outcome:?}");
         assert!(
-            matches!(
-                outcome,
-                Ok(Resumed::Completed {
-                    recovered: 5,
-                    redelivered: None
-                })
-            ),
-            "{outcome:?}"
+            dispatcher.entered.is_empty(),
+            "an over-wide declaration was dispatched before being refused"
         );
         assert_eq!(
-            dispatcher.entered,
-            [2],
-            "the extra effect was not dispatched from the declared workload"
+            device.image(),
+            before.as_slice(),
+            "an over-wide declaration mutated the device before being refused"
         );
         checked += 1;
         break;

@@ -1316,6 +1316,14 @@ impl Rig {
 
     /// [`resume`](Self::resume) and [`resume_declaring`](Self::resume_declaring), over the
     /// workload each one means to audit history against.
+    ///
+    /// Refuses a `workload` wider than [`effects`](Self::effects) before touching the
+    /// device: `resume_declaring`'s `declared` can share this rig's seed and iteration and
+    /// so match its recovered prefix exactly while naming more effects than the bank or the
+    /// witness were ever provisioned for — `Rig::new` sizes both against `effects` alone.
+    /// Review found this call answering that case by writing and dispatching until an
+    /// unrelated capacity error stopped it, in place of the refusal-before-mutation every
+    /// other path here promises.
     fn resume_as<S: StableStorage, D: Dispatcher>(
         &self,
         iteration: u32,
@@ -1326,6 +1334,9 @@ impl Rig {
     ) -> Result<Resumed, RigError<S::Error, D::Error>> {
         if page.len() < Self::PAGE_BYTES {
             return Err(RigError::ShortPage);
+        }
+        if workload.effects() > self.effects {
+            return Err(RigError::Workload);
         }
         let Some(records) = workload.records() else {
             return Err(RigError::Workload);
