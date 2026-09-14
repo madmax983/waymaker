@@ -499,6 +499,17 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
     // `Some(items)` once it has stepped into a sibling module by name
     // (issue #169), at which point `scope` stops tracking it.
     let mut entered: Option<&[syn::Item]> = None;
+    // Module names consumed by descent since the last real alias
+    // substitution (issue #169; Codex review, PR #176). Descent alone
+    // decides only which scope to search next — it must not remove a name
+    // from the answer unless an alias actually substituted for it. `self`
+    // and `super` are safe to drop unconditionally because `self::X` and
+    // `X` name the same thing; a module name is not: `TimerSpec::BestEffort`
+    // with no alias anywhere in `TimerSpec` names a real item by that whole
+    // path, and returning bare `BestEffort` would silently rewrite it.
+    // Cleared on every alias hit, because a substitution is a legitimate
+    // answer standing for everything read to reach it.
+    let mut descended_prefix: Vec<String> = Vec::new();
     // A renamed re-export chains one alias to another, and a plain
     // relative path can step into a sibling module (issue #169), possibly
     // more than once. Bounded by the whole file's own alias count plus its
@@ -532,6 +543,7 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
             let mut resolved = alias.target.clone();
             resolved.extend(segments.drain(1..));
             segments = resolved;
+            descended_prefix.clear();
             // `use ::a::b as c;` reaches the extern prelude directly, past
             // every local scope on purpose (Codex review, PR #160, round
             // 8): `a` is never a local alias, whatever else in this file
@@ -550,7 +562,7 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
                 .into_iter()
                 .find(|(name, _)| *name == first)
             {
-                segments.remove(0);
+                descended_prefix.push(segments.remove(0));
                 entered = Some(module_items);
                 continue;
             }
@@ -561,7 +573,11 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
         Some(_) => consume_self_prefix(&mut segments),
         None => consume_scope_prefix(&mut segments, &mut scope),
     }
-    segments
+    // Nothing resolved past the last module entered by name: give the
+    // names descent consumed back, so the answer is the path as written
+    // rather than a name silently thrown away (Codex review, PR #176).
+    descended_prefix.append(&mut segments);
+    descended_prefix
 }
 
 /// Consumes a leading `self` segment, if there is one. The half of
@@ -2364,6 +2380,25 @@ mod alias_scope_tests {
              Awaitable;\n    struct Innocent;\n    impl Awaitable for Innocent {}\n}\n";
         let implementors = future_trait_implementors(code).expect("the fixture parses");
         assert_eq!(implementors, ["Real"], "{implementors:?}");
+    }
+
+    #[test]
+    fn an_unresolvable_tail_after_module_descent_keeps_its_module_prefix() {
+        // Codex review, PR #176: `TimerSpec::BestEffort` names a real item
+        // through a real module, with no `use` alias anywhere in
+        // `TimerSpec`. Descending into `TimerSpec` to look for one must not
+        // throw the module's own name away when the look fails — a
+        // suffix check like `check_clock_spec_construction`'s needs the
+        // whole path back, not a bare `BestEffort` that looks unqualified.
+        let code = "mod TimerSpec {\n    pub struct BestEffort;\n}\nfn f() {\n    let _ = \
+             TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "module descent dropped its own prefix when nothing further resolved: {paths:?}"
+        );
     }
 
     #[test]
