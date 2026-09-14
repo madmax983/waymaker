@@ -27,11 +27,13 @@ waymaker-flash.workspace = true
 waymaker-fault.workspace = true
 waymaker-rig.workspace = true
 # Design document §04's context term and the generated workflow futures are *measured* as
-# well, on the types the firmware links, rather than transcribed. `waymaker-drive` is where
-# a concrete `Ctx` and §06's example workflow are named; issue #39 asks the report to make
-# both visible. Host-only, and it grants no layer anything, for the reason above.
+# well, on the types the firmware links, rather than transcribed. `waymaker-facade-demo` is
+# where a concrete `Ctx` and §06's two example workflows are named; issue #39 asks the
+# report to make both visible. Host-only, and it grants no layer anything, for the reason
+# above.
 waymaker-drive.workspace = true
-# Issue: `cargo xtask profile` gates six crates at zero heap blocks, and a crate the
+waymaker-facade-demo.workspace = true
+# Issue: `cargo xtask profile` gates seven crates at zero heap blocks, and a crate the
 # workload never links can never be attributed one — so the gate would cover it in name and
 # not in fact. Codex found exactly that on the first review of the profiling gate:
 # `waymaker-conformance` was not in this graph at all, and `waymaker-embassy` was linked

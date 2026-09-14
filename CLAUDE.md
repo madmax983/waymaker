@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 56 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 57 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -39,7 +39,7 @@ cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
-cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
 cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings
@@ -212,6 +212,39 @@ where no such operation exists the case says so rather than reaching somewhere u
 `xtask::policy::LAYERS` are empty — only `waymaker-embassy` has entries, and only for issue
 #37's optional codecs — so the kernel growing that dependency fails
 `kernel-zero-dependencies` and `waymaker-flash` growing it fails `dependency-direction`.
+
+## The storage-shape catalogue
+
+Issue [#130](https://github.com/madmax983/waymaker/issues/130) item 2 asks that "every legal
+operation shape the firmware issues must appear in the suite". `xtask::docs::STORAGE_SHAPES`
+holds the six shapes, the conformance crate's own `shape.rs` holds them again, and the
+`storage-shapes` rule fails a build in which this section, that table, the crate and
+[ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md) stop naming the
+same set.
+
+A shape is a claim about a legal call, transcribed by a reviewer from `waymaker-flash`'s
+writers the same way `STORAGE_CONTRACT_CLAUSES` transcribes §12 rather than deriving it from
+source. What holds the claim to the suite is `shape::ShapeWitness`, which wraps a
+`StableStorage` and records which shapes a run really issues, crediting nothing an adapter
+refused —
+`crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape` fails a
+build in which a declared shape goes unexercised.
+
+All 6 storage shapes, with the id to cite when a change touches one:
+
+| Id | Sentence | Issued by |
+| --- | --- | --- |
+| `program-single-unit` | A program of exactly one program unit. | `append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value — at the journal's own alignment, which may be coarser than the device program unit — comes to exactly one device program unit |
+| `program-multi-unit` | A program of more than one program unit in one call. | `append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever that padded value spans more than one device program unit |
+| `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
+| `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
+| `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s header read and its erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — come to exactly one read unit |
+| `read-multi-unit` | A read of more than one read unit in one call. | `recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; and its header read and erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — span more than one read unit |
+
+Issue #130 item 3 — a generator that mutation-tests the suite against its own model, with a
+conformant arm so a false positive is reachable and not only a broken adapter — is still
+open. It is `waymaker-spec`-shaped work, not a small addition to `tests/teeth.rs`, and this
+catalogue does not attempt it.
 
 ## The frozen wire format
 
@@ -528,7 +561,7 @@ row you are reading is the string the gate reads.
 adapter can be written later against the same semantic kernel; it must not expand the
 firmware traits to accommodate host conveniences.
 
-Eight crates are in the workspace and are *not* layers:
+Nine crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes and its symbols can be
@@ -596,10 +629,9 @@ Eight crates are in the workspace and are *not* layers:
   firmware target builds. §07 is here rather than in `waymaker-flash` because step 4 is an
   activity, and that crate's must-not-own cell names activities — see
   [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md).
-  Outside `default-members`, and the only crate that depends on it is `xtask`, which reads
-  §04's context term and the generated workflow future sizes out of §06's example rather than
-  transcribing them — the same reason `xtask` depends on `waymaker-fault` and
-  `waymaker-rig`. It is the third member of this
+  Outside `default-members`, and it names no dependency on `waymaker-embassy` at all, in any
+  table — issue [#106](https://github.com/madmax983/waymaker/issues/106). It is the third
+  member of this
   category that is `#![no_std]` and allocation-free, and the reason is the claim it exists to
   make: issue #28 asks for a workflow driven to completion with "no `Future`, no Embassy, and
   no allocation", and a driver that could only be built for the host would leave the last
@@ -608,6 +640,23 @@ Eight crates are in the workspace and are *not* layers:
   dispatcher and wakeups are rung 0.4's, and a façade that contained the protocol would be
   the opposite of the thing #28 asks to be proved. See
   [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
+- `waymaker-facade-demo` — issue
+  [#106](https://github.com/madmax983/waymaker/issues/106)'s bridge from `waymaker-drive` to
+  `waymaker-embassy`, also `policy::TEST_SUPPORT_CRATES`. `facade`, `ota` and `provisioning`
+  used to be three modules of `waymaker-drive` itself, removed by a `without-facade` feature
+  to test that the driver did not need them — which proved only that no *other* module
+  needed them, since `waymaker-drive`'s manifest kept the edge to `waymaker-embassy` either
+  way. This crate holds the edge instead, so `waymaker-drive`'s independence from the façade
+  is a fact `cargo metadata` states rather than a claim a feature flag argued for. Outside
+  `default-members`, and the only crate that depends on it is `xtask`, which reads §04's
+  context term and the generated workflow future sizes out of §06's two examples rather than
+  transcribing them — the same reason `xtask` depends on `waymaker-fault` and
+  `waymaker-rig`. It is the fourth member of this category that is `#![no_std]` and
+  allocation-free, for `waymaker-drive`'s own reason one layer up: a bridge that could only
+  be built for the host would leave "the protocol is fully usable through the synchronous
+  driver" unchecked on the one crate that names the façade at all — so the
+  `facade-demo-firmware` stage builds its library for `thumbv6m-none-eabi`. See
+  [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md).
 - `waymaker-spec` — the formal specification of the recovery invariants, also
   `policy::TEST_SUPPORT_CRATES`. The ghost model of committed history, the journal and bank
   state machines, and the exhaustive search that discharges design document §14's guarantees
@@ -847,7 +896,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 56 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 57 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -869,7 +918,7 @@ this table is how you find out what a red build is telling you.
 | `commit-discipline` | The two-barrier writer's public function surface differs from `source::APPEND_SURFACE`; or the typestate that makes design document §07's order unrepresentable comes apart — the staged frame grows a second method or the word `program`, the sealable frame grows anything but `commit`, the sealable frame is constructed anywhere but inside `payload_barrier`, or that barrier stops calling `storage.barrier` exactly once. Issue [#24](https://github.com/madmax983/waymaker/issues/24) asks that "it is not possible to program a seal without the intervening payload barrier having returned", and a `compile_fail` doctest in the crate proves that of the code as it stands. This is what stops it being given back: a `Staged::commit`, a `Journal::write` that did all four steps in one call, or a second constructor for `Sealable` would each break no other rule and turn a protocol into a convention. What it cannot see is whether the barrier is a real one — that is §12's contract and `waymaker-conformance`'s across-reset witness. |
 | `capacity-reserve` | §10's capacity reserve gains a public function `source::CAPACITY_SURFACE` does not list, in either direction — or the gate comes apart: `source::CAPACITY_GATE` declares no inherent `impl`, declares `stage` other than exactly once, or its `stage` does not *open* with `source::CAPACITY_ADMISSION_CALL` and go on to `source::CAPACITY_DELEGATION`. §10 says "the runtime never overwrites committed history to make room", and every way of giving that back is an *addition*: a `Reserved::stage_unchecked`, a `Reserved::into_journal` handing the ungated writer back, a `Reserve::none()`, or a `Reserve::for_bytes(tail)` taking the figure from its caller rather than from a `BankLayout` — which is the sharpest of the four, because a reserve is only a promise because a layout vouched for it. The order half is the other word §10 uses: scheduling fails **early**, and issue #25 asks that the failure "produce no mutation at all". §12 says a failed program may still have changed media, so the only refusal that changes nothing is one taken before the device is called. The decision must therefore be the body's **first** statement, not merely one that precedes the delegation — review of this change wrote an admission inside `if false`, inside a closure nobody calls, and guarded so that only `RunStarted` reached it, and watched a rule that only checked the order stay green on all three. The blocks are read for the named type rather than by finding the first `fn stage` in the file, because the surface half counts only *public* functions and a private decoy carrying the pinned call stood in for the real one. What it cannot see is the arithmetic: a `tail_bytes` that quietly stopped counting the outcome record is `crates/waymaker-flash/tests/capacity.rs`'s, where `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` drives the wrong reserve and watches a run reach a state it can never leave. |
 | `swap-discipline` | §10's bank swap gains a public function `source::SWAP_SURFACE` does not list, in either direction — or its step order comes apart: a state in `source::SWAP_TYPESTATE` declares anything but the one method its row names, `Staged` names `program`, a value in `source::SWAP_CONSTRUCTIONS` is built anywhere but inside the body its row names, `payload_barrier` stops taking `source::SWAP_BARRIER_CALL`, or a row of `source::SWAP_ERASE_CALLS` stops erasing exactly the bank it names, before a barrier, without naming the other one. Issue [#26](https://github.com/madmax983/waymaker/issues/26) states §10 as seven steps and two recovery rules — "a crash before step 5 recovers the old run, a crash after step 6 recovers the new run" — and every one of those is a statement about *where the barriers are*. A `Prepared::commit` skipping the header, a `Staged::seal_now` skipping the payload barrier, an `Installed` built anywhere but in `commit`, or a `Swap::install(bank)` taking the bank to erase from its caller would each break no other rule and turn a protocol into a convention. The erase rows are the sharpest: which bank a swap clears is derived from the authority the device booted, and a `prepare` that erased the *retiring* bank is a device clearing the run it is executing. What it cannot see is whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness, nor whether the crash windows behave — that is `crates/waymaker-fault/tests/swap.rs`, at every crash point of all seven steps. |
-| `ctx-facade` | Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s façade stops adding sugar and starts adding authority. `waymaker-embassy/src/ctx.rs` or `waymaker-embassy/src/journal.rs` gains or loses a public function `source::CTX_SURFACE` or `source::CTX_JOURNAL_SURFACE` lists; `ctx.rs` declares a future `source::CTX_FUTURES` does not name, or a number of `fn poll` bodies other than that list's length; `Ctx` declares a method `source::CTX_SURFACE` and `source::CTX_PRIVATE_METHODS` do not list between them — read at *every* visibility — or an associated constant; **any** file of the crate names one of `source::CTX_FORBIDDEN_VOCABULARY` — `StableStorage`, `Reserved`, `RecordRef`, `Recovery`, `ReplayMachine`, `BankLayout`, `Swap` — declares a `static`, declares a `macro_rules!`, or implements `Future` for a type `CTX_FUTURES` does not name; or a `waymaker-drive` module outside `source::FACADE_DRIVER_MODULES` names one of `source::FACADE_FREE_VOCABULARY`. §05's must-not-own cell for this crate is "on-media authority or hidden global state", and every way of giving that back is an *addition*: a `Ctx::record` that appends for itself, a journal method that answers a question the workflow never asked, a `static` buffer two runs share. Each would break no layering rule — `waymaker-embassy` may depend on `waymaker-flash`, so nothing else stops the façade reaching a writer — and pass every test, because the run still completes. The surface pin sets `poll` aside, because four futures declare it and a pin that is a list of names cannot speak about a name declared four times; `CTX_FUTURES` holds the count instead, and the *set* of types the crate implements `Future` for beside it, so a fifth future is a line a reviewer writes wherever it is declared. The vocabulary, `static`, macro and future-set bans read every file of the crate rather than the two the surfaces are pinned in, because those four are statements about the crate: review of this change put a renamed `StableStorage`, a `pub static AtomicUsize`, a `macro_rules!` expanding a tenth public method into `impl Ctx`, and a fifth future in `dispatch.rs` — one file over — and watched a two-file version stay green on all four. Codex round 4 found the fifth, and it is about the *reader* rather than the rule: the future-set scan tested `starts_with("impl")` on the raw line while every classifier beside it stripped attributes first, so `#[rustfmt::skip] impl Future for SignalFuture` — a spelling `cargo fmt` preserves — walked past the one check that looks outside `ctx.rs`. The driver half is the fast half of issue #35's second "done when": every `waymaker-drive` module but the three in `source::FACADE_DRIVER_MODULES` is held to naming none of `source::FACADE_FREE_VOCABULARY`, so a module added tomorrow is covered without anyone remembering a row. The half a *compiler* decides is the `drive-facadeless` stage, which builds the crate under `without-facade` — with `facade.rs`, `ota.rs` and their four lines in `lib.rs` gone — for the firmware target. Both exist because a scanner cannot see an import routed through `crate::facade`, or a dependency renamed in a manifest, and a compiler sees each at once. What the stage does *not* establish is that the crate would build with `waymaker-embassy` deleted: the manifest entry is not optional, so a compile error inside the façade fails it too — issue [#106](https://github.com/madmax983/waymaker/issues/106). What it cannot see is a public *function* added from a sibling module — the two surfaces are pinned in one file each, exactly as `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin — and it compares *names*, so a `Ctx::payload` that started handing back the journal's buffer is `crates/waymaker-embassy/tests/ctx.rs`'s. The `static` scan sets the `'static` *lifetime* aside before it looks for the identifier: the rule is about a `static` **item**, and `&'static str` is what compile-time metadata is spelled as — issue #36's activity names. An item is `static NAME:` and never `'static`, so the narrowing loses nothing, and `a_static_item_beside_a_static_lifetime_is_still_reported` is what says so rather than leaving it argued. [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md). |
+| `ctx-facade` | Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s façade stops adding sugar and starts adding authority. `waymaker-embassy/src/ctx.rs` or `waymaker-embassy/src/journal.rs` gains or loses a public function `source::CTX_SURFACE` or `source::CTX_JOURNAL_SURFACE` lists; `ctx.rs` declares a future `source::CTX_FUTURES` does not name, or a number of `fn poll` bodies other than that list's length; `Ctx` declares a method `source::CTX_SURFACE` and `source::CTX_PRIVATE_METHODS` do not list between them — read at *every* visibility — or an associated constant; **any** file of `waymaker-embassy` or `waymaker-facade-demo` names one of `source::CTX_FORBIDDEN_VOCABULARY` — `StableStorage`, `Reserved`, `RecordRef`, `Recovery`, `ReplayMachine`, `BankLayout`, `Swap` — declares a `static`, declares a `macro_rules!`, or implements `Future` for a type `CTX_FUTURES` does not name; or a `waymaker-drive` module outside `source::FACADE_DRIVER_MODULES` names one of `source::FACADE_FREE_VOCABULARY`. §05's must-not-own cell for this crate is "on-media authority or hidden global state", and every way of giving that back is an *addition*: a `Ctx::record` that appends for itself, a journal method that answers a question the workflow never asked, a `static` buffer two runs share. Each would break no layering rule — `waymaker-embassy` may depend on `waymaker-flash`, so nothing else stops the façade reaching a writer — and pass every test, because the run still completes. The surface pin sets `poll` aside, because four futures declare it and a pin that is a list of names cannot speak about a name declared four times; `CTX_FUTURES` holds the count instead, and the *set* of types the crate implements `Future` for beside it, so a fifth future is a line a reviewer writes wherever it is declared. The vocabulary, `static`, macro and future-set bans read every file of `waymaker-embassy` rather than the two the surfaces are pinned in, because those four are statements about the crate: review of this change put a renamed `StableStorage`, a `pub static AtomicUsize`, a `macro_rules!` expanding a tenth public method into `impl Ctx`, and a fifth future in `dispatch.rs` — one file over — and watched a two-file version stay green on all four. Issue #106's review found the same four bans stopped at the crate boundary: `Bridge` moved to `waymaker-facade-demo`, and a `facade.rs` naming `StableStorage` directly passed every check here until the same four bans started reading that crate's files too, attributing each violation to whichever crate the offending file is actually in. Codex round 4 found the fifth, and it is about the *reader* rather than the rule: the future-set scan tested `starts_with("impl")` on the raw line while every classifier beside it stripped attributes first, so `#[rustfmt::skip] impl Future for SignalFuture` — a spelling `cargo fmt` preserves — walked past the one check that looks outside `ctx.rs`. The driver half is the fast half of issue #35's second "done when": every `waymaker-drive` module is held to naming none of `source::FACADE_FREE_VOCABULARY`, so a module added tomorrow is covered without anyone remembering a row — `source::FACADE_DRIVER_MODULES` is empty rather than gone, because issue [#106](https://github.com/madmax983/waymaker/issues/106) moved `facade`, `ota` and `provisioning` into `waymaker-facade-demo`, a crate above `waymaker-drive`, rather than exempting a file inside it. The half a scanner cannot decide is `cargo metadata`'s: a companion check reads the resolved graph directly and refuses a dependency from `waymaker-drive` to an Embassy crate — a direct one in any table, the manifest-only edge a source scan cannot see since a dependency needs no `use` to be linked, *and* one reached through a chain of `[dependencies]` at any depth, the shape a later normal dependency on some other crate would take. The walk stops at the first `[dev-dependencies]` or `[build-dependencies]` edge rather than crossing it, at the root or below: `waymaker-drive` dev-depends on `waymaker-rig`, which normal-depends on `waymaker-embassy` for `PersistentClock` (issue #34) — a legitimate edge a walk that crossed every kind would misattribute, and one that stopped at the root entirely would miss the same edge arriving through a *normal* dependency instead. Together the two halves are what make "the protocol is fully usable through the synchronous driver" a fact about the resolved graph rather than a claim a feature flag argued for. A fifth round found the direct half had a gap of its own: it had skipped every `Normal`-kind declaration on the assumption the walk would catch it, but `facade = { package = "waymaker-embassy", optional = true }` with no feature enabling it stays in `packages[].dependencies` and drops out of `resolve.nodes[].deps` entirely, so an unresolved optional dependency was invisible to both halves at once. The direct check now reads every declared dependency regardless of kind, and the two halves' findings are deduplicated by crate name so an *enabled* optional dependency — caught by both — is reported once. A sixth round found both halves resolved `waymaker-drive` with a bare name search, which `cargo metadata` does not promise returns the workspace's own package first: a same-named dependency at another version or source sorting ahead of it in `packages[]` would have let the real driver declare or reach Embassy unnoticed. Both now resolve the root through a lookup that also checks `workspace_members`. What it cannot see is a public *function* added from a sibling module — the two surfaces are pinned in one file each, exactly as `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin — and it compares *names*, so a `Ctx::payload` that started handing back the journal's buffer is `crates/waymaker-embassy/tests/ctx.rs`'s. The `static` scan sets the `'static` *lifetime* aside before it looks for the identifier: the rule is about a `static` **item**, and `&'static str` is what compile-time metadata is spelled as — issue #36's activity names. An item is `static NAME:` and never `'static`, so the narrowing loses nothing, and `a_static_item_beside_a_static_lifetime_is_still_reported` is what says so rather than leaving it argued. [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md). |
 | `dispatch-wiring` | Issue [#36](https://github.com/madmax983/waymaker/issues/36)'s dispatch path stops being a number. `waymaker-embassy/src/dispatch.rs` or `waymaker-embassy/src/wiring.rs` gains or loses a public function `source::DISPATCH_SURFACE` or `source::WIRING_SURFACE` lists, or declares one of them twice so the pin can no longer speak about it; a type in `source::WIRING_TYPE_METHODS` — `Activity`, `Table` — declares a method set other than its row's, read at *every* visibility, stops being a braced struct, or declares a public field; or a body in `source::WIRING_SELECTION_BODIES` is declared other than exactly once or names one of `source::WIRING_SELECTION_FORBIDDEN`; or either module is gone, so the pin checks nothing. Issue #36 states two of its work items as absences — "numeric `ActivityKind` on the dispatch path", and "no dynamic workflow loading and no string-addressed activity registry" — and every way of giving either back is an *addition*: a `Table::by_name`, a `Table::register`, a `pub rows` field a caller can rewrite at run time, a lookup that falls back to a label. Each would break no layering rule, need no dependency, and pass every test in the workspace, because the run still completes. The selection half is read out of the file rather than out of an `impl` body, because `poll_dispatch` is a *trait* method, which `inherent_impl_bodies` skips. The declaration is counted first, for `effect-protocol`'s reason: `braced_body` takes the first match, so a decoy above the real one is what a first-match scan reads. Four of the halves are things review demonstrated rather than things anybody predicted, and each was watched passing on a mutation before it was closed: a free `pub(crate) fn by_name` at *module* scope, which is on neither a surface pin nor a method pin — and which the label ban does not catch either, because `names_identifier` reads `by_name` as one identifier; a `register` beside it, which is the dynamic-loading non-goal as a free function; a `mod shim { pub struct Table {} }` above the real one, whose empty body is what the public-field scan read; and `Activity::name` renamed to `label` with the accessor left in place, which frees a selection body to compare it and names nothing forbidden. The function pin therefore reads every `fn` in the file at every visibility, and the field pin compares names as well as visibility — which is also what refuses a tuple struct, since one has no braced body of its own for the field scan to read. What it cannot see is a function added from a sibling module — it pins two files, exactly as `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin — and it compares *names*, so that a label never reaches media is `crates/waymaker-drive/tests/dispatch.rs`'s, which reads the device image back with a needle short enough to fit a record. [ADR 0033](docs/adr/0033-the-dispatcher-answers-in-a-bound-the-journal-states.md). |
 | `codec-is-optional` | Issue [#37](https://github.com/madmax983/waymaker/issues/37)'s codec helpers stop being optional. A `waymaker-embassy` module other than `source::CODEC_PATH` names one of `source::CODEC_VOCABULARY` — `serde`, `postcard`, `Serialize`, `Deserialize`, `DeserializeOwned`, `Coded`, `Format`, `Postcard`, `FromPostcard`, matched as *identifiers* over code with its comments and `#[cfg(test)]` modules removed; an item of the codec module that names one of them — anywhere in the item, not only on its declaration line — carries no bare `#[cfg(feature = ..)]`; `source::CODEC_FREE_TRAIT` is missing or is itself behind a feature; a dependency in `source::CODEC_DEPENDENCIES` is declared without `optional = true`; or a feature in `source::CODEC_FEATURES` stops enabling what its row names. §02 decision 4 says Serde and Postcard are "optional conveniences, never wire-format requirements", and the way that is given back is not a dependency — it is a *bound*: a `Ctx::activity` asking for `DeserializeOwned`, or a `Handoff` naming a codec type, makes every workflow carry the codec whatever the manifest says, and every other rule stays green because the run still completes. The manifest half is the other one that fails silently: a `serde` declared without `optional` links in every build, and the size report's row for it then measures an image that already had it. What it cannot see is a codec named from a sibling crate, or a bound written without one of those words — a type alias for `DeserializeOwned` declared in the codec module and used in `ctx.rs` names nothing forbidden. It reads *items* rather than lines, because review of this change wrote a `pub struct Bridge {` whose declaration line named no codec and whose field below it did, and watched a line-based version stay green. Two things it does not read: which feature gates an item — `code_only` removes string literals along with comments, and any single positive feature gate keeps the item out of a default build, which is the whole of the claim — and a compound `#[cfg(all(..))]`, `any(..)` or `not(..)`, which is *not* read as gating, so an item behind one is reported rather than trusted. It pins one crate and one module of it, the way `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one file they pin. [ADR 0034](docs/adr/0034-a-codec-is-a-bridge-behind-a-feature-and-the-probe-mirrors-it.md). |
 | `rig-oracle` | `waymaker-rig`'s oracle or its census gains a public function `source::RIG_AUDIT_SURFACE` or `source::RIG_CENSUS_SURFACE` does not list, in either direction — or either file is gone, so the pin checks nothing. A rig is the one piece of code here whose bugs are *invisible*: a firmware bug shows up as a failing test, a rig bug as a passing one. Every way of giving the instrument back is an addition — an `Audit::assume_passed`, an `Audit::ignore`, a `Breach::suppress`, a second `finish` taking the authority count as advisory, a `Coverage::force_complete`, a `Gap::ignore` — and each would break no other rule, need no dependency and pass every test that exists. The census is a file of its own rather than part of `phase.rs` for this rule's sake: `Phase` and `ResetCause` each declare an `index`, a `from_index` and a `name`, and a pin that compares names cannot tell two such declarations apart. What it cannot see is whether the oracle's arithmetic is right — `crates/waymaker-rig/tests/teeth.rs` is what holds that, with two writers wrong in one way each and a control writer required to pass. |
@@ -914,6 +963,7 @@ this table is how you find out what a red build is telling you.
 | `claude-md` | This file loses a must-not-own cell, a permitted dependency edge, a settled-decision id, a backticked gate rule id, a pipeline command, or its links to the decision record and the diagrams. |
 | `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
 | `storage-conformance` | Design document §12's storage contract and the four places it lives stop agreeing: a clause in `docs::STORAGE_CONTRACT_CLAUSES` is missing from this file, from [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md), or from `crates/waymaker-conformance/src/clause.rs`; its row here does not carry the sentence or what discharges it; the count is wrong; the crate discharges a clause differently than the table does; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Two tables agreeing on the names of six things and disagreeing about what any of them costs is the failure worth catching, so ids and discharges are compared in both directions. What it cannot see is inside the crate: that a clause the table calls in-process is reached by a case is `crates/waymaker-conformance/tests/clauses.rs`. |
+| `storage-shapes` | Issue #130 item 2's shape catalogue and the four places it lives stop agreeing: a shape in `docs::STORAGE_SHAPES` is missing from this file, from [ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md), or from `crates/waymaker-conformance/src/shape.rs`; its row here does not carry the sentence or the issuer; the count is wrong; the crate names a shape's issuer differently than the table does; the crate declares a shape the table never did; or the shape table is not where the gate looks for it. What it cannot see is inside the crate: that a declared shape is really issued by a run is `crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape`. |
 | `hardware-attestation` | Rung 0.2's board runs and the places they are recorded stop agreeing: a target in `docs::HARDWARE_TARGETS` has no backticked table row in this file, its row does not carry the headline or the status the table renders, the count is wrong, a target marked `Passed` has no accepted ADR carrying `docs::HARDWARE_ATTESTATION_MARKER` for it or has more than one, a target marked `Not run` is nevertheless claimed by an ADR, or an ADR attests a target the table never declared. What it cannot check is that a `Passed` row is *true* — the evidence is a log from a bench — only that the claim is a line in an accepted decision record rather than a status somebody flipped. |
 | `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]`, `#[cfg(` or `#[cfg_attr(` is not a test — a conditional attribute is refused outright, because a row test is either a test or it is not (issue #97). What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
@@ -1014,6 +1064,13 @@ Stated so that nobody mistakes silence for coverage:
   pins one file. A `trait StorageExt: StableStorage { fn read_all(..) }` with a blanket impl
   in a sibling module adds a method to every port's type with the rule silent, the same way
   `integrity-check`'s table scan cannot see a table in a module `crc.rs` calls.
+- **That a shape's `issued_by` names the function that really issues it.** `storage-shapes`
+  compares the sentence and the issuer *text* across the four places the table lives, the
+  same as `storage-conformance` does for a clause's discharge — it does not resolve
+  `append::Sealable::commit` against the crate and check that such a function exists. A row
+  transcribed against the wrong type — a program attributed to `Journal::commit` when the
+  method is `Sealable::commit`'s — reads and checks the same as a correct one; review of this
+  section is what catches it.
 - **Crash points of operations that exist only after an injected failure.** `injections` is
   computed from the *fault-free* write sequence, so a retry a writer performs only because a
   call failed has no crash points of its own — it is never torn, interrupted or power-lost
@@ -1603,15 +1660,19 @@ Stated so that nobody mistakes silence for coverage:
   `Sealable`. Reaching a writer still needs a `Reserved` or a `Recovery`, both of which
   *are* banned, so this is a hole in a list presented as exhaustive rather than an open
   door.
-- **That `waymaker-drive` would build with `waymaker-embassy` deleted.** Its dependency is
-  not optional, so the `drive-facadeless` stage still resolves and compiles the façade
-  crate — a `compile_error!` inside the façade fails that stage too, which Codex round 3
-  measured. What the stage establishes is the weaker and still useful claim: no module
-  outside `facade.rs`, `ota.rs` and `provisioning.rs` *needs* the façade, because the crate
-  compiles with those deleted. Making the dependency optional would take the façade out of
-  the lint, test, docs and coverage stages, which all pass `--no-default-features`; moving
-  the façade-naming modules into a crate of their own would say it in the dependency graph,
-  and is issue [#106](https://github.com/madmax983/waymaker/issues/106).
+- **That `Suspended::awaiting_dispatch` is called only when a dispatcher is genuinely still
+  working.** `waymaker-facade-demo`'s `Bridge` stores the boundary's own `Suspended` on
+  every call that returns one, and `ota`'s and `provisioning`'s `Workflow::run` read it back
+  rather than minting a fresh value. One stall has no boundary call behind it at all:
+  `ActivityFuture`'s dispatching stage answers `Poll::Pending` straight from
+  `ActivityDispatcher::poll_dispatch`, with nothing recorded and nothing to propagate, so
+  `take_suspended()` reads back `None` and the fallback is
+  `Suspended::awaiting_dispatch()` — a value named for that one case rather than a fresh
+  `Suspended::NEW`, which stays `pub(crate)` to `waymaker-drive`. `awaiting_dispatch` is
+  `pub`, though, because a caller outside this crate needs it too; nothing stops a
+  `Workflow` calling it without any dispatcher behind it at all, which is the same
+  standing `Suspended::NEW`'s own doc comment already states the type cannot prevent on its
+  own — a scanner cannot see every future's poll body, only the examples' tests can.
 - **That a workflow stops at its own ending, for a caller that is not an `async fn`.**
   `TerminalFuture` never resolves and every other future refuses once a conclusion is
   recorded, which is two mechanisms for one rule: a run that ended has no boundaries left.
@@ -1630,11 +1691,13 @@ Stated so that nobody mistakes silence for coverage:
   [#110](https://github.com/madmax983/waymaker/issues/110) is what makes cancellation a thing a
   caller really does.
 - **That the façade's journal is the driver below it.** `ctx-facade` pins two files in
-  `waymaker-embassy` and six in `waymaker-drive`. It says the façade declares no authority
-  and that the driver names no façade type; it cannot say that a given `Journal`
-  implementation is honest. A journal that answered `Handoff::Replayed` from a buffer rather
-  than from media would satisfy every rule here, and the façade would dispatch nothing.
-  `crates/waymaker-drive/tests/ota.rs` is what runs the real driver under the real façade.
+  `waymaker-embassy` and holds every file of `waymaker-drive` to naming no façade — seven of
+  them, since issue #106 moved `facade`, `ota` and `provisioning` above the crate. It says
+  the façade declares no authority and that the driver names no façade type; it cannot say
+  that a given `Journal` implementation is honest. A journal that answered
+  `Handoff::Replayed` from a buffer rather than from media would satisfy every rule here, and
+  the façade would dispatch nothing. `crates/waymaker-facade-demo/tests/ota.rs` is what runs
+  the real driver under the real façade.
 - **That a workflow future is small.** §04 says the workflow future is user memory and is
   *reported* rather than budgeted, and `cargo xtask size` now reports it: a section of its
   own, summed into nothing, with a line saying it is not part of the runtime RAM total above
@@ -2602,19 +2665,20 @@ futures the executor polls, and a plain `core::future::Future` is one; a façade
 in an executor to hand out four futures would be more than the adapter §02 decision 5 says
 it is. `embassy-below-facade` still guards the edge if a later rung needs one.
 Both "done when"s are driven rather than argued.
-`crates/waymaker-drive/tests/ota.rs` runs §06's OTA example — three activities and a
-completion, with the image crossing every boundary as an eight-byte handle — through the
-real façade, the real driver and `waymaker-fault`'s NOR model: it completes, it dispatches
-nothing on replay, a reboot mid-run redelivers the identity the schedule record committed,
-and the synchronous `Activities` world is asked zero times. The second is structural rather
-than behavioural: `Boundary`, `Driver` and §07's typestate name no `waymaker-embassy` type,
-so the façade edge is two modules — `facade.rs` and `ota.rs` — plus their four lines in
-`lib.rs` and the manifest entry. `waymaker-drive`'s `without-facade` feature deletes the two
-modules and the `drive-facadeless` stage builds that configuration for the part, which is as
-much of the claim as a compile can make while the manifest entry stands; `ctx-facade` is the
-scan beside it, and it reads every module of the crate rather than a list, so a module added
-tomorrow is covered. Issue
-[#106](https://github.com/madmax983/waymaker/issues/106) is the rest of it.
+`crates/waymaker-facade-demo/tests/ota.rs` (moved there by issue #106, below) runs §06's OTA
+example — three activities and a completion, with the image crossing every boundary as an
+eight-byte handle — through the real façade, the real driver and `waymaker-fault`'s NOR
+model: it completes, it dispatches nothing on replay, a reboot mid-run redelivers the
+identity the schedule record committed, and the synchronous `Activities` world is asked zero
+times. The second is structural rather than behavioural: `Boundary`, `Driver` and §07's
+typestate name no `waymaker-embassy` type, so the façade edge is two modules — `facade.rs`
+and `ota.rs` — plus their four lines in `lib.rs` and the manifest entry. `waymaker-drive`'s
+`without-facade` feature deleted the two modules and the `drive-facadeless` stage built that
+configuration for the part, which was as much of the claim as a compile could make while the
+manifest entry stood; `ctx-facade` is the scan beside it, and it reads every module of the
+crate rather than a list, so a module added tomorrow is covered. Issue
+[#106](https://github.com/madmax983/waymaker/issues/106), below, is the rest of it — moving
+the edge above the crate instead, so the manifest never stands.
 Two things came out of this rather than out of reading the code. A dispatcher that answered
 `Poll::Pending` after the schedule record was committed left the boot with no recorded
 reason at all, because the façade tells the journal nothing on a stall and only the driver
@@ -3641,6 +3705,36 @@ report. No new ADR: nothing here moves a must-not-own cell, a dependency edge, o
 id — see
 [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md), which this
 leaves exactly as accepted.
+
+Issue #106 then closes a gap Codex found on the third review round of issue #35: the
+`drive-facadeless` stage proved that no *other* `waymaker-drive` module needed the façade,
+not that the crate would build with `waymaker-embassy` deleted — the dependency was never
+optional, so a façade regression failed the same stage a façade absence would have.
+`waymaker-facade-demo` is the fix. `facade`, `ota` and `provisioning` — issue #35's bridge
+and design document §06's two examples — now live in a crate above `waymaker-drive` rather
+than inside it, and `waymaker-drive` names no dependency on `waymaker-embassy` in any table.
+`cargo metadata` states the claim the feature flag could only argue for. `without-facade`
+and the `drive-facadeless` stage are gone; `facade-demo-firmware` replaces the second,
+building the new crate's library for `thumbv6m-none-eabi` — `nm` on the rlib still finds
+`ota_update` and `ActivityFuture`, for `ota.rs`'s own reason. `ctx-facade`'s driver half
+keeps its shape and loses its exemption: `source::FACADE_DRIVER_MODULES` is empty, so every
+`waymaker-drive` module is held to naming no façade rather than every module but three.
+
+Moving `ota` and `provisioning` moved a dependency their new home could not carry for free.
+Both mint a `Suspended` when a driven future stalls with no recorded ending, and
+`Suspended`'s field is private to `waymaker-drive` — a privilege the two modules held only
+by being files of that crate. `facade::Bridge` now keeps the real value the boundary
+returned on every call that produced one, and the two examples read it back after their
+poll rather than building a new one; `Suspended::NEW` stays `pub(crate)` and neither example
+names it. That is a strengthening rather than a workaround: the value returned is now
+provably the boundary's own, carried across the `.await`, rather than a fresh one asserted
+to match it.
+
+The lint, test, docs and coverage stages that pass `--no-default-features` reach the new
+crate exactly as they reached the three modules before: an ordinary workspace member rather
+than a feature-gated one, so nothing fell out of them. See
+[ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md),
+which records the split as superseding its own `without-facade` compromise.
 
 Issue #96 closes the four rows [the failure matrix](#the-failure-matrix-row-by-row) owed on
 the rig, and it does so without moving a single count of the six rows already swept. The

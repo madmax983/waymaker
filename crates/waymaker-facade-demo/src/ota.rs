@@ -12,8 +12,8 @@
 //!
 //! # Here rather than in `tests/`
 //!
-//! For [`demo`](crate::demo)'s reason. The `drive-firmware` stage builds this crate's
-//! library for `thumbv6m-none-eabi`.
+//! For `waymaker_drive::demo`'s reason. The `facade-demo-firmware` stage builds this
+//! crate's library for `thumbv6m-none-eabi`.
 //!
 //! [`ota_update`] and [`Ota`] are generic, and a generic body no caller names is
 //! type-checked rather than compiled. [`Downloader`] and [`poll_ota`] are what make the
@@ -34,14 +34,13 @@ use core::task::{Context as Task, Poll, Waker};
 use waymaker_core::EffectId;
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, Outcome};
+use waymaker_drive::{Boundary, Identity, Suspended, Workflow};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Decode, Journal};
 use waymaker_flash::capacity::Bounds;
 
-use crate::boundary::{Boundary, Suspended};
 use crate::facade::Bridge;
-use crate::workflow::{Identity, Workflow};
 
 /// Fetch the image and leave it somewhere the device can reach.
 pub const DOWNLOAD: ActivityKind = ActivityKind(11);
@@ -171,7 +170,7 @@ where
 /// There is no executor here. A dispatcher that answers now lets the future run on to the
 /// next boundary within the same poll, so one poll carries the run as far as it goes. A
 /// dispatcher that answers [`Poll::Pending`] ends the boot, exactly as
-/// [`Performed::Pending`](crate::Performed) does on the synchronous path.
+/// [`Performed::Pending`](waymaker_drive::Performed) does on the synchronous path.
 ///
 /// A run that *finished* is `Poll::Pending` too, because `ctx.complete(..)` never resolves.
 /// What the run ended with is [`Ctx::conclusion`](waymaker_embassy::Ctx::conclusion), and
@@ -225,7 +224,7 @@ impl<D: ActivityDispatcher> Workflow for Ota<D> {
     }
 
     fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-        let ended = {
+        let (ended, suspended) = {
             let mut bridge = Bridge::over(boundary);
             let mut ctx = Ctx::new(&mut bridge, &mut self.dispatcher, &mut self.out);
             let polled = {
@@ -236,7 +235,7 @@ impl<D: ActivityDispatcher> Workflow for Ota<D> {
             // never resolves: a workflow that ended is a future that is `Pending` for ever,
             // which is what stops a later boundary overwriting the buffer the ending points
             // into.
-            match (ctx.conclusion(), polled) {
+            let ended = match (ctx.conclusion(), polled) {
                 (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => {
                     Some(Ended::Completed(bytes.len()))
                 }
@@ -254,10 +253,16 @@ impl<D: ActivityDispatcher> Workflow for Ota<D> {
                 // what the run ended with.
                 (None, Poll::Ready(Ok(()))) => Some(Ended::Completed(0)),
                 (None, Poll::Ready(Err(_))) => Some(Ended::Failed(0)),
-            }
+            };
+            // Read after `ctx`'s last use: the same `Suspended` the boundary returned, not
+            // a fresh one — see `facade`'s module doc.
+            (ended, bridge.take_suspended())
         };
         let Some(ended) = ended else {
-            return Err(Suspended::NEW);
+            // `suspended` is the real value whenever a boundary call produced one; a
+            // dispatcher still working produces none, so this falls back to the one
+            // `Suspended` named for that — see `Suspended::awaiting_dispatch`.
+            return Err(suspended.unwrap_or_else(Suspended::awaiting_dispatch));
         };
         Ok(match ended {
             Ended::Completed(len) => Outcome::Completed(self.out.get(..len).unwrap_or_default()),
@@ -318,7 +323,7 @@ pub type OtaContext<'a> = Ctx<'a, Downloader, Bridge<'a>>;
 /// is the caller's; this is the fourth term, and until now nothing measured it.
 ///
 /// The assertion below is the gate on the target the budget is stated for — the
-/// `drive-firmware` stage compiles this module for `thumbv6m-none-eabi`. `cargo xtask size`
+/// `facade-demo-firmware` stage compiles this module for `thumbv6m-none-eabi`. `cargo xtask size`
 /// reports the same constant measured on the host, where a pointer is wider, so the
 /// reported figure is an upper bound on this one.
 pub const CONTEXT_BYTES: usize = size_of::<OtaContext<'static>>();
