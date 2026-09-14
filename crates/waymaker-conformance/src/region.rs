@@ -11,12 +11,13 @@ use waymaker_flash::storage::Geometry;
 
 /// How many erase blocks a region must have.
 ///
-/// Three, and each one is load-bearing. The suite proves an erase is confined to the block
-/// it names, which takes a neighbour to watch; and the across-reset witness of
-/// [`crate::durability`] puts its acknowledged witness, its seal and its unacknowledged
-/// witness in three *different* blocks, because two of them sharing a block would make a
-/// single interrupted erase look like a barrier that failed to order.
-pub const REQUIRED_ERASE_BLOCKS: u32 = 3;
+/// Four, and each one is load-bearing. An erase must be confined to the block it names,
+/// which takes one neighbour to watch. A *two*-block erase must be confined to the pair it
+/// names, which takes a neighbour on each side — the fourth block. And the across-reset
+/// witness of [`crate::durability`] needs three blocks of its own: one each for the
+/// acknowledged witness, the seal, and the unacknowledged witness, so a single interrupted
+/// erase cannot look like a barrier that failed to order.
+pub const REQUIRED_ERASE_BLOCKS: u32 = 4;
 
 /// A geometry-checked window of a device that a conformance run may destroy.
 ///
@@ -144,7 +145,7 @@ impl RegionError {
         match self {
             Self::NotEraseAligned => "region is not erase-block aligned",
             Self::OutOfBounds => "region is out of bounds",
-            Self::TooFewEraseBlocks => "region is shorter than three erase blocks",
+            Self::TooFewEraseBlocks => "region is shorter than four erase blocks",
         }
     }
 }

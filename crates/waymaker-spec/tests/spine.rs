@@ -13,7 +13,7 @@
 
 use waymaker_spec::explore::explore;
 use waymaker_spec::invariant::Invariant;
-use waymaker_spec::model::{Bound, Guards, Journal, OnMedia};
+use waymaker_spec::model::{BankId, Bound, Guards, Journal, OnMedia, Transition};
 use waymaker_spec::reader::{Reader, Specified};
 
 /// The ceiling every proof in this crate runs under. Reaching it is an error, not a stop.
@@ -120,71 +120,96 @@ fn a_legal_recovery_is_a_prefix_that_holds_every_acknowledged_record() {
 }
 
 #[test]
-fn a_torn_record_is_always_the_last_one_on_media() {
+fn a_torn_record_is_always_the_last_one_on_media_in_its_own_bank() {
     // Not one of §14's five, and that is why it is here: it is the reachability invariant
     // the proof of acknowledged durability *rests on*. If a torn record could sit behind a
     // whole one, a prefix-honest reader would stop before records a barrier had already
     // acknowledged. Proving the guarantee without proving this would be proving the theorem
     // and assuming the lemma.
+    //
+    // Scoped per bank rather than over `state.records()` as one sequence: issue #67 lets a
+    // torn record a swap left behind in a retired bank coexist with an independent torn
+    // record in the bank that superseded it, and that is two banks each obeying their own
+    // append-only discipline, not one interruption doing something impossible.
     let explored = proof_space();
     for state in explored.states() {
-        let torn: Vec<usize> = state
-            .records()
-            .iter()
-            .enumerate()
-            .filter(|(_, record)| record.media == OnMedia::Partial)
-            .map(|(index, _)| index)
-            .collect();
-        assert!(
-            torn.len() <= 1,
-            "two records are torn at once in {state:?}, which no single interruption could do"
-        );
-        if let Some(position) = torn.first() {
-            for later in state.records().iter().skip(position + 1) {
-                assert_eq!(
-                    later.media,
-                    OnMedia::Absent,
-                    "record {} reached media behind a torn one in {state:?}",
-                    later.id.0
-                );
+        for bank in BankId::ALL {
+            let records: Vec<&_> = state
+                .records()
+                .iter()
+                .filter(|record| record.bank == bank)
+                .collect();
+            let torn: Vec<usize> = records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.media == OnMedia::Partial)
+                .map(|(index, _)| index)
+                .collect();
+            assert!(
+                torn.len() <= 1,
+                "two records are torn at once in bank {bank:?} in {state:?}, which no single \
+                 interruption could do"
+            );
+            if let Some(position) = torn.first() {
+                for later in records.iter().skip(position + 1) {
+                    assert_eq!(
+                        later.media,
+                        OnMedia::Absent,
+                        "record {} reached media behind a torn one in bank {bank:?} in \
+                         {state:?}",
+                        later.id.0
+                    );
+                }
             }
         }
     }
 }
 
 #[test]
-fn an_acknowledged_record_is_never_behind_a_gap() {
+fn an_acknowledged_record_is_never_behind_a_gap_in_its_own_bank() {
     // The other lemma acknowledged durability rests on, stated as its own claim so that a
-    // change which breaks it fails here rather than three inferences away.
+    // change which breaks it fails here rather than three inferences away. Scoped per bank
+    // for the reason the test above is.
     let explored = proof_space();
     for state in explored.states() {
-        let mut seen_gap = false;
-        for record in state.records() {
-            if record.media != OnMedia::Whole {
-                seen_gap = true;
-            } else if seen_gap {
-                assert!(
-                    !record.acknowledged,
-                    "record {} is acknowledged behind a gap in {state:?}",
-                    record.id.0
-                );
+        for bank in BankId::ALL {
+            let mut seen_gap = false;
+            for record in state.records().iter().filter(|record| record.bank == bank) {
+                if record.media != OnMedia::Whole {
+                    seen_gap = true;
+                } else if seen_gap {
+                    assert!(
+                        !record.acknowledged,
+                        "record {} is acknowledged behind a gap in bank {bank:?} in {state:?}",
+                        record.id.0
+                    );
+                }
             }
         }
     }
 }
 
 #[test]
-fn the_power_going_away_is_the_end_of_the_run() {
+fn the_power_going_away_is_the_end_of_the_run_except_for_reboot() {
+    // Issue #67's second gap: `Reboot` is now the one transition legal while unpowered, and
+    // it is legal only then — `tests/necessity.rs`'s counterpart to this file would be the
+    // wrong place for that half, since there is no guard to remove that changes it.
     let explored = proof_space();
     let alphabet = Journal::alphabet(Bound::PROOF);
     for state in explored.states().iter().filter(|state| !state.powered()) {
         for transition in &alphabet {
-            assert!(
-                state
-                    .step(*transition, Guards::ENFORCED, Bound::PROOF)
-                    .is_err(),
-                "{transition:?} is legal after the power went away in {state:?}"
-            );
+            let result = state.step(*transition, Guards::ENFORCED, Bound::PROOF);
+            if transition == &Transition::Reboot {
+                assert!(
+                    result.is_ok(),
+                    "Reboot is refused while unpowered in {state:?}"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{transition:?} is legal after the power went away in {state:?}"
+                );
+            }
         }
     }
 }

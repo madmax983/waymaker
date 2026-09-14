@@ -133,9 +133,13 @@ fn a_clause_discharged_against_the_model_is_falsified_somewhere_other_than_its_o
 
 #[test]
 fn what_is_still_owed_is_written_down_rather_than_left_out() {
-    // Two clauses are only partly discharged, and both say so. This asserts the count so
-    // that a third gap has to be declared rather than absorbed, and that a gap closed is a
-    // row edited rather than a note quietly left behind.
+    // Two clauses are only partly discharged, and say so. `single-authority` briefly had
+    // nothing owed at all: issue #67 gave the model the bank expressiveness it lacked and
+    // issue #73 closed the refinement against a real two-bank writer — but Codex's review of
+    // the pull request that closed issue #67 found the two refinements never compose, so the
+    // gap this row now names is real rather than inherited. This asserts the count so that a
+    // new gap has to be declared rather than absorbed, and that a gap closed is a row edited
+    // rather than a note quietly left behind.
     let owed: Vec<&str> = CLAUSES
         .iter()
         .filter(|entry| entry.owed.is_some())

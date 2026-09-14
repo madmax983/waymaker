@@ -324,6 +324,13 @@ jobs:
     # run its iterations into a cut, resumed them and judged every one — and requires the
     # two cores to agree about what it did.
     #
+    # The third core, an ESP32-S3 (Xtensa LX7), joins the run only where its Espressif
+    # stack is provisioned: `WAYMAKER_XTENSA_OPT_IN` opts it in. Its build and boot need
+    # the `esp` toolchain, the Espressif QEMU fork, the private offline cargo cache,
+    # `esptool`, and the fork's shared libraries — none of which a clean runner has — so
+    # this job deliberately does not set the variable and runs the ARM pair. An opted-in
+    # machine whose dependencies are absent still fails the run rather than skipping.
+    #
     # What it is NOT is a board. Neither machine has a NOR part, a supply that can be
     # removed, a reset-cause register or a backup domain, so every row of the hardware
     # table in CLAUDE.md stays `Not run` and a green check here may not be cited to move
@@ -348,7 +355,9 @@ jobs:
       # The stage shells out to an emulator no rustup profile carries, installed before the
       # stage runs for the reason valgrind is: a missing tool must be an install failure
       # rather than a boot that quietly did not happen. `cargo xtask emulate` fails closed
-      # if QEMU is absent, and failing here says why in one line.
+      # if QEMU is absent, and failing here says why in one line. Only the ARM emulator is
+      # installed: the ESP32-S3's Espressif fork QEMU is not provisioned here, and the
+      # machine stays opted out of this job for that reason.
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y qemu-system-arm
 

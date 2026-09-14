@@ -79,10 +79,10 @@ fn reserve() -> Reserve {
 
 /// The kind byte of every record the journal holds.
 fn kinds(device: &mut Device) -> Vec<RecordKind> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };

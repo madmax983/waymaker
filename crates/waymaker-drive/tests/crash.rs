@@ -81,10 +81,10 @@ fn recovered(image: &[u8]) -> Vec<Summary> {
     let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
         unreachable!("the image is device-sized")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut history = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             // §14: the frame is ignored and the previous history prefix wins.
             break;
@@ -152,10 +152,10 @@ fn recovered_outcomes(image: &[u8]) -> Vec<Vec<u8>> {
     let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
         unreachable!("the image is device-sized")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };
@@ -369,9 +369,9 @@ fn a_driver_that_dispatches_before_it_commits_loses_the_intent() {
         .run(|session| {
             logs.borrow_mut().push(Vec::new());
             let mut page = [0_u8; 256];
-            let mut scan = Recovery::new(region());
+            let mut scan = Recovery::new(region(), session);
             let mut probe = [0_u8; 256];
-            while scan.next(session, &mut probe).is_some() {}
+            while scan.next(&mut probe).is_some() {}
             let Some(mut journal) = Journal::after(scan) else {
                 return Ok(());
             };
@@ -452,8 +452,8 @@ fn append(
 ) -> Result<(), waymaker_flash::append::AppendError<FaultError>> {
     journal
         .stage(session, record, page)?
-        .payload_barrier(session)?
-        .commit(session)
+        .payload_barrier()?
+        .commit()
         .map(|_| ())
 }
 

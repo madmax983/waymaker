@@ -32,7 +32,27 @@ fn proof_space() -> waymaker_spec::explore::Explored {
 /// one — it means part of the machine stopped being reachable while every proof about the
 /// rest kept passing — and a change that makes it larger is one a reviewer should see too.
 /// Either way the number is the review, and it is expected to move when the model does.
-const REACHABLE_STATES: usize = 2_576;
+///
+/// It moved with issue [#67](https://github.com/madmax983/waymaker/issues/67):
+/// `Transition::Reboot` reopens every crashed state into a fresh live one, and a `Record` now
+/// carrying a `bank` lets `Journal::begin_erase` produce states two banks could not
+/// distinguish before. It moved again once `BeginErase` stopped being legal on the pre-seal
+/// implicit current bank (`Journal::protects_current_run`): a whole family of states in which
+/// a fresh device erased the only bank it could ever write into stopped being reachable. It
+/// moved a third time once `BeginSeal` refused a bank that still held records from before it
+/// was retired without ever being erased: a whole family of states in which a superseded run's
+/// leftover bytes got resealed at a higher generation stopped being reachable. It grew a
+/// fourth time, substantially, once `Journal::reboot` started discarding a still-`OnMedia::Absent`
+/// record instead of leaving it in place to permanently strand its bank (Codex, PR #135's
+/// merge round): every state with an undischarged `Absent` declaration used to dead-end at
+/// `Reboot` with no further `Declare` legal in that bank, and now opens back up into the
+/// states a bank that had never declared anything reaches. It shrank again, substantially,
+/// once that same `reboot` started rolling `next_id` back by the count of records it just
+/// discarded (a second Codex finding on the same round): before that, every distinct crash
+/// count before a bank's first media write was a distinct state — `next_id` climbing higher
+/// with each crash cycle even though nothing ever changed on media — and now those cycles
+/// collapse back onto the states a device that crashed once, or not at all, already reaches.
+const REACHABLE_STATES: usize = 5_620;
 
 #[test]
 fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
@@ -54,18 +74,19 @@ fn the_state_space_is_the_size_it_was_when_these_proofs_were_written() {
 /// interleavings and leave `REACHABLE_STATES` unchanged — because every state those edges
 /// led to is reachable by some other path. Every invariant, every mutant verdict and every
 /// necessity proof stays green through all three. The edge counts do not.
-const TRANSITION_EDGES: [(TransitionKind, usize); 11] = [
-    (TransitionKind::Declare, 532),
-    (TransitionKind::Program, 392),
-    (TransitionKind::FailedProgram, 392),
-    (TransitionKind::Barrier, 1288),
-    (TransitionKind::Dispatch, 84),
-    (TransitionKind::BeginErase, 1104),
-    (TransitionKind::CommitErase, 552),
-    (TransitionKind::BeginSeal, 368),
-    (TransitionKind::CommitSeal, 368),
-    (TransitionKind::Tear, 392),
-    (TransitionKind::PowerLoss, 1288),
+const TRANSITION_EDGES: [(TransitionKind, usize); 12] = [
+    (TransitionKind::Declare, 821),
+    (TransitionKind::Program, 947),
+    (TransitionKind::FailedProgram, 947),
+    (TransitionKind::Barrier, 2_810),
+    (TransitionKind::Dispatch, 380),
+    (TransitionKind::BeginErase, 2_312),
+    (TransitionKind::CommitErase, 498),
+    (TransitionKind::BeginSeal, 400),
+    (TransitionKind::CommitSeal, 400),
+    (TransitionKind::Tear, 654),
+    (TransitionKind::PowerLoss, 2_810),
+    (TransitionKind::Reboot, 2_810),
 ];
 
 #[test]
@@ -129,6 +150,7 @@ fn every_precondition_refused_something() {
         Illegal::EraseAlreadyInFlight,
         Illegal::WouldEraseTheAuthority,
         Illegal::GenerationExhausted,
+        Illegal::AlreadyPowered,
     ];
     for reason in reasons {
         assert!(
@@ -205,11 +227,26 @@ fn every_bank_shape_edge_the_two_bank_swap_needs_was_walked() {
 }
 
 #[test]
-fn the_search_reaches_every_shape_of_record_history_the_model_can_hold() {
+fn the_search_reaches_every_shape_of_record_history_a_single_bank_can_hold() {
+    // Per bank rather than over `state.records()` as one flat sequence: issue #67 lets two
+    // banks each hold their own independent history side by side — a torn record left behind
+    // in a retired bank alongside a fresh one in the bank that superseded it — which is two
+    // append-only journals each obeying the rule below, not one flat sequence obeying it
+    // twice over. `waymaker_spec::model::BankId::ALL` is what makes this a claim about each
+    // bank rather than about the pair combined.
     let explored = proof_space();
     let mut shapes: BTreeSet<Vec<OnMedia>> = BTreeSet::new();
     for state in explored.states() {
-        shapes.insert(state.records().iter().map(|record| record.media).collect());
+        for bank in waymaker_spec::model::BankId::ALL {
+            shapes.insert(
+                state
+                    .records()
+                    .iter()
+                    .filter(|record| record.bank == bank)
+                    .map(|record| record.media)
+                    .collect(),
+            );
+        }
     }
     // Every whole-prefix-then-gap shape up to the bound, including the torn tail. Written
     // out rather than generated, because a generator that agreed with the model would agree
@@ -240,8 +277,8 @@ fn the_search_reaches_every_shape_of_record_history_the_model_can_hold() {
     .collect();
     assert_eq!(
         shapes, expected,
-        "the shapes of history the search reaches are not the ones the model is supposed to \
-         admit"
+        "the shapes of history a single bank's own records reach are not the ones the model \
+         is supposed to admit"
     );
 }
 

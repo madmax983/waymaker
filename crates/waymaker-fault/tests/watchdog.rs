@@ -527,6 +527,194 @@ fn the_enumeration_has_no_duplicates_and_every_cause_in_it() {
     }
 }
 
+#[test]
+fn the_enumeration_has_no_point_after_the_last_operation() {
+    // Issue #87 and ADR 0042. No operation follows the last one, so no `Watchdog` point
+    // can name it. A caller who wants "the writer finished and then the core reset" reads
+    // the fault-free run instead — see the test below.
+    for ops in [
+        vec![Op::Barrier],
+        vec![Op::Program { offset: 0, len: 8 }, Op::Barrier],
+        vec![
+            Op::Erase {
+                offset: 0,
+                len: 256,
+            },
+            Op::Program { offset: 0, len: 8 },
+            Op::Barrier,
+        ],
+    ] {
+        let points = injections(&ops, geometry());
+        assert!(
+            points.iter().all(|point| point.op < ops.len()),
+            "a crash point named an operation past the end of {ops:?}"
+        );
+    }
+}
+
+#[test]
+fn a_watchdog_reset_after_the_last_operation_is_the_fault_free_run() {
+    // Issue #87 and ADR 0042. No enumerated point lets `barrier()?` return and the code
+    // after it run and *then* a reset happen — every `Watchdog` point on the last
+    // operation makes the call return an error first. This is the answer: the one
+    // hand-built point at that position is the fault-free run, tagged so a caller can
+    // tell it was asked for. A reset with nothing left to interrupt changes nothing this
+    // crate can observe.
+    let harness = Harness::new(geometry());
+    let baseline = match harness.run_fault_free(one_program) {
+        Ok(run) => run,
+        Err(error) => unreachable!("{error}"),
+    };
+
+    let terminal = run_one(
+        Injection {
+            op: baseline.ops().len(),
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+        one_program,
+    );
+
+    assert_eq!(terminal.image(), baseline.image());
+    assert_eq!(terminal.ops(), baseline.ops());
+    assert_eq!(terminal.ledger(), baseline.ledger());
+    assert_eq!(
+        terminal.injection(),
+        Some(Injection {
+            op: baseline.ops().len(),
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        }),
+        "the terminal point is tagged, unlike the fault-free run's own `None`"
+    );
+}
+
+#[test]
+fn a_watchdog_reset_after_the_last_operation_does_not_run_the_writer_again() {
+    // A review finding on issue #87. `Session::injection` is public, so a writer can see
+    // that a crash point is armed. Running the writer a second time for the terminal
+    // sentinel would let such a writer add a mark after its last storage call — here,
+    // `begin_record` with no op after it — that changes the ledger without changing any
+    // operation. `trace` cannot catch this: it compares operations up to the crash point,
+    // and a mark placed at `ops.len()` sits outside every span `trace` computes here. So
+    // the terminal sentinel must not run the writer again at all; it answers with the
+    // fault-free run itself.
+    let calls = RefCell::new(0_u32);
+    let writer = |session: &mut Session| -> Result<(), FaultError> {
+        *calls.borrow_mut() += 1;
+        session.begin_record(RecordId(1));
+        session.program(0, PAYLOAD)?;
+        session.barrier()?;
+        session.end_record();
+        if session.injection().is_some() {
+            // No further storage call follows: this mark sits at `ops.len()`.
+            session.begin_record(RecordId(99));
+        }
+        Ok(())
+    };
+
+    // `program(0, PAYLOAD)` and `barrier()`: two operations, known ahead of time so the
+    // terminal sentinel's `op` does not need a separate baseline call of its own — the
+    // point of this test is that `run_one` calls `writer` exactly once in total.
+    let harness = Harness::new(geometry());
+    let Ok(terminal) = harness.run_one(
+        Injection {
+            op: 2,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+        writer,
+    ) else {
+        unreachable!("the terminal sentinel is answerable")
+    };
+
+    assert_eq!(
+        *calls.borrow(),
+        1,
+        "the terminal sentinel answered without running the writer a second time"
+    );
+    assert_eq!(
+        terminal.ledger().state(RecordId(99)),
+        None,
+        "the terminal sentinel's ledger is the fault-free run's, with no record a writer \
+         added only because it saw the crash point armed"
+    );
+    assert_eq!(
+        terminal.ledger().state(RecordId(1)),
+        Some(waymaker_fault::Durability::Acknowledged)
+    );
+}
+
+#[test]
+fn nearby_shapes_at_the_terminal_point_are_still_refused() {
+    // The sentinel is exactly one shape, not every `op` past the end. Issue #87's review:
+    // pin the narrowness rather than leave it true only by inspection.
+    let ops = baseline_op_count();
+    for injection in [
+        Injection {
+            op: ops,
+            progress: Progress::Bytes(1),
+            interruption: Interruption::Watchdog,
+        },
+        Injection {
+            op: ops,
+            progress: Progress::Whole,
+            interruption: Interruption::Watchdog,
+        },
+        Injection {
+            op: ops,
+            progress: Progress::None,
+            interruption: Interruption::PowerLoss,
+        },
+        Injection {
+            op: ops + 1,
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+    ] {
+        let outcome = Harness::new(geometry()).run_one(injection, one_program);
+        assert_eq!(
+            outcome.err(),
+            Some(waymaker_fault::HarnessError::CrashPointNeverFired { injection }),
+            "{injection:?} looks close to the terminal sentinel but must not be accepted"
+        );
+    }
+}
+
+#[test]
+fn a_hand_built_zero_bytes_at_the_terminal_point_is_the_sentinel_too() {
+    // A review finding on issue #87. `Progress::Bytes` documents that a hand-built zero is
+    // `Progress::None` — the same clamping `Session::barrier` already holds itself to, so
+    // that a caller normalizing progress through `Bytes(0)` sees one sentinel, not two.
+    let none = run_one(
+        Injection {
+            op: baseline_op_count(),
+            progress: Progress::None,
+            interruption: Interruption::Watchdog,
+        },
+        one_program,
+    );
+    let zero_bytes = run_one(
+        Injection {
+            op: baseline_op_count(),
+            progress: Progress::Bytes(0),
+            interruption: Interruption::Watchdog,
+        },
+        one_program,
+    );
+    assert_eq!(zero_bytes.image(), none.image());
+    assert_eq!(zero_bytes.ops(), none.ops());
+    assert_eq!(zero_bytes.ledger(), none.ledger());
+}
+
+/// How many operations [`one_program`] issues.
+fn baseline_op_count() -> usize {
+    match Harness::new(geometry()).run_fault_free(one_program) {
+        Ok(run) => run.ops().len(),
+        Err(error) => unreachable!("{error}"),
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // 4. The real writer, at every watchdog reset
 // ---------------------------------------------------------------------------------------
@@ -592,21 +780,24 @@ fn unwind(error: AppendError<FaultError>) -> FaultError {
 /// The real thing: design document §07's two barriers per record.
 fn journal_writer(session: &mut Session) -> Result<(), FaultError> {
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region());
-    while recovery.next(session, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region(), session);
+    while recovery.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly at its first byte")
     };
 
     for index in 0..RECORDS {
         let mut staging = [0_u8; PAGE];
-        let sealable = journal
+        let before = session.operations();
+        // Declared before any of this record's operations are attempted — see the same
+        // comment in `tests/commit_discipline.rs` — over the two operations `commit` is
+        // pinned to spend once `stage` and `payload_barrier` have spent theirs.
+        session.mark_operations(id(index), (before + 2)..(before + 4));
+        journal
             .stage(session, &record(index), &mut staging)
-            .and_then(|staged| staged.payload_barrier(session))
+            .and_then(waymaker_flash::Staged::payload_barrier)
+            .and_then(waymaker_flash::Sealable::commit)
             .map_err(unwind)?;
-        session.begin_record(id(index));
-        sealable.commit(session).map_err(unwind)?;
-        session.end_record();
     }
     Ok(())
 }
@@ -620,9 +811,9 @@ fn recovered(run: &Run) -> Vec<RecordId> {
         unreachable!("the image came from a device of this geometry")
     };
     let mut page = [0_u8; PAGE];
-    let mut reader = Recovery::new(region());
+    let mut reader = Recovery::new(region(), &mut device);
     let mut history = Vec::new();
-    while let Some(step) = reader.next(&mut device, &mut page) {
+    while let Some(step) = reader.next(&mut page) {
         if step.is_err() {
             break;
         }

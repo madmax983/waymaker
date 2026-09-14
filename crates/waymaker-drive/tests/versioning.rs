@@ -79,10 +79,10 @@ fn boot_image(device: &mut Device, world: &mut World, workflow: Upgradable) -> B
 
 /// The kind byte of every record the journal holds.
 fn kinds(device: &mut Device) -> Vec<RecordKind> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -93,10 +93,10 @@ fn kinds(device: &mut Device) -> Vec<RecordKind> {
 
 /// Every `VersionMarker` the journal holds, as `(gate, version)`.
 fn markers(device: &mut Device) -> Vec<(GateId, u16)> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -200,10 +200,10 @@ fn a_fresh_run_records_the_version_the_image_writes() {
         Upgradable::v2(Branching::RecordedVersion),
     );
 
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let first = recovery
-        .next(&mut device, &mut page)
+        .next(&mut page)
         .expect("the journal is not empty")
         .expect("the first record is legal");
     assert!(
@@ -426,10 +426,10 @@ fn a_recorded_branch_a_rollback_cannot_replay_is_refused_by_the_gate() {
     );
     // The refusal came from the gate, so the run's own record was accepted first: a
     // `NotThisWorkflow` here would mean `begin` had refused and the gate was never reached.
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let first = recovery
-        .next(&mut device, &mut page)
+        .next(&mut page)
         .expect("the journal is not empty")
         .expect("the first record is legal");
     assert!(
@@ -590,10 +590,10 @@ fn a_marker_spends_a_sequence_that_the_effects_after_it_are_numbered_past() {
 
     let _ = boot_image(&mut device, &mut world, Upgradable::v2(Branching::Gate));
 
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut sequences = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -809,10 +809,10 @@ fn the_gates_activity_vocabulary_is_the_one_the_journal_records() {
     let mut device = Device::new(geometry());
     let _ = boot_image(&mut device, &mut fresh(), Upgradable::v2(Branching::Gate));
 
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut called = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -830,18 +830,18 @@ fn the_gates_activity_vocabulary_is_the_one_the_journal_records() {
 /// has to be written by something that is not this driver.
 fn append_past_the_end(device: &mut Device, record: &RecordRef<'_>) {
     let mut page = [0_u8; 256];
-    let mut scan = Recovery::new(region());
-    while scan.next(device, &mut page).is_some() {}
+    let mut scan = Recovery::new(region(), device);
+    while scan.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(scan) else {
         unreachable!("the fixtures here end in erased media")
     };
     let Ok(staged) = journal.stage(device, record, &mut page) else {
         unreachable!("the record fits the region")
     };
-    let Ok(sealable) = staged.payload_barrier(device) else {
+    let Ok(sealable) = staged.payload_barrier() else {
         unreachable!("the model's barrier cannot fail")
     };
-    let Ok(_) = sealable.commit(device) else {
+    let Ok(_) = sealable.commit() else {
         unreachable!("the model's program cannot fail here")
     };
 }
@@ -942,11 +942,11 @@ fn recovered(image: &[u8]) -> (Vec<RecordKind>, Vec<(GateId, u16)>) {
     let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
         unreachable!("the image is device-sized")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut seen = Vec::new();
     let mut found = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };

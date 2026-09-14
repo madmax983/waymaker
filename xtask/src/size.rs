@@ -44,6 +44,7 @@
 //! memory, and issue [#39](https://github.com/madmax983/waymaker/issues/39) asks that a
 //! large future not be hidden behind a small context.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +68,15 @@ pub const ENGINE_FEATURE: &str = "engine";
 
 /// The probe feature that also links the Embassy façade.
 pub const FACADE_FEATURE: &str = "facade";
+
+/// The probe feature that links ADR 0010's five checksum candidates.
+///
+/// Independent of every layer: no `dep:` entry, so it needs no mirror and
+/// `check_probe_mirrors` does not iterate it. Issue #61.
+pub const CRC_CANDIDATES_FEATURE: &str = "crc-candidates";
+
+/// The row the checksum-candidate section is measured from.
+pub const CRC_CANDIDATES_ROW: &str = "crc-candidates";
 
 /// Where `cargo xtask size` writes the report it then gates and uploads.
 pub const REPORT_PATH: &str = "target/waymaker-size.json";
@@ -510,6 +520,129 @@ fn identifier(rest: &str) -> Option<&str> {
     (starts && continues).then_some(name)
 }
 
+/// One checksum candidate ADR 0010 weighed, measured as a symbol rather than typed by hand.
+///
+/// Design document §16's first deferred question is settled by
+/// [ADR 0010](../../../docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
+/// on numbers nothing in this repository reproduced. Issue #61 closes that gap:
+/// `waymaker-size-probe`'s `crc-candidates` feature links all five loops into one image,
+/// and each row here is one candidate's own symbol in it. Reported, never gated — ADR 0010
+/// is a comparison between candidates, not a cost this firmware pays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumCandidate {
+    /// The candidate's name, as ADR 0010's table names it.
+    pub name: String,
+    /// Whether Waymaker ships this candidate.
+    pub shipped: bool,
+    /// `.text` bytes: the loop body.
+    pub text: u64,
+    /// `.rodata` bytes: a lookup table. Zero for a bitwise loop.
+    pub rodata: u64,
+}
+
+/// One candidate: its report name, whether it ships, its function's identifier, and its
+/// table's identifier where it has one.
+///
+/// The identifiers are `crates/waymaker-size-probe/src/checksum_candidates.rs`'s, which
+/// copies each body from an already-tested one — the two shipped algorithms from
+/// `waymaker-flash/src/crc.rs`, and the three rejected candidates from
+/// `waymaker-flash/tests/integrity.rs`.
+const CHECKSUM_CANDIDATES: &[(&str, bool, &str, Option<&str>)] = &[
+    (
+        "crc32-iso-hdlc-bitwise",
+        true,
+        "crc32_iso_hdlc_bitwise_candidate",
+        None,
+    ),
+    ("crc32c-bitwise", false, "crc32c_bitwise_candidate", None),
+    (
+        "crc32c-nibble-table",
+        false,
+        "crc32c_nibble_table_candidate",
+        Some("CRC32C_NIBBLE_TABLE_CANDIDATE"),
+    ),
+    (
+        "crc32c-byte-table",
+        false,
+        "crc32c_byte_table_candidate",
+        Some("CRC32C_BYTE_TABLE_CANDIDATE"),
+    ),
+    (
+        "crc16-ccitt-false-bitwise",
+        true,
+        "crc16_ccitt_false_bitwise_candidate",
+        None,
+    ),
+];
+
+/// Whether `mangled` names the item `identifier`, declared in `crate_name`.
+///
+/// A length-prefixed substring search — [`identifier`]'s own technique for reading one out
+/// of a `v0` path — rather than a full demangler. Every identifier
+/// [`CHECKSUM_CANDIDATES`] names is written to be unique on its own, so this cannot match
+/// the wrong body by chance: nothing else in a `crc-candidates` image is a fold table or a
+/// checksum loop named after one.
+#[must_use]
+fn names_item(mangled: &str, crate_name: &str, identifier: &str) -> bool {
+    defining_crate(mangled) == Some(crate_name)
+        && mangled.contains(&format!("{}{identifier}", identifier.len()))
+}
+
+/// `identifier`'s own size in `symbols`, read out of `crate_name`'s code.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if no symbol names `identifier`, or more than one does — both mean
+/// the identifier cannot be attributed to one body.
+fn candidate_symbol_bytes(
+    symbols: &[elf::Symbol],
+    crate_name: &str,
+    identifier: &str,
+) -> Result<u64, SizeError> {
+    let mut found = symbols
+        .iter()
+        .filter(|symbol| symbol.size > 0 && names_item(&symbol.name, crate_name, identifier));
+    let Some(first) = found.next() else {
+        return Err(SizeError::new(format!(
+            "no symbol names `{identifier}`; the crc-candidates image did not retain it"
+        )));
+    };
+    if found.next().is_some() {
+        return Err(SizeError::new(format!(
+            "more than one symbol names `{identifier}`, so its size cannot be attributed to one body"
+        )));
+    }
+    Ok(first.size)
+}
+
+/// Every checksum candidate's size, read out of one `crc-candidates` image.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if a candidate's function or table cannot be found by name, or is
+/// not uniquely named.
+pub fn checksum_candidate_sizes(
+    symbols: &[elf::Symbol],
+) -> Result<Vec<ChecksumCandidate>, SizeError> {
+    let crate_name = probe_crate_name();
+    CHECKSUM_CANDIDATES
+        .iter()
+        .map(|&(name, shipped, function, table)| {
+            let text = candidate_symbol_bytes(symbols, &crate_name, function)?;
+            let rodata = table
+                .map(|table| candidate_symbol_bytes(symbols, &crate_name, table))
+                .transpose()?
+                .unwrap_or(0);
+            Ok(ChecksumCandidate {
+                name: name.to_owned(),
+                shipped,
+                text,
+                rodata,
+            })
+        })
+        .collect()
+}
+
 /// How many of the image's stored bytes the symbol table attributes to `crate_name`.
 ///
 /// Only symbols in a section that costs flash, because that is the budget being read: a
@@ -893,6 +1026,7 @@ pub struct SizeReport {
     rows: Vec<Row>,
     kernel_state: Option<KernelState>,
     runtime: Option<RuntimeRam>,
+    checksum_candidates: Option<Vec<ChecksumCandidate>>,
 }
 
 impl SizeReport {
@@ -907,7 +1041,31 @@ impl SizeReport {
             rows,
             kernel_state,
             runtime,
+            checksum_candidates: None,
         }
+    }
+
+    /// Attaches ADR 0010's checksum-candidate measurement to an existing report.
+    ///
+    /// A builder rather than a fourth [`Self::new`] parameter, so every report built before
+    /// issue #61 existed — every call site in this file's own tests — keeps compiling
+    /// unchanged.
+    #[must_use]
+    pub fn with_checksum_candidates(
+        mut self,
+        checksum_candidates: Option<Vec<ChecksumCandidate>>,
+    ) -> Self {
+        self.checksum_candidates = checksum_candidates;
+        self
+    }
+
+    /// ADR 0010's checksum candidates, where this checkout could take the reading.
+    ///
+    /// `None` for a checkout whose probe declares no `crc-candidates` feature, for
+    /// [`Self::kernel_state`]'s reason.
+    #[must_use]
+    pub fn checksum_candidates(&self) -> Option<&[ChecksumCandidate]> {
+        self.checksum_candidates.as_deref()
     }
 
     /// Every measured row, in matrix order.
@@ -1162,6 +1320,22 @@ impl SizeReport {
             // the budget for "core + flash adapter", and issue #72 is that the probe's own
             // arithmetic had grown to more than a third of what was being gated.
             let layers = Self::layers_of(row, baseline);
+            // The whole-image delta saturates, so a row that links *less* than the
+            // baseline displays `Δflash` 0 while `probe` keeps its sign and `layers`
+            // keeps its growth: `probe` + `layers` no longer reconciles with
+            // `Δflash`, and the rendered row contradicts the table's own legend. A
+            // row that links less is a measurement fault rather than a negative
+            // cost — [`SectionSizes::saturating_delta`]'s reason — so it is refused
+            // rather than rendered.
+            if row.sizes.flash < baseline.sizes.flash {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` links {} B less flash than the baseline, which the saturating image delta reads as 0 while `probe` keeps its sign; the row cannot reconcile, so it is not a measurement",
+                        row.name,
+                        baseline.sizes.flash - row.sizes.flash,
+                    ),
+                });
+            }
             // A gated row links the kernel and the flash adapter, which cannot cost
             // nothing — the baseline's own zero is refused above for that reason. Two
             // routes reach this one, and both are faults rather than results: the linker
@@ -1197,6 +1371,115 @@ impl SizeReport {
         }
 
         shortfalls.extend(self.runtime_shortfalls());
+        shortfalls.extend(self.checksum_candidate_shortfalls());
+        shortfalls
+    }
+
+    /// ADR 0010's five candidates, checked for existence rather than for a ceiling.
+    ///
+    /// Issue #61 asks this section not to be gated against design document §04's budget: it
+    /// is a comparison between candidates, not a cost this firmware pays. What it must not
+    /// do is go quiet — an empty, duplicated, missing, unknown, wrongly-`shipped`, or
+    /// zero-byte candidate is a measurement that did not happen, the same rule every other
+    /// section in this file holds to — and a `None` section is refused unconditionally, the
+    /// way [`Self::runtime_shortfalls`] refuses a missing `runtime` section, rather than read
+    /// as "nothing to check here". `measure_into` never produces `None` here for the
+    /// checkout `xtask` was built from — a checkout with the feature that fails to measure
+    /// fails the whole report instead — so the only way this method meets `None` is a
+    /// `--report` document with the section removed or nulled out after the fact, which is
+    /// exactly the case this refuses.
+    fn checksum_candidate_shortfalls(&self) -> Vec<BudgetShortfall> {
+        let mut shortfalls = Vec::new();
+        let Some(candidates) = self.checksum_candidates.as_ref() else {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report has no checksum-candidate section, so ADR 0010's five candidates were not read".to_owned(),
+            });
+            return shortfalls;
+        };
+
+        if candidates.is_empty() {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report declares the `crc-candidates` feature but names no candidate; ADR 0010 measured five".to_owned(),
+            });
+            return shortfalls;
+        }
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidates
+                .iter()
+                .take(index)
+                .any(|earlier| earlier.name == candidate.name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names the checksum candidate `{}` twice",
+                        candidate.name
+                    ),
+                });
+            }
+            // `.rodata` is legitimately zero for three of the five: a bitwise loop has no
+            // table. `.text` is not — every candidate is a loop, and a loop compiles to
+            // some code.
+            if candidate.text == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{}` measures 0 B of `.text`, which no checksum loop does",
+                        candidate.name
+                    ),
+                });
+            }
+            if !CHECKSUM_CANDIDATES
+                .iter()
+                .any(|&(name, ..)| name == candidate.name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names a checksum candidate `{}`, which ADR 0010 never measured",
+                        candidate.name
+                    ),
+                });
+            }
+        }
+
+        // A report can name every candidate it has correctly and still be missing most of
+        // ADR 0010's table — `--report` reads a document this process did not produce, and
+        // a section with one valid entry passed every check above it until this one.
+        for &(name, shipped, _function, table) in CHECKSUM_CANDIDATES {
+            let Some(candidate) = candidates.iter().find(|candidate| candidate.name == name) else {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names no checksum candidate `{name}`; ADR 0010 measured it"
+                    ),
+                });
+                continue;
+            };
+            if candidate.shipped != shipped {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` is marked shipped: {}, but ADR 0010 says shipped: {shipped}",
+                        candidate.shipped
+                    ),
+                });
+            }
+            // The two table candidates are the ones ADR 0010's decision turns on — a 0 B
+            // reading here is the one number the whole section exists to report, missing.
+            // And the other three are bitwise loops with no table at all, so a nonzero
+            // reading there is not a smaller table, it is a wrong one.
+            match (table.is_some(), candidate.rodata) {
+                (true, 0) => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures 0 B of `.rodata`, but ADR 0010's table names a lookup table for it"
+                    ),
+                }),
+                (false, rodata) if rodata != 0 => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures {rodata} B of `.rodata`, but it is a bitwise loop with no table at all"
+                    ),
+                }),
+                _ => {}
+            }
+        }
+
         shortfalls
     }
 
@@ -1437,6 +1720,7 @@ impl SizeReport {
             ),
         ));
         table.push(self.workflow_future_lines());
+        table.push(self.checksum_candidate_lines());
         for notice in self.notices() {
             table.push(format!("\nnotice: {notice}\n"));
         }
@@ -1476,6 +1760,56 @@ impl SizeReport {
             lines.push(format!("  {name:<24}  {size:>9} B\n"));
         }
         lines.concat()
+    }
+
+    /// ADR 0010's five checksum candidates, in a section of their own.
+    ///
+    /// Not gated, for [`Self::checksum_candidate_shortfalls`]'s reason. Empty for a
+    /// checkout whose probe declares no `crc-candidates` feature.
+    fn checksum_candidate_lines(&self) -> String {
+        let Some(candidates) = self.checksum_candidates.as_ref() else {
+            return String::new();
+        };
+        let mut lines = vec![format!(
+            "\nchecksum candidates: design document \u{a7}16's first deferred question, settled by ADR 0010 and measured rather than typed in by hand. Informational, not gated against any budget above.\n  {:<28} {:>9} {:>9}\n",
+            "candidate", "text", "rodata"
+        )];
+        for candidate in candidates {
+            lines.push(format!(
+                "  {:<28} {:>7} B {:>7} B{}\n",
+                candidate.name,
+                candidate.text,
+                candidate.rodata,
+                if candidate.shipped { "  shipped" } else { "" },
+            ));
+        }
+        lines.concat()
+    }
+
+    /// [`RuntimeRam`] as [`Self::to_json`] writes it.
+    ///
+    /// A method of its own rather than inline in [`Self::to_json`], which clippy's line
+    /// budget refuses with this section folded in.
+    fn runtime_json(&self) -> Value {
+        self.runtime.as_ref().map_or(Value::Null, |runtime| {
+            let futures: Vec<Value> = runtime
+                .workflow_futures
+                .iter()
+                .map(|(name, size)| {
+                    let mut entry = Map::new();
+                    entry.insert("name".to_owned(), Value::from(name.clone()));
+                    entry.insert("size".to_owned(), Value::from(*size));
+                    Value::Object(entry)
+                })
+                .collect();
+            let mut object = Map::new();
+            object.insert("context".to_owned(), Value::from(runtime.context));
+            object.insert("workflow_futures".to_owned(), Value::Array(futures));
+            if let Some(total) = self.runtime_ram_total() {
+                object.insert("total".to_owned(), Value::from(total));
+            }
+            Value::Object(object)
+        })
     }
 
     /// The report as JSON, for the CI artifact and for the base-branch diff.
@@ -1536,25 +1870,8 @@ impl SizeReport {
             Value::Object(object)
         });
 
-        let runtime = self.runtime.as_ref().map_or(Value::Null, |runtime| {
-            let futures: Vec<Value> = runtime
-                .workflow_futures
-                .iter()
-                .map(|(name, size)| {
-                    let mut entry = Map::new();
-                    entry.insert("name".to_owned(), Value::from(name.clone()));
-                    entry.insert("size".to_owned(), Value::from(*size));
-                    Value::Object(entry)
-                })
-                .collect();
-            let mut object = Map::new();
-            object.insert("context".to_owned(), Value::from(runtime.context));
-            object.insert("workflow_futures".to_owned(), Value::Array(futures));
-            if let Some(total) = self.runtime_ram_total() {
-                object.insert("total".to_owned(), Value::from(total));
-            }
-            Value::Object(object)
-        });
+        let runtime = self.runtime_json();
+        let checksum_candidates = checksum_candidates_json(self.checksum_candidates.as_deref());
 
         let mut budgets = Map::new();
         budgets.insert(
@@ -1588,6 +1905,7 @@ impl SizeReport {
         document.insert("budgets".to_owned(), Value::Object(budgets));
         document.insert("kernel_state".to_owned(), kernel_state);
         document.insert("runtime".to_owned(), runtime);
+        document.insert("checksum_candidates".to_owned(), checksum_candidates);
         document.insert("rows".to_owned(), Value::Array(rows));
 
         format!("{:#}\n", Value::Object(document))
@@ -1681,6 +1999,7 @@ impl SizeReport {
             rows,
             kernel_state: parse_kernel_state(&document)?,
             runtime: parse_runtime(&document)?,
+            checksum_candidates: parse_checksum_candidates(&document)?,
         })
     }
 }
@@ -1767,6 +2086,65 @@ fn parse_runtime(document: &Value) -> Result<Option<RuntimeRam>, SizeError> {
         context: number(runtime, "context")?,
         workflow_futures,
     }))
+}
+
+/// [`ChecksumCandidate`]s as [`SizeReport::to_json`] writes them.
+///
+/// A function of its own rather than inline in [`SizeReport::to_json`], which clippy's line
+/// budget refuses with this section folded in.
+fn checksum_candidates_json(candidates: Option<&[ChecksumCandidate]>) -> Value {
+    candidates.map_or(Value::Null, |candidates| {
+        Value::Array(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    let mut entry = Map::new();
+                    entry.insert("name".to_owned(), Value::from(candidate.name.clone()));
+                    entry.insert("shipped".to_owned(), Value::from(candidate.shipped));
+                    entry.insert("text".to_owned(), Value::from(candidate.text));
+                    entry.insert("rodata".to_owned(), Value::from(candidate.rodata));
+                    Value::Object(entry)
+                })
+                .collect(),
+        )
+    })
+}
+
+/// The checksum-candidate section of a report, or `None` where the document has none.
+///
+/// Absent and `null` both read as `None`, [`parse_runtime`]'s reason: a report taken before
+/// issue #61 existed, or of a checkout whose probe declares no `crc-candidates` feature,
+/// says nothing about it rather than nothing.
+fn parse_checksum_candidates(
+    document: &Value,
+) -> Result<Option<Vec<ChecksumCandidate>>, SizeError> {
+    let Some(candidates) = document
+        .get("checksum_candidates")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    candidates
+        .as_array()
+        .ok_or_else(|| SizeError::new("the size report's `checksum_candidates` is not an array"))?
+        .iter()
+        .map(|entry| {
+            Ok(ChecksumCandidate {
+                name: entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| SizeError::new("a checksum candidate has no `name`"))?
+                    .to_owned(),
+                shipped: entry
+                    .get("shipped")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| SizeError::new("a checksum candidate has no `shipped` flag"))?,
+                text: number(entry, "text")?,
+                rodata: number(entry, "rodata")?,
+            })
+        })
+        .collect::<Result<Vec<ChecksumCandidate>, SizeError>>()
+        .map(Some)
 }
 
 /// Rule: no two rows of a report carry one name.
@@ -2203,31 +2581,9 @@ pub fn measure_into(
     let mut rows = Vec::with_capacity(variants.len());
     for variant in variants {
         let image = build_variant(root, build_dir, &variant)?;
-        let bytes = std::fs::read(&image).map_err(|err| {
-            SizeError::new(format!(
-                "could not read the linked image at {}: {err}",
-                image.display()
-            ))
-        })?;
-        let machine = elf::machine(&bytes)
-            .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
-        if machine != elf::EM_ARM {
-            return Err(SizeError::new(format!(
-                "{} is for machine {machine:#x}, not ARM ({:#x}); the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}, and a host image parses cleanly and measures plausibly",
-                image.display(),
-                elf::EM_ARM
-            )));
-        }
-        let sections = elf::sections(&bytes)
-            .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+        let (sections, symbols) = linked_image(&image)?;
         check_symbols_are_not_measured(&sections).map_err(|err| {
             SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
-        })?;
-        let symbols = elf::symbols(&bytes).map_err(|err| {
-            SizeError::new(format!(
-                "could not read the symbols of {}: {err}",
-                image.display()
-            ))
         })?;
         rows.push(Row {
             name: variant.name,
@@ -2239,7 +2595,103 @@ pub fn measure_into(
         });
     }
 
-    Ok(SizeReport::new(rows, kernel_state, runtime))
+    // Only for the checkout `xtask` was built from, [`KernelState::measured`]'s own
+    // reason and its own signal: `CHECKSUM_CANDIDATES` names identifiers this binary's
+    // source declares, so reading them out of a *base-branch* image is reading this
+    // binary's expectations against another commit's code. A rename on either side would
+    // turn a base-branch worktree's checksum-candidate section into a hard error — and
+    // since that section carries no row `diff` ever reads, failing the base measurement
+    // over it would cost every other row's comparison for a section nobody compares.
+    let checksum_candidates = if kernel_state.is_some() || runtime.is_some() {
+        Some(measure_checksum_candidates(root, build_dir, &graph)?)
+    } else {
+        None
+    };
+
+    Ok(SizeReport::new(rows, kernel_state, runtime).with_checksum_candidates(checksum_candidates))
+}
+
+/// Reads and validates one linked image: its sections and its symbols.
+///
+/// Shared by the matrix loop above and [`measure_checksum_candidates`], which both read an
+/// image the same way and differ only in what they do with it.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if the image cannot be read, is not built for ARM, or its symbol
+/// table cannot be read.
+fn linked_image(image: &Path) -> Result<(Vec<Section>, Vec<elf::Symbol>), SizeError> {
+    let bytes = std::fs::read(image).map_err(|err| {
+        SizeError::new(format!(
+            "could not read the linked image at {}: {err}",
+            image.display()
+        ))
+    })?;
+    let machine = elf::machine(&bytes)
+        .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+    if machine != elf::EM_ARM {
+        return Err(SizeError::new(format!(
+            "{} is for machine {machine:#x}, not ARM ({:#x}); the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}, and a host image parses cleanly and measures plausibly",
+            image.display(),
+            elf::EM_ARM
+        )));
+    }
+    let sections = elf::sections(&bytes)
+        .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+    let symbols = elf::symbols(&bytes).map_err(|err| {
+        SizeError::new(format!(
+            "could not read the symbols of {}: {err}",
+            image.display()
+        ))
+    })?;
+    Ok((sections, symbols))
+}
+
+/// ADR 0010's five checksum candidates, measured rather than typed by hand.
+///
+/// Only ever called for the checkout `xtask` was built from — [`measure_into`] skips this
+/// entirely for a base-branch worktree, because the identifiers this function searches for
+/// are compiled into *this* binary from *this* checkout's source, and matching them
+/// against another commit's image is a comparison that means nothing and can fail on a
+/// rename neither side made wrong. So a caller reaching this function has already
+/// committed to "this checkout ought to have the section," and an undeclared feature here
+/// is a real regression — the probe's `Cargo.toml` and this file's own
+/// [`CHECKSUM_CANDIDATES`] table have drifted apart — refused rather than read as "not
+/// measured", the same way every other missing figure in this report is.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if the checkout's probe declares no [`CRC_CANDIDATES_FEATURE`],
+/// or if the image cannot be built, read, or attributed candidate by candidate.
+fn measure_checksum_candidates(
+    root: &Path,
+    build_dir: &Path,
+    graph: &PackageGraph,
+) -> Result<Vec<ChecksumCandidate>, SizeError> {
+    let declared = graph.find(PROBE_PACKAGE).is_some_and(|package| {
+        package
+            .features
+            .iter()
+            .any(|feature| feature == CRC_CANDIDATES_FEATURE)
+    });
+    if !declared {
+        return Err(SizeError::new(format!(
+            "`{PROBE_PACKAGE}` declares no `{CRC_CANDIDATES_FEATURE}` feature, so ADR 0010's checksum candidates cannot be measured on the checkout `xtask` was built from"
+        )));
+    }
+
+    let variant = Variant {
+        name: CRC_CANDIDATES_ROW.to_owned(),
+        features: vec![PROBE_FEATURE.to_owned(), CRC_CANDIDATES_FEATURE.to_owned()],
+        measured_against: BASELINE_ROW.to_owned(),
+        gated: false,
+    };
+    let image = build_variant(root, build_dir, &variant)?;
+    let (sections, symbols) = linked_image(&image)?;
+    check_symbols_are_not_measured(&sections).map_err(|err| {
+        SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
+    })?;
+    checksum_candidate_sizes(&symbols)
 }
 
 /// Links one image and returns the path to it.
@@ -2643,6 +3095,10 @@ enum Block {
 pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
     let mut found = Vec::new();
     for source in sources {
+        // A trait can live in one file. Its `impl` can live in another. Collect the
+        // crate's private trait names first, before any `impl` in the crate is read.
+        let private_traits = private_trait_names(sources, &source.crate_name);
+
         let mut depth: i32 = 0;
         let mut test_module: Option<i32> = None;
         let mut pending_test_attribute = false;
@@ -2689,7 +3145,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     // rather than above it. Review of issue #35 landed exactly that and
                     // watched nine surface pins and `size-probe-reach` stay green, so it is
                     // closed in the reader they share rather than in one rule.
-                    let declared_here = declaration_kind(classified);
+                    let declared_here = declaration_kind(classified, &private_traits);
                     let inline = declared_here.is_some() && opens > 0;
                     // The member's *own* prefix, which is what follows the block's opening
                     // brace — not the whole line before the `fn` keyword. Testing that the
@@ -2713,7 +3169,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     }
                 }
 
-                if let Some(kind) = declaration_kind(classified) {
+                if let Some(kind) = declaration_kind(classified, &private_traits) {
                     pending = Some(kind);
                 }
                 if opens > 0 {
@@ -2750,26 +3206,191 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
 /// its own, and classifying that bare `{` would read every method of the impl as an
 /// ordinary private one and quietly drop them from the reach rule.
 ///
+/// A bare `trait` or a `pub(crate) trait` reads as [`Block::Other`]. So does an `impl` of
+/// one. `waymaker-size-probe` is a separate crate. It has no path to either. This is issue
+/// #49: `check_probe_reach` demanded a call the probe could not make. `private_traits`
+/// names every non-public trait already found in this crate, from [`private_trait_names`].
+///
 /// `None` for every other line, so that a block nobody declared — a `mod`, a function body
 /// — is pushed as [`Block::Other`] and the stack still mirrors the brace depth.
-fn declaration_kind(line: &str) -> Option<Block> {
-    let declaration = line.strip_prefix("pub ").unwrap_or(line);
-    let declaration = declaration
-        .split_once("(crate)")
-        .map_or(declaration, |(_, rest)| rest.trim_start());
-    if declaration.starts_with("trait ") {
-        return Some(Block::Trait);
+fn declaration_kind(line: &str, private_traits: &HashSet<String>) -> Option<Block> {
+    if let Some((_, public)) = trait_declaration(line) {
+        return Some(if public { Block::Trait } else { Block::Other });
     }
-    if declaration.starts_with("impl") {
+    if line.starts_with("impl") {
         // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
-        // makes its unmarked methods callable from outside.
-        return Some(if declaration.contains(" for ") {
-            Block::TraitImpl
-        } else {
-            Block::Other
+        // makes its unmarked methods callable from outside, and only while `Storage` is
+        // itself a trait the probe has a path to.
+        return Some(match impl_trait_name(line) {
+            Some((name, true)) if private_traits.contains(name) => Block::Other,
+            Some(_) => Block::TraitImpl,
+            None => Block::Other,
         });
     }
     None
+}
+
+/// The name a `trait` declaration names. Also whether it is `pub`.
+///
+/// A `pub` trait is reachable from a separate crate. Every restricted form —
+/// `pub(crate)`, `pub(super)`, `pub(in a::path)`, or fully private — is not. Reads
+/// the line that declares the trait, the same line [`declaration_kind`] classifies a
+/// block from. Returns `None` for a line with no trait declaration.
+fn trait_declaration(line: &str) -> Option<(&str, bool)> {
+    let public = declares_public(line);
+    let rest = skip_restricted_visibility(line.strip_prefix("pub ").unwrap_or(line));
+    let name = rest
+        .strip_prefix("trait ")?
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .find(|token| !token.is_empty())?;
+    Some((name, public))
+}
+
+/// `line` with a leading `pub(...)` restricted-visibility clause removed.
+///
+/// Covers `pub(crate)`, `pub(super)`, and `pub(in a::path)` alike, balanced across a
+/// nested parenthesis — a path can carry one of its own. Returns `line` unchanged if
+/// it has no leading `pub(...)`.
+fn skip_restricted_visibility(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix("pub(") else {
+        return line;
+    };
+    let mut depth: u32 = 1;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest
+                        .get(index.saturating_add(1)..)
+                        .unwrap_or("")
+                        .trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+/// The names of every non-public trait a crate declares — a bare `trait` or a
+/// `pub(crate) trait`. A separate crate has no path to any of these.
+///
+/// `size-probe-reach` needs this list before it can classify an `impl <Trait> for
+/// <Type>`. A trait's methods are as reachable as the trait itself. The trait can live
+/// in one file of the crate and the impl in another. Reads `source::code_only` and
+/// `source::without_test_modules` first, the same lexical pass most rules in this
+/// workspace use. A trait named inside a comment, a string, or a `#[cfg(test)]`
+/// module is then never mistaken for a shipped declaration.
+///
+/// A floor, not a proof: two traits sharing one name in a crate collapse into one
+/// entry here, public or not. Naming a private trait after a public one in the same
+/// crate is a review question, not a case this set can tell apart.
+fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == crate_name)
+    {
+        let code = crate::source::without_test_modules(&crate::source::code_only(&source.contents));
+        for line in code.lines() {
+            let classified = without_leading_attributes(line.trim());
+            if let Some((name, false)) = trait_declaration(classified) {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// The trait name an `impl <Trait> for <Type>` line names. Also whether that name can
+/// resolve to a trait this crate declares. Returns `None` for an inherent `impl` with
+/// no `for`.
+///
+/// `line` is the item's declaration line, the same line [`declaration_kind`] reads.
+/// Two things are stripped before the name is read. First, the impl's own generic
+/// parameters — `impl<T: Copy> Storage<T> for Bank<T>` — as one balanced `<...>`
+/// group, since a bound can carry a nested `<...>` of its own. Second, the trait's
+/// own generic arguments, so `Storage<T>` names `Storage`.
+///
+/// A path names its last segment: `crate::sealed::Sealed` and `sealed::Sealed` both
+/// name `Sealed`. The second field is `false` only when the path's first segment is
+/// one of [`EXTERNAL_PATH_ROOTS`] — `core::fmt::Debug` names an external trait, and
+/// its last segment must never be checked against this crate's own private trait
+/// names, a private trait happening to share that name is a different trait, in a
+/// different crate. Every other qualified path — `crate::`, `self::`, `super::`, or a
+/// bare relative path such as `sealed::Sealed` — can still name a trait this crate
+/// itself declares, so its last segment is checked.
+fn impl_trait_name(line: &str) -> Option<(&str, bool)> {
+    let (before, _after) = line.split_once(" for ")?;
+    let before = before.strip_prefix("impl").unwrap_or(before);
+    let before = skip_leading_generic_params(before);
+    let path = before.split('<').next().unwrap_or(before);
+
+    let mut segments = path
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty());
+    let first = segments.next()?;
+    let mut name = first;
+    let mut qualified = false;
+    for segment in segments {
+        name = segment;
+        qualified = true;
+    }
+    let local = !qualified || !EXTERNAL_PATH_ROOTS.contains(&first);
+    Some((name, local))
+}
+
+/// Path roots no crate in this workspace can declare a module or a trait under.
+///
+/// A qualified trait path starting with one of these is always a foreign trait, so
+/// its name is never checked against this crate's own private trait names. Every
+/// other root — `crate`, `self`, `super`, or a bare relative path such as `sealed` —
+/// can still resolve to a trait this crate declares itself.
+///
+/// A floor, not a proof: a real dependency root this list does not name — `serde` in
+/// `impl serde::Serialize for Bank`, say — reads as potentially local too. A private
+/// trait declared under that exact name in the same crate would then hide a live,
+/// reachable impl. Closing that needs the crate's real dependency names, which this
+/// function has no path to; [`PackageGraph`] holds them elsewhere in this module, and
+/// issue [#141](https://github.com/madmax983/waymaker/issues/141) is where wiring it
+/// through is owed.
+const EXTERNAL_PATH_ROOTS: &[&str] = &["core", "std", "alloc"];
+
+/// Removes one leading `<...>` group from `text`, balanced across any nested pair.
+///
+/// Returns `text` unchanged if it has no leading `<`. A `>` that closes a return
+/// type — `Fn() -> u32` in a bound — closes no bracket and is not counted.
+fn skip_leading_generic_params(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix('<') else {
+        return trimmed;
+    };
+    let mut depth: u32 = 1;
+    let mut previous: Option<char> = None;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '<' => depth = depth.saturating_add(1),
+            '>' if previous == Some('-') => {}
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest
+                        .get(index.saturating_add(1)..)
+                        .unwrap_or("")
+                        .trim_start();
+                }
+            }
+            _ => {}
+        }
+        previous = Some(character);
+    }
+    // Unbalanced: the header spans lines. `public_functions`'s own `pending` state
+    // handles the line that opens the block instead. Report no trait name here.
+    // Under-reporting is the safe direction.
+    ""
 }
 
 /// `line` with any leading attributes removed.
@@ -3622,6 +4243,7 @@ mod tests {
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()))
     }
 
     /// A report within every budget whose one workflow future is `bytes` wide.
@@ -3634,6 +4256,7 @@ mod tests {
                 workflow_futures: vec![("ota_update".to_owned(), bytes)],
             }),
         )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()))
     }
 
     /// Both gated rows at one figure. The façade image contains the engine one, so the two
@@ -3873,7 +4496,8 @@ mod tests {
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
-        );
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
         assert!(
             over_as_an_image.shortfalls().is_empty(),
             "{:?}",
@@ -4525,6 +5149,396 @@ mod tests {
         assert!(change.contains("not compared"), "{change}");
     }
 
+    /// A symbol shaped like one `checksum_candidates.rs` really produces, at a given size.
+    fn candidate_symbol(identifier: &str, size: u64) -> crate::elf::Symbol {
+        symbol(
+            &format!(
+                "_RNvNtCs1_19waymaker_size_probe19checksum_candidates{}{identifier}",
+                identifier.len()
+            ),
+            0x1000,
+            size,
+            1,
+        )
+    }
+
+    /// The five real identifiers, each a plausible size.
+    fn candidate_symbols() -> Vec<crate::elf::Symbol> {
+        vec![
+            candidate_symbol("crc32_iso_hdlc_bitwise_candidate", 52),
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+            candidate_symbol("crc32c_nibble_table_candidate", 76),
+            candidate_symbol("CRC32C_NIBBLE_TABLE_CANDIDATE", 64),
+            candidate_symbol("crc32c_byte_table_candidate", 44),
+            candidate_symbol("CRC32C_BYTE_TABLE_CANDIDATE", 1_024),
+            candidate_symbol("crc16_ccitt_false_bitwise_candidate", 60),
+        ]
+    }
+
+    /// Five candidates of known size, [`fixture_kernel_state`]'s reason.
+    fn fixture_checksum_candidates() -> Vec<ChecksumCandidate> {
+        checksum_candidate_sizes(&candidate_symbols()).expect("the fixture symbols are complete")
+    }
+
+    #[test]
+    fn names_item_finds_a_probe_symbol_by_its_plain_identifier() {
+        let mangled =
+            "_RNvNtCs1_19waymaker_size_probe19checksum_candidates24crc32c_bitwise_candidate";
+        assert!(names_item(
+            mangled,
+            "waymaker_size_probe",
+            "crc32c_bitwise_candidate"
+        ));
+        // A different candidate's name is not a match, even though both share a crate and
+        // a module: the length prefix has to agree with the identifier that follows it.
+        assert!(!names_item(
+            mangled,
+            "waymaker_size_probe",
+            "crc32c_byte_table_candidate"
+        ));
+        // A symbol from another crate names nothing here, whatever it is called.
+        assert!(!names_item(
+            "_RNvCs1_14waymaker_flash5frame",
+            "waymaker_size_probe",
+            "frame"
+        ));
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_reads_the_one_matching_symbol() {
+        let symbols = candidate_symbols();
+        assert_eq!(
+            candidate_symbol_bytes(
+                &symbols,
+                "waymaker_size_probe",
+                "crc32c_byte_table_candidate"
+            )
+            .expect("the symbol exists"),
+            44
+        );
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_refuses_a_name_the_image_never_retained() {
+        let error = candidate_symbol_bytes(&[], "waymaker_size_probe", "crc32c_bitwise_candidate")
+            .expect_err("an empty image names nothing");
+        assert!(error.to_string().contains("crc32c_bitwise_candidate"));
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_refuses_an_identifier_that_is_not_unique() {
+        let symbols = vec![
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+        ];
+        let error =
+            candidate_symbol_bytes(&symbols, "waymaker_size_probe", "crc32c_bitwise_candidate")
+                .expect_err("two symbols of one name cannot be attributed to one body");
+        assert!(error.to_string().contains("more than one"));
+    }
+
+    #[test]
+    fn checksum_candidate_sizes_reads_all_five_by_name() {
+        let candidates = fixture_checksum_candidates();
+        assert_eq!(candidates.len(), 5);
+
+        let by_name = |name: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.name == name)
+                .unwrap_or_else(|| panic!("no candidate named `{name}`"))
+        };
+
+        let bitwise = by_name("crc32-iso-hdlc-bitwise");
+        assert_eq!(
+            (bitwise.text, bitwise.rodata, bitwise.shipped),
+            (52, 0, true)
+        );
+
+        let rejected = by_name("crc32c-bitwise");
+        assert_eq!(
+            (rejected.text, rejected.rodata, rejected.shipped),
+            (52, 0, false)
+        );
+
+        let nibble = by_name("crc32c-nibble-table");
+        assert_eq!(
+            (nibble.text, nibble.rodata, nibble.shipped),
+            (76, 64, false)
+        );
+
+        let byte = by_name("crc32c-byte-table");
+        assert_eq!((byte.text, byte.rodata, byte.shipped), (44, 1_024, false));
+
+        let crc16 = by_name("crc16-ccitt-false-bitwise");
+        assert_eq!((crc16.text, crc16.rodata, crc16.shipped), (60, 0, true));
+    }
+
+    #[test]
+    fn checksum_candidate_sizes_refuses_an_image_missing_a_candidate() {
+        let symbols: Vec<crate::elf::Symbol> = candidate_symbols()
+            .into_iter()
+            .filter(|symbol| !symbol.name.contains("crc16_ccitt_false_bitwise_candidate"))
+            .collect();
+        let error = checksum_candidate_sizes(&symbols)
+            .expect_err("a missing candidate must fail the measurement rather than read as 0 B");
+        assert!(
+            error
+                .to_string()
+                .contains("crc16_ccitt_false_bitwise_candidate")
+        );
+    }
+
+    #[test]
+    fn measure_checksum_candidates_refuses_a_checkout_with_no_crc_candidates_feature() {
+        // Codex review on PR #133: `measure_into` only ever calls this function for the
+        // checkout `xtask` was built from — a base-branch worktree is skipped one level up,
+        // before this is reached at all (see `a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image`
+        // in `xtask/tests/size_budgets.rs`, which drives that guard against the real
+        // workspace). So a call that lands here with the feature undeclared is not "this
+        // checkout predates issue #61" — it is `size.rs`'s own `CHECKSUM_CANDIDATES` table
+        // and the probe's `Cargo.toml` having drifted apart, and has to fail loudly rather
+        // than silently report nothing.
+        //
+        // `probe_graph()` declares `engine`, `facade` and `probe` but not `crc-candidates`.
+        // The refusal has to come before `build_variant` is ever reached, which is what a
+        // bogus path proves: a caller that tried to build it anyway would fail on the path
+        // rather than on the feature, and this asserts the feature message instead.
+        let bogus = Path::new("/does/not/exist/waymaker-size-checksum-candidates-fixture");
+        let error = measure_checksum_candidates(bogus, bogus, &probe_graph())
+            .expect_err("a checkout with no `crc-candidates` feature must not be read as `None`");
+        assert!(
+            error.to_string().contains(CRC_CANDIDATES_FEATURE),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidate_section_is_not_a_pass() {
+        // Codex review on PR #133: a `--report` document with the section removed or
+        // nulled out must not silently pass just because `None` reads as "nothing to
+        // check" — that is exactly how a stripped section would bypass every check above.
+        // `measure_into` never produces this shape for the checkout `xtask` was built
+        // from: a checkout with the feature that fails to measure fails the whole
+        // report, for [`KernelState::measured`]'s reason. So a `None` reaching
+        // `shortfalls` is always either a document from before issue #61 (which
+        // `shortfall_report` is never actually run against — see
+        // `a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image`
+        // in `xtask/tests/size_budgets.rs`) or a stripped one, and both are refused
+        // alike.
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(report.checksum_candidates(), None);
+        let message = rendered(&report.shortfalls());
+        assert!(
+            message.contains("no checksum-candidate section"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_checksum_candidate_section_is_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(Vec::new()));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("names no candidate"), "{message}");
+    }
+
+    #[test]
+    fn two_checksum_candidates_under_one_name_are_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("twice"), "{message}");
+    }
+
+    #[test]
+    fn a_checksum_candidate_that_measures_no_text_is_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 0,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-bitwise"), "{message}");
+        assert!(message.contains("0 B"), "{message}");
+    }
+
+    #[test]
+    fn a_section_missing_four_of_the_five_candidates_is_not_a_pass() {
+        // Codex review on PR #133: a nonempty section with one valid, uniquely-named,
+        // nonzero candidate passed every check above. ADR 0010 measured five, and a
+        // report naming only one is a measurement that mostly did not happen.
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        for missing in [
+            "crc32-iso-hdlc-bitwise",
+            "crc32c-nibble-table",
+            "crc32c-byte-table",
+            "crc16-ccitt-false-bitwise",
+        ] {
+            assert!(message.contains(missing), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_checksum_candidate_adr_0010_never_named_is_not_a_pass() {
+        // A renamed, substituted, or invented candidate must be refused by name, not
+        // waved through because it happens to be unique and nonzero.
+        let mut candidates = fixture_checksum_candidates();
+        candidates.push(ChecksumCandidate {
+            name: "crc32-koopman".to_owned(),
+            shipped: false,
+            text: 52,
+            rodata: 0,
+        });
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-koopman"), "{message}");
+    }
+
+    #[test]
+    fn a_checksum_candidate_with_the_wrong_shipped_flag_is_not_a_pass() {
+        // ADR 0010 says exactly two of the five ship. A report that flipped the flag on
+        // one is not the measurement it claims to be.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32-iso-hdlc-bitwise" {
+                candidate.shipped = false;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-iso-hdlc-bitwise"), "{message}");
+        assert!(message.contains("shipped"), "{message}");
+    }
+
+    #[test]
+    fn a_table_candidate_that_measures_no_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the `.text` check alone let a truncated report set
+        // `rodata: 0` on either table candidate — dropping the 64 B / 1024 B figures ADR
+        // 0010's decision turns on — and still pass.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-nibble-table" {
+                candidate.rodata = 0;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-nibble-table"), "{message}");
+        assert!(message.contains("0 B of `.rodata`"), "{message}");
+    }
+
+    #[test]
+    fn a_bitwise_candidate_with_nonzero_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the table-candidate check only ran one way. A report
+        // that claimed `.rodata` for a bitwise loop — which has no table at all — must be
+        // refused just as loudly as one that dropped a real table's figure.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-bitwise" {
+                candidate.rodata = 64;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-bitwise"), "{message}");
+        assert!(message.contains("no table at all"), "{message}");
+    }
+
+    #[test]
+    fn checksum_candidates_are_reported_and_charged_to_no_budget() {
+        let report = full_report(1_024, 0, 1_024, 0)
+            .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        assert!(report.shortfalls().is_empty(), "{:?}", report.shortfalls());
+
+        let table = report.render();
+        assert!(table.contains("checksum candidates"), "{table}");
+        assert!(table.contains("crc32c-byte-table"), "{table}");
+        assert!(table.contains("1024"), "{table}");
+        assert!(table.contains("shipped"), "{table}");
+        assert!(table.contains("ADR 0010"), "{table}");
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidates_renders_no_section_for_them() {
+        let table = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        )
+        .render();
+        assert!(!table.contains("checksum candidates"), "{table}");
+    }
+
+    #[test]
+    fn the_checksum_candidate_section_survives_a_json_round_trip() {
+        let original = full_report(512, 32, 700, 32)
+            .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        let json = original.to_json();
+        let parsed = SizeReport::from_json(&json).expect("the report should round-trip");
+        assert_eq!(parsed.checksum_candidates(), original.checksum_candidates());
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidates_key_is_read_as_none() {
+        // A report written before issue #61 existed has no `checksum_candidates` key at
+        // all, not a `null` one — and it must still read, the same way an older report with
+        // no `runtime` key does.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 32, 700, 32).to_json())
+                .expect("the report should be JSON");
+        document
+            .as_object_mut()
+            .expect("a report is an object")
+            .remove("checksum_candidates");
+        let parsed = SizeReport::from_json(&document.to_string())
+            .expect("a report with no checksum-candidates key should still read");
+        assert_eq!(parsed.checksum_candidates(), None);
+    }
+
+    #[test]
+    fn a_malformed_checksum_candidate_is_refused_rather_than_silently_dropped() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 32, 700, 32).to_json())
+                .expect("the report should be JSON");
+        document
+            .as_object_mut()
+            .expect("a report is an object")
+            .insert(
+                "checksum_candidates".to_owned(),
+                serde_json::json!([{"name": "crc32c-bitwise"}]),
+            );
+        let refusal = SizeReport::from_json(&document.to_string())
+            .expect_err("a candidate with no `shipped` flag must not be read");
+        assert!(refusal.to_string().contains("shipped"), "{refusal}");
+    }
+
     #[test]
     fn a_report_within_every_budget_has_no_shortfalls() {
         assert!(report(1_024, 64).shortfalls().is_empty());
@@ -4766,6 +5780,43 @@ mod tests {
     }
 
     #[test]
+    fn a_gated_row_that_links_less_than_the_baseline_is_not_a_measurement() {
+        // A shrinking probe with growing layers reads `probe` negative, `layers`
+        // positive, and the saturating whole-image delta 0: `probe` + `layers` no
+        // longer reconciles with `Δflash`, so the row is a measurement fault rather
+        // than a negative cost.
+        let base = baseline_sizes();
+        let row = Row::new(
+            DEFAULT_ROW,
+            &[PROBE_FEATURE, ENGINE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                text: base.text - 5,
+                flash: base.flash - 5,
+                ..base
+            },
+            BASELINE_PROBE_FLASH - 8,
+            true,
+        );
+        let report = SizeReport::new(
+            vec![baseline_row(), row],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(report.probe_delta_signed_of(DEFAULT_ROW), Some(-8));
+        assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(3));
+        assert_eq!(
+            report.delta_of(DEFAULT_ROW).map(|delta| delta.flash),
+            Some(0)
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("cannot reconcile"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
     fn a_report_with_two_rows_of_one_name_is_rejected_rather_than_gated_on_the_first() {
         // Every figure in a report is looked up by name, so a second `default` row would
         // be gated on the first one's numbers whatever it held. `--report` reads a
@@ -4812,7 +5863,8 @@ mod tests {
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
-        );
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
         assert!(report.shortfalls().is_empty());
         assert!(report.render().contains("waymaker-core/serde"));
     }
@@ -5730,6 +6782,257 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["seal", "erase", "erase"]);
+    }
+
+    #[test]
+    fn a_private_traits_methods_are_not_required_of_the_probe() {
+        // Issue #49. A bare `trait` has no path from another crate. The probe cannot
+        // call it. The gate must not ask for a call nothing can make.
+        let functions = public_functions(&kernel(
+            "trait Internal {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_crate_traits_methods_are_not_required_of_the_probe() {
+        // `pub(crate)` keeps the trait inside its own crate. The probe is a separate
+        // crate, so it has no path to the trait either.
+        let functions = public_functions(&kernel(
+            "pub(crate) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_public_traits_methods_are_still_required_of_the_probe() {
+        let functions = public_functions(&kernel(
+            "pub trait Storage {\n\
+            \x20   fn seal(&self);\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal"]);
+    }
+
+    #[test]
+    fn an_impl_of_a_private_trait_is_not_required_of_the_probe() {
+        // The trait and its impl can sit in different files of one crate.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Internal {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Internal for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_impl_of_a_public_trait_is_still_required_of_the_probe() {
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "pub trait Storage {\n    fn seal(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Storage for Bank {\n    fn seal(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal", "seal"]);
+    }
+
+    #[test]
+    fn a_path_qualified_impl_of_a_private_trait_is_not_required_of_the_probe() {
+        // A qualified path names the trait too: `crate::sealed::Sealed` names
+        // `Sealed`, not `crate`. Taking the first token instead reads a common
+        // sealed-trait idiom as an unrelated public name and demands the call back.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl crate::sealed::Sealed for Bank {\n    fn hidden(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_path_qualified_impl_of_an_external_trait_is_still_required_of_the_probe() {
+        // No local declaration named `core` exists, so the trait is external and
+        // stays reachable — the same as an unqualified external trait always was.
+        let functions = public_functions(&kernel(
+            "impl core::fmt::Debug for Bank {\n\
+            \x20   fn fmt(&self) {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_return_arrow_inside_a_generic_bound_does_not_close_the_bracket_early() {
+        // `Fn() -> u32`'s `>` is not a generic close. Counting it as one truncates
+        // the scan before the real trait name and reads garbage in its place —
+        // garbage that then fails to match the private name and is misread as
+        // reachable. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Internal {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents:
+                    "impl<F: Fn() -> u32> Internal for Bank<F> {\n    fn hidden(&self) {}\n}\n"
+                        .to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_qualified_external_trait_is_not_hidden_by_a_same_named_private_trait() {
+        // A private trait and an external one can share a name. The qualified
+        // path to the external trait must not be judged by that collision.
+        // Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Debug {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl core::fmt::Debug for Bank {\n    fn fmt(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_trait_declared_only_inside_a_block_comment_is_not_counted_as_private() {
+        // A hand-rolled `//`-only comment skip leaves a block-commented trait
+        // declaration counted as real. That hides a live impl of an unrelated
+        // trait sharing its name. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "/*\ntrait Display {\n    fn hidden(&self);\n}\n*/\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Display for Bank {\n    fn fmt(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_relative_module_path_to_a_private_trait_is_not_required_of_the_probe() {
+        // `sealed::Sealed`, with no `crate`/`self`/`super` prefix, is still a path
+        // this crate can declare a trait under. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl sealed::Sealed for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_super_traits_methods_are_not_required_of_the_probe() {
+        // `pub(super)` restricts a trait to its parent module. A separate crate has
+        // no path to it either. Codex found this on PR #136.
+        let functions = public_functions(&kernel(
+            "pub(super) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_in_path_traits_methods_are_not_required_of_the_probe() {
+        let functions = public_functions(&kernel(
+            "pub(in crate::internal) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_impl_of_a_pub_super_trait_is_not_required_of_the_probe() {
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "pub(super) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Sealed for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
     }
 
     #[test]

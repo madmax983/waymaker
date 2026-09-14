@@ -47,6 +47,9 @@
 
 use core::panic::PanicInfo;
 
+#[cfg(feature = "crc-candidates")]
+mod checksum_candidates;
+
 /// Required of any `no_std` binary, and never reached: nothing runs this image.
 ///
 /// `const` because the workspace's nursery lints ask for it and there is no reason to
@@ -78,6 +81,7 @@ fn probe() -> usize {
     kept = kept.wrapping_add(facade());
     kept = kept.wrapping_add(codec_bridge());
     kept = kept.wrapping_add(codec_postcard());
+    kept = kept.wrapping_add(crc_candidates());
     core::hint::black_box(kept)
 }
 
@@ -1397,9 +1401,9 @@ fn recovery_walk(
     let mut media = ProbeMedia { geometry };
     // `ProbeMedia::read` validates and copies nothing, so the frame staged above is what
     // every step decodes. That is what links the *record* arm; the arms below link the rest.
-    let mut recovery = Recovery::<Catalogued>::with_integrity(region);
+    let mut recovery = Recovery::<_, Catalogued>::with_integrity(region, &mut media);
     let mut kept = 0_usize;
-    while let Some(step) = recovery.next(&mut media, page) {
+    while let Some(step) = recovery.next(page) {
         kept = kept.wrapping_add(match step {
             Ok(record) => record.kind().0 as usize,
             Err(error) => recovery_error_cost(&error),
@@ -1418,13 +1422,18 @@ fn recovery_walk(
 
     // The page-too-small refusal, which is the one ending a caller cannot reach by having a
     // damaged device: a record longer than the page it was handed.
-    let mut cramped = Recovery::new(region);
+    let mut cramped = Recovery::new(region, &mut media);
     let mut crumb = [0_u8; 2];
-    kept = kept.wrapping_add(match cramped.next(&mut media, &mut crumb) {
+    kept = kept.wrapping_add(match cramped.next(&mut crumb) {
         Some(Ok(record)) => record.kind().0 as usize,
         Some(Err(error)) => recovery_error_cost(&error),
         None => 0,
     });
+
+    // Issue #84's escape hatch: a caller that stops scanning keeps the device, rather than
+    // losing it the way a `Recovery` with no accessor at all would.
+    let given_back = cramped.into_storage();
+    kept = kept.wrapping_add(given_back.geometry.capacity() as usize);
 
     core::hint::black_box(kept)
 }
@@ -1499,8 +1508,8 @@ fn journal_append() -> usize {
     // header and ends cleanly, which is the ending `Journal::after` accepts.
     let mut media = ProbeMedia { geometry };
     let mut page = [0_u8; 64];
-    let mut recovery = Recovery::<Catalogued>::with_integrity(region);
-    while recovery.next(&mut media, &mut page).is_some() {}
+    let mut recovery = Recovery::<_, Catalogued>::with_integrity(region, &mut media);
+    while recovery.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         return core::hint::black_box(kept);
     };
@@ -1512,8 +1521,8 @@ fn journal_append() -> usize {
     kept = kept.wrapping_add(
         match journal
             .stage(&mut media, &record, &mut staging)
-            .and_then(|staged| staged.payload_barrier(&mut media))
-            .and_then(|sealable| sealable.commit(&mut media))
+            .and_then(waymaker_flash::append::Staged::payload_barrier)
+            .and_then(waymaker_flash::append::Sealable::commit)
         {
             Ok(written) => amplification_cost(written.plus(journal.amplification())),
             Err(error) => append_error_cost(&error),
@@ -1529,6 +1538,15 @@ fn journal_append() -> usize {
         Err(error) => append_error_cost(&error),
     });
     kept = kept.wrapping_add(amplification_cost(WriteAmplification::NONE));
+
+    // Issue #84's paired constructor: the same finished scan, but keeping the device
+    // besides the writer, for a caller moving on to `Journal::stage` without losing it. A
+    // second small scan rather than reusing the one above, so the writer this function
+    // built from the plain `Journal::after` is untouched.
+    let mut second_recovery = Recovery::<_, Catalogued>::with_integrity(region, &mut media);
+    while second_recovery.next(&mut page).is_some() {}
+    let (media_back, _second_journal) = Journal::after_taking_storage(second_recovery);
+    kept = kept.wrapping_add(media_back.geometry.capacity() as usize);
 
     // §10's reserve and §10's swap are measured with the geometry and the writer this
     // function already built rather than with ones of their own. A second geometry, region,
@@ -1620,9 +1638,9 @@ fn capacity_reserve(
     kept = kept.wrapping_add(
         match writer
             .stage(media, &schedule, &mut staging)
-            .map(|staged| staged.payload_barrier(media))
+            .map(waymaker_flash::append::Staged::payload_barrier)
         {
-            Ok(Ok(sealable)) => match sealable.commit(media) {
+            Ok(Ok(sealable)) => match sealable.commit() {
                 Ok(written) => amplification_cost(written),
                 Err(error) => append_error_cost(&error),
             },
@@ -1689,7 +1707,7 @@ fn bank_swap(media: &mut ProbeMedia, layout: waymaker_flash::bank::BankLayout) -
             generation: Generation(core::hint::black_box(1)),
         },
         RunId(core::hint::black_box(1)),
-        Retired::Recovery(Recovery::new(region)),
+        Retired::Recovery(Recovery::new(region, media)),
         next,
     ) {
         Ok(swap) => swap,
@@ -1699,22 +1717,29 @@ fn bank_swap(media: &mut ProbeMedia, layout: waymaker_flash::bank::BankLayout) -
     let mut page = [0_u8; 64];
     let installed = match swap
         .prepare(media)
-        .and_then(|prepared| prepared.stage(media, &mut page))
-        .and_then(|staged| staged.payload_barrier(media))
-        .and_then(|sealable| sealable.commit(media))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
     {
         Ok(installed) => installed,
         Err(error) => return swap_failure_cost(error),
     };
 
-    // Everything a caller does with a completed swap: where the new run writes, what the
-    // next swap begins from, and the identity space it starts in.
-    let mut kept = (installed.region().bytes() as usize)
-        .wrapping_add(generation_cost(installed.authority()))
+    // Everything a caller does with a completed swap: what the next swap begins from, and
+    // the identity space it starts in — both `&self`, and callable before the value is
+    // spent. `recovery`, keyed to the check it was sealed with (issue #85), and `reclaim`
+    // each consume `installed` outright, since issue #84 binds the device to it for the
+    // whole of that call: only one of the two can run here, and the `black_box` is what
+    // stops the compiler from proving which, so both stay linked.
+    let mut kept = generation_cost(installed.authority())
         .wrapping_add(usize::from(installed.allocator().peek().is_some()));
-    kept = kept.wrapping_add(match installed.reclaim(media) {
-        Ok(()) => 1,
-        Err(error) => swap_failure_cost(error),
+    kept = kept.wrapping_add(if core::hint::black_box(true) {
+        installed.recovery().region().bytes() as usize
+    } else {
+        match installed.reclaim() {
+            Ok(()) => 1,
+            Err(error) => swap_failure_cost(error),
+        }
     });
 
     // `Display` is a trait impl, so `size-probe-reach` counts its `fmt`. Retained as a
@@ -2244,6 +2269,21 @@ fn codec_postcard() -> usize {
 #[cfg(not(feature = "embassy-serde"))]
 #[inline(never)]
 fn codec_bridge() -> usize {
+    core::hint::black_box(0)
+}
+
+/// Issue #61's row: ADR 0010's five checksum candidates, linked so their `.text` and
+/// `.rodata` can be read rather than typed into an ADR by hand.
+#[cfg(feature = "crc-candidates")]
+#[inline(never)]
+fn crc_candidates() -> usize {
+    checksum_candidates::probe()
+}
+
+/// Nothing, in an image built without the checksum candidates.
+#[cfg(not(feature = "crc-candidates"))]
+#[inline(never)]
+fn crc_candidates() -> usize {
     core::hint::black_box(0)
 }
 
