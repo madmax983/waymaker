@@ -666,12 +666,12 @@ pub const STORAGE_SHAPES: &[StorageShape] = &[
     StorageShape {
         id: "program-single-unit",
         sentence: "A program of exactly one program unit.",
-        issued_by: "`append::Sealable::commit`'s record commit seal, always exactly one unit by construction; and `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, on a program unit wide enough that the padded value fits one",
+        issued_by: "`append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value — at the journal's own alignment, which may be coarser than the device program unit — comes to exactly one device program unit",
     },
     StorageShape {
         id: "program-multi-unit",
         sentence: "A program of more than one program unit in one call.",
-        issued_by: "`append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value spans more than one program unit",
+        issued_by: "`append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever that padded value spans more than one device program unit",
     },
     StorageShape {
         id: "erase-single-block",
