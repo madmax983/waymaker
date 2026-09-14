@@ -1,4 +1,3 @@
-#![cfg(not(feature = "without-facade"))]
 //! The two halves of design document §07, called out of order.
 //!
 //! [`Boundary::schedule`] hands the writer to the effect it committed, and
@@ -6,17 +5,18 @@
 //! place must be refused rather than left with a run §08 can never end, so both misuses are
 //! named errors and both are driven here.
 //!
-//! The ordinary path is `crates/waymaker-drive/tests/ota.rs`.
+//! The ordinary path is `crates/waymaker-facade-demo/tests/ota.rs`.
 
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
-use waymaker_drive::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_drive::{
-    Activities, Answered, Boundary, Bridge, CheckedDispatch, Clocks, DriveError, Driver, Handoff,
+    Activities, Answered, Boundary, CheckedDispatch, Clocks, DriveError, Driver, Handoff,
     Identity, Performed, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::journal::{Answer, Journal as _};
+use waymaker_facade_demo::Bridge;
+use waymaker_facade_demo::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;

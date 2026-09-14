@@ -58,6 +58,10 @@ pub struct ManifestDep {
     pub name: String,
     /// The table it was declared in.
     pub kind: DepKind,
+    /// The local name, if the manifest renamed this dependency with `package = "..."`.
+    ///
+    /// Rust source names the crate by this, not by `name`, when it is set.
+    pub rename: Option<String>,
 }
 
 /// One binary target of a package.
@@ -90,6 +94,16 @@ pub struct Package {
     pub features: Vec<String>,
     /// Resolved graph edges, by package id.
     pub resolved_deps: Vec<PackageId>,
+    /// The subset of `resolved_deps` reached through at least one `[dependencies]` table
+    /// entry for that edge.
+    ///
+    /// By resolved id, not by declared name: two differently-versioned packages can share a
+    /// name, and a lookup by name alone could walk the wrong one's subtree.
+    /// [`PackageGraph::normal_transitive_dependencies`] is why this exists — it needs to
+    /// walk only the edges the shipped library actually links, and `resolved_deps` alone
+    /// does not say which those are, because `cargo metadata`'s resolved graph carries no
+    /// kind at all: only the *manifest* half does.
+    pub normal_resolved_deps: Vec<PackageId>,
     /// Absolute path to the package's `Cargo.toml`, when known.
     pub manifest_path: Option<PathBuf>,
     /// Absolute path to the package's library root, when the package has a library.
@@ -124,6 +138,7 @@ impl Package {
             features: Vec::new(),
             is_proc_macro: false,
             resolved_deps: Vec::new(),
+            normal_resolved_deps: Vec::new(),
             manifest_path: None,
             lib_source_path: None,
             source: None,
@@ -153,6 +168,14 @@ impl Package {
         self
     }
 
+    /// Overrides the package id, so two packages can share a name with distinct ids — the
+    /// shape two differently-versioned copies of one crate take in a real resolved graph.
+    #[must_use]
+    pub fn with_id(mut self, id: &str) -> Self {
+        id.clone_into(&mut self.id);
+        self
+    }
+
     /// Marks the package as having a `build.rs`.
     #[must_use]
     pub const fn with_build_script(mut self) -> Self {
@@ -161,13 +184,62 @@ impl Package {
     }
 
     /// Adds a declared and resolved dependency on `name`, in the given table.
+    ///
+    /// Test packages use the name as its own id, so `normal_resolved_deps` can be built the
+    /// same way the real parser builds it — from a resolved id, not a declared name.
     #[must_use]
     pub fn with_dependency(mut self, name: &str, kind: DepKind) -> Self {
         self.manifest_deps.push(ManifestDep {
             name: name.to_owned(),
             kind,
+            rename: None,
         });
         self.resolved_deps.push(name.to_owned());
+        if kind == DepKind::Normal {
+            self.normal_resolved_deps.push(name.to_owned());
+        }
+        self
+    }
+
+    /// Adds a declared and resolved dependency on `name`, renamed to `rename` by the
+    /// manifest's `package = "..."`.
+    #[must_use]
+    pub fn with_renamed_dependency(mut self, name: &str, rename: &str, kind: DepKind) -> Self {
+        self.manifest_deps.push(ManifestDep {
+            name: name.to_owned(),
+            kind,
+            rename: Some(rename.to_owned()),
+        });
+        self.resolved_deps.push(name.to_owned());
+        if kind == DepKind::Normal {
+            self.normal_resolved_deps.push(name.to_owned());
+        }
+        self
+    }
+
+    /// Adds a declared dependency with no matching resolved edge — the shape an *optional*
+    /// dependency takes in real `cargo metadata` output when nothing enables its feature:
+    /// `packages[].dependencies` still names it, but `resolve.nodes[].deps` does not, so
+    /// [`PackageGraph::transitive_dependencies`] and
+    /// [`PackageGraph::normal_transitive_dependencies`] cannot walk through it.
+    #[must_use]
+    pub fn with_manifest_only_dependency(mut self, name: &str, kind: DepKind) -> Self {
+        self.manifest_deps.push(ManifestDep {
+            name: name.to_owned(),
+            kind,
+            rename: None,
+        });
+        self
+    }
+
+    /// Adds a resolved edge to package id `id`, in the given table — for a test that needs
+    /// to name the specific id an edge resolved to, as when two packages share a name.
+    #[must_use]
+    pub fn with_resolved_dependency(mut self, id: &str, kind: DepKind) -> Self {
+        self.resolved_deps.push(id.to_owned());
+        if kind == DepKind::Normal {
+            self.normal_resolved_deps.push(id.to_owned());
+        }
         self
     }
 
@@ -257,6 +329,22 @@ impl PackageGraph {
         self.packages.iter().find(|package| package.name == name)
     }
 
+    /// Finds the workspace member named `name`, rather than the first package with that
+    /// name in `cargo metadata`'s package list.
+    ///
+    /// [`find`](Self::find) resolves by name alone, so a dependency at another version or
+    /// source that happens to share a workspace member's name can be the one it returns —
+    /// `cargo metadata` is free to list such a package before the workspace's own entry.
+    /// A caller that means "the crate this workspace builds", such as
+    /// [`check_driver_reaches_no_embassy`], needs the one `workspace_members` actually
+    /// names.
+    #[must_use]
+    pub fn find_workspace_member(&self, name: &str) -> Option<&Package> {
+        self.packages.iter().find(|package| {
+            package.name == name && self.workspace_members.iter().any(|id| id == &package.id)
+        })
+    }
+
     /// Finds a package by cargo package id.
     #[must_use]
     pub fn by_id(&self, id: &str) -> Option<&Package> {
@@ -292,6 +380,65 @@ impl PackageGraph {
         }
 
         reached.remove(name);
+        reached
+    }
+
+    /// Returns the names of every package reachable from `name` by following only
+    /// `[dependencies]` edges, excluding `name` itself.
+    ///
+    /// Kind-aware, unlike [`transitive_dependencies`](Self::transitive_dependencies): a
+    /// `[dev-dependencies]` or `[build-dependencies]` edge is never followed, at `name` or
+    /// at any hop below it, so a package reached only through such a path is not in the
+    /// answer. This is what a question about the *shipped library* needs — neither table is
+    /// ever linked into it — where `transitive_dependencies` answers the broader one: what
+    /// building and testing this package needs at all.
+    ///
+    /// By resolved id at every hop, via [`Package::normal_resolved_deps`], the same as
+    /// `transitive_dependencies` and for the same reason: a lookup by declared *name* alone
+    /// can resolve to the wrong package when two differently-versioned copies of one name
+    /// are both in the graph, walking whichever one happened to sort first rather than the
+    /// one this specific edge actually selected.
+    #[must_use]
+    pub fn normal_transitive_dependencies(&self, name: &str) -> BTreeSet<String> {
+        let Some(root) = self.find(name) else {
+            return BTreeSet::new();
+        };
+        self.normal_transitive_dependencies_from(root)
+    }
+
+    /// [`normal_transitive_dependencies`](Self::normal_transitive_dependencies), from a root
+    /// the caller has already resolved rather than one looked up here by name.
+    ///
+    /// For a caller that cannot afford [`find`](Self::find)'s ambiguity even once — a bare
+    /// name search can return a dependency at another version or source that happens to
+    /// share a workspace member's name, rather than the member itself. Such a caller
+    /// resolves the root through [`find_workspace_member`](Self::find_workspace_member)
+    /// first and passes it in here, so the walk that follows starts from the same package
+    /// the direct check already used.
+    #[must_use]
+    pub fn normal_transitive_dependencies_from(&self, root: &Package) -> BTreeSet<String> {
+        let mut reached = BTreeSet::new();
+        let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+        seen_ids.insert(root.id.as_str());
+        let mut queue: VecDeque<&str> = root
+            .normal_resolved_deps
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        while let Some(id) = queue.pop_front() {
+            if !seen_ids.insert(id) {
+                continue;
+            }
+            let Some(package) = self.by_id(id) else {
+                continue;
+            };
+            reached.insert(package.name.clone());
+            for next in &package.normal_resolved_deps {
+                queue.push_back(next.as_str());
+            }
+        }
+
         reached
     }
 
@@ -392,6 +539,7 @@ impl PackageGraph {
             .collect();
 
         let resolved = resolved_edges(&root);
+        let normal_resolved = normal_resolved_edges(&root);
 
         let mut packages = Vec::with_capacity(package_values.len());
         for value in package_values {
@@ -409,7 +557,8 @@ impl PackageGraph {
                             let name = string_field(dep, "name")?;
                             let kind =
                                 DepKind::from_metadata(dep.get("kind").and_then(Value::as_str));
-                            Some(ManifestDep { name, kind })
+                            let rename = string_field(dep, "rename");
+                            Some(ManifestDep { name, kind, rename })
                         })
                         .collect()
                 })
@@ -445,6 +594,7 @@ impl PackageGraph {
 
             packages.push(Package {
                 resolved_deps: resolved.get(&id).cloned().unwrap_or_default(),
+                normal_resolved_deps: normal_resolved.get(&id).cloned().unwrap_or_default(),
                 id,
                 name,
                 manifest_deps,
@@ -497,6 +647,60 @@ fn resolved_edges(root: &Value) -> BTreeMap<PackageId, Vec<PackageId>> {
     }
 
     edges
+}
+
+/// The subset of [`resolved_edges`] reached through at least one `[dependencies]` table
+/// entry for that edge, by resolved package id.
+///
+/// `resolve.nodes[].deps[].dep_kinds[]` is where `cargo metadata` puts this — a `null` kind
+/// is `[dependencies]`, matching [`DepKind::from_metadata`]. An edge can carry more than one
+/// entry, normal and dev both, if a workspace declares the same package in both tables; it
+/// counts as normal if *any* entry does, because that is what decides whether the shipped
+/// library links it. An edge with no `dep_kinds` at all — a metadata shape this parser does
+/// not otherwise expect — is kept rather than dropped: a walk that missed a real edge here
+/// would under-report the façade this exists to catch, which is the wrong direction to fail
+/// closed in.
+fn normal_resolved_edges(root: &Value) -> BTreeMap<PackageId, Vec<PackageId>> {
+    let mut edges = BTreeMap::new();
+    let Some(nodes) = root
+        .get("resolve")
+        .and_then(|resolve| resolve.get("nodes"))
+        .and_then(Value::as_array)
+    else {
+        return edges;
+    };
+
+    for node in nodes {
+        let Some(id) = string_field(node, "id") else {
+            continue;
+        };
+        let deps = node
+            .get("deps")
+            .and_then(Value::as_array)
+            .map(|deps| {
+                deps.iter()
+                    .filter(|dep| is_normal_edge(dep))
+                    .filter_map(|dep| string_field(dep, "pkg"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        edges.insert(id, deps);
+    }
+
+    edges
+}
+
+/// Whether a `resolve.nodes[].deps[]` entry carries a `[dependencies]` kind.
+fn is_normal_edge(dep: &Value) -> bool {
+    let Some(kinds) = dep.get("dep_kinds").and_then(Value::as_array) else {
+        // No `dep_kinds` at all: fail closed by keeping the edge, per this function's own
+        // doc.
+        return true;
+    };
+    kinds.is_empty()
+        || kinds.iter().any(|entry| {
+            DepKind::from_metadata(entry.get("kind").and_then(Value::as_str)) == DepKind::Normal
+        })
 }
 
 /// Every crate type that produces a library, and therefore has a crate root the
@@ -684,6 +888,92 @@ pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
     violations
 }
 
+/// Rule: `waymaker-drive` reaches no Embassy crate through `[dependencies]`, at any depth,
+/// and declares none directly in any other table either.
+///
+/// `ctx-facade`'s other half — `check_facade_free_driver` in `source.rs` — reads identifiers
+/// in Rust source, so it cannot see a dependency a manifest declares and no `use` ever
+/// names, nor one reached only through another crate's own manifest. This is the half issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106) asked for: `waymaker-drive`'s
+/// independence from the façade as a fact `cargo metadata` states, not a scanner's opinion
+/// about what its source happens to import today. The edge belongs in `waymaker-facade-demo`,
+/// one crate above.
+///
+/// Two checks, and both run over every direct declaration rather than splitting the tables
+/// between them, because an *optional* normal dependency is invisible to one of them.
+/// `waymaker-drive` dev-depends on `waymaker-rig`, and `waymaker-rig` normal-depends on
+/// `waymaker-embassy` for the `PersistentClock` two board clocks implement (issue #34, ADR
+/// 0031), a legitimate edge that predates and is unrelated to this one — which is why the
+/// walk below follows only `[dependencies]` edges, at every hop, rather than every kind: that
+/// stops it misreading the dev-only test dependency as the façade edge, while still catching
+/// `waymaker-drive` gaining a normal dependency on some *other* crate that itself
+/// normal-depends on the façade.
+///
+/// But a manifest can declare `facade = { package = "waymaker-embassy", optional = true }`
+/// with no feature enabling it, and `cargo metadata` then omits the edge from
+/// `resolve.nodes[].deps` entirely — an unresolved optional dependency is not part of the
+/// resolved graph [`PackageGraph::normal_transitive_dependencies`] walks, so the walk cannot
+/// see it. It is still in `packages[].dependencies`, though, which is why the direct check
+/// below reads every manifest declaration regardless of kind rather than only the non-Normal
+/// ones: a Normal, optional, disabled dependency is exactly the case the walk is structurally
+/// blind to, and skipping it here on the assumption the walk would catch it left the gate
+/// passing for a declaration that named the façade in plain text. Reporting both checks over
+/// the full manifest can now double a finding when the same crate is both declared directly
+/// and reached through the walk (an enabled optional dependency is both), so each crate name
+/// is reported at most once.
+///
+/// `waymaker-drive` is not in [`LAYERS`], so [`check_embassy_stays_above_flash`] does not
+/// reach it; this is that check's cousin, narrowed to the one test-support crate issue #106
+/// makes a promise about and to the one table its shipped library actually links.
+///
+/// The root is resolved through [`PackageGraph::find_workspace_member`], not
+/// [`PackageGraph::find`]: a bare name search can return a dependency at another version or
+/// source that happens to share `waymaker-drive`'s name, and `cargo metadata` is free to
+/// list such a package before the workspace's own entry — a sixth round found that both
+/// halves below had been resolving the root by name alone, so a same-named non-member
+/// package ahead of the real one in `packages[]` would have let the real driver declare or
+/// reach Embassy with nothing here noticing.
+#[must_use]
+pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
+    const DRIVER: &str = "waymaker-drive";
+
+    let Some(package) = graph.find_workspace_member(DRIVER) else {
+        return Vec::new();
+    };
+
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    let mut violations = Vec::new();
+
+    for dep in &package.manifest_deps {
+        if policy::is_embassy_package(&dep.name) && reported.insert(dep.name.clone()) {
+            violations.push(Violation::new(
+                "ctx-facade",
+                DRIVER,
+                format!(
+                    "declares `{}` in [{}]; the façade edge belongs in \
+                     waymaker-facade-demo, above this crate",
+                    dep.name, dep.kind
+                ),
+            ));
+        }
+    }
+
+    for reached in graph.normal_transitive_dependencies_from(package) {
+        if policy::is_embassy_package(&reached) && reported.insert(reached.clone()) {
+            violations.push(Violation::new(
+                "ctx-facade",
+                DRIVER,
+                format!(
+                    "reaches Embassy crate `{reached}` through a chain of [dependencies]; \
+                     the façade edge belongs in waymaker-facade-demo, above this crate"
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
 /// Rule: every layer and every test-support crate has empty default features.
 #[must_use]
 pub fn check_empty_default_features(graph: &PackageGraph) -> Vec<Violation> {
@@ -800,6 +1090,7 @@ mod tests {
         let mut all = check_dependency_direction(graph);
         all.extend(check_kernel_has_no_dependencies(graph));
         all.extend(check_embassy_stays_above_flash(graph));
+        all.extend(check_driver_reaches_no_embassy(graph));
         all.extend(check_empty_default_features(graph));
         all
     }
@@ -987,6 +1278,275 @@ mod tests {
                 .with_dependency("waymaker-flash", DepKind::Normal),
         ]);
         assert!(check_embassy_stays_above_flash(&graph).is_empty());
+    }
+
+    #[test]
+    fn the_driver_may_not_reach_embassy_even_though_it_is_not_a_layer() {
+        // Issue #106: `check_embassy_stays_above_flash` iterates `LAYERS`, and
+        // `waymaker-drive` is not one, so it would otherwise be free to declare the edge
+        // the crate split exists to remove — a manifest change a source scanner cannot see,
+        // since it never has to appear as a `use`.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
+
+        let violations = rules(&graph);
+        assert!(
+            fired(&violations, "ctx-facade", "waymaker-drive"),
+            "an undeclared façade edge on the driver must be caught: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn the_driver_may_not_dev_depend_on_embassy_either() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Development),
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
+
+        let violations = rules(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule == "ctx-facade"
+                    && violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")
+                    && violation.detail.contains("dev-dependencies")),
+            "a dev-dependency on the façade is still the façade edge: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_legitimate_dev_dependency_that_itself_reaches_embassy_is_not_the_drivers_edge() {
+        // `waymaker-rig` normal-depends on `waymaker-embassy` for `PersistentClock` (issue
+        // #34, ADR 0031), and `waymaker-drive` dev-depends on `waymaker-rig` for
+        // `tests/matrix.rs`'s shared vocabulary. Neither edge is issue #106's façade edge,
+        // and a transitive walk would wrongly flag the second because of the first.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-rig")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-rig", DepKind::Development),
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
+
+        assert!(
+            check_driver_reaches_no_embassy(&graph).is_empty(),
+            "waymaker-rig's own edge to the fa\u{e7}ade must not be attributed to waymaker-drive"
+        );
+    }
+
+    #[test]
+    fn a_normal_dependency_that_itself_normal_depends_on_embassy_is_still_the_drivers_edge() {
+        // Codex's follow-up on the same pull request: a direct-only check misses
+        // `waymaker-drive` gaining a *normal* dependency on some other crate that itself
+        // normal-depends on the façade — a chain the firmware library build would link, and
+        // a shape no `use` in `waymaker-drive`'s own source would ever have to name either.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("innocent-helper").with_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("innocent-helper", DepKind::Normal),
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")),
+            "a two-hop normal chain to the fa\u{e7}ade must be caught: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn normal_transitive_dependencies_follows_the_resolved_id_not_the_name() {
+        // Codex's second follow-up: two packages can share a *name* while resolving to
+        // distinct *ids* — semver allows two incompatible versions of one crate in a real
+        // graph. A walk that looked the next hop up by declared name alone, rather than by
+        // the id the edge actually named, could follow the wrong version's subtree — here,
+        // the one that never reaches Embassy, silently clearing the one that does.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-drive")
+                .with_id("drive")
+                .with_resolved_dependency("helper@1", DepKind::Normal),
+            Package::new("helper").with_id("helper@1"),
+            Package::new("helper")
+                .with_id("helper@2")
+                .with_resolved_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-embassy").with_id("waymaker-embassy"),
+        ]);
+
+        let reached = graph.normal_transitive_dependencies("waymaker-drive");
+        assert!(
+            !reached.contains("waymaker-embassy"),
+            "waymaker-drive's own edge names helper@1, which does not reach Embassy: {reached:?}"
+        );
+
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-drive")
+                .with_id("drive")
+                .with_resolved_dependency("helper@2", DepKind::Normal),
+            Package::new("helper").with_id("helper@1"),
+            Package::new("helper")
+                .with_id("helper@2")
+                .with_resolved_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-embassy").with_id("waymaker-embassy"),
+        ]);
+
+        let reached = graph.normal_transitive_dependencies("waymaker-drive");
+        assert!(
+            reached.contains("waymaker-embassy"),
+            "waymaker-drive's edge names helper@2, which does reach Embassy, and a lookup \
+             by name alone (matching whichever `helper` sorts first) must not miss it: \
+             {reached:?}"
+        );
+    }
+
+    #[test]
+    fn the_driver_with_no_facade_edge_is_not_flagged() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
+        assert!(check_driver_reaches_no_embassy(&graph).is_empty());
+    }
+
+    #[test]
+    fn a_disabled_optional_normal_dependency_on_embassy_is_still_caught() {
+        // Codex's third follow-up: `facade = { package = "waymaker-embassy", optional =
+        // true }` with nothing enabling the feature stays in `packages[].dependencies` but
+        // drops out of `resolve.nodes[].deps` entirely, so the walk cannot see it. The old
+        // direct check filtered out every `Normal`-kind declaration on the assumption the
+        // walk would catch it, which left exactly this case unreported by either half.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_manifest_only_dependency("waymaker-embassy", DepKind::Normal),
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")),
+            "a disabled optional normal dependency on the fa\u{e7}ade must still be caught: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_enabled_optional_dependency_on_embassy_is_reported_once() {
+        // The other half of the same fix: once a `Normal`-kind declaration is checked
+        // directly rather than skipped, an *enabled* optional dependency is both a direct
+        // declaration and a resolved edge the walk reaches — the same crate must not be
+        // reported twice under one rule id.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        let embassy_violation_count = violations
+            .iter()
+            .filter(|violation| violation.detail.contains("waymaker-embassy"))
+            .count();
+        assert_eq!(
+            embassy_violation_count, 1,
+            "one crate reached both directly and through the walk must be reported once: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_named_non_member_package_does_not_hide_the_real_drivers_edge() {
+        // Codex's sixth follow-up: both halves resolved `waymaker-drive` with `find`, a bare
+        // name search — a dependency at another version or source that happens to share the
+        // workspace member's name can sort earlier in `packages[]`, and `cargo metadata`
+        // does not promise the workspace's own entry comes first. A decoy ahead of the real
+        // member, itself clean, must not make the real member's own violation disappear.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-drive")
+                .with_id("waymaker-drive-decoy")
+                .with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_id("waymaker-drive-real")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+        ])
+        .with_workspace_members(&["waymaker-drive-real"]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")),
+            "the real workspace member's edge must be caught even though a same-named, \
+             non-member package sorts first: {violations:?}"
+        );
     }
 
     #[test]

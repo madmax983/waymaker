@@ -1,11 +1,10 @@
-#![cfg(not(feature = "without-facade"))]
 //! Issue [#36](https://github.com/madmax983/waymaker/issues/36)'s two "done when"s, over
 //! real media.
 //!
 //! The workflow is an `async fn` over `Ctx`, the world is a
-//! [`Table`](waymaker_embassy::wiring::Table) of numeric kinds, the driver is this crate's
-//! and the media is `waymaker-fault`'s model of NOR. So what is measured is the protocol
-//! rather than a fixture that agrees with it.
+//! [`Table`](waymaker_embassy::wiring::Table) of numeric kinds, the driver is
+//! `waymaker-drive`'s and the media is `waymaker-fault`'s model of NOR. So what is measured
+//! is the protocol rather than a fixture that agrees with it.
 //!
 //! * **the bound.** The run declares four bytes of effect result and eight of terminal
 //!   payload, so the context buffer is wider than an answer may be. A dispatcher that
@@ -25,13 +24,14 @@ use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::{
-    Activities, Boundary, Bridge, CheckedDispatch, Clocks, DriveError, Driver, Identity, Performed,
+    Activities, Boundary, CheckedDispatch, Clocks, DriveError, Driver, Identity, Performed,
     Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::wiring::{Activity, Table, Unhandled};
 use waymaker_embassy::{ActivityDispatcher, Journal};
+use waymaker_facade_demo::Bridge;
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::{Bounds, Reserve};

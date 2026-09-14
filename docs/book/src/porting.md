@@ -15,7 +15,7 @@ Describe the part with a `Geometry`: capacity, erase size, program size and read
 units must nest. Then implement the five methods.
 
 ```rust,ignore
-{{#include ../../../crates/waymaker-drive/tests/book.rs:a_storage_adapter_is_four_operations_and_a_barrier}}
+{{#include ../../../crates/waymaker-facade-demo/tests/book.rs:a_storage_adapter_is_four_operations_and_a_barrier}}
 ```
 
 ### What the contract requires
@@ -52,7 +52,7 @@ is your part's own rules for programming a cell twice, and no suite checks it.
 Implement `PersistentClock` only if the reading really survives power loss.
 
 ```rust,ignore
-{{#include ../../../crates/waymaker-drive/tests/book.rs:a_persistent_clock_is_a_reading_and_a_bit}}
+{{#include ../../../crates/waymaker-facade-demo/tests/book.rs:a_persistent_clock_is_a_reading_and_a_bit}}
 ```
 
 ### What the contract requires

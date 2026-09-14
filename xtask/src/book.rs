@@ -120,7 +120,7 @@ pub const BOOK_CHAPTERS: &[Chapter] = &[
 /// code samples are tested, not merely quoted": the bytes the book shows are the bytes of a
 /// file the `test` stage compiles and runs, so a sample that stopped compiling is a red
 /// pipeline rather than a wrong page.
-pub const BOOK_SAMPLE_FILES: &[&str] = &["crates/waymaker-drive/tests/book.rs"];
+pub const BOOK_SAMPLE_FILES: &[&str] = &["crates/waymaker-facade-demo/tests/book.rs"];
 
 /// The documents a chapter may include whole, by workspace-relative path.
 ///
@@ -736,12 +736,19 @@ fn anchors(sample: &str) -> Vec<Anchor> {
 /// every attribute on the function regardless of where it sits, so order was never actually
 /// load-bearing here.
 ///
-/// The line index returned on success is [`crate::parse::NamedFn::line`], read off the same
-/// parsed function whose attributes decided the verdict — not found again by a second,
+/// The span returned on success is a start and end line, read from
+/// [`NamedFn::line`](crate::parse::NamedFn::line) and
+/// [`NamedFn::end_line`](crate::parse::NamedFn::end_line) of the same parsed
+/// function whose attributes decided the verdict — not found again by a second,
 /// independent text search. Two searches for "the same" declaration used to be able to
 /// answer about two different ones: `name` declared twice, once inside the anchor and once
 /// outside it, could pair one declaration's attributes with the other's position and wrongly
 /// vouch for either (issue #97, Codex review round 5).
+///
+/// A candidate counts as "in `anchor`" only when both its start and its end sit inside
+/// `anchor` (see [`fully_in`]). The start alone is not enough: an anchor can end between
+/// the `fn` keyword and the name, so the page shows only the word `fn` (issue #165, Codex
+/// review round 8 of issue #97).
 ///
 /// `name` can be declared more than once — in different modules, or as a method of the same
 /// name in different `impl` blocks — and which declaration is *this anchor's* is a question
@@ -761,11 +768,11 @@ fn declares_test(
     sample: &str,
     name: &str,
     anchor: std::ops::RangeInclusive<usize>,
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let candidates = crate::parse::fns_matching(sample, name, true);
     let mut in_anchor = candidates
         .iter()
-        .filter(|function| anchor.contains(&function.line.saturating_sub(1)))
+        .filter(|function| fully_in(function, &anchor))
         .peekable();
     let pool: Box<dyn Iterator<Item = &crate::parse::NamedFn>> = if in_anchor.peek().is_some() {
         Box::new(in_anchor)
@@ -775,16 +782,28 @@ fn declares_test(
     let mut last_reason = None;
     for function in pool {
         match verdict(function, name) {
-            Ok(at) => return Ok(at),
+            Ok(span) => return Ok(span),
             Err(reason) => last_reason.get_or_insert(reason),
         };
     }
     Err(last_reason.unwrap_or_else(|| format!("declares no `#[test] fn {name}`")))
 }
 
-/// Whether `function` is a test nothing can skip, and its position if it is.
-fn verdict(function: &crate::parse::NamedFn, name: &str) -> Result<usize, String> {
-    let at = function.line.saturating_sub(1);
+/// Checks whether `function`'s start line and end line both sit inside `anchor`.
+///
+/// The start line alone does not prove the page shows the whole function. An anchor can
+/// end between the `fn` keyword and the name. Then the page shows only `fn` (issue #165).
+fn fully_in(function: &crate::parse::NamedFn, anchor: &std::ops::RangeInclusive<usize>) -> bool {
+    anchor.contains(&function.line.saturating_sub(1))
+        && anchor.contains(&function.end_line.saturating_sub(1))
+}
+
+/// Checks whether `function` is a test that cannot be skipped. Returns its span if it is.
+fn verdict(function: &crate::parse::NamedFn, name: &str) -> Result<(usize, usize), String> {
+    let span = (
+        function.line.saturating_sub(1),
+        function.end_line.saturating_sub(1),
+    );
     let mut tested = false;
     for attribute in &function.attrs {
         let Some(ident) = attribute.path().get_ident() else {
@@ -805,7 +824,7 @@ fn verdict(function: &crate::parse::NamedFn, name: &str) -> Result<usize, String
     if !tested {
         return Err(format!("declares no `#[test] fn {name}`"));
     }
-    Ok(at)
+    Ok(span)
 }
 
 /// Every link target a summary names that is not an absolute URL.
@@ -1147,8 +1166,8 @@ fn check_anchor(
         return violations;
     };
 
-    let at = match declares_test(sample, anchor, declared.start..=declared.end) {
-        Ok(at) => Some(at),
+    let span = match declares_test(sample, anchor, declared.start..=declared.end) {
+        Ok(span) => Some(span),
         Err(why) => {
             violations.push(Violation::new(
                 rule,
@@ -1178,8 +1197,12 @@ fn check_anchor(
                 ),
             ));
         }
-    } else if let Some(at) = at {
-        if at < declared.start || at > declared.end {
+    } else if let Some((start, end)) = span {
+        let outside = start < declared.start
+            || start > declared.end
+            || end < declared.start
+            || end > declared.end;
+        if outside {
             violations.push(Violation::new(
                 rule,
                 chapter,
@@ -2125,7 +2148,7 @@ mod tests {
             .find(|(name, _)| name == BOOK_CHAPTERS[0].file)
             .expect("the fixture has the first chapter");
         chapter.1 = chapter.1.replace(
-            "crates/waymaker-drive/tests/book.rs",
+            "crates/waymaker-facade-demo/tests/book.rs",
             "crates/waymaker-drive/src/ota.rs",
         );
         assert!(
@@ -2678,6 +2701,52 @@ mod tests {
         assert!(
             fired(&check(&inputs), BOOK),
             "an anchor missing its own `fn` keyword was accepted as showing a real test"
+        );
+    }
+
+    #[test]
+    fn an_anchor_end_marker_between_fn_and_the_name_does_not_count_as_containing_the_test() {
+        // Issue #165, Codex review round 8 of issue #97. `declares_test` checked only
+        // the function's start line. Here the anchor's own `ANCHOR_END` marker sits
+        // between `fn` and the name. The anchor's start line holds `fn`. Its end line
+        // holds `ANCHOR_END`. The name, the parameter list and the body sit after the
+        // anchor. The rendered page shows only the word `fn`, not a test.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "// ANCHOR: a_first_sample\n#[test]\nfn\n// ANCHOR_END: a_first_sample\n\
+             a_first_sample() {\n    assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            fired(&check(&inputs), BOOK),
+            "an anchor that ends before its own name was accepted as showing a real test"
+        );
+    }
+
+    #[test]
+    fn a_method_in_an_impl_block_is_held_to_the_same_span_check_as_a_free_function() {
+        // `collect_fns_named` builds a `NamedFn` at two sites: a free function, and a
+        // method in an `impl` block. The free-function site is covered above. This
+        // repeats the same straddle for the method site, so both are held to the rule.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n\
+             // ANCHOR_END: a_first_sample\n",
+            "impl Fixture {\n\
+             // ANCHOR: a_first_sample\n\
+             #[test]\n\
+             fn\n\
+             // ANCHOR_END: a_first_sample\n\
+             a_first_sample() {\n\
+                 assert!(true);\n\
+             }\n\
+             }\n",
+            1,
+        );
+        assert!(
+            fired(&check(&inputs), BOOK),
+            "an anchor that ends before a method's own name was accepted as showing a real test"
         );
     }
 
