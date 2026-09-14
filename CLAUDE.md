@@ -3247,6 +3247,27 @@ read `Item::Struct` at all. Both gained a `Struct` arm, the latter through a new
 to keep `collect_child_modules` under this file's own line-count lint, each field's `#[cfg(test)]`
 gate carried onward the same way an enum variant's already was.
 
+Round 20 found two more, one of the same type-bearing shape and one of a different kind
+entirely. The same shape: an enum variant's own *fields*, not only its discriminant, can
+each carry a buried block too (`enum E { V([(); { impl Clone for super::Recovery { .. };
+0 }]) }`), so both `nested_body_items`'s enum arm and `collect_child_modules`'s gained a walk
+over each variant's fields alongside its discriminant, the latter through a new
+`enum_variant_bodies` helper mirroring `struct_field_bodies`. The different kind was a false
+*positive* rather than one of this scanner's usual false negatives: `trait_implementors`
+built one alias table for an entire file by recursing `collect_item_aliases` and
+`collect_type_aliases` through every inline module and flattening everything into one shared
+table, so an unrelated nested module's own `use core::clone::Clone as C;` — which real Rust
+scopes strictly to that `mod { .. }` block, never letting it leak to a sibling scope or its
+parent — could resolve an unrelated, identically-named alias used by a completely different
+`impl` elsewhere in the file, rejecting a `Recovery` that implemented neither `Clone` nor
+anything resolving to it. `collect_type_aliases` no longer recurses into `Item::Mod` at all;
+a new `module_scope_aliases` builds a table from one module's own direct `use` and type-alias
+declarations only, and `collect_trait_implementors`'s own `Item::Mod` arm now calls it afresh
+for each nested module instead of inheriting the caller's table — matching that a `mod { .. }`
+block is a real scope boundary in Rust while a function, `impl`, `const`, `enum`, `struct` or
+`type` body is not, so `nested_body_items`'s descent into those still inherits whatever table
+the caller passes down.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

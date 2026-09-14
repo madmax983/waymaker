@@ -11557,6 +11557,69 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_in_an_unrelated_nested_module_does_not_leak_into_a_different_scope() {
+        // Found by Codex review of this change (PR #143), round 20: `trait_implementors`
+        // built one alias table for the whole file by recursing through every inline
+        // module and accumulating everything into one shared `Vec`, so an unrelated
+        // nested module's own `use core::clone::Clone as Marker;` — which real Rust
+        // scopes strictly to that `mod { .. }` block, never letting it leak to a
+        // sibling scope or its parent — resolved an unrelated, identically-named alias
+        // used by a completely different `impl` elsewhere in the file. This is a false
+        // *positive*: `Recovery` here implements only a local, harmless marker trait,
+        // never `Clone`, and must not be rejected.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use self::Harmless as Marker;\n",
+            "mod hidden {\n",
+            "    #[allow(unused_imports)]\n",
+            "    use core::clone::Clone as Marker;\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "impl Marker for Recovery {}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_enum_variant_field_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 20: after struct field
+        // types gained their own traversal, an enum variant's own *fields* — not only
+        // its discriminant — were still unvisited, and a field's type can carry an
+        // array-length block exactly the way a struct field's or a type alias's own
+        // type can.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "enum E {\n",
+                "    V([(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }]),\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

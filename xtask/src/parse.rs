@@ -512,13 +512,9 @@ pub fn future_trait_implementors(contents: &str) -> Result<Vec<String>, syn::Err
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String>, syn::Error> {
     let file = parse_rust(contents)?;
-    let mut aliases = Vec::new();
-    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
-    // `type R = super::Recovery;` binds a local name to a path exactly the way
-    // `use super::Recovery as R;` does, and `impl Clone for R` is an impl for the type
-    // the alias names — so a plain-path type alias is collected into the same table a
-    // `use` alias is, and every resolution below chases it exactly the same way.
-    collect_type_aliases(&file.items, &mut aliases);
+    // File scope is a module scope like any other — see `module_scope_aliases`, which
+    // is also what a nested `mod` gets its own table from during the walk below.
+    let aliases = module_scope_aliases(&file.items);
     let mut implementors = Vec::new();
     collect_trait_implementors(&file.items, &aliases, trait_name, &mut implementors);
     Ok(implementors)
@@ -541,12 +537,18 @@ pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String
 ///
 /// Reached at any nesting depth `nested_body_items` covers too — a function, method, or
 /// default trait-method body; a `const`/`static` initializer; an associated const's
-/// default — not only file scope and inline modules. Round 17 of Codex review on this
-/// change (PR #143) found `fn install() { type R = super::Recovery; impl Clone for R {
-/// .. } }`: `collect_trait_implementors` has descended into a function body since round
-/// 15 and found the `impl` there, but this function read only `Item::Mod`, so `R`
-/// resolved to nothing and the impl went unmatched even though the alias sits in the
-/// very same body as the impl that names it.
+/// default — not only file scope. Round 17 of Codex review on this change (PR #143)
+/// found `fn install() { type R = super::Recovery; impl Clone for R { .. } }`:
+/// `collect_trait_implementors` has descended into a function body since round 15 and
+/// found the `impl` there, but this function read only `Item::Mod`, so `R` resolved to
+/// nothing and the impl went unmatched even though the alias sits in the very same body
+/// as the impl that names it.
+///
+/// Does **not** recurse into an inline `Item::Mod`, unlike every round through 19: round
+/// 20 found that recursion, paired with [`collect_trait_implementors`]'s own, flattening
+/// every module's aliases into one table shared across the whole file — see
+/// [`module_scope_aliases`], which is now the one place a nested module's own scope is
+/// entered.
 fn collect_type_aliases<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     aliases: &mut Vec<UseAlias>,
@@ -574,11 +576,6 @@ fn collect_type_aliases<'a>(
                 // as the arm below.
                 collect_type_aliases(nested_body_items(item), aliases);
             }
-            syn::Item::Mod(module) => {
-                if let Some((_, nested)) = module.content.as_ref() {
-                    collect_type_aliases(nested, aliases);
-                }
-            }
             syn::Item::Fn(_)
             | syn::Item::Impl(_)
             | syn::Item::Trait(_)
@@ -591,6 +588,47 @@ fn collect_type_aliases<'a>(
             _ => {}
         }
     }
+}
+
+/// The `use` aliases and plain-path type aliases visible directly in one module's own
+/// scope — `items` — without crossing into a nested `Item::Mod`.
+///
+/// Found by Codex review of this change (PR #143), round 20: `trait_implementors` built
+/// one alias table for an entire file by recursing `collect_item_aliases` and
+/// `collect_type_aliases` through every inline module and accumulating everything into
+/// one shared `Vec`, so an unrelated nested module's own `use core::clone::Clone as C;`
+/// — which real Rust scopes strictly to that `mod { .. }` block, never letting it leak
+/// to a sibling scope or its parent — could resolve an unrelated, identically-named
+/// alias used by a completely different `impl` elsewhere in the file. That is a false
+/// *positive* rather than one of this scanner's usual false negatives: a root-scope
+/// `use self::Harmless as C; impl C for Recovery {}` was reported as implementing
+/// `Clone`, purely because some other module anywhere in the same file happened to
+/// alias an unrelated `Clone` under the same local name.
+///
+/// [`collect_trait_implementors`]'s own `Item::Mod` arm calls this afresh for each
+/// nested module's own scope instead of inheriting the caller's table, and this is
+/// where [`trait_implementors`] builds the file-root table it starts the walk with.
+/// `Fn`/`Impl`/`Trait`/`Const`/`Static`/`Enum`/`Type`/`Struct` bodies are not module
+/// boundaries in Rust — an item declared inside one still resolves names through the
+/// enclosing module's own imports — so [`nested_body_items`]'s descent into them keeps
+/// inheriting whatever table the caller passes down; only [`syn::Item::Mod`] opens a
+/// new scope.
+fn module_scope_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAlias> {
+    let items: Vec<&syn::Item> = items.into_iter().collect();
+    let mut aliases = Vec::new();
+    for item in items.iter().copied() {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        if let syn::Item::Use(use_item) = item {
+            collect_tree_aliases(&use_item.tree, &mut Vec::new(), &mut aliases);
+        }
+    }
+    // `type R = super::Recovery;` binds a local name to a path exactly the way
+    // `use super::Recovery as R;` does, so it belongs in the same table and at the same
+    // scope.
+    collect_type_aliases(items.iter().copied(), &mut aliases);
+    aliases
 }
 
 /// Strips any number of redundant `(..)` wrappers from a type, so `(Recovery)` and
@@ -673,7 +711,13 @@ fn collect_trait_implementors<'a>(
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
-                    collect_trait_implementors(nested, aliases, trait_name, implementors);
+                    // Round 20: a `mod { .. }` block is a real scope boundary in Rust,
+                    // so the caller's `aliases` must not apply inside it, and this
+                    // module's own aliases must not leak back out to the caller either
+                    // — each nested module gets a table built fresh from its own scope
+                    // alone, the same way `trait_implementors` builds the file-root one.
+                    let module_aliases = module_scope_aliases(nested);
+                    collect_trait_implementors(nested, &module_aliases, trait_name, implementors);
                 }
             }
             // Round 15 of Codex review on this change (PR #143) found an `impl`
@@ -2008,6 +2052,11 @@ impl<'ast> syn::visit::Visit<'ast> for BlockItemVisitor<'ast> {
 /// { field: [(); { impl Clone for super::Recovery { .. }; 0 }] }`), so every field's
 /// type is walked with [`type_items`] too, skipping a `#[cfg(test)]` field the same way
 /// the enum arm skips a `#[cfg(test)]` variant.
+///
+/// Round 20 found the same gap in the enum arm itself: a variant's own fields — not
+/// only its discriminant — can each carry a buried block (`enum E { V([(); { impl
+/// Clone for super::Recovery { .. }; 0 }]) }`), so every field of every variant is
+/// walked with [`type_items`] too, alongside the discriminant.
 fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
     match item {
         syn::Item::Fn(function) => block_items(&function.block),
@@ -2049,6 +2098,14 @@ fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
                     .discriminant
                     .as_ref()
                     .map_or_else(Vec::new, |(_, expr)| expr_items(expr))
+                    .into_iter()
+                    .chain(
+                        variant
+                            .fields
+                            .iter()
+                            .filter(|field| !has_cfg_test(&field.attrs))
+                            .flat_map(|field| type_items(&field.ty)),
+                    )
             })
             .collect(),
         syn::Item::Type(type_item) => type_items(&type_item.ty),
@@ -2144,6 +2201,41 @@ fn struct_field_bodies(
             (
                 struct_gated || has_cfg_test(&field.attrs),
                 type_items(&field.ty),
+            )
+        })
+        .collect()
+}
+
+/// [`struct_field_bodies`], for an enum's own variants — each variant's discriminant
+/// expression and its fields' types combined into the one nested-item set that
+/// variant's own `#[cfg(test)]` gating covers.
+///
+/// Round 20 of Codex review on this change (PR #143) found that a variant's *fields*,
+/// not only its discriminant, can carry a buried block the same way a struct's own
+/// field types can (`enum E { V([(); { impl Clone for super::Recovery { .. }; 0 }]) }`)
+/// — a `mod` hidden inside one was never reached by this walk, and neither was an
+/// `impl` hidden inside one by [`nested_body_items`]'s own enum arm, which round 20
+/// also closed the same way.
+fn enum_variant_bodies(
+    enum_item: &syn::ItemEnum,
+    enum_gated: bool,
+) -> Vec<(bool, Vec<&syn::Item>)> {
+    enum_item
+        .variants
+        .iter()
+        .map(|variant| {
+            let variant_gated = enum_gated || has_cfg_test(&variant.attrs);
+            let discriminant_items = variant
+                .discriminant
+                .as_ref()
+                .map_or_else(Vec::new, |(_, expr)| expr_items(expr));
+            let field_items = variant
+                .fields
+                .iter()
+                .flat_map(|field| type_items(&field.ty));
+            (
+                variant_gated,
+                discriminant_items.into_iter().chain(field_items).collect(),
             )
         })
         .collect()
@@ -2266,17 +2358,8 @@ fn collect_child_modules<'a>(
             }
             syn::Item::Enum(enum_item) => {
                 let enum_gated = gated || has_cfg_test(&enum_item.attrs);
-                for variant in &enum_item.variants {
-                    if let Some((_, expr)) = &variant.discriminant {
-                        let variant_gated = enum_gated || has_cfg_test(&variant.attrs);
-                        collect_child_modules(
-                            expr_items(expr),
-                            parent_dir,
-                            child_dir,
-                            variant_gated,
-                            found,
-                        );
-                    }
+                for (variant_gated, items) in enum_variant_bodies(enum_item, enum_gated) {
+                    collect_child_modules(items, parent_dir, child_dir, variant_gated, found);
                 }
             }
             syn::Item::Type(type_item) => {
