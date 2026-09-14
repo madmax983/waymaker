@@ -1127,6 +1127,84 @@ pub fn crate_root_pattern_uses(contents: &str) -> Result<Vec<String>, syn::Error
     Ok(visitor.found)
 }
 
+/// Every `const` `contents` declares whose initializer is a call expression, named by
+/// the constant's own name, in source order.
+///
+/// Reaches any level `syn` reaches: file, module, `impl`, or a block's own local item.
+/// Items and `impl` members under exactly `#[cfg(test)]` are skipped, the same
+/// structural exclusion [`macro_uses`] makes.
+///
+/// Codex's thirty-ninth-round finding: `const P0: u8 = index(0);` through `P14` is
+/// `Expr::Call`, which `literal_or_const_value` does not evaluate — deliberately, since
+/// doing that in general means interpreting an arbitrary function body, which this scan
+/// does not attempt — so `resolve_scope_consts` folds none of them and a table built this
+/// way reads as unresolved on every arm, passing every dense-match check here by never
+/// being recognised as dense at all. The same shape of gap [`crate_root_pattern_uses`]
+/// closes for a crate-anchored pattern: rather than reasoning about what a call might
+/// evaluate to, or which calls are safe to interpret, a `const` whose own initializer is
+/// a call is refused outright, independent of whether anything ever pattern-matches on it.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::Error> {
+    struct ConstCallInitializers {
+        found: Vec<String>,
+    }
+
+    /// Whether `expr` is a call once any parentheses or brace-group wrapping have been
+    /// seen through — the same two wrappers [`literal_or_const_value`] already sees
+    /// through for every other shape it resolves.
+    fn is_call_shaped(expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Paren(inner) => is_call_shaped(&inner.expr),
+            syn::Expr::Group(inner) => is_call_shaped(&inner.expr),
+            syn::Expr::Call(_) => true,
+            _ => false,
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ConstCallInitializers {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            if let syn::Item::Const(constant) = node {
+                if is_call_shaped(&constant.expr) {
+                    self.found.push(ident_name(&constant.ident));
+                }
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            if let syn::ImplItem::Const(constant) = node {
+                if is_call_shaped(&constant.expr) {
+                    self.found.push(ident_name(&constant.ident));
+                }
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            for stmt in &node.stmts {
+                if stmt_is_cfg_test(stmt) {
+                    continue;
+                }
+                self.visit_stmt(stmt);
+            }
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = ConstCallInitializers { found: Vec::new() };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
 /// Every name a file uses: all identifiers in source order, and all paths with `use`
 /// aliases resolved.
 ///
@@ -2462,12 +2540,13 @@ const MAX_RANGE_PATTERN_VALUES: usize = 4096;
 /// applies to a whole arm's own pattern — or `None` when zero or more than one field
 /// qualifies.
 ///
-/// A tuple or tuple-struct pattern with any number of fields, all but one of them a
-/// catch-all, is exactly as dense a table row as that one field alone: `rustc` still
-/// indexes on the one field that actually varies and ignores every field that always
-/// matches. Two or more non-catch-all fields is genuinely ambiguous — nothing here says
-/// which one a table would be keyed on — and is refused the same as zero, rather than
-/// guessing.
+/// A tuple, tuple-struct, or named-field struct pattern with any number of fields, all
+/// but one of them a catch-all, is exactly as dense a table row as that one field alone:
+/// `rustc` still indexes on the one field that actually varies and ignores every field
+/// that always matches — a field's own *name*, where it has one, plays no part in this,
+/// only whether its subpattern is irrefutable. Two or more non-catch-all fields is
+/// genuinely ambiguous — nothing here says which one a table would be keyed on — and is
+/// refused the same as zero, rather than guessing.
 fn single_discriminating_field<'a>(
     elems: impl IntoIterator<Item = &'a syn::Pat>,
     resolve: &dyn Fn(&syn::Path) -> Option<i128>,
@@ -2628,6 +2707,19 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         // same way the tuple-struct case above was.
         syn::Pat::Tuple(tuple) => single_discriminating_field(&tuple.elems, resolve)
             .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
+        // Codex's next-round finding: `Key { n: 0, ignored: _ }` through
+        // `Key { n: 14, ignored: _ }` is exactly as dense once more, since `rustc`
+        // indexes on the one named field that varies and ignores a field that is
+        // always a catch-all — a named-field struct pattern is the third shape this
+        // reasoning applies to, so it gets the identical treatment: the field name
+        // itself plays no part (a dense table could be built keyed on any one field,
+        // whichever one actually varies), only which single field's own subpattern is
+        // not irrefutable.
+        syn::Pat::Struct(pat_struct) => single_discriminating_field(
+            pat_struct.fields.iter().map(|field| field.pat.as_ref()),
+            resolve,
+        )
+        .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
         // Codex's finding: `0 | 1 => VALUE` covers two values in a single arm, and
         // `rustc` still lowers a match built this way to the identical indexed table a
         // one-value-per-arm spelling gets — this fell to the `_ => Vec::new()` case
@@ -3143,6 +3235,47 @@ fn resolve_pattern_path(path: &syn::Path, ctx: &ResolutionContext<'_>) -> Option
     resolve_qualified_path(path, ctx.qualified, ctx.module_path)
 }
 
+/// `trait_name`'s own default associated constants, found by the identical
+/// most-specific-first search [`resolve_pattern_path`]'s own fallback already makes over
+/// `module_path`, `function_path` and `block_path` — mirroring it exactly, rather than
+/// inventing a second search order, because a trait impl's bare, unqualified reference to
+/// its trait resolves under the same lexical-scoping rules as any other bare name.
+///
+/// Codex's finding: keying `trait_defaults` by the trait's bare name alone let two
+/// *different* traits of the same name, declared in two different modules, collide — the
+/// first module's `impl Indices for u8 {}` looked up "Indices" and could just as easily
+/// find the second module's own same-named trait's defaults, non-dense ones included.
+/// `visit_item_trait` now records each trait's defaults under its own full scope path,
+/// the same way every other declaration here already is, and this is `visit_item_impl`'s
+/// side of that: try the trait impl's own full scope first, peeling `block_path` down to
+/// nothing, then drop `function_path` and try the bare `module_path` — never falling all
+/// the way to a bare, unscoped trait name, which is exactly the collision this closes.
+fn lookup_trait_defaults<'a>(
+    trait_defaults: &'a std::collections::HashMap<String, std::collections::HashMap<String, i128>>,
+    module_path: &[String],
+    function_path: &[String],
+    block_path: &[String],
+    trait_name: &str,
+) -> Option<&'a std::collections::HashMap<String, i128>> {
+    for depth in (0..=block_path.len()).rev() {
+        let mut combined = module_path.to_vec();
+        combined.extend(function_path.iter().cloned());
+        if let Some(prefix) = block_path.get(..depth) {
+            combined.extend(prefix.iter().cloned());
+        }
+        combined.push(trait_name.to_string());
+        if let Some(defaults) = trait_defaults.get(&combined.join("::")) {
+            return Some(defaults);
+        }
+    }
+    if function_path.is_empty() {
+        return None;
+    }
+    let mut bare = module_path.to_vec();
+    bare.push(trait_name.to_string());
+    trait_defaults.get(&bare.join("::"))
+}
+
 /// Walks a parsed file collecting every [`FoundMatch`], skipping anything declared under
 /// `#[cfg(test)]` — an item, an `impl` member, or an inline module's contents — the
 /// structural equivalent of `without_test_modules` blanking the same text.
@@ -3293,9 +3426,22 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // recorded here, once, under the trait's own name, for `visit_item_impl` to start
         // a trait impl's own scope from before the impl's own redeclarations (if any) are
         // laid over it.
+        //
+        // Codex's next-round finding: keyed by the trait's bare name alone, two different
+        // traits named `Indices` in two different modules collided under one key, and the
+        // later-visited trait's own defaults silently answered for the earlier one's
+        // impls. Keyed by the trait's full scope path instead — `module_path` plus
+        // `function_path` plus `block_path`, exactly the way every other declaration this
+        // file indexes already is — so `lookup_trait_defaults` can tell the two apart the
+        // same way `resolve_pattern_path` already tells two same-named local modules
+        // apart.
         if !has_cfg_test(&node.attrs) {
             let scope = resolve_scope_consts(&trait_const_exprs(&node.items), &self.scopes);
-            self.trait_defaults.insert(ident_name(&node.ident), scope);
+            let mut key_path = self.module_path.clone();
+            key_path.extend(self.function_path.iter().cloned());
+            key_path.extend(self.block_path.iter().cloned());
+            key_path.push(ident_name(&node.ident));
+            self.trait_defaults.insert(key_path.join("::"), scope);
         }
         syn::visit::visit_item_trait(self, node);
     }
@@ -3326,11 +3472,17 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // `impl Indices for u8 {}`, redeclaring *none* of a trait all of whose constants
         // already carry a default, indexed nothing at all, even though `u8::P0` still
         // names the trait's own default value. `self.trait_defaults`, populated by
-        // `visit_item_trait`, is consulted here by the trait path's own last segment —
-        // the trait's name is unambiguous the same way the type's is, since a `Self` type
-        // implementing two traits of the same name is not something Rust itself allows —
-        // and seeded as the starting scope for a trait impl before the impl's own
+        // `visit_item_trait`, is consulted here by the trait path's own last segment,
+        // seeded as the starting scope for a trait impl before the impl's own
         // redeclarations are layered over it, so an override still wins where one exists.
+        //
+        // Codex's next-round finding after that: the trait's name alone is *not*
+        // unambiguous — two different modules can each declare their own trait named
+        // `Indices`, and a bare name lookup could answer from either one's defaults.
+        // `lookup_trait_defaults` is `resolve_pattern_path`'s own most-specific-first
+        // search, reused rather than reinvented, since this impl's own bare reference to
+        // its trait resolves under the identical lexical-scoping rules any other bare
+        // name here does.
         // Codex's next-round finding: `Self::P0`, written inside this very impl, named no
         // module `resolve_pattern_path` could ever find — the constant below is indexed
         // under the concrete type's own name, but nothing recorded that `Self` currently
@@ -3346,7 +3498,15 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                         .trait_
                         .as_ref()
                         .and_then(|(_, trait_path, _)| trait_path.segments.last())
-                        .and_then(|segment| self.trait_defaults.get(&ident_name(&segment.ident)))
+                        .and_then(|segment| {
+                            lookup_trait_defaults(
+                                &self.trait_defaults,
+                                &self.module_path,
+                                &self.function_path,
+                                &self.block_path,
+                                &ident_name(&segment.ident),
+                            )
+                        })
                         .cloned()
                         .unwrap_or_default();
                     scope.extend(resolve_scope_consts(

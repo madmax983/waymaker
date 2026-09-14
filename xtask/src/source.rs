@@ -8513,6 +8513,7 @@ fn check_integrity_check_module_tree(
 
         check_checksum_module_macros(scanned, &mut violations);
         check_checksum_module_crate_root_patterns(scanned, &mut violations);
+        check_checksum_module_const_call_initializers(scanned, &mut violations);
 
         let prefix = prefixes
             .iter()
@@ -8637,6 +8638,57 @@ fn check_checksum_module_crate_root_patterns(
             format!(
                 "{} could not be parsed ({error}) while scanning for crate-root patterns; \
                  an unreadable source fails closed rather than approving what it cannot see",
+                scanned.path.replace('\\', "/")
+            ),
+        )),
+    }
+}
+
+/// [`check_integrity_check_module_tree`]'s const-call-initializer half, factored out to
+/// keep that function under clippy's line count: every `const` `scanned` declares whose
+/// own initializer is a call expression, pushed as a violation.
+///
+/// Codex's thirty-ninth-round finding: `const P0: u8 = index(0);` through `P14` is
+/// `Expr::Call`, which `literal_or_const_value` does not evaluate on purpose — doing that
+/// in general means interpreting an arbitrary function body, which this scan does not
+/// attempt — so `resolve_scope_consts` folds none of them, and [`missing_value`] and
+/// [`fully_dense_arm_patterns`] both fail a match's *entire* dense-table check the moment
+/// any one arm is unresolved. A table built entirely from such constants would never be
+/// recognised as dense at all. Rather than reasoning about which calls are safe to
+/// evaluate, any `const` whose initializer is a call is refused outright, independent of
+/// whether anything ever pattern-matches on it — the checksum module's own arithmetic
+/// needs no indirection through a function call to compute a constant.
+fn check_checksum_module_const_call_initializers(
+    scanned: &crate::size::LayerSource,
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::const_call_initializer_uses(&scanned.contents) {
+        Ok(names) => {
+            for name in names {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} declares `{name}` with a call as its own initializer — a \
+                         value this scan does not evaluate, so a match built from a run \
+                         of such constants would never be recognised as the dense table \
+                         it might be; the checksum module's own arithmetic needs no \
+                         function call to compute a constant",
+                        scanned.path.replace('\\', "/")
+                    ),
+                ));
+            }
+        }
+        Err(error) => violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{} could not be parsed ({error}) while scanning for const-call \
+                 initializers; an unreadable source fails closed rather than approving \
+                 what it cannot see",
                 scanned.path.replace('\\', "/")
             ),
         )),
@@ -16952,6 +17004,97 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_named_struct_patterns_with_one_discriminating_field_is_reported() {
+        // Codex's thirty-ninth-round finding: `Key { n: 0, ignored: _ }` through
+        // `Key { n: 14, ignored: _ }` is exactly as dense once more, since `rustc`
+        // indexes on the one named field that varies and ignores a field that is
+        // always a catch-all — a named-field struct pattern is a third shape the
+        // discriminating-field reasoning applies to, alongside tuples and tuple
+        // structs, and fell to the wildcard case since `Pat::Struct` had no handling
+        // at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Key {\n    n: u8,\n    ignored: bool,\n}\n\nconst fn \
+             struct_field_helper(nibble: u32) -> u32 {\n    nibble\n}\n\nconst fn \
+             struct_field_table(key: Key) -> u32 {\n    match key {\n        \
+             Key { n: 0, ignored: _ } => struct_field_helper(0),\n        \
+             Key { n: 1, ignored: _ } => struct_field_helper(1),\n        \
+             Key { n: 2, ignored: _ } => struct_field_helper(2),\n        \
+             _ => struct_field_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_const_call_initializer_is_reported() {
+        // Codex's thirty-ninth-round finding: `const P0: u8 = identity(0);` through
+        // `P3` is `Expr::Call`, which `literal_or_const_value` does not evaluate on
+        // purpose — doing so in general means interpreting an arbitrary function
+        // body — so every such constant stayed unresolved and a table built entirely
+        // from them was never recognised as dense at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn identity(value: u8) -> u8 {\n    value\n}\n\nconst P0: u8 \
+             = identity(0);\nconst P1: u8 = identity(1);\nconst P2: u8 = \
+             identity(2);\nconst P3: u8 = identity(3);\n\nconst fn \
+             const_call_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 \
+             => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `P0` with a call as its own initializer")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn trait_defaults_do_not_collide_across_two_same_named_traits_in_different_modules() {
+        // Codex's thirty-ninth-round finding: `trait_defaults` was keyed by the
+        // trait's bare name alone, so two *different* traits named `Indices`,
+        // declared in two different modules, collided under one key — the
+        // later-visited trait's own defaults silently overwrote the earlier one's,
+        // and an impl of the *first* trait could read the *second* trait's values
+        // instead of its own. `poison`'s own `Indices` sits textually between
+        // `outer`'s own `Indices` and the impl that uses it, so the corruption — if
+        // present — lands exactly where the impl looks: read correctly, the match
+        // below is `0..=3`; read from `poison`'s leftover values it would instead
+        // see four identical `0`s and hide a real 5-arm dense table. Real Rust
+        // itself is unambiguous here — `poison::Indices` is not in scope at
+        // `impl Indices for u8 {}`'s own position without an explicit `use` or
+        // qualification — so this is a scanner-only collision, not a genuine
+        // ambiguity.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod outer {\n    trait Indices {\n        const P0: u8 = 0;\n        \
+             const P1: u8 = 1;\n        const P2: u8 = 2;\n        const P3: u8 = \
+             3;\n    }\n\n    mod poison {\n        trait Indices {\n            \
+             const P0: u8 = 0;\n            const P1: u8 = 0;\n            const P2: \
+             u8 = 0;\n            const P3: u8 = 0;\n        }\n    }\n\n    impl \
+             Indices for u8 {}\n\n    const fn trait_scope_pattern_table(nibble: u8) \
+             -> u32 {\n        match nibble & 0xF {\n            <u8 as \
+             Indices>::P0 => 0,\n            <u8 as Indices>::P1 => 1,\n            \
+             <u8 as Indices>::P2 => 2,\n            <u8 as Indices>::P3 => 3,\n            \
+             _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
             "{violations:?}"
         );
     }
