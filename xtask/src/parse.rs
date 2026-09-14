@@ -2059,6 +2059,13 @@ pub fn match_expressions_with_prefix(
         // this parameter is what carries it there — the identical map
         // `qualified_constants_with_prefix` now returns instead of discarding.
         qualified_unsigned: external_qualified_unsigned.clone(),
+        // Codex's next-round finding: `path_declared_type` answered `None` for every
+        // qualified reference, because nothing here tracked a qualified constant's own
+        // declared type at all — only `qualified_unsigned`'s own bool did. Seeded empty
+        // here the same first-round way `qualified_unsigned` itself once was, before that
+        // map's own cross-file threading was added: this file's own inline modules are what
+        // `visit_item_mod` populates it from below.
+        qualified_types: std::collections::HashMap::new(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -2224,6 +2231,10 @@ pub fn qualified_constants_with_prefix(
         trait_defaults: std::collections::HashMap::new(),
         qualified,
         qualified_unsigned,
+        // Codex's next-round finding: seeded empty here for the identical first-round
+        // reason `match_expressions_with_prefix`'s own seed is — this file's own inline
+        // modules are what `visit_item_mod` populates it from during the walk below.
+        qualified_types: std::collections::HashMap::new(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -4068,6 +4079,16 @@ fn evaluate_index(indexed: &syn::ExprIndex, resolve: &Resolve<'_>) -> Option<i12
 /// `resolve.unsigned`: `None` for anything this scan cannot confirm a width for — a qualified
 /// path, one reached only through an outer scope, or a name with no declared width at all —
 /// stays unresolved rather than guessed at.
+///
+/// Codex's next-round finding: `!(255 as u8)` carries its width in the cast's own
+/// destination type rather than in a literal's suffix or a path's declaration —
+/// `as_suffixed_int_literal` only reads a `Lit::Int` through parentheses or a brace group,
+/// never a `Cast`, so this fell straight through to the path-only case and declined a shape
+/// that names its width just as plainly as `!255u8` does. [`literal_or_const_value`]'s own
+/// `Expr::Cast` case already evaluates the cast for real — recursing into the operand and
+/// truncating to the destination type — so the same masked-then-truncated answer
+/// [`apply_integer_cast`] gives the suffixed-literal case above is reached here by asking for
+/// `operand`'s own value pre-negation, then negating within the cast's own destination width.
 fn evaluate_bitwise_not(operand: &syn::Expr, resolve: &Resolve<'_>) -> Option<i128> {
     if let Some(boolean) = as_bool_literal(operand) {
         return Some(i128::from(!boolean));
@@ -4076,6 +4097,10 @@ fn evaluate_bitwise_not(operand: &syn::Expr, resolve: &Resolve<'_>) -> Option<i1
         let ty = syn::parse_str::<syn::Type>(int.suffix()).ok()?;
         let raw = lit_value(&syn::Lit::Int(int.clone()))?;
         return apply_integer_cast(!raw, &ty);
+    }
+    if let syn::Expr::Cast(cast) = strip_parens(operand) {
+        let truncated = literal_or_const_value(operand, resolve)?;
+        return apply_integer_cast(!truncated, &cast.ty);
     }
     let syn::Expr::Path(path) = strip_parens(operand) else {
         return None;
@@ -5339,6 +5364,104 @@ fn resolve_qualified_unsigned_at_any_depth(
     false
 }
 
+/// [`resolve_qualified_unsigned`]'s own mirror for a declared *type name* rather than only
+/// whether one is unsigned — [`resolve_qualified_path`]'s own answer for whether the entry
+/// it found is one `qualified_types` records a type name for. Every `qualified.get` this
+/// mirrors is gated on the identical `qualified.contains_key` here, for the identical reason
+/// `resolve_qualified_unsigned` already states: a `relative` key present only in
+/// `qualified_types` and not in `qualified` never happens given the two are inserted
+/// together, but this reads defensively rather than trusting that.
+///
+/// Codex's next-round finding: `path_declared_type` answered `None` for every *qualified*
+/// reference unconditionally, because `qualified` carried no declared-type counterpart at
+/// all — only [`ConstTypeScopes`] did, for the bare-name case. `const OFF: bool = false;` in
+/// an inline `mod bounds { .. }` this file itself declares, referenced as `!bounds::OFF` in a
+/// match guard, therefore stayed unresolved the identical way a qualified `bounds::HI`'s own
+/// unsignedness once did before [`resolve_qualified_unsigned`] existed. `MatchVisitor::
+/// qualified_types` is `qualified`'s own type-name mirror, inserted at the identical key
+/// everywhere `qualified` itself gains one, the same way `qualified_unsigned` already is.
+fn resolve_qualified_type<'a>(
+    path: &syn::Path,
+    qualified: &std::collections::HashMap<String, i128>,
+    qualified_types: &'a std::collections::HashMap<String, String>,
+    current_module: &[String],
+) -> Option<&'a str> {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    let is_crate_absolute = segments.first().map(String::as_str) == Some("crate");
+    let relevant: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .skip_while(|segment| *segment == "crate" || *segment == "self")
+        .collect();
+    let super_count = (relevant.len() >= 2).then(|| {
+        relevant
+            .iter()
+            .take_while(|segment| **segment == "super")
+            .count()
+    })?;
+    let rest = relevant.get(super_count..)?;
+    if rest.len() < 2 {
+        return None;
+    }
+    let joined = rest.join("::");
+    if !is_crate_absolute {
+        let pop = super_count.min(current_module.len());
+        if let Some(effective_module) = current_module.get(..current_module.len() - pop) {
+            if !effective_module.is_empty() {
+                let relative = format!("{}::{joined}", effective_module.join("::"));
+                if qualified.contains_key(&relative) {
+                    return qualified_types.get(&relative).map(String::as_str);
+                }
+            }
+        }
+    }
+    if qualified.contains_key(&joined) {
+        return qualified_types.get(&joined).map(String::as_str);
+    }
+    let tail_start = rest.len().saturating_sub(2);
+    let tail = rest.get(tail_start..)?;
+    let tail_key = tail.join("::");
+    qualified
+        .contains_key(&tail_key)
+        .then(|| qualified_types.get(&tail_key).map(String::as_str))
+        .flatten()
+}
+
+/// [`resolve_qualified_type`]'s own [`resolve_qualified_unsigned_at_any_depth`]: the same
+/// depth search, re-run to find which depth's `combined_module` is the one
+/// [`resolve_qualified_path`] itself would answer from, and [`resolve_qualified_type`]'s
+/// answer at that exact depth — never a different one, for the identical reason
+/// [`resolve_qualified_unsigned_at_any_depth`] already states.
+fn resolve_qualified_type_at_any_depth<'a>(
+    path: &syn::Path,
+    qualified: &std::collections::HashMap<String, i128>,
+    qualified_types: &'a std::collections::HashMap<String, String>,
+    module_path: &[String],
+    function_path: &[String],
+    block_path: &[String],
+) -> Option<&'a str> {
+    for depth in (0..=block_path.len()).rev() {
+        let mut combined_module = module_path.to_vec();
+        combined_module.extend(function_path.iter().cloned());
+        if let Some(prefix) = block_path.get(..depth) {
+            combined_module.extend(prefix.iter().cloned());
+        }
+        if resolve_qualified_path(path, qualified, &combined_module).is_some() {
+            return resolve_qualified_type(path, qualified, qualified_types, &combined_module);
+        }
+    }
+    if !(function_path.is_empty() && block_path.is_empty())
+        && resolve_qualified_path(path, qualified, module_path).is_some()
+    {
+        return resolve_qualified_type(path, qualified, qualified_types, module_path);
+    }
+    None
+}
+
 /// `name`'s value at the module `levels_up` ancestors above the current one — `0` for the
 /// current module (`self::NAME`), `1` for its parent (`super::NAME`), and so on.
 ///
@@ -5526,6 +5649,9 @@ struct ResolutionContext<'a> {
     /// [`ConstTypeScopes`]'s own mirror of `scopes` — [`path_declared_type`]'s
     /// bare-identifier case, the way `scopes_unsigned` is [`path_is_definitely_unsigned`]'s.
     scopes_types: &'a ConstTypeScopes,
+    /// `qualified`'s own declared-type mirror — [`path_declared_type`]'s qualified case, the
+    /// way `qualified_unsigned` is [`path_is_definitely_unsigned`]'s.
+    qualified_types: &'a std::collections::HashMap<String, String>,
 }
 
 /// `path`'s own value against `qualified`, searched at every depth a bare or qualified
@@ -5854,10 +5980,11 @@ fn path_is_definitely_unsigned(path: &syn::Path, ctx: &ResolutionContext<'_>) ->
     well_known_integer_bound(type_name, member).is_some()
 }
 
-/// `path`'s own declared type name (`"u8"`, `"bool"`, ..), when `path` is a bare identifier
-/// naming a `const` whose own type ascription [`ConstTypeScopes`] recorded — `None` for a
-/// qualified path or a well-known bound, which decline rather than guess, the identical
-/// narrowing [`Resolve::width`]'s own doc comment states.
+/// `path`'s own declared type name (`"u8"`, `"bool"`, ..) — a bare identifier naming a
+/// `const` whose own type ascription [`ConstTypeScopes`] recorded, or a qualified reference
+/// to one `ctx.qualified_types` records the identical way `ctx.qualified_unsigned` records an
+/// unsignedness for the identical key. `None` for a well-known bound, which declines rather
+/// than guesses, the identical narrowing [`Resolve::width`]'s own doc comment states.
 ///
 /// Codex's next-round finding: `const OFF: bool = false; .. _ if !OFF => value, _ =>
 /// fallback` named a guard [`evaluate_bitwise_not`] could not fold, because every match
@@ -5867,13 +5994,30 @@ fn path_is_definitely_unsigned(path: &syn::Path, ctx: &ResolutionContext<'_>) ->
 /// which this scan already represents as exactly `0` or `1` regardless of which way `!` is
 /// read: the only fact missing was that `OFF` is a `bool` at all. This is that fact,
 /// answered the identical bare-name-only way [`ConstTypeScopes::resolve`] already carries
-/// it — a qualified reference stays undeclined by design, the same narrowing
-/// `resolve_scope_consts`'s own `resolve_width` closure already applies for the identical
-/// reason: a wrong guess about which bits a qualified `!` operand's width covers is not a
-/// risk worth taking to fold a case this scan can simply decline.
+/// it — a qualified reference used to stay undeclined by design, the same narrowing
+/// `resolve_scope_consts`'s own `resolve_width` closure still applies for the identical
+/// reason there: a wrong guess about which bits a qualified `!` operand's width covers is
+/// not a risk worth taking to fold a case that pass can simply decline.
+///
+/// Codex's next-round finding: that same narrowing left a *qualified* `bool` unresolved too
+/// — `const OFF: bool = false;` in an inline `mod bounds { .. }`, referenced as
+/// `!bounds::OFF`, is not a guess about an integer's width, it is the identical fact
+/// [`path_is_definitely_unsigned`] already resolves for a qualified reference through
+/// `qualified_unsigned`. Widened to match: a qualified path now searches
+/// [`resolve_qualified_type_at_any_depth`] the same most-specific-first way, before falling
+/// back to `None` for anything neither map records.
 fn path_declared_type<'a>(path: &syn::Path, ctx: &ResolutionContext<'a>) -> Option<&'a str> {
-    let ident = path.get_ident()?;
-    ctx.scopes_types.resolve(&ident_name(ident))
+    if let Some(ident) = path.get_ident() {
+        return ctx.scopes_types.resolve(&ident_name(ident));
+    }
+    resolve_qualified_type_at_any_depth(
+        path,
+        ctx.qualified,
+        ctx.qualified_types,
+        ctx.module_path,
+        ctx.function_path,
+        ctx.block_path,
+    )
 }
 
 /// `trait_name`'s own default associated constants, found by the identical
@@ -6115,6 +6259,10 @@ struct MatchVisitor {
     /// module-qualified twin of [`Self::scopes_unsigned`], inserted at the identical key
     /// every time `qualified` itself gains one.
     qualified_unsigned: std::collections::HashMap<String, bool>,
+    /// [`qualified`]'s own mirror of each entry's declared *type name* — the
+    /// module-qualified twin of `scopes_types`, inserted at the identical key every time
+    /// `qualified` itself gains one, the same way `qualified_unsigned` already is.
+    qualified_types: std::collections::HashMap<String, String>,
     found: Vec<FoundMatch>,
 }
 
@@ -6181,11 +6329,12 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         key_path.extend(self.function_path.iter().cloned());
         key_path.extend(self.block_path.iter().cloned());
         let unsigned_names = item_const_unsigned(items);
+        let types_names = item_const_types(items);
         let scope = resolve_scope_consts(
             &OwnConsts {
                 exprs: &item_const_exprs(items),
                 unsigned: &unsigned_names,
-                types: &item_const_types(items),
+                types: &types_names,
             },
             &OuterScopes {
                 values: &self.scopes,
@@ -6209,12 +6358,24 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             // Inserted at the identical key `qualified` itself just gained, so
             // [`resolve_qualified_unsigned`] can answer the same question `resolve_qualified_path`
             // does, for the same declaration.
-            self.qualified_unsigned
-                .insert(key, unsigned_names.get(name).copied().unwrap_or(false));
+            self.qualified_unsigned.insert(
+                key.clone(),
+                unsigned_names.get(name).copied().unwrap_or(false),
+            );
+            // Codex's next-round finding: `path_declared_type` answered `None` for every
+            // *qualified* reference the same way `path_is_definitely_unsigned` used to,
+            // because `qualified` carried no declared-type counterpart either — only
+            // `scopes_types` did, for the bare-name case. Inserted at the identical key,
+            // from the identical `types_names` map `scopes_types` itself is pushed from
+            // below, so [`resolve_qualified_type_at_any_depth`] can answer the same
+            // question `resolve_qualified_path` does, for the same declaration.
+            if let Some(type_name) = types_names.get(name) {
+                self.qualified_types.insert(key, type_name.clone());
+            }
         }
         self.scopes.0.push(scope);
         self.scopes_unsigned.0.push(unsigned_names);
-        self.scopes_types.0.push(item_const_types(items));
+        self.scopes_types.0.push(types_names);
         self.use_scopes.0.push(item_use_imports(items));
         self.module_scope_depths.push(self.scopes.0.len());
         syn::visit::visit_item_mod(self, node);
@@ -6508,6 +6669,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 scopes_unsigned: &self.scopes_unsigned,
                 qualified_unsigned: &self.qualified_unsigned,
                 scopes_types: &self.scopes_types,
+                qualified_types: &self.qualified_types,
             };
             let resolve_value = |path: &syn::Path| resolve_pattern_path(path, &ctx);
             let resolve_unsigned = |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
@@ -6616,6 +6778,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             scopes_unsigned: &self.scopes_unsigned,
             qualified_unsigned: &self.qualified_unsigned,
             scopes_types: &self.scopes_types,
+            qualified_types: &self.qualified_types,
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
@@ -6736,6 +6899,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             scopes_unsigned: &self.scopes_unsigned,
             qualified_unsigned: &self.qualified_unsigned,
             scopes_types: &self.scopes_types,
+            qualified_types: &self.qualified_types,
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);

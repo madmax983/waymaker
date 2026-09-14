@@ -20901,6 +20901,70 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_negated_cast_expressions_is_reported() {
+        // Codex's next-round finding: `!(255 as u8)` carries its width in `Expr::Cast`
+        // rather than in a literal's own suffix, which `as_suffixed_int_literal` — reading
+        // only a `Lit::Int` through parentheses or a brace group — had no way to find,
+        // falling straight through to the path-only case and declining. `evaluate_bitwise_not`
+        // now recognises a cast operand directly: `literal_or_const_value` already evaluates
+        // the cast for real (recursing into the operand and truncating to the destination
+        // type), and negating that truncated value within the identical destination width is
+        // the same masked answer the suffixed-literal case above already gives.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn negated_cast_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = !(255 as u8);\n    const P1: u8 = !(254 as u8);\n    \
+             const P2: u8 = !(253 as u8);\n    const P3: u8 = !(252 as u8);\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_qualified_declared_bool_constant_is_the_effective_catchall() {
+        // Codex's next-round finding: `path_declared_type` answered `None` for every
+        // *qualified* reference unconditionally, because `qualified` — `MatchVisitor`'s own
+        // tree of module-qualified constant values — carried no declared-type counterpart at
+        // all; only `ConstTypeScopes` did, for the bare-name case. `const OFF: bool = false;`
+        // in an inline `mod bounds { .. }`, referenced as `!bounds::OFF` in a guard, stayed
+        // unresolved the identical way a qualified `bounds::HI`'s own unsignedness once did
+        // before `qualified_unsigned` existed — so the guard never resolved to the provably
+        // `true` value `a_dense_match_with_a_provably_true_guarded_wildcard_is_reported`
+        // already covers for an unqualified condition, and never became the effective
+        // catch-all that lets the numbered prefix in front of it read as dense.
+        // `MatchVisitor::qualified_types` is `qualified`'s own type-name mirror now, inserted
+        // at the identical key everywhere `qualified` itself gains one, and
+        // `path_declared_type` consults it through `resolve_qualified_type_at_any_depth` the
+        // same most-specific-first way `path_is_definitely_unsigned` already consults
+        // `qualified_unsigned`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod bounds {\n    pub(crate) const OFF: bool = false;\n}\n\n\
+             const fn qualified_bool_catchall_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn qualified_bool_catchall_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => qualified_bool_catchall_guard_helper(0),\n        \
+             1 => qualified_bool_catchall_guard_helper(1),\n        \
+             2 => qualified_bool_catchall_guard_helper(2),\n        \
+             _ if !bounds::OFF => qualified_bool_catchall_guard_helper(3),\n        \
+             _ => qualified_bool_catchall_guard_helper(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
