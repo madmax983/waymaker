@@ -30,9 +30,11 @@ pub struct Shape {
 /// Every shape a call above this contract can have.
 ///
 /// A program and an erase each have two rows: one unit and more than one. A read has the
-/// same two, and no third row for the page-sized scan `recovery::Recovery`'s erased-tail
-/// walk makes — a scan of many units in one call is still a multi-unit read, the same shape
-/// a wide record's read has, and a caller-chosen chunk size is not a new shape of its own.
+/// same two, and no third row for the caller-sized scan `recovery::Recovery`'s erased-tail
+/// walk makes: its width is the caller's own page, rounded down to a whole number of read
+/// units, so it lands in one of the same two rows depending on that page — one unit on a
+/// page that holds no more, more than one on a wider page — and a caller-chosen chunk size
+/// is not a shape of its own.
 pub const SHAPES: &[Shape] = &[
     Shape {
         id: "program-single-unit",
@@ -57,12 +59,12 @@ pub const SHAPES: &[Shape] = &[
     Shape {
         id: "read-single-unit",
         sentence: "A read of exactly one read unit.",
-        issued_by: "`recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit",
+        issued_by: "`recovery::Recovery::stage`'s header read, on a geometry where the header fits one read unit; and its erased-tail walk, when the caller's page holds exactly one read unit",
     },
     Shape {
         id: "read-multi-unit",
         sentence: "A read of more than one read unit in one call.",
-        issued_by: "`recovery::Recovery::stage`'s whole-record read and its erased-tail walk",
+        issued_by: "`recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; its header read, on a geometry where the header spans more than one; and its erased-tail walk, when the caller's page holds more than one read unit",
     },
 ];
 

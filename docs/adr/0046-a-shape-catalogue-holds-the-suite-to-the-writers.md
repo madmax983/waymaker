@@ -37,9 +37,10 @@ written for an implementation that does not exist, which
 
 **`waymaker-conformance`'s `shape` module is the catalogue.** Six shapes: a program of one
 program unit and of more than one, an erase of one erase block and of more than one, a read
-of one read unit and of more than one. A read wider than a record — the erased-tail scan
-`recovery::Recovery` makes — is not a seventh row: it is still a multi-unit read, the same
-shape a wide record's read has, and a caller-chosen chunk size is not a shape of its own.
+of one read unit and of more than one. The erased-tail scan `recovery::Recovery` makes is not
+a seventh row: its width is the caller's own page, rounded down to a whole number of read
+units, so it lands in one of the same two rows depending on that page rather than needing a
+category of its own — a caller-chosen chunk size is not a shape.
 
 **Each row states the shape and names who issues it**, transcribed by a reviewer from
 `waymaker-flash`'s source the way `STORAGE_CONTRACT_CLAUSES` transcribes design document §12
@@ -51,8 +52,8 @@ rather than deriving it:
 | `program-multi-unit` | A program of more than one program unit in one call. | `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value spans more than one program unit |
 | `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
 | `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
-| `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit |
-| `read-multi-unit` | A read of more than one read unit in one call. | `recovery::Recovery::stage`'s whole-record read and its erased-tail walk |
+| `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s header read, on a geometry where the header fits one read unit; and its erased-tail walk, when the caller's page holds exactly one read unit |
+| `read-multi-unit` | A read of more than one read unit in one call. | `recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; its header read, on a geometry where the header spans more than one; and its erased-tail walk, when the caller's page holds more than one read unit |
 
 **`shape::ShapeWitness` proves the claim rather than only stating it.** It wraps a
 `StableStorage` and, for every call the wrapped adapter *accepts*, records which shape it
