@@ -2948,15 +2948,21 @@ fn single_segment_type_name(ty: &syn::Type) -> Option<String> {
     type_path.path.get_ident().map(ident_name)
 }
 
+/// Whether `name` is one of the five unsigned fixed-width integer type names — `u8`, `u16`,
+/// `u32`, `u64`, `u128` — factored out of [`declared_type_is_unsigned`] so a caller already
+/// holding a type *name* (rather than a `syn::Type` to read one from) does not repeat this
+/// five-way match of its own; every one of those callers checks the identical five names
+/// [`is_definitely_unsigned`]'s own suffix and cast cases already accept.
+fn is_unsigned_type_name(name: &str) -> bool {
+    matches!(name, "u8" | "u16" | "u32" | "u64" | "u128")
+}
+
 /// Whether `ty` is a plain, unqualified path naming one of the five unsigned fixed-width
-/// integer types — `u8`, `u16`, `u32`, `u64`, `u128` — the same shape [`single_segment_type_name`]
-/// already recognises, checked here against the same five names [`is_definitely_unsigned`]'s
-/// own suffix and cast cases already accept. [`item_const_unsigned`] and
-/// [`block_const_unsigned`] are what read it off a `const` item's own type ascription rather
-/// than a cast.
+/// integer types — the same shape [`single_segment_type_name`] already recognises.
+/// [`item_const_unsigned`] and [`block_const_unsigned`] are what read it off a `const`
+/// item's own type ascription rather than a cast.
 fn declared_type_is_unsigned(ty: &syn::Type) -> bool {
-    single_segment_type_name(ty)
-        .is_some_and(|name| matches!(name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128"))
+    single_segment_type_name(ty).is_some_and(|name| is_unsigned_type_name(&name))
 }
 
 /// The full, dotted name of `ty`, if it is a plain, unqualified type path of any length —
@@ -3209,6 +3215,18 @@ fn as_bool_literal(expr: &syn::Expr) -> Option<bool> {
 /// Factored out of [`literal_or_const_value`]'s own `Expr::Block` case so `Expr::If`'s
 /// `then` branch — itself a plain `syn::Block` — can be evaluated the identical way,
 /// rather than duplicating the local-binding fixed point a second time.
+/// `path`'s own name, when it is a bare identifier already resolved as one of a block's own
+/// locals — factored out of [`evaluate_block`]'s four near-identical resolver closures to
+/// keep that function under clippy's line count.
+fn resolved_local_name(
+    path: &syn::Path,
+    resolved: &std::collections::HashMap<String, i128>,
+) -> Option<String> {
+    let ident = path.get_ident()?;
+    let candidate = ident_name(ident);
+    resolved.contains_key(&candidate).then_some(candidate)
+}
+
 fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     let mut locals = block_const_exprs(block);
     let lets = block_let_exprs(block);
@@ -3257,32 +3275,25 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
                     .and_then(|candidate| resolved.get(&candidate).copied())
                     .or_else(|| (resolve.value)(path))
             };
-            // A name already resolved to a value in `resolved` is one of this block's own
-            // local bindings, whose declared type (if any) this function never reads — the
-            // same safe decline [`resolve_scope_consts`]'s own sibling-reference closure
-            // takes for the same reason. Anything else falls through to the outer scope's
-            // own answer, exactly as the value lookup above does.
+            // Codex's next-round finding: unsignedness used to decline unconditionally for
+            // any locally-resolved name, left standing even after `local_types` was added to
+            // answer `local_resolve_width` the identical question below — both now answer
+            // from `local_types`, an untyped `let` still declining rather than guessing.
             let local_resolve_unsigned = |path: &syn::Path| {
-                if let Some(ident) = path.get_ident() {
-                    if resolved.contains_key(&ident_name(ident)) {
-                        return false;
-                    }
-                }
-                (resolve.unsigned)(path)
+                resolved_local_name(path, &resolved).map_or_else(
+                    || (resolve.unsigned)(path),
+                    |candidate| {
+                        local_types
+                            .get(&candidate)
+                            .is_some_and(|name| is_unsigned_type_name(name))
+                    },
+                )
             };
-            // A name already resolved is one of this block's own locals, whose declared
-            // type — if `local_types` recorded one, from a `const`'s own type ascription or
-            // a typed `let` — answers directly; a local this function tracked no type for
-            // (an untyped `let`) declines rather than guessing. Anything else falls through
-            // to the outer scope's own answer, exactly as the value lookup above does.
             let local_resolve_width = |path: &syn::Path| {
-                if let Some(ident) = path.get_ident() {
-                    let candidate = ident_name(ident);
-                    if resolved.contains_key(&candidate) {
-                        return local_types.get(&candidate).map(String::as_str);
-                    }
-                }
-                (resolve.width)(path)
+                resolved_local_name(path, &resolved).map_or_else(
+                    || (resolve.width)(path),
+                    |candidate| local_types.get(&candidate).map(String::as_str),
+                )
             };
             let local_resolve = Resolve {
                 value: &local_resolve_value,
@@ -3305,21 +3316,20 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
             .or_else(|| (resolve.value)(path))
     };
     let block_resolve_unsigned = |path: &syn::Path| {
-        if let Some(ident) = path.get_ident() {
-            if resolved.contains_key(&ident_name(ident)) {
-                return false;
-            }
-        }
-        (resolve.unsigned)(path)
+        resolved_local_name(path, &resolved).map_or_else(
+            || (resolve.unsigned)(path),
+            |candidate| {
+                local_types
+                    .get(&candidate)
+                    .is_some_and(|name| is_unsigned_type_name(name))
+            },
+        )
     };
     let block_resolve_width = |path: &syn::Path| {
-        if let Some(ident) = path.get_ident() {
-            let candidate = ident_name(ident);
-            if resolved.contains_key(&candidate) {
-                return local_types.get(&candidate).map(String::as_str);
-            }
-        }
-        (resolve.width)(path)
+        resolved_local_name(path, &resolved).map_or_else(
+            || (resolve.width)(path),
+            |candidate| local_types.get(&candidate).map(String::as_str),
+        )
     };
     let block_resolve = Resolve {
         value: &block_resolve_value,
@@ -3459,9 +3469,10 @@ fn is_definitely_unsigned(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
         syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Int(int),
             ..
-        }) => matches!(int.suffix(), "u8" | "u16" | "u32" | "u64" | "u128"),
-        syn::Expr::Cast(cast) => single_segment_type_name(&cast.ty)
-            .is_some_and(|name| matches!(name.as_str(), "u8" | "u16" | "u32" | "u64" | "u128")),
+        }) => is_unsigned_type_name(int.suffix()),
+        syn::Expr::Cast(cast) => {
+            single_segment_type_name(&cast.ty).is_some_and(|name| is_unsigned_type_name(&name))
+        }
         syn::Expr::Path(path) if path.qself.is_none() => (resolve.unsigned)(&path.path),
         syn::Expr::Binary(binary)
             if matches!(
@@ -3902,6 +3913,18 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
         }
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
+        // Codex's next-round finding: `match (0u8,) { (0,) => 0, _ => 100 }` — a one-element
+        // tuple scrutinee over a one-element tuple pattern — fell to the wildcard `_ => None`
+        // case below, so `evaluate_match` could never even resolve the *scrutinee*, and every
+        // arm of a numbered constant built this way stayed unresolved regardless of whether
+        // the pattern side could have matched it. A one-element tuple carries exactly its own
+        // element's value and nothing else a dense integer table could ever be keyed on, so
+        // this recurses into it the same way a parenthesized or grouped expression already
+        // does; a tuple of any other arity is not a shape this scan's own `i128` domain can
+        // represent at all and stays unresolved.
+        syn::Expr::Tuple(tuple) if tuple.elems.len() == 1 => {
+            literal_or_const_value(tuple.elems.first()?, resolve)
+        }
         syn::Expr::Path(path) => (resolve.value)(&path.path),
         // [`evaluate_short_circuit_op`] holds the rationale for why `&&`/`||` are not
         // folded through `evaluate_binary_op` like every other operator.
@@ -4227,6 +4250,14 @@ fn match_arm_matches_constant(
             match_arm_matches_constant(subpat, value, resolve)
         }
         syn::Pat::Paren(paren) => match_arm_matches_constant(&paren.pat, value, resolve),
+        // [`literal_or_const_value`]'s own `Expr::Tuple` case holds the rationale: a
+        // one-element tuple pattern names exactly its own element's value, the pattern-side
+        // twin of that scrutinee-side fold — `(0,) => 0` over a `(0u8,)` scrutinee is
+        // otherwise indistinguishable from `0 => 0` over `0u8` to this scan's own `i128`
+        // domain. A tuple of any other arity is not a shape that domain can represent.
+        syn::Pat::Tuple(tuple) if tuple.elems.len() == 1 => {
+            match_arm_matches_constant(tuple.elems.first()?, value, resolve)
+        }
         syn::Pat::Or(or_pattern) => {
             let mut matched = false;
             for case in &or_pattern.cases {

@@ -20619,6 +20619,63 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_typed_block_locals_unsigned_shift_is_reported() {
+        // Codex's next-round finding: `evaluate_block`'s own `local_resolve_unsigned` and
+        // `block_resolve_unsigned` closures declined unconditionally for any name already
+        // resolved as one of the block's own locals, even after `local_types` was added to
+        // answer the parallel `width` question — so `{ let hi: u128 = u128::MAX; (hi >>
+        // 127) as u32 }` could resolve `hi`'s own value (`-1` in this scan's shared `i128`
+        // storage) but never its unsignedness, and `evaluate_shift_op` refuses a negative
+        // left operand unless `is_definitely_unsigned` says otherwise. Both closures now
+        // answer from `local_types` the same way `*_resolve_width` already does, so a
+        // block-local declared `u128` reinterprets its own top bit as `1` rather than
+        // leaving the shift — and every constant built from it — unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_block_local_unsigned_shift_table(nibble: u32) -> u32 {\n    \
+             const P0: u32 = { let hi: u128 = u128::MAX; (hi >> 127) as u32 };\n    \
+             const P1: u32 = P0 + 1;\n    const P2: u32 = P0 + 2;\n    const P3: u32 = P0 + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_one_element_tuple_scrutinees_is_reported() {
+        // Codex's next-round finding: `literal_or_const_value` had no `Expr::Tuple` case at
+        // all, so a one-element tuple scrutinee (`match (0u8,) { .. }`) could never resolve
+        // to a value in the first place — `evaluate_match`'s own search never even began,
+        // whatever the arms inside it matched against. A one-element tuple names exactly its
+        // own element's value with no ambiguity, the same as a parenthesized expression, so
+        // it is folded the identical way; `match_arm_matches_constant` gained the pattern-side
+        // twin, `Pat::Tuple` with exactly one element, for the arms themselves (`(0,) => ..`).
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_scrutinee_match_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = match (0u8,) { (0,) => 0, _ => 100 };\n    \
+             const P1: u8 = match (0u8,) { (0,) => 1, _ => 100 };\n    \
+             const P2: u8 = match (0u8,) { (0,) => 2, _ => 100 };\n    \
+             const P3: u8 = match (0u8,) { (0,) => 3, _ => 100 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
