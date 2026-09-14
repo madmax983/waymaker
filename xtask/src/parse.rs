@@ -2724,6 +2724,23 @@ fn literal_or_const_value(
                 apply_integer_cast(!raw, &ty)
             }
         }
+        // Codex's next-round finding: `*&0u8` — dereferencing a reference taken in the
+        // same expression — is `Expr::Unary(Deref, Expr::Reference(..))`, which fell to
+        // the wildcard `_ => None` case below and left every such arm unresolved, the
+        // const-call and array backstops included, since a dereference is neither a call
+        // nor an array index. `*&X` is definitionally `X` for any `X`, whatever `X` turns
+        // out to be, so this recurses into the reference's own inner expression through
+        // the identical pipeline rather than evaluating anything new. Scoped to exactly
+        // that shape — the operand must itself be a freshly taken `&`-reference — since
+        // dereferencing anything else (a raw pointer, a path naming some other
+        // reference-typed value) is a question about what that reference points *at*,
+        // which this scan has no way to answer without guessing.
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            let syn::Expr::Reference(reference) = unary.expr.as_ref() else {
+                return None;
+            };
+            literal_or_const_value(&reference.expr, resolve)
+        }
         // Codex's finding: `const P0: u8 = { const N: u8 = 0; N };` is `Expr::Block` — a
         // block used as an expression, most often to give an initializer a scope of its
         // own — and was not unwrapped at all, so a table whose numbered arms are spelled

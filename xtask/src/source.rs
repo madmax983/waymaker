@@ -18082,6 +18082,32 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_dereferenced_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = *&0u8;` — dereferencing a reference
+        // taken in the same expression — is `Expr::Unary(Deref, Expr::Reference(..))`,
+        // which fell to the wildcard `_ => None` case in `literal_or_const_value` and left
+        // every such constant unresolved, the const-call and array backstops included,
+        // since a dereference is neither a call nor an array index. `*&X` is definitionally
+        // `X`, so the new case recurses into the reference's own inner expression through
+        // the identical pipeline.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dereferenced_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = *&0u8;\n    const P1: u8 = *&1u8;\n    \
+             const P2: u8 = *&2u8;\n    const P3: u8 = *&3u8;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
