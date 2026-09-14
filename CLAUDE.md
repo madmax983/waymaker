@@ -3591,4 +3591,4 @@ a caller still cannot tell "the world is slow" from "no firmware will ever servi
 the return value alone. Both cases return `Poll::Pending` — a halted journal and an unpassed
 deadline already work the same way. Design document §13's boundary gives no reason for any
 stop, and this change adds none. See
-[ADR 0046](docs/adr/0046-an-unserviceable-kind-is-an-answer-not-a-record.md).
+[ADR 0047](docs/adr/0047-an-unserviceable-kind-is-an-answer-not-a-record.md).

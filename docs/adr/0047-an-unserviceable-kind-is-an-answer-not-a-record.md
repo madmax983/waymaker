@@ -1,4 +1,4 @@
-# 0046. An unserviceable kind is an answer, not a record
+# 0047. An unserviceable kind is an answer, not a record
 
 - Status: Accepted
 - Date: 2026-09-14
