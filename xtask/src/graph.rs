@@ -307,6 +307,22 @@ impl PackageGraph {
         self.packages.iter().find(|package| package.name == name)
     }
 
+    /// Finds the workspace member named `name`, rather than the first package with that
+    /// name in `cargo metadata`'s package list.
+    ///
+    /// [`find`](Self::find) resolves by name alone, so a dependency at another version or
+    /// source that happens to share a workspace member's name can be the one it returns —
+    /// `cargo metadata` is free to list such a package before the workspace's own entry.
+    /// A caller that means "the crate this workspace builds", such as
+    /// [`check_driver_reaches_no_embassy`], needs the one `workspace_members` actually
+    /// names.
+    #[must_use]
+    pub fn find_workspace_member(&self, name: &str) -> Option<&Package> {
+        self.packages.iter().find(|package| {
+            package.name == name && self.workspace_members.iter().any(|id| id == &package.id)
+        })
+    }
+
     /// Finds a package by cargo package id.
     #[must_use]
     pub fn by_id(&self, id: &str) -> Option<&Package> {
@@ -362,11 +378,24 @@ impl PackageGraph {
     /// one this specific edge actually selected.
     #[must_use]
     pub fn normal_transitive_dependencies(&self, name: &str) -> BTreeSet<String> {
-        let mut reached = BTreeSet::new();
         let Some(root) = self.find(name) else {
-            return reached;
+            return BTreeSet::new();
         };
+        self.normal_transitive_dependencies_from(root)
+    }
 
+    /// [`normal_transitive_dependencies`](Self::normal_transitive_dependencies), from a root
+    /// the caller has already resolved rather than one looked up here by name.
+    ///
+    /// For a caller that cannot afford [`find`](Self::find)'s ambiguity even once — a bare
+    /// name search can return a dependency at another version or source that happens to
+    /// share a workspace member's name, rather than the member itself. Such a caller
+    /// resolves the root through [`find_workspace_member`](Self::find_workspace_member)
+    /// first and passes it in here, so the walk that follows starts from the same package
+    /// the direct check already used.
+    #[must_use]
+    pub fn normal_transitive_dependencies_from(&self, root: &Package) -> BTreeSet<String> {
+        let mut reached = BTreeSet::new();
         let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
         seen_ids.insert(root.id.as_str());
         let mut queue: VecDeque<&str> = root
@@ -873,11 +902,19 @@ pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
 /// `waymaker-drive` is not in [`LAYERS`], so [`check_embassy_stays_above_flash`] does not
 /// reach it; this is that check's cousin, narrowed to the one test-support crate issue #106
 /// makes a promise about and to the one table its shipped library actually links.
+///
+/// The root is resolved through [`PackageGraph::find_workspace_member`], not
+/// [`PackageGraph::find`]: a bare name search can return a dependency at another version or
+/// source that happens to share `waymaker-drive`'s name, and `cargo metadata` is free to
+/// list such a package before the workspace's own entry — a sixth round found that both
+/// halves below had been resolving the root by name alone, so a same-named non-member
+/// package ahead of the real one in `packages[]` would have let the real driver declare or
+/// reach Embassy with nothing here noticing.
 #[must_use]
 pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
     const DRIVER: &str = "waymaker-drive";
 
-    let Some(package) = graph.find(DRIVER) else {
+    let Some(package) = graph.find_workspace_member(DRIVER) else {
         return Vec::new();
     };
 
@@ -898,7 +935,7 @@ pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
         }
     }
 
-    for reached in graph.normal_transitive_dependencies(DRIVER) {
+    for reached in graph.normal_transitive_dependencies_from(package) {
         if policy::is_embassy_package(&reached) && reported.insert(reached.clone()) {
             violations.push(Violation::new(
                 "ctx-facade",
@@ -1236,7 +1273,8 @@ mod tests {
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal)
                 .with_dependency("waymaker-embassy", DepKind::Normal),
-        ]);
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
 
         let violations = rules(&graph);
         assert!(
@@ -1257,7 +1295,8 @@ mod tests {
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal)
                 .with_dependency("waymaker-embassy", DepKind::Development),
-        ]);
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
 
         let violations = rules(&graph);
         assert!(
@@ -1291,7 +1330,8 @@ mod tests {
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal)
                 .with_dependency("waymaker-rig", DepKind::Development),
-        ]);
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
 
         assert!(
             check_driver_reaches_no_embassy(&graph).is_empty(),
@@ -1316,7 +1356,8 @@ mod tests {
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal)
                 .with_dependency("innocent-helper", DepKind::Normal),
-        ]);
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
 
         let violations = check_driver_reaches_no_embassy(&graph);
         assert!(
@@ -1383,7 +1424,8 @@ mod tests {
             Package::new("waymaker-drive")
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal),
-        ]);
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
         assert!(check_driver_reaches_no_embassy(&graph).is_empty());
     }
 
@@ -1404,7 +1446,8 @@ mod tests {
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal)
                 .with_manifest_only_dependency("waymaker-embassy", DepKind::Normal),
-        ]);
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
 
         let violations = check_driver_reaches_no_embassy(&graph);
         assert!(
@@ -1433,7 +1476,8 @@ mod tests {
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal)
                 .with_dependency("waymaker-embassy", DepKind::Normal),
-        ]);
+        ])
+        .with_workspace_members(&["waymaker-drive"]);
 
         let violations = check_driver_reaches_no_embassy(&graph);
         let embassy_violation_count = violations
@@ -1444,6 +1488,41 @@ mod tests {
             embassy_violation_count, 1,
             "one crate reached both directly and through the walk must be reported once: \
              {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_named_non_member_package_does_not_hide_the_real_drivers_edge() {
+        // Codex's sixth follow-up: both halves resolved `waymaker-drive` with `find`, a bare
+        // name search — a dependency at another version or source that happens to share the
+        // workspace member's name can sort earlier in `packages[]`, and `cargo metadata`
+        // does not promise the workspace's own entry comes first. A decoy ahead of the real
+        // member, itself clean, must not make the real member's own violation disappear.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-drive")
+                .with_id("waymaker-drive-decoy")
+                .with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_id("waymaker-drive-real")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+        ])
+        .with_workspace_members(&["waymaker-drive-real"]);
+
+        let violations = check_driver_reaches_no_embassy(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")),
+            "the real workspace member's edge must be caught even though a same-named, \
+             non-member package sorts first: {violations:?}"
         );
     }
 
