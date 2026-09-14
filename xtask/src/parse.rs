@@ -235,6 +235,29 @@ fn collect_item_aliases(
     }
 }
 
+/// The `use` bindings `items` declares directly, at its own level only.
+///
+/// Unlike [`collect_item_aliases`], this does not recurse into a nested `mod`.
+/// Real Rust scopes a `use` binding to the module that declares it: an inner
+/// module does not inherit an outer one's aliases, and a sibling module's
+/// aliases are not visible either. A resolver that read every alias in the
+/// file as one flat list could chain a name through an unrelated module's
+/// rename and report a real, correct `impl` as a fifth future (issue #109
+/// review). Each caller that walks into a nested module must call this again
+/// on that module's own items, so every scope stays its own.
+fn own_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
+    let mut aliases = Vec::new();
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        if let syn::Item::Use(use_item) = item {
+            collect_tree_aliases(&use_item.tree, &mut Vec::new(), &mut aliases);
+        }
+    }
+    aliases
+}
+
 fn collect_tree_aliases(
     tree: &syn::UseTree,
     prefix: &mut Vec<String>,
@@ -302,12 +325,12 @@ impl ResolvedPath {
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Error> {
-    struct PathVisitor<'aliases> {
-        aliases: &'aliases [UseAlias],
+    struct PathVisitor {
+        aliases: Vec<UseAlias>,
         paths: Vec<ResolvedPath>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for PathVisitor<'_> {
+    impl<'ast> syn::visit::Visit<'ast> for PathVisitor {
         fn visit_item_use(&mut self, _use: &'ast syn::ItemUse) {}
 
         fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -319,22 +342,28 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
             syn::visit::visit_item(self, item);
         }
 
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            // A nested module keeps its own aliases only (issue #109 review):
+            // swap in scope, walk it, then restore the enclosing scope.
+            let Some((_, items)) = node.content.as_ref() else {
+                return;
+            };
+            let outer = core::mem::replace(&mut self.aliases, own_aliases(items));
+            syn::visit::visit_item_mod(self, node);
+            self.aliases = outer;
+        }
+
         fn visit_path(&mut self, path: &'ast syn::Path) {
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(path, self.aliases),
+                segments: resolve_segments(path, &self.aliases),
             });
             syn::visit::visit_path(self, path);
         }
     }
 
     let file = parse_rust(contents)?;
-    let aliases = {
-        let mut collected = Vec::new();
-        collect_item_aliases(&file.items, &mut Vec::new(), &mut collected);
-        collected
-    };
     let mut visitor = PathVisitor {
-        aliases: &aliases,
+        aliases: own_aliases(&file.items),
         paths: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -384,8 +413,7 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn future_trait_implementors(contents: &str) -> Result<Vec<String>, syn::Error> {
     let file = parse_rust(contents)?;
-    let mut aliases = Vec::new();
-    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    let aliases = own_aliases(&file.items);
     let mut implementors = Vec::new();
     collect_future_implementors(&file.items, &aliases, &mut implementors);
     Ok(implementors)
@@ -415,7 +443,10 @@ fn collect_future_implementors(
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
-                    collect_future_implementors(nested, aliases, implementors);
+                    // The nested module's own aliases only (issue #109 review):
+                    // it does not inherit this scope's, and this scope's chain
+                    // must not resolve through one of its renames either.
+                    collect_future_implementors(nested, &own_aliases(nested), implementors);
                 }
             }
             _ => {}
@@ -573,13 +604,13 @@ pub fn struct_literal_counts(
     name: &str,
     inside: FnScope<'_>,
 ) -> Result<LiteralCounts, syn::Error> {
-    struct Literals<'aliases> {
-        aliases: &'aliases [UseAlias],
+    struct Literals {
+        aliases: Vec<UseAlias>,
         name: String,
         count: usize,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for Literals<'_> {
+    impl<'ast> syn::visit::Visit<'ast> for Literals {
         fn visit_item(&mut self, node: &'ast syn::Item) {
             if has_cfg_test(item_attrs(node)) {
                 return;
@@ -594,8 +625,19 @@ pub fn struct_literal_counts(
             syn::visit::visit_impl_item(self, node);
         }
 
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            // A nested module keeps its own aliases only (issue #109 review):
+            // swap in scope, walk it, then restore the enclosing scope.
+            let Some((_, items)) = node.content.as_ref() else {
+                return;
+            };
+            let outer = core::mem::replace(&mut self.aliases, own_aliases(items));
+            syn::visit::visit_item_mod(self, node);
+            self.aliases = outer;
+        }
+
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            let resolved = resolve_segments(&node.path, self.aliases);
+            let resolved = resolve_segments(&node.path, &self.aliases);
             if resolved
                 .last()
                 .is_some_and(|last| last.as_str() == self.name)
@@ -607,11 +649,9 @@ pub fn struct_literal_counts(
     }
 
     let file = parse_rust(contents)?;
-    let mut aliases = Vec::new();
-    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
 
     let mut total = Literals {
-        aliases: &aliases,
+        aliases: own_aliases(&file.items),
         name: name.to_owned(),
         count: 0,
     };
@@ -620,13 +660,13 @@ pub fn struct_literal_counts(
     let mut inside_count = 0_usize;
     for target in inside_targets(&file, &inside) {
         let mut visitor = Literals {
-            aliases: &aliases,
+            aliases: target.aliases().to_vec(),
             name: name.to_owned(),
             count: 0,
         };
-        match target {
-            InsideTarget::Block(block) => visitor.visit_block(block),
-            InsideTarget::Impl(implementation) => visitor.visit_item_impl(implementation),
+        match &target {
+            InsideTarget::Block(block, _) => visitor.visit_block(block),
+            InsideTarget::Impl(implementation, _) => visitor.visit_item_impl(implementation),
         }
         inside_count = inside_count.saturating_add(visitor.count);
     }
@@ -637,57 +677,77 @@ pub fn struct_literal_counts(
     })
 }
 
-/// Something [`struct_literal_counts`] can count literals inside of.
+/// Something [`struct_literal_counts`] can count literals inside of, with the
+/// aliases in scope at the point it was found (issue #109 review: an inner
+/// module's own, not inherited from where the search started).
 enum InsideTarget<'a> {
     /// A function body.
-    Block(&'a syn::Block),
+    Block(&'a syn::Block, Vec<UseAlias>),
     /// An `impl` block, visited whole.
-    Impl(&'a syn::ItemImpl),
+    Impl(&'a syn::ItemImpl, Vec<UseAlias>),
+}
+
+impl InsideTarget<'_> {
+    fn aliases(&self) -> &[UseAlias] {
+        match self {
+            Self::Block(_, aliases) | Self::Impl(_, aliases) => aliases,
+        }
+    }
 }
 
 /// The bodies [`FnScope`] selects, in source order.
 fn inside_targets<'a>(file: &'a syn::File, scope: &FnScope<'a>) -> Vec<InsideTarget<'a>> {
+    let root_aliases = own_aliases(&file.items);
     match *scope {
         FnScope::None => Vec::new(),
         FnScope::FirstFn(name) => {
             let mut blocks = Vec::new();
-            fn_blocks(&file.items, name, &mut blocks);
+            fn_blocks(&file.items, &root_aliases, name, &mut blocks);
             blocks.truncate(1);
-            blocks.into_iter().map(InsideTarget::Block).collect()
+            blocks
+                .into_iter()
+                .map(|(block, aliases)| InsideTarget::Block(block, aliases))
+                .collect()
         }
         FnScope::InherentFns { ty, name } => {
             let mut blocks = Vec::new();
-            for implementation in inherent_impls(&file.items, ty) {
+            for (implementation, aliases) in inherent_impls(&file.items, &root_aliases, ty) {
                 for item in &implementation.items {
                     if has_cfg_test(impl_item_attrs(item)) {
                         continue;
                     }
                     if let syn::ImplItem::Fn(function) = item {
                         if ident_is(&function.sig.ident, name) {
-                            blocks.push(InsideTarget::Block(&function.block));
+                            blocks.push(InsideTarget::Block(&function.block, aliases.clone()));
                         }
                     }
                 }
             }
             blocks
         }
-        FnScope::InherentImpls(ty) => inherent_impls(&file.items, ty)
+        FnScope::InherentImpls(ty) => inherent_impls(&file.items, &root_aliases, ty)
             .into_iter()
-            .map(InsideTarget::Impl)
+            .map(|(implementation, aliases)| InsideTarget::Impl(implementation, aliases))
             .collect(),
     }
 }
 
 /// The bodies of every `fn name`, in source order through inline modules and `impl`
-/// blocks, skipping `#[cfg(test)]`.
-fn fn_blocks<'a>(items: &'a [syn::Item], name: &str, blocks: &mut Vec<&'a syn::Block>) {
+/// blocks, skipping `#[cfg(test)]`. Each body carries the aliases visible where it
+/// was found: an inline module's own, not `aliases` (issue #109 review).
+fn fn_blocks<'a>(
+    items: &'a [syn::Item],
+    aliases: &[UseAlias],
+    name: &str,
+    blocks: &mut Vec<(&'a syn::Block, Vec<UseAlias>)>,
+) {
     for item in items {
         if has_cfg_test(item_attrs(item)) {
             continue;
         }
         match item {
             syn::Item::Fn(function) if ident_is(&function.sig.ident, name) => {
-                blocks.push(&function.block);
+                blocks.push((&function.block, aliases.to_vec()));
             }
             syn::Item::Impl(implementation) => {
                 for impl_item in &implementation.items {
@@ -696,14 +756,14 @@ fn fn_blocks<'a>(items: &'a [syn::Item], name: &str, blocks: &mut Vec<&'a syn::B
                     }
                     if let syn::ImplItem::Fn(function) = impl_item {
                         if ident_is(&function.sig.ident, name) {
-                            blocks.push(&function.block);
+                            blocks.push((&function.block, aliases.to_vec()));
                         }
                     }
                 }
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
-                    fn_blocks(nested, name, blocks);
+                    fn_blocks(nested, &own_aliases(nested), name, blocks);
                 }
             }
             _ => {}
@@ -712,8 +772,13 @@ fn fn_blocks<'a>(items: &'a [syn::Item], name: &str, blocks: &mut Vec<&'a syn::B
 }
 
 /// The inherent `impl` blocks for `ty`, in source order through inline modules,
-/// skipping `#[cfg(test)]`.
-fn inherent_impls<'a>(items: &'a [syn::Item], ty: &str) -> Vec<&'a syn::ItemImpl> {
+/// skipping `#[cfg(test)]`. Each carries the aliases visible where it was found:
+/// an inline module's own, not `aliases` (issue #109 review).
+fn inherent_impls<'a>(
+    items: &'a [syn::Item],
+    aliases: &[UseAlias],
+    ty: &str,
+) -> Vec<(&'a syn::ItemImpl, Vec<UseAlias>)> {
     let mut found = Vec::new();
     for item in items {
         if has_cfg_test(item_attrs(item)) {
@@ -724,11 +789,11 @@ fn inherent_impls<'a>(items: &'a [syn::Item], ty: &str) -> Vec<&'a syn::ItemImpl
                 if implementation.trait_.is_none()
                     && self_ty_names(&implementation.self_ty, ty) =>
             {
-                found.push(implementation);
+                found.push((implementation, aliases.to_vec()));
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
-                    found.extend(inherent_impls(nested, ty));
+                    found.extend(inherent_impls(nested, &own_aliases(nested), ty));
                 }
             }
             _ => {}
@@ -937,13 +1002,13 @@ impl NameUses {
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
-    struct Names<'aliases> {
-        aliases: &'aliases [UseAlias],
+    struct Names {
+        aliases: Vec<UseAlias>,
         idents: Vec<String>,
         paths: Vec<ResolvedPath>,
     }
 
-    impl<'ast> syn::visit::Visit<'ast> for Names<'_> {
+    impl<'ast> syn::visit::Visit<'ast> for Names {
         fn visit_item(&mut self, node: &'ast syn::Item) {
             if has_cfg_test(item_attrs(node)) {
                 return;
@@ -958,24 +1023,33 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
             syn::visit::visit_impl_item(self, node);
         }
 
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            // A nested module keeps its own aliases only (issue #109 review):
+            // swap in scope, walk it, then restore the enclosing scope.
+            let Some((_, items)) = node.content.as_ref() else {
+                return;
+            };
+            let outer = core::mem::replace(&mut self.aliases, own_aliases(items));
+            syn::visit::visit_item_mod(self, node);
+            self.aliases = outer;
+        }
+
         fn visit_ident(&mut self, node: &'ast syn::Ident) {
             self.idents.push(ident_name(node));
         }
 
         fn visit_path(&mut self, node: &'ast syn::Path) {
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(node, self.aliases),
+                segments: resolve_segments(node, &self.aliases),
             });
             syn::visit::visit_path(self, node);
         }
     }
 
     let file = parse_rust(contents)?;
-    let mut aliases = Vec::new();
-    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
 
     let mut names = Names {
-        aliases: &aliases,
+        aliases: own_aliases(&file.items),
         idents: Vec::new(),
         paths: Vec::new(),
     };
@@ -1525,5 +1599,88 @@ mod raw_identifier_tests {
     fn a_raw_ident_use_is_still_named() {
         let uses = name_uses("fn f() { let r#alloc = 1; }").expect("the fixture parses");
         assert!(uses.names_word("alloc"), "{uses:?}");
+    }
+}
+
+#[cfg(test)]
+mod alias_scope_tests {
+    //! Codex review, issue #109: a `use` alias is scoped to its own module. It
+    //! is not visible in a sibling module, and a sibling module's alias must
+    //! not resolve a chain that starts here.
+    use super::{future_trait_implementors, name_uses, resolved_path_uses};
+
+    #[test]
+    fn an_unrelated_trait_in_a_sibling_module_is_not_a_fifth_future() {
+        // Module `a` renames `Future` to `Awaitable` through a chain. Module
+        // `b` renames its own, unrelated trait to the same local name,
+        // `Awaitable`, and implements it. A flat, unscoped alias table would
+        // let `b`'s impl resolve through `a`'s chain and report `Innocent`
+        // as a fifth future.
+        let code = "mod a {\n\
+             use core::future::Future as Pollable;\n\
+             pub use Pollable as Awaitable;\n\
+             }\n\
+             mod b {\n\
+             trait Unrelated {}\n\
+             use Unrelated as Awaitable;\n\
+             struct Innocent;\n\
+             impl Awaitable for Innocent {}\n\
+             }\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            !implementors.contains(&"Innocent".to_owned()),
+            "an unrelated trait in a sibling module was reported as a future: {implementors:?}"
+        );
+    }
+
+    #[test]
+    fn a_chain_within_one_module_still_resolves() {
+        // The scoping fix must not lose the same-module chain issue #109
+        // itself asks for: `Awaitable` still means `Future` when both
+        // aliases are declared in the same module.
+        let code = "mod a {\n\
+             use core::future::Future as Pollable;\n\
+             pub use Pollable as Awaitable;\n\
+             struct Real;\n\
+             impl Awaitable for Real {}\n\
+             }\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Real"], "{implementors:?}");
+    }
+
+    #[test]
+    fn a_sibling_modules_alias_does_not_leak_into_name_uses() {
+        // `name_uses` shares `resolve_segments`. A path in module `b` must not
+        // resolve through module `a`'s alias of the same local name.
+        let code = "mod a {\n\
+             use core::future::Future as Marker;\n\
+             }\n\
+             mod b {\n\
+             fn f() { let _ = Marker::x; }\n\
+             }\n";
+        let uses = name_uses(code).expect("the fixture parses");
+        assert!(
+            !uses
+                .paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future", "x"]),
+            "{:?}",
+            uses.paths
+        );
+    }
+
+    #[test]
+    fn a_sibling_modules_alias_does_not_leak_into_resolved_path_uses() {
+        let code = "mod a {\n\
+             use core::future::Future as Marker;\n\
+             }\n\
+             mod b {\n\
+             fn f() { let _ = Marker::x; }\n\
+             }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Marker", "x"]),
+            "module b's own, unaliased path went missing: {paths:?}"
+        );
     }
 }
