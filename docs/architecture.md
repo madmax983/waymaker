@@ -227,8 +227,11 @@ content is the frame's own `frame_crc` with bit 7 of each byte cleared, repeated
 unit, and the cleared bit is what makes the promise checkable. No byte of a seal is ever
 `0xFF`, so an erased program unit is never a seal and a seal interrupted part-way through its
 own program always ends in erased bytes. `waymaker-flash`'s `append` module is the writer
-that cannot take the two steps out of order, and `Ending::Unsealed` is what a reader reports
-when it meets a frame with no seal over it.
+that cannot take the two steps out of order. A reader that meets a frame with no seal over it
+ignores it and reports `Ending::Clean` past the frame's reserved slot when every byte of that
+slot is erased — issue #95, since no writer ever starts the next record before this one has
+sealed — and `Ending::Unsealed` otherwise, when a byte in the slot is neither erased nor a
+real seal and an interrupted append cannot be told from damage.
 
 Between the frame and its seal is padding, up to the device's program granularity from §12's
 `Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never

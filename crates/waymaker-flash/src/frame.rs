@@ -1441,11 +1441,15 @@ impl<'a> Scan<'a, Catalogued> {
     ///
     /// Both directions are now refused, and the second one only since issue #24. A reader
     /// given a *smaller* granularity looks for the first record's commit seal inside that
-    /// record's own padding, which is erased, and no byte of a seal ever is: the answer is
-    /// [`DecodeError::Unsealed`] at the first record, which is diagnosable. A reader given a
-    /// *larger* one strides over whole frames and looks for the seal past the end of the
-    /// record it belongs to, and finds either erased media — refused outright — or another
-    /// record's bytes, which is a twenty-eight-bit coincidence away from being refused.
+    /// record's own padding, which is erased, and no byte of a seal ever is — so the scan
+    /// treats it as issue [#95](https://github.com/madmax983/waymaker/issues/95)'s ignorable
+    /// case and tries again a byte later, still inside the same real padding, which is an
+    /// erased header next: the mismatch is still refused, one call to [`Iterator::next`],
+    /// just as [`DecodeError::IntegrityFailed`] at that erased header rather than as
+    /// [`DecodeError::Unsealed`] at the first record. A reader given a *larger* one strides
+    /// over whole frames and looks for the seal past the end of the record it belongs to,
+    /// and finds either erased media — refused outright — or another record's bytes, which
+    /// is a twenty-eight-bit coincidence away from being refused.
     ///
     /// That second half used to be undetectable and is worth saying was closed by accident:
     /// a seal sits at a fixed offset from the frame it seals, so believing in the wrong
@@ -1515,101 +1519,143 @@ impl<'a, C: IntegrityCheck> Iterator for Scan<'a, C> {
     type Item = Result<RecordRef<'a>, DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.stopped {
-            return None;
-        }
-        let rest = self.journal.get(self.offset..)?;
-        let Some(header) = rest.get(..HEADER_BYTES) else {
-            // Fewer bytes left than a header. Erased is the ordinary end of a journal;
-            // programmed bytes are a torn header, and the same rule applies to them as to a
-            // full one — reporting an end of history there hands a caller an offset that
-            // points into cells a program cycle has already cleared, which on NOR cannot be
-            // written again without erasing the block.
-            self.stopped = true;
-            return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
-                None
-            } else {
-                Some(Err(DecodeError::Truncated))
-            };
-        };
-        if header.iter().all(|byte| *byte == ERASED_BYTE) {
-            self.stopped = true;
-            // An erased header ends history only if everything after it is erased too.
-            // Nothing on media records the program granularity a journal was written at, so
-            // a reader handed a smaller one strides short and lands inside a frame's
-            // padding — which is a run of `ERASED_BYTE`, and which would otherwise read as
-            // a clean end of history with committed records still ahead of it. Silently
-            // returning a truncated prefix is the worst failure this type has, because
-            // everything downstream believes it.
-            return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
-                None
-            } else {
-                Some(Err(DecodeError::IntegrityFailed))
-            };
-        }
-
-        let frame = match decode_with::<C>(rest) {
-            Ok(frame) => frame,
-            Err(error) => {
+        // A loop rather than a single attempt: an unsealed frame whose own reserved slot is
+        // clean is ignored, and scanning has to carry on from past it rather than stop —
+        // see the seal check below, and `Recovery::past_the_seal_slot` for the same rule
+        // against real storage. Every branch either returns or strictly advances
+        // `self.offset` before looping, so this always terminates over a finite journal.
+        loop {
+            if self.stopped {
+                return None;
+            }
+            let rest = self.journal.get(self.offset..)?;
+            let Some(header) = rest.get(..HEADER_BYTES) else {
+                // Fewer bytes left than a header. Erased is the ordinary end of a journal;
+                // programmed bytes are a torn header, and the same rule applies to them as
+                // to a full one — reporting an end of history there hands a caller an
+                // offset that points into cells a program cycle has already cleared, which
+                // on NOR cannot be written again without erasing the block.
                 self.stopped = true;
-                return Some(Err(error));
+                return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
+                    None
+                } else {
+                    Some(Err(DecodeError::Truncated))
+                };
+            };
+            if header.iter().all(|byte| *byte == ERASED_BYTE) {
+                self.stopped = true;
+                // An erased header ends history only if everything after it is erased too.
+                // Nothing on media records the program granularity a journal was written
+                // at, so a reader handed a smaller one strides short and lands inside a
+                // frame's padding — which is a run of `ERASED_BYTE`, and which would
+                // otherwise read as a clean end of history with committed records still
+                // ahead of it. Silently returning a truncated prefix is the worst failure
+                // this type has, because everything downstream believes it.
+                return if rest.iter().all(|byte| *byte == ERASED_BYTE) {
+                    None
+                } else {
+                    Some(Err(DecodeError::IntegrityFailed))
+                };
             }
-        };
-        let Some(body) = self.align.round_up(frame.frame_len) else {
-            self.stopped = true;
-            return Some(Err(DecodeError::LengthOutOfBounds));
-        };
-        // A record whose padded body and commit seal run past the end of the journal could
-        // not have been written into it: `encode` reserves the whole of both before it
-        // writes a byte, and refuses when the buffer is one short. So the journal is
-        // shorter than the record it appears to hold, which is a truncation and not a
-        // record — and accepting it would advance to an offset that is not on a program
-        // boundary, which is not a place anything may be written.
-        let Some(next) = body
-            .checked_add(seal_bytes(self.align))
-            .and_then(|record_len| self.offset.checked_add(record_len))
-            .filter(|next| *next <= self.journal.len())
-        else {
-            self.stopped = true;
-            return Some(Err(DecodeError::Truncated));
-        };
 
-        // §09's first stop condition, and the one this reader could not state before issue
-        // #24: a frame body with no commit seal over it is a frame whose writer never got
-        // past the payload barrier. It is not damage and it is not history. Checked before
-        // the record kind, because what an uncommitted frame *says* is not a question worth
-        // asking.
-        let Some(seal) = self.journal.get(self.offset.saturating_add(body)..next) else {
-            // Unreachable: `next <= journal.len()` was just established.
-            self.stopped = true;
-            return Some(Err(DecodeError::Truncated));
-        };
-        if !commit_seal_holds(frame.frame_crc, seal) {
-            self.stopped = true;
-            return Some(Err(DecodeError::Unsealed));
-        }
+            let frame = match decode_with::<C>(rest) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.stopped = true;
+                    return Some(Err(error));
+                }
+            };
+            let Some(body) = self.align.round_up(frame.frame_len) else {
+                self.stopped = true;
+                return Some(Err(DecodeError::LengthOutOfBounds));
+            };
+            // A record whose padded body and commit seal run past the end of the journal
+            // could not have been written into it: `encode` reserves the whole of both
+            // before it writes a byte, and refuses when the buffer is one short. So the
+            // journal is shorter than the record it appears to hold, which is a truncation
+            // and not a record — and accepting it would advance to an offset that is not on
+            // a program boundary, which is not a place anything may be written.
+            let Some(next) = body
+                .checked_add(seal_bytes(self.align))
+                .and_then(|record_len| self.offset.checked_add(record_len))
+                .filter(|next| *next <= self.journal.len())
+            else {
+                self.stopped = true;
+                return Some(Err(DecodeError::Truncated));
+            };
 
-        match frame.decoded {
-            Decoded::Record(record) => {
-                // A record is at least `FRAME_OVERHEAD_BYTES` of body and one byte of seal,
-                // so the offset always moves and a scan over a finite journal is finite.
-                self.offset = next;
-                Some(Ok(record))
-            }
-            Decoded::UnknownKind(_) => {
-                // §09 makes skipping a property of the format version, and
-                // `permits_unknown_record_skip` answers `false` for every one of the 256 a
-                // version byte can hold. So the scan stops, and there is deliberately no
-                // second arm here.
+            // §09's first stop condition, and the one this reader could not state before
+            // issue #24: a frame body with no commit seal over it is a frame whose writer
+            // never got past the payload barrier. It is not damage and it is not history.
+            // Checked before the record kind, because what an uncommitted frame *says* is
+            // not a question worth asking.
+            let Some(seal) = self.journal.get(self.offset.saturating_add(body)..next) else {
+                // Unreachable: `next <= journal.len()` was just established.
+                self.stopped = true;
+                return Some(Err(DecodeError::Truncated));
+            };
+            if !commit_seal_holds(frame.frame_crc, seal) {
+                // No writer starts a record before the one ahead of it has sealed — see
+                // `crate::append` — so between `frame.frame_len` and `next` is only ever
+                // padding and a seal. If every byte there is erased, the record is ignored
+                // exactly as an unsealed frame always was: `self.offset` advances past it
+                // and the loop tries again from there, which is issue
+                // [#95](https://github.com/madmax983/waymaker/issues/95)'s fix — the same
+                // run keeps its identity instead of being forced into `continue_as_new`.
+                // Looping, rather than declaring `next` a clean finish outright, is what a
+                // *later* boot's own committed history needs: that history starts exactly
+                // at `next`, and stopping here instead of continuing would hide it behind a
+                // slot no later scan ever gets past either.
                 //
-                // An `if permits_unknown_record_skip(..) { advance; continue }` would read
-                // as the rule made mechanical, and it would be a branch no test can reach —
-                // whose first execution, years from now, is recovery after a power loss on
-                // somebody's device. The version that grants skipping adds the arm, the
-                // loop it needs, and the test that reaches it, in one change.
+                // The check is bounded to `[frame.frame_len, next)` rather than run to the
+                // end of the journal, and that is what keeps it sound against a caller's
+                // wrong alignment: a scan walked at a granularity *wider* than the one a
+                // journal was written at computes a `next` that runs past real, committed
+                // records without ever looking at them, and checking only the bytes between
+                // `frame.frame_len` and that `next` reads exactly what a real writer would
+                // have left behind for *this* record — so a miscomputed slot landing on
+                // erased media further out is not mistaken for one. See
+                // `Recovery::past_the_seal_slot` for the same rule against real storage.
+                //
+                // If a byte in `[frame.frame_len, next)` is not erased, this reader cannot
+                // tell an interrupted append from damage — nothing legitimate should be
+                // there — and `Unsealed` stands exactly as it always has.
+                let clean = self
+                    .offset
+                    .checked_add(frame.frame_len)
+                    .and_then(|padding_at| self.journal.get(padding_at..next))
+                    .is_some_and(|slot| slot.iter().all(|byte| *byte == ERASED_BYTE));
+                if clean {
+                    self.offset = next;
+                    continue;
+                }
                 self.stopped = true;
-                Some(Err(DecodeError::UnknownRecordKind))
+                return Some(Err(DecodeError::Unsealed));
             }
+
+            return match frame.decoded {
+                Decoded::Record(record) => {
+                    // A record is at least `FRAME_OVERHEAD_BYTES` of body and one byte of
+                    // seal, so the offset always moves and a scan over a finite journal is
+                    // finite.
+                    self.offset = next;
+                    Some(Ok(record))
+                }
+                Decoded::UnknownKind(_) => {
+                    // §09 makes skipping a property of the format version, and
+                    // `permits_unknown_record_skip` answers `false` for every one of the
+                    // 256 a version byte can hold. So the scan stops, and there is
+                    // deliberately no second arm here.
+                    //
+                    // An `if permits_unknown_record_skip(..) { advance; continue }` would
+                    // read as the rule made mechanical, and it would be a branch no test
+                    // can reach — whose first execution, years from now, is recovery after
+                    // a power loss on somebody's device. The version that grants skipping
+                    // adds the arm and the test that reaches it, in one change.
+                    self.stopped = true;
+                    Some(Err(DecodeError::UnknownRecordKind))
+                }
+            };
         }
     }
 }

@@ -125,8 +125,16 @@ fn marks_on(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Option<Marks> {
         .ok()
 }
 
-/// How the journal of the rig's bank ends, read the way a boot reads it.
-fn ending_on(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Option<Ending> {
+/// How the journal of the rig's bank ends, read the way a boot reads it — and the offset at
+/// which the record at `index` would have started, which is wherever the scan stood after
+/// exactly `index` records were yielded.
+///
+/// Issue #95: recovery now ignores a torn record whose own reserved slot came out clean, so
+/// `Ending::Clean` no longer means "nothing was attempted here" on its own — a scan that
+/// stopped *past* `index`'s own starting offset consumed and ignored a slot rather than
+/// finding erased media from the start. Comparing the two is what tells row 4 (nothing of
+/// the attempted record landed) from row 5 (something did, and was safely skipped).
+fn ending_on(rig: &Rig, device: &mut Device, page: &mut [u8], index: u16) -> Option<(Ending, u32)> {
     let layout = rig.layout();
     let region = layout.bank(Rig::BANK);
     let mut engine = Window::new(device, 0, layout.geometry().capacity()).ok()?;
@@ -137,12 +145,18 @@ fn ending_on(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Option<Ending> 
     let header = bank::decode_header(page.get(..want)?).ok()?;
     let journal = JournalRegion::of(layout, Rig::BANK, &header).ok()?;
     let mut recovery = Recovery::new(journal, &mut engine);
+    let mut yielded: u16 = 0;
+    let mut before_index: u32 = 0;
     while let Some(step) = recovery.next(page) {
         if step.is_err() {
             break;
         }
+        yielded += 1;
+        if yielded == index {
+            before_index = recovery.offset();
+        }
     }
-    recovery.ending()
+    Some((recovery.ending()?, before_index))
 }
 
 /// How far the dispatcher got with the effect a record belongs to.
@@ -167,22 +181,28 @@ struct Evidence {
     recovered_it: bool,
     /// What the dispatcher did with the record's effect.
     activity: Activity,
-    /// Whether the journal ends in erased media.
-    clean: bool,
+    /// Whether any byte of the attempted record's own write reached media.
+    ///
+    /// Not the same question as whether the journal ends clean. Issue #95: no writer starts
+    /// a record before the one ahead of it has sealed, so a torn record whose own reserved
+    /// slot came out clean is ignored and recovery reports an ordinary clean end past it —
+    /// which no longer says the record's write never began, only that nothing of it
+    /// survived. This is read off the media directly, by comparing where the scan stopped
+    /// against where the attempted record's own slot starts.
+    landed: bool,
 }
 
 /// Which row `evidence` is an instance of, or `None` for a crash outside every effect row.
 const fn row_of(evidence: Evidence) -> Option<Row> {
     match (evidence.attempted, evidence.activity) {
         (Role::Schedule(_), _) if !evidence.recovered_it => Some(Row::DuringScheduleFrameWrite),
-        (Role::Schedule(_), Activity::Returned) => Some(Row::AfterActivityBeforeCompletionBarrier),
         (Role::Schedule(_), Activity::Entered) => Some(Row::DuringPhysicalActivity),
         (Role::Schedule(_), Activity::NotEntered) => Some(Row::AfterScheduleBarrierBeforeDispatch),
         (Role::Completion(_), _) if evidence.recovered_it => Some(Row::AfterCompletionBarrier),
-        (Role::Completion(_), _) if evidence.clean => {
+        (Role::Completion(_), _) if evidence.landed => Some(Row::DuringCompletionWrite),
+        (Role::Schedule(_), Activity::Returned) | (Role::Completion(_), _) => {
             Some(Row::AfterActivityBeforeCompletionBarrier)
         }
-        (Role::Completion(_), _) => Some(Row::DuringCompletionWrite),
         (Role::Finish, _) => Some(Row::AfterCompletionBarrier),
         (Role::Start, _) => None,
     }
@@ -227,16 +247,19 @@ fn evidence(
         true if returned => Activity::Returned,
         true => Activity::Entered,
     };
-    let clean = matches!(
-        ending_on(rig, device, &mut page).ok_or(Skip::Breached)?,
-        Ending::Clean { .. }
-    );
+    let (ending, before_index) = ending_on(rig, device, &mut page, index).ok_or(Skip::Breached)?;
+    // Landed exactly when the scan stopped *past* where the attempted record's own slot
+    // starts: a clean end sitting right at that offset found nothing there at all.
+    let landed = match ending {
+        Ending::Clean { append_at } => append_at != before_index,
+        Ending::Unsealed { .. } | Ending::Damaged { .. } | Ending::Incomplete { .. } => true,
+    };
     Ok(Evidence {
         attempted,
         index,
         recovered_it: verdict.recovered() > index,
         activity,
-        clean,
+        landed,
     })
 }
 
@@ -342,14 +365,22 @@ fn require(point: &Classified) {
         }
         Row::DuringCompletionWrite => {
             assert_eq!(evidence.activity, Activity::Returned, "{at}");
-            assert_eq!(
-                *resumed,
-                Resumed::Unextendable {
-                    recovered: evidence.index
-                },
-                "a torn completion is ignored and leaves no append point: {at}"
-            );
-            assert!(resumed_entered.is_empty(), "nothing is dispatched: {at}");
+            match resumed {
+                // Issue #95: no writer starts a record before the one ahead of it has
+                // sealed, so a torn completion whose own reserved slot came out clean is
+                // ignored, and the run redelivers under its own identity rather than being
+                // forced into `continue_as_new`.
+                Resumed::Completed { redelivered, .. } => {
+                    assert_eq!(*redelivered, effect, "the same id is redelivered: {at}");
+                    assert_eq!(resumed_entered.first().copied(), effect, "{at}");
+                }
+                // A tear inside the commit seal itself still leaves no append point: this
+                // reader cannot tell an interrupted append from damage.
+                Resumed::Unextendable { recovered } => {
+                    assert_eq!(*recovered, evidence.index, "{at}");
+                    assert!(resumed_entered.is_empty(), "nothing is dispatched: {at}");
+                }
+            }
         }
         Row::AfterCompletionBarrier => {
             // A torn *terminal* record is in this row too, and it leaves no append point.
@@ -536,8 +567,22 @@ fn after_physical_activity_before_completion_barrier_the_same_id_is_redelivered_
 #[test]
 fn during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed_on_the_rig()
  {
-    for point in points_of(Row::DuringCompletionWrite) {
-        require(&point);
+    // Issue #95: this row now holds two outcomes rather than one, and both are swept.
+    let points = points_of(Row::DuringCompletionWrite);
+    assert!(
+        points
+            .iter()
+            .any(|p| matches!(p.resumed, Resumed::Completed { .. })),
+        "no crash point in this row redelivered"
+    );
+    assert!(
+        points
+            .iter()
+            .any(|p| matches!(p.resumed, Resumed::Unextendable { .. })),
+        "no crash point in this row was refused"
+    );
+    for point in &points {
+        require(point);
     }
 }
 
@@ -738,9 +783,13 @@ fn a_reset_at_any_point_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
     // sealed, the distinct images resumed, the resets taken, and those inside a mark.
     // 180 of the 389 images resume to a part that needs no writes, so they contribute
     // no cuts: a resume that writes nothing has no point to cut.
+    //
+    // The last two moved with issue #95: a torn completion whose own reserved slot came
+    // out clean is now a healthy, resumable part rather than one `rig.verify` filtered out
+    // before a resume was ever attempted, so more images reach the injector below.
     assert_eq!(
         (uninstalled, images.len(), cuts, torn_marks),
-        (47, 389, 46_797, 15_990),
+        (47, 389, 48_534, 16_536),
         "the resume sweep changed size"
     );
 }
@@ -1086,7 +1135,7 @@ fn a_row_is_read_from_the_dispatcher_and_the_media_and_never_from_a_mark() {
         index: 3,
         recovered_it: true,
         activity: Activity::NotEntered,
-        clean: true,
+        landed: false,
     };
     assert_eq!(row_of(base), Some(Row::AfterScheduleBarrierBeforeDispatch));
     assert_eq!(
@@ -1115,12 +1164,12 @@ fn a_row_is_read_from_the_dispatcher_and_the_media_and_never_from_a_mark() {
         index: 4,
         recovered_it: false,
         activity: Activity::Returned,
-        clean: false,
+        landed: true,
     };
     assert_eq!(row_of(completion), Some(Row::DuringCompletionWrite));
     assert_eq!(
         row_of(Evidence {
-            clean: true,
+            landed: false,
             ..completion
         }),
         Some(Row::AfterActivityBeforeCompletionBarrier)

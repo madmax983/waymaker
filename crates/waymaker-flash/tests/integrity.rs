@@ -535,30 +535,44 @@ fn a_write_torn_at_a_program_unit_boundary_is_never_read_as_a_record() {
                 torn.fill(ERASED_BYTE);
                 torn[..cut].copy_from_slice(&page[..cut]);
 
+                // A record on its own, with nothing programmed after it, is never read as a
+                // record whatever the tear — but since issue #95 it is not always refused
+                // *either*: a tear at or before the frame's own padded length leaves
+                // nothing but erased media behind it, which the reader now treats as a
+                // safe place to keep writing rather than as damage.
+                let frame_len = FRAME_OVERHEAD_BYTES + payload_len(&record);
+                let padded = frame::body_len(&record, align).expect("this record encodes");
+                let recoverable = cut >= frame_len && cut <= padded;
                 assert!(
                     !reads_as_a_record(&torn[..written], align),
                     "{record:?} at {bytes} torn after {cut} of {written} B decoded as a record"
                 );
                 // The refusal *kind* matters and is asserted rather than discarded. A tear
                 // after nothing is an erased journal, which is a clean end of history; a
-                // tear after a program unit leaves programmed bytes behind, and calling
-                // that a clean end hands a caller an offset into cells a program cycle has
-                // already cleared.
+                // tear inside the commit seal leaves programmed bytes a reader cannot tell
+                // from damage, and calling that a clean end hands a caller an offset into
+                // cells a program cycle has already cleared.
                 let (yielded, failure, offset) = walk(&torn[..written], align);
                 assert_eq!(yielded, 0, "{record:?} at {bytes} torn after {cut} B");
-                assert_eq!(offset, 0);
-                // Three cases rather than two since issue #24. A tear before the frame
-                // body is complete fails a checksum; a tear after it and before the commit
-                // seal leaves a sound frame nothing says was committed, which is the
-                // *point* of the seal and is a different refusal.
+                // Four cases rather than two since issue #24, and issue #95 split the third
+                // in two: a tear before the frame body is complete fails a checksum; a tear
+                // past it and no later than the frame's own padding is ignored, and the
+                // slot it reserved becomes the append point; a tear inside the seal itself
+                // leaves a sound frame nothing says was committed, which is the *point* of
+                // the seal and is refused exactly as before.
                 assert_eq!(
                     failure,
                     match cut {
                         0 => None,
-                        cut if cut >= FRAME_OVERHEAD_BYTES + payload_len(&record) =>
-                            Some(DecodeError::Unsealed),
-                        _ => Some(DecodeError::IntegrityFailed),
+                        _ if recoverable => None,
+                        _ if cut < frame_len => Some(DecodeError::IntegrityFailed),
+                        _ => Some(DecodeError::Unsealed),
                     },
+                    "{record:?} at {bytes} torn after {cut} B"
+                );
+                assert_eq!(
+                    offset,
+                    if recoverable { written } else { 0 },
                     "{record:?} at {bytes} torn after {cut} B"
                 );
                 units += 1;
@@ -606,9 +620,11 @@ fn a_write_torn_inside_a_program_unit_is_never_read_as_a_record() {
 #[test]
 fn a_torn_write_leaves_the_committed_prefix_of_earlier_records_intact() {
     // §14: "frame ignored; previous history prefix wins". A tear in the last record must
-    // cost the journal that record and nothing else, and the scan must stop *at* it rather
-    // than past it — an offset past a torn frame is an offset into cells a program cycle
-    // has already cleared.
+    // cost the journal that record and nothing else — the record is never yielded, whether
+    // the scan stops *at* it (a torn frame body, where an offset past it would be an offset
+    // into cells a program cycle has already cleared) or *past* its whole reserved slot,
+    // which is issue #95's fix: past the slot is where nothing else was ever written, and
+    // that is a safe place to keep appending rather than damage.
     let align = align_or_byte(8);
     let unit = usize::from(align.get());
     let mut journal = [ERASED_BYTE; SCRATCH];
@@ -641,19 +657,33 @@ fn a_torn_write_leaves_the_committed_prefix_of_earlier_records_intact() {
         torn.fill(ERASED_BYTE);
         torn[..prefix_end + cut].copy_from_slice(&journal[..prefix_end + cut]);
 
+        let frame_len = FRAME_OVERHEAD_BYTES + payload_len(&last);
+        let padded = frame::body_len(&last, align).expect("this record encodes");
+        let recoverable = cut >= frame_len && cut <= padded;
+
         let (yielded, failure, stopped) = walk(&torn[..prefix_end + last_len], align);
         assert_eq!(yielded, 2, "torn after {cut} B of the last record");
-        assert_eq!(stopped, prefix_end, "torn after {cut} B of the last record");
+        assert_eq!(
+            stopped,
+            if recoverable {
+                prefix_end + last_len
+            } else {
+                prefix_end
+            },
+            "torn after {cut} B of the last record"
+        );
         // Two records and then *nothing programmed* is a clean end of history; two records
-        // and then a torn frame is not, and the difference is the one §14 turns on. Without
-        // this assertion a scan that reported every tear as a clean end passed.
+        // and a tear inside the last one's commit seal is not, and the difference is the one
+        // §14 turns on. Without this assertion a scan that reported every tear as a clean
+        // end passed. A tear no later than the frame's own padding is issue #95's third
+        // case: also no failure, but the slot it reserved is where history now ends.
         assert_eq!(
             failure,
             match cut {
                 0 => None,
-                cut if cut >= FRAME_OVERHEAD_BYTES + payload_len(&last) =>
-                    Some(DecodeError::Unsealed),
-                _ => Some(DecodeError::IntegrityFailed),
+                _ if recoverable => None,
+                _ if cut < frame_len => Some(DecodeError::IntegrityFailed),
+                _ => Some(DecodeError::Unsealed),
             },
             "torn after {cut} B of the last record"
         );
