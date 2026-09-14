@@ -2379,6 +2379,14 @@ fn lit_value(lit: &syn::Lit) -> Option<i128> {
         }),
         syn::Lit::Byte(byte) => Some(i128::from(byte.value())),
         syn::Lit::Char(char) => Some(i128::from(u32::from(char.value()))),
+        // Codex's forty-fifth-round finding: a bare `true`/`false` reaching this function
+        // — by way of `Expr::If`'s own condition, since a `bool` is the only type Rust
+        // permits one to be — had no representation here at all. `0`/`1` is the same
+        // representation the const-folded machine code itself uses for a `bool` (`rustc`
+        // never allocates a `bool` a byte wider than that), so treating `false` and `true`
+        // as `0` and `1` in this scan's own `i128` domain costs nothing and needs no
+        // separate boolean domain of its own.
+        syn::Lit::Bool(boolean) => Some(i128::from(boolean.value)),
         _ => None,
     }
 }
@@ -2476,6 +2484,63 @@ fn as_suffixed_int_literal(expr: &syn::Expr) -> Option<&syn::LitInt> {
     }
 }
 
+/// `block`'s own value as a constant-initializer expression: its own tail expression,
+/// once any local `const` declarations feeding that tail are resolved first — a
+/// block-scoped mirror of `resolve_scope_consts`'s own fixed point, self-contained here
+/// since this function carries no `ConstScopes` of its own, only the caller's flat
+/// `resolve`. Scoped narrowly: every statement but the last must be a local `const` item
+/// (`block_const_exprs` is what recognises one), and the last must be a semicolon-less
+/// tail expression — a block holding a `let`, a loop, or any other statement shape stays
+/// unresolved rather than guessed at, and so does a labelled block (`'a: { .. }`), whose
+/// tail a `break 'a value;` elsewhere in the block could also supply — a labelled block
+/// is the caller's to refuse, since a `syn::Block` carries no label of its own to check.
+///
+/// Factored out of [`literal_or_const_value`]'s own `Expr::Block` case so `Expr::If`'s
+/// `then` branch — itself a plain `syn::Block` — can be evaluated the identical way,
+/// rather than duplicating the local-`const` fixed point a second time.
+fn evaluate_block(
+    block: &syn::Block,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
+    let locals = block_const_exprs(block);
+    let (tail, rest) = block.stmts.split_last()?;
+    if rest.len() != locals.len() {
+        return None;
+    }
+    let syn::Stmt::Expr(tail_expr, None) = tail else {
+        return None;
+    };
+    let mut resolved: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
+    for _ in 0..locals.len().max(1) {
+        let mut progressed = false;
+        for (name, local_expr) in &locals {
+            if resolved.contains_key(name) {
+                continue;
+            }
+            let local_resolve = |path: &syn::Path| {
+                path.get_ident()
+                    .map(ident_name)
+                    .and_then(|candidate| resolved.get(&candidate).copied())
+                    .or_else(|| resolve(path))
+            };
+            if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
+                resolved.insert(name.clone(), value);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let block_resolve = |path: &syn::Path| {
+        path.get_ident()
+            .map(ident_name)
+            .and_then(|candidate| resolved.get(&candidate).copied())
+            .or_else(|| resolve(path))
+    };
+    literal_or_const_value(tail_expr, &block_resolve)
+}
+
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
@@ -2570,44 +2635,30 @@ fn literal_or_const_value(
         // (`'a: { .. }`), whose tail a `break 'a value;` elsewhere in the block could
         // also supply.
         syn::Expr::Block(block_expr) if block_expr.label.is_none() => {
-            let locals = block_const_exprs(&block_expr.block);
-            let (tail, rest) = block_expr.block.stmts.split_last()?;
-            if rest.len() != locals.len() {
-                return None;
+            evaluate_block(&block_expr.block, resolve)
+        }
+        // Codex's forty-fifth-round finding: `const P0: u8 = if SELECT_FIRST { 0 } else {
+        // 100 };` is `Expr::If`, which fell to the wildcard `_ => None` case below and
+        // left every such arm unresolved — and the const-call backstop
+        // (`const_call_initializer_uses`) does not catch it either, since an `if` is not
+        // a call. A `bool` is the only type Rust permits an `if`'s own condition to be,
+        // so evaluating it through this same `i128` pipeline (`0` for `false`, anything
+        // else for `true`, by way of [`lit_value`]'s own `Lit::Bool` case) and then
+        // evaluating the chosen branch is exactly as sound as `Expr::Block`'s own
+        // handling, which the `then` branch shares directly since it is the identical
+        // `syn::Block` shape. An `if` with no `else` cannot type-check as an integer
+        // value in real Rust — the missing branch would have to produce `()` — so one is
+        // required rather than assumed; the `else` branch recurses through this same
+        // function, which is what lets an `else if` chain resolve without a case of its
+        // own.
+        syn::Expr::If(if_expr) => {
+            let condition = literal_or_const_value(&if_expr.cond, resolve)?;
+            let (_, else_branch) = if_expr.else_branch.as_ref()?;
+            if condition == 0 {
+                literal_or_const_value(else_branch, resolve)
+            } else {
+                evaluate_block(&if_expr.then_branch, resolve)
             }
-            let syn::Stmt::Expr(tail_expr, None) = tail else {
-                return None;
-            };
-            let mut resolved: std::collections::HashMap<String, i128> =
-                std::collections::HashMap::new();
-            for _ in 0..locals.len().max(1) {
-                let mut progressed = false;
-                for (name, local_expr) in &locals {
-                    if resolved.contains_key(name) {
-                        continue;
-                    }
-                    let local_resolve = |path: &syn::Path| {
-                        path.get_ident()
-                            .map(ident_name)
-                            .and_then(|candidate| resolved.get(&candidate).copied())
-                            .or_else(|| resolve(path))
-                    };
-                    if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
-                        resolved.insert(name.clone(), value);
-                        progressed = true;
-                    }
-                }
-                if !progressed {
-                    break;
-                }
-            }
-            let block_resolve = |path: &syn::Path| {
-                path.get_ident()
-                    .map(ident_name)
-                    .and_then(|candidate| resolved.get(&candidate).copied())
-                    .or_else(|| resolve(path))
-            };
-            literal_or_const_value(tail_expr, &block_resolve)
         }
         _ => None,
     }
