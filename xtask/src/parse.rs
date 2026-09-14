@@ -1438,6 +1438,8 @@ pub fn match_expressions(contents: &str) -> Result<Vec<FoundMatch>, syn::Error> 
     let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
+        module_path: Vec::new(),
+        qualified: std::collections::HashMap::new(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -1516,11 +1518,16 @@ fn resolve_scope_consts(
             if resolved.contains_key(name) {
                 continue;
             }
-            let resolve = |candidate: &str| {
+            // Bare names only: a same-scope or an outer-scope reference, never a qualified
+            // path. Qualifying a constant's own initializer with a module path is a far
+            // deeper reach than the finding this scope machinery closes, and unsupported
+            // here means "not resolved" rather than "resolved wrongly".
+            let resolve = |path: &syn::Path| {
+                let candidate = ident_name(path.get_ident()?);
                 resolved
-                    .get(candidate)
+                    .get(&candidate)
                     .copied()
-                    .or_else(|| outer.resolve(candidate))
+                    .or_else(|| outer.resolve(&candidate))
             };
             if let Some(value) = literal_or_const_value(expr, &resolve) {
                 resolved.insert(name.clone(), value);
@@ -1535,12 +1542,11 @@ fn resolve_scope_consts(
 }
 
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
-/// cast, a set of parentheses or a brace group; or a bare path naming one identifier that
-/// `resolve` answers for — the constant-pattern half of both [`FoundArm::pattern`] and a
-/// call argument's own value.
+/// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
+/// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
 fn literal_or_const_value(
     expr: &syn::Expr,
-    resolve: &dyn Fn(&str) -> Option<u128>,
+    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
 ) -> Option<u128> {
     match expr {
         syn::Expr::Lit(literal) => match &literal.lit {
@@ -1550,33 +1556,31 @@ fn literal_or_const_value(
         syn::Expr::Cast(cast) => literal_or_const_value(&cast.expr, resolve),
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
-        syn::Expr::Path(path) => path
-            .path
-            .get_ident()
-            .and_then(|ident| resolve(&ident_name(ident))),
+        syn::Expr::Path(path) => resolve(&path.path),
         _ => None,
     }
 }
 
 /// `pattern`'s own integer value, the pattern half of [`literal_or_const_value`]: a bare
-/// literal, or a plain identifier — a pattern this simple parses as a binding rather than a
-/// path, since `syn` cannot tell one from a constant of the same name without resolving it —
-/// that `resolve` answers for. `None` for a wildcard, a range, a tuple, or anything else a
-/// dense table's patterns are not, and for a binding that names no known constant — that is
-/// [`is_catchall_pattern`]'s question, not this one's.
-fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&str) -> Option<u128>) -> Option<u128> {
+/// literal, or a path — a single plain identifier parses as a binding rather than a path,
+/// since `syn` cannot tell one from a constant of the same name without resolving it, so it
+/// is turned into a one-segment [`syn::Path`] before asking `resolve` the same question a
+/// multi-segment, qualified pattern (`module::P0`) would be asked. `None` for a wildcard, a
+/// range, a tuple, or anything else a dense table's patterns are not, and for a binding that
+/// names no known constant — that is [`is_catchall_pattern`]'s question, not this one's.
+fn pattern_literal(
+    pattern: &syn::Pat,
+    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
+) -> Option<u128> {
     match pattern {
         syn::Pat::Lit(literal) => match &literal.lit {
             syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
             _ => None,
         },
         syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
-            resolve(&ident_name(&named.ident))
+            resolve(&syn::Path::from(named.ident.clone()))
         }
-        syn::Pat::Path(path) => path
-            .path
-            .get_ident()
-            .and_then(|ident| resolve(&ident_name(ident))),
+        syn::Pat::Path(path) => resolve(&path.path),
         _ => None,
     }
 }
@@ -1595,7 +1599,7 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&str) -> Option<u128>) -
 fn is_catchall_pattern(
     pattern: &syn::Pat,
     guarded: bool,
-    resolve: &dyn Fn(&str) -> Option<u128>,
+    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
 ) -> bool {
     if guarded {
         return false;
@@ -1603,7 +1607,7 @@ fn is_catchall_pattern(
     match pattern {
         syn::Pat::Wild(_) => true,
         syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
-            resolve(&ident_name(&named.ident)).is_none()
+            resolve(&syn::Path::from(named.ident.clone())).is_none()
         }
         _ => false,
     }
@@ -1615,7 +1619,7 @@ fn is_catchall_pattern(
 /// an unwrapped one once a real parser is reading it.
 fn call_shape_of(
     expr: &syn::Expr,
-    resolve: &dyn Fn(&str) -> Option<u128>,
+    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
 ) -> Option<(String, Option<u128>)> {
     match expr {
         syn::Expr::Paren(paren) => call_shape_of(&paren.expr, resolve),
@@ -1644,17 +1648,61 @@ fn call_shape_of(
     }
 }
 
+/// `path`'s value as a *qualified* reference (`module::P0`, or a longer chain reaching one),
+/// resolved against every module-qualified constant [`MatchVisitor`] has recorded so far.
+///
+/// Codex's finding: [`ConstScopes`] alone only ever resolves a bare, single-segment name
+/// against the scopes lexically enclosing a match — exactly right for `P0`, and exactly
+/// wrong for `indices::P0`, which `Pat::Path`/`Expr::Path` parse as a *multi*-segment path
+/// that a single-identifier lookup (`path.get_ident()`) simply refuses to look at, silently
+/// treating a qualified constant pattern as unresolved rather than as the value it names. A
+/// leading `crate`/`self` is stripped before joining, since it names no module of its own;
+/// a `super` is not resolved positionally, so a chain that does not match in full falls back
+/// to its last two segments (`module::name`), which is what lets `crate::indices::P0` and
+/// `super::indices::P0` both still find a `mod indices` recorded relative to the file root.
+fn resolve_qualified_path(
+    path: &syn::Path,
+    qualified: &std::collections::HashMap<String, u128>,
+) -> Option<u128> {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    let relevant: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .skip_while(|segment| *segment == "crate" || *segment == "self")
+        .collect();
+    if relevant.len() < 2 {
+        return None;
+    }
+    if let Some(value) = qualified.get(&relevant.join("::")) {
+        return Some(*value);
+    }
+    let tail_start = relevant.len().saturating_sub(2);
+    let tail = relevant.get(tail_start..)?;
+    qualified.get(&tail.join("::")).copied()
+}
+
 /// Walks a parsed file collecting every [`FoundMatch`], skipping anything declared under
 /// `#[cfg(test)]` — an item, an `impl` member, or an inline module's contents — the
 /// structural equivalent of `without_test_modules` blanking the same text.
 ///
 /// `scopes` grows and shrinks as the walk enters and leaves a module or a block (a
 /// function's body among them): each carries only the constants declared directly in it, so
-/// resolving a name at any point searches the live stack from the innermost scope outward —
-/// the same shadowing a real name lookup gives these declarations, and what stops one
-/// module's or function's own constants from being read through another's of the same name.
+/// resolving a bare name at any point searches the live stack from the innermost scope
+/// outward — the same shadowing a real name lookup gives these declarations, and what stops
+/// one module's or function's own constants from being read through another's of the same
+/// name. `qualified` is the other half, for a path a bare-name search cannot answer at all:
+/// every module's own constants, recorded once under that module's file-root-relative path
+/// (`module_path` is the stack of module names currently entered) as the walk resolves each
+/// module's scope, so a later `module::P0` reference — from anywhere the walk has since
+/// moved on to — still finds it.
 struct MatchVisitor {
     scopes: ConstScopes,
+    module_path: Vec<String>,
+    qualified: std::collections::HashMap<String, u128>,
     found: Vec<FoundMatch>,
 }
 
@@ -1679,9 +1727,15 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             return;
         };
         let scope = resolve_scope_consts(&item_const_exprs(items), &self.scopes);
+        self.module_path.push(ident_name(&node.ident));
+        for (name, value) in &scope {
+            self.qualified
+                .insert(format!("{}::{name}", self.module_path.join("::")), *value);
+        }
         self.scopes.0.push(scope);
         syn::visit::visit_item_mod(self, node);
         self.scopes.0.pop();
+        self.module_path.pop();
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
@@ -1693,7 +1747,30 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
         let scopes = &self.scopes;
-        let resolve = move |name: &str| scopes.resolve(name);
+        let qualified = &self.qualified;
+        let resolve = move |path: &syn::Path| {
+            if let Some(ident) = path.get_ident() {
+                return scopes.resolve(&ident_name(ident));
+            }
+            // A leading `crate` or `self` names no module of its own, so a path that is
+            // only that plus one more segment (`crate::P0`) is still a bare, ambiently
+            // resolved name once it is stripped — the qualified map only holds an actual
+            // module's own constants.
+            let segments: Vec<String> = path
+                .segments
+                .iter()
+                .map(|segment| ident_name(&segment.ident))
+                .collect();
+            let relevant: Vec<&str> = segments
+                .iter()
+                .map(String::as_str)
+                .skip_while(|segment| *segment == "crate" || *segment == "self")
+                .collect();
+            if relevant.len() == 1 {
+                return relevant.first().and_then(|name| scopes.resolve(name));
+            }
+            resolve_qualified_path(path, qualified)
+        };
         let selector = node.expr.to_token_stream().to_string();
         let arms = node
             .arms

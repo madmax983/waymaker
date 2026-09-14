@@ -15101,6 +15101,34 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_qualified_constant_patterns_is_reported() {
+        // Codex's fourteenth-round finding: `Pat::Path`/`Expr::Path` resolution used
+        // `path.get_ident()`, which answers `None` for anything but a single, unqualified
+        // segment — so `indices::P0` through `indices::P3` (constants declared inside a
+        // `mod indices`) resolved to nothing at all, even though `rustc` treats a
+        // qualified constant pattern exactly like the literal it names. Every module's
+        // own constants are now recorded once under that module's file-root-relative
+        // path as the walk resolves it, and a qualified pattern or call argument is
+        // looked up there when a bare-name search cannot answer it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: u8 \
+             = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = 3;\n}\n\n\
+             const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        indices::P0 => crc32_nibble(0),\n        \
+             indices::P1 => crc32_nibble(1),\n        indices::P2 => crc32_nibble(2),\n        \
+             indices::P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
