@@ -1901,3 +1901,235 @@ fn a_higher_generation_banks_unsupported_format_version_is_never_ignored_for_a_s
          higher-generation authority is in a format this firmware cannot read: {progress:?}"
     );
 }
+
+#[test]
+fn a_page_smaller_than_the_seal_itself_reports_page_too_small() {
+    // `read_bank`'s first read is a bank's own seal, and a page too short to hold even
+    // that has nothing to defer: there is no claimed generation yet to weigh against the
+    // other bank, so this is the one hard `PageTooSmall` `read_bank`'s own `Errors` section
+    // still describes as immediate.
+    let mut device = booted();
+    let mut page = [0_u8; 1];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall { .. }))
+        ),
+        "a page shorter than a bank's own seal must be refused as too small, not treated as \
+         a bigger problem: {progress:?}"
+    );
+}
+
+/// Fails every read of one bank's own seal-region offset; every other read reaches the
+/// real device unchanged.
+///
+/// Unlike a header read, a seal read that fails leaves `read_bank` with no claimed
+/// generation to weigh at all — there is nothing to defer this to, so it stays the one
+/// immediate `Err` `read_bank`'s own `Errors` section still describes.
+struct SealReadFails<'a> {
+    device: &'a mut Device,
+    failing: BankId,
+}
+
+impl StableStorage for SealReadFails<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let region = layout().bank(self.failing);
+        if offset == region.seal_offset() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_seal_read_error_is_reported_immediately_with_no_bank_to_defer_to() {
+    let mut device = booted();
+    let mut storage = SealReadFails {
+        device: &mut device,
+        failing: BankId::A,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Storage(
+                waymaker_fault::FaultError::PowerLoss
+            )))
+        ),
+        "a seal read failure names no claimed generation to weigh against the other bank, \
+         so it has to surface immediately: {progress:?}"
+    );
+}
+
+/// Fails every read of *both* banks' header-base offsets; seals and everything else reach
+/// the real device unchanged.
+struct BothHeaderReadsFail<'a> {
+    device: &'a mut Device,
+}
+
+impl StableStorage for BothHeaderReadsFail<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let region_a = layout().bank(BankId::A);
+        let region_b = layout().bank(BankId::B);
+        if offset == region_a.base() || offset == region_b.base() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn two_unreadable_banks_report_the_higher_generations_own_error() {
+    // Both banks' seals validate — each names a claimed generation — but neither header can
+    // be read at all. Neither bank can rescue the boot, so this is `resolve_bank_read`'s
+    // `(Unreadable, Unreadable)` arm: the higher claimed generation's own error is the
+    // honest answer, the same priority the two `Oversized` arms already give it.
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut storage = BothHeaderReadsFail {
+        device: &mut device,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Storage(
+                waymaker_fault::FaultError::PowerLoss
+            )))
+        ),
+        "two unreadable banks must still report a device error rather than anything else: \
+         {progress:?}"
+    );
+}
+
+#[test]
+fn an_oversized_bank_and_an_unreadable_bank_prefer_the_higher_generations_own_answer() {
+    // Bank A is genuinely too large for the shared page (`Oversized`); bank B's header
+    // cannot be read at all (`Unreadable`). Bank B is one generation higher, so
+    // `resolve_bank_read`'s mixed `(Oversized, Unreadable)` arm must report bank B's own
+    // device error rather than bank A's `PageTooSmall` — a bigger page could still rescue
+    // bank A, but no page size fixes bank B's fault, and bank B's claim outranks it anyway.
+    let mut device = Device::new(geometry());
+    let wide_input = &[b'x'; 60][..];
+    let wide_header = BankHeader {
+        input: wide_input,
+        ..first_header()
+    };
+    install(&mut device, BankId::A, Generation::FIRST, &wide_header);
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank B's own header and its seal, deliberately short of bank A's.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank A's declared length to overflow this page"
+    );
+
+    let mut storage = HeaderReadFails {
+        device: &mut device,
+        failing: BankId::B,
+    };
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Storage(
+                waymaker_fault::FaultError::PowerLoss
+            )))
+        ),
+        "the higher-generation bank's own device fault must be the answer, not the lower \
+         bank's page-size complaint: {progress:?}"
+    );
+}
