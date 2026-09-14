@@ -3974,3 +3974,20 @@ recovery is read at all. Reproduced first by completing iteration 0 with no cut 
 then calling `resume_declaring(1, rig.workload(0), ..)` on the same device: the unfixed
 code answered `Ok(Completed { recovered: 6, .. })`, reporting iteration 0's own history as
 iteration 1's, rather than refusing with `RigError::Workload`.
+
+A twelfth found the eleventh's own fix unsound: comparing `Workload::run` is comparing a
+hash, and `RunId` is `SplitMix64::new(seed).at(iteration)` — `mix(seed + GAMMA *
+(iteration + 1))`, injective in the mixed word but not in the *pair* the word is built
+from. `seed` plus `GAMMA` at iteration zero sums to the same word as plain `seed` at
+iteration one, so a device whose real history was written by a wholly different rig —
+seeded `SEED` plus `GAMMA` rather than this rig's own `SEED` — at iteration zero satisfies
+both the eleventh's check and `own_bank_journal`'s header comparison for a
+`resume_declaring(1, ..)` call on the genuine rig: the header truly names the colliding
+run, and so does the declaration. `resume_as` now compares the seed and the iteration
+directly against this rig's own plan and the `iteration` argument, rather than routing the
+comparison through a hash nothing ever claimed was injective over two arguments at once.
+Reproduced first with two rigs sharing a geometry and differing only by that one seed
+offset: the foreign rig wrote a complete run at its own iteration zero, and the genuine
+rig's `resume_declaring(1, ..)` over that same device answered `Ok(Completed { recovered:
+6, .. })` under the eleventh's fix alone, never having written a byte to the device it
+just reported completing.

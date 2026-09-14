@@ -3011,3 +3011,83 @@ fn resume_declaring_refuses_a_workload_for_another_iterations_run() {
         "a mismatched iteration mutated the device before being refused"
     );
 }
+
+/// Round 12: the fix above compared `Workload::run` against `self.workload(iteration).run()`.
+/// A run id is `SplitMix64::new(seed).at(iteration)`, an injective mix of one pre-mix word,
+/// `seed` plus `GAMMA` times `iteration` plus one — but that word is not injective over the
+/// pair of arguments together, so a workload built from a different seed at a different
+/// iteration can land on the identical pre-mix word and therefore the identical run id.
+/// Concretely, `seed` plus `GAMMA` at iteration zero sums to the same word as plain `seed` at
+/// iteration one. A device whose real history was written by a different rig entirely — one
+/// seeded `SEED` plus `GAMMA` rather than this file's `SEED` — at iteration zero therefore
+/// satisfies every check the old code ran against `resume_declaring(1, ..)`:
+/// `own_bank_journal`'s header-run comparison, because the header genuinely names that
+/// colliding run, and the old run-id comparison, for the identical reason.
+///
+/// The fix compares the seed and the iteration directly, against this rig's own seed and the
+/// `iteration` argument, which is exact rather than routed through a hash that was never
+/// claimed to be injective over two arguments at once.
+#[test]
+fn resume_declaring_refuses_a_workload_whose_run_id_collides_from_another_seed() {
+    // The same constant `plan::GAMMA` uses — not exported, so reproduced here to construct
+    // the exact cross-seed collision `Workload::run` is vulnerable to through a hash.
+    const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    let rig = rig();
+    let Ok(other) =
+        Rig::new::<FaultError>(geometry(), Plan::new(SEED.wrapping_add(GAMMA)), EFFECTS)
+    else {
+        unreachable!("the same geometry that holds two banks and a witness for `rig`")
+    };
+    assert_eq!(
+        other.workload(0).run(),
+        rig.workload(1).run(),
+        "the two rigs' seeds do not collide at (0, 1) as intended"
+    );
+
+    // The device's real history is written by `other` — a foreign rig, at iteration 0 — not
+    // by `rig` at all.
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        other
+            .prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        let outcome = other.iterate(
+            0,
+            &mut metered,
+            &mut Log::default(),
+            &mut NeverCut,
+            &mut page,
+        );
+        assert!(
+            matches!(outcome, Ok(Stop::Completed)),
+            "the fault-free iteration completes: {outcome:?}"
+        );
+    }
+
+    // `rig` — a different seed entirely — is asked to resume iteration 1 over that device,
+    // declaring `other`'s own iteration-0 workload. Its run id collides with `rig.workload(1)`,
+    // which is the whole point: `rig` never wrote a single byte to this device.
+    let declared = other.workload(0);
+    let mut dispatcher = Log::default();
+    let before = device.image().to_vec();
+    let outcome = {
+        let mut metered = Metered::new(&mut device);
+        rig.resume_declaring(1, declared, &mut metered, &mut dispatcher, &mut page)
+    };
+    assert!(
+        matches!(outcome, Err(RigError::Workload)),
+        "a cross-seed run-id collision let a foreign declaration through: {outcome:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched before being refused"
+    );
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "a mismatched iteration mutated the device before being refused"
+    );
+}

@@ -1372,13 +1372,13 @@ impl Rig {
     /// [`resume`](Self::resume) and [`resume_declaring`](Self::resume_declaring), over the
     /// workload each one means to audit history against.
     ///
-    /// Refuses a `workload` other than [`effects`](Self::effects) wide, or one whose run
-    /// disagrees with `iteration`'s own, before touching the device. `resume_declaring`'s
-    /// `declared` only ever means to audit history against a workload that agrees with this
-    /// rig's own run everywhere but the one record [`Workload::diverging`] names, and a
-    /// workload of another length or another run is not that shape — nor one this bank or
-    /// this witness was provisioned for, since `Rig::new` sizes both against `effects` alone
-    /// and [`Workload::run`] is what a bank belongs to.
+    /// Refuses a `workload` other than [`effects`](Self::effects) wide, or one whose seed or
+    /// iteration disagrees with this rig's own and `iteration`'s, before touching the device.
+    /// `resume_declaring`'s `declared` only ever means to audit history against a workload
+    /// that agrees with this rig's own run everywhere but the one record
+    /// [`Workload::diverging`] names, and a workload of another length, another seed or
+    /// another iteration is not that shape — nor one this bank or this witness was
+    /// provisioned for, since `Rig::new` sizes both against `effects` alone.
     ///
     /// A *wider* declaration was the first review found: it can share this rig's seed and
     /// iteration and so match its recovered prefix exactly while naming more effects than
@@ -1395,6 +1395,15 @@ impl Rig {
     /// because `declared` genuinely is that other iteration's own workload — so a run
     /// already complete for that iteration was reported as `iteration`'s own `Completed`
     /// before the per-record comparison against `self.workload(iteration)` was ever reached.
+    /// The fix first compared [`Workload::run`] against `self.workload(iteration).run()`, and
+    /// a fourth review found that comparison itself unsound: [`Workload::run`] mixes the seed
+    /// and the iteration through [`SplitMix64`](crate::plan::SplitMix64), which is not
+    /// injective across both arguments at once, so a `declared` built from a *different* seed
+    /// at a *different* iteration can name the identical run id `self.workload(iteration)`
+    /// does — reproduced directly, since `SplitMix64::at` computes `seed + GAMMA * (index +
+    /// 1)`, and `at(0)` under `seed + GAMMA` equals `at(1)` under `seed`. The check now
+    /// compares `workload.seed()` and `workload.iteration()` against `self.plan.seed()` and
+    /// `iteration` directly, which is exact rather than routed through a hash.
     fn resume_as<S: StableStorage, D: Dispatcher>(
         &self,
         iteration: u32,
@@ -1406,7 +1415,10 @@ impl Rig {
         if page.len() < Self::PAGE_BYTES {
             return Err(RigError::ShortPage);
         }
-        if workload.effects() != self.effects || workload.run() != self.workload(iteration).run() {
+        if workload.effects() != self.effects
+            || workload.seed() != self.plan.seed()
+            || workload.iteration() != iteration
+        {
             return Err(RigError::Workload);
         }
         let Some(records) = workload.records() else {
