@@ -968,6 +968,10 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
     // lines the same way `in_html_comment` and `open_non_rendering_tag` already are.
     let mut pending_tag: Option<PendingTag> = None;
+    // A raw-text element's own close tag name matched but its terminating `>` had not
+    // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
+    // close tags before popping"), carried the same way `pending_tag` is.
+    let mut pending_raw_text_close = false;
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
@@ -1106,6 +1110,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     &mut in_html_comment,
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
+                    &mut pending_raw_text_close,
                 );
                 if !container_hidden {
                     append_visible_html(&mut out, &html, spans);
@@ -1227,7 +1232,16 @@ fn find_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)
 /// straight over the closer "trapped" inside it, leaving the non-rendering stack open
 /// for the rest of the document; this function is what the raw-text branch of
 /// [`next_non_rendering_marker`] uses instead.
-fn find_raw_text_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)> {
+///
+/// The tag name having matched is not the whole answer (Codex, pull request #138,
+/// round 45, "Finish multiline raw-text close tags before popping"): a browser keeps
+/// consuming the end tag's own markup through to its own `>`, wherever that falls, the
+/// same way it does an ordinary tag's — `</script\n data-note="decision-id
+/// headline">` really is one close tag split by `pulldown-cmark` into two `Event::Html`
+/// lines, not a closed script followed by an ordinary paragraph. [`RawTextClose::Pending`]
+/// is what says the name matched but the terminating `>` did not yet appear, so a
+/// caller carries the wait into the next line instead of popping early.
+fn find_raw_text_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, RawTextClose)> {
     let lower = line.to_ascii_lowercase();
     let needle = format!("</{tag}");
     let bytes = line.as_bytes();
@@ -1239,14 +1253,26 @@ fn find_raw_text_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usiz
             .get(after_name)
             .is_none_or(|&byte| byte.is_ascii_whitespace() || byte == b'/' || byte == b'>');
         if terminates {
-            let end = line
+            let close = line
                 .get(after_name..)
                 .and_then(|rest| rest.find('>'))
-                .map_or(line.len(), |offset| after_name + offset + 1);
-            return Some((start, end));
+                .map_or(RawTextClose::Pending, |offset| {
+                    RawTextClose::Whole(after_name + offset + 1)
+                });
+            return Some((start, close));
         }
         cursor = start + 1;
     }
+}
+
+/// Whether [`find_raw_text_closing_tag`] found the closing tag's own terminating `>`
+/// on the same line as its name, or only the name.
+enum RawTextClose {
+    /// The tag closes at this byte offset, `>` included.
+    Whole(usize),
+    /// The tag's name matched, but its own `>` was not found before the line ran out;
+    /// not resolved yet.
+    Pending,
 }
 
 /// The earliest opening tag, at or after `from` in `line`, among the three non-rendering
@@ -1384,6 +1410,21 @@ fn closes_non_rendering_element(line: &str, tag: &str) -> bool {
     find_closing_tag(line, 0, tag).is_some_and(|(start, _)| start == 0)
 }
 
+/// Whether `line` *itself is* a well-formed opening tag for `tag`, case-insensitively —
+/// [`closes_non_rendering_element`]'s opening twin, for a name that is not one of the
+/// three fixed non-rendering ones (Codex, pull request #138, round 45, "Preserve
+/// inline nesting for hidden elements"): the
+/// block-level nesting search already reopens an arbitrary `hidden`-suppressed element
+/// by its own name (`find_opening_tag(line, cursor, top)`, round 43, finding 1), but
+/// `track_non_rendering_html`'s inline twin only ever checked
+/// [`opens_non_rendering_element`]'s fixed three, so an ordinary same-named child of a
+/// `hidden`-suppressed element reaching *inline* Markdown —
+/// `<span hidden><span>x</span>decision-id headline</span>` — was never pushed, and its
+/// own close popped the outer element early, exposing text still really inside it.
+fn opens_tag_named(line: &str, tag: &str) -> bool {
+    find_opening_tag(line, 0, tag).is_some_and(|(start, _)| start == 0)
+}
+
 /// The tag name (`"script"`, `"style"` or `"template"`) of an opening non-rendering tag,
 /// if `line` *itself is* one, case-insensitively.
 ///
@@ -1445,6 +1486,12 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<String>) -> bool {
         Some(top) if non_rendering_element_nests(&top) => {
             if let Some(tag) = opens_non_rendering_element(html) {
                 stack.push(tag.to_owned());
+            } else if opens_tag_named(html, &top) {
+                // Codex, pull request #138, round 45 ("Preserve inline
+                // nesting for hidden elements"): a same-named ordinary child of
+                // the `hidden`-suppressed `top` reopens it, the same way the
+                // block-level scan's `top_reopen` already does.
+                stack.push(top);
             } else if closes_non_rendering_element(html, &top) {
                 stack.pop();
             }
@@ -1726,6 +1773,10 @@ enum NonRenderingAdvance {
     Open(usize, String),
     /// The innermost open element closed.
     Close(usize),
+    /// The innermost open element's raw-text close tag name matched, but its own `>`
+    /// was not found before the line ran out (Codex, pull request #138, round 45,
+    /// "Finish multiline raw-text close tags before popping") — not resolved yet.
+    PendingClose,
 }
 
 /// The next thing relevant to the innermost currently-open non-rendering element `top`,
@@ -1763,8 +1814,10 @@ enum NonRenderingAdvance {
 /// the three; this closes the same gap for an arbitrary `hidden`-suppressed name.
 fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<NonRenderingAdvance> {
     if !non_rendering_element_nests(top) {
-        return find_raw_text_closing_tag(line, cursor, top)
-            .map(|(_, end)| NonRenderingAdvance::Close(end));
+        return find_raw_text_closing_tag(line, cursor, top).map(|(_, close)| match close {
+            RawTextClose::Whole(end) => NonRenderingAdvance::Close(end),
+            RawTextClose::Pending => NonRenderingAdvance::PendingClose,
+        });
     }
     let close = find_closing_tag(line, cursor, top)
         .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
@@ -1791,32 +1844,86 @@ fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<Non
 /// nothing more is found before the end of `line`, meaning the rest of the line stays
 /// hidden and `stack` (and `in_html_comment`, if a comment was left open) carry into the
 /// next line unchanged.
+///
+/// `pending_tag` and `pending_raw_text_close` carry the same two kinds of unresolved
+/// tag `visible_html_ranges` already tracks at the top level, extended to this nested
+/// context (Codex, pull request #138, round 45). A raw-text element's own close tag
+/// name matching with no `>` yet on this line (`NonRenderingAdvance::PendingClose`,
+/// "Finish multiline raw-text close tags before popping") sets `pending_raw_text_close`
+/// rather than popping early. And when nothing at all is found — not even a complete
+/// open or close — the remainder is not necessarily plain hidden text the way it would
+/// be at the top level: an incomplete same-name reopen or an incomplete close of a
+/// *nesting* element (`<template>`, or an arbitrary `hidden`-suppressed one) whose own
+/// `>` lands on a later line ("Carry nested multiline tags through hidden blocks") is
+/// otherwise invisible to [`next_non_rendering_marker`], which only recognizes a
+/// complete tag — so an unclosed tag start found via [`next_tag_start`] is captured the
+/// same way the top-level fallback already does, and resolved by the same pending-tag
+/// logic in [`visible_html_ranges`], which now also recognizes a resolved name matching
+/// the current stack top as a reopen or a real close of it.
 fn advance_past_non_rendering(
     line: &str,
     cursor: usize,
     stack: &mut Vec<String>,
     in_html_comment: &mut bool,
+    pending_tag: &mut Option<PendingTag>,
+    pending_raw_text_close: &mut bool,
 ) -> Option<usize> {
     // Cloned rather than borrowed (Codex, pull request #138, round 42, finding 3):
     // the stack widened from `Vec<&'static str>` to `Vec<String>` so it can hold an
     // arbitrary `hidden`-suppressed name, and a borrow of its last element would
     // still be live across the `stack.push`/`stack.pop` calls below.
     let top = stack.last()?.clone();
-    match next_non_rendering_marker(line, cursor, &top)? {
-        NonRenderingAdvance::Comment(start) => {
-            let Some(offset) = line[start..].find("-->") else {
-                *in_html_comment = true;
+    let mut cursor = cursor;
+    loop {
+        match next_non_rendering_marker(line, cursor, &top) {
+            Some(NonRenderingAdvance::Comment(start)) => {
+                let Some(offset) = line[start..].find("-->") else {
+                    *in_html_comment = true;
+                    return None;
+                };
+                return Some(start + offset + "-->".len());
+            }
+            Some(NonRenderingAdvance::Open(end, tag)) => {
+                stack.push(tag);
+                return Some(end);
+            }
+            Some(NonRenderingAdvance::Close(end)) => {
+                stack.pop();
+                return Some(end);
+            }
+            Some(NonRenderingAdvance::PendingClose) => {
+                *pending_raw_text_close = true;
                 return None;
-            };
-            Some(start + offset + "-->".len())
-        }
-        NonRenderingAdvance::Open(end, tag) => {
-            stack.push(tag);
-            Some(end)
-        }
-        NonRenderingAdvance::Close(end) => {
-            stack.pop();
-            Some(end)
+            }
+            None => {
+                if !non_rendering_element_nests(&top) {
+                    return None;
+                }
+                let start = next_tag_start(line, cursor)?;
+                let mut quote: Option<u8> = None;
+                if let Some(end) = scan_tag_close(line, start + 1, &mut quote) {
+                    // A complete tag, but not one `next_non_rendering_marker` found
+                    // relevant — not `top`'s own name, not one of the fixed three, no
+                    // comment opener, no close (Codex, pull request #138, round 45,
+                    // "Carry nested multiline tags through hidden blocks"). An
+                    // ordinary, irrelevant child like `<span title="<!--">` is skipped
+                    // over, the same way the top-level scan already skips one via
+                    // `HidingMarker::Markup`, and the search resumes past it rather
+                    // than mistaking its own, already-complete markup for an
+                    // unresolved tag.
+                    cursor = end;
+                    continue;
+                }
+                let closing = line[start..].starts_with("</");
+                let name = markup_tag_name(&line[start..]).to_ascii_lowercase();
+                *pending_tag = Some(PendingTag {
+                    name,
+                    closing,
+                    quote,
+                    text: line[start..].to_owned(),
+                });
+                return None;
+            }
         }
     }
 }
@@ -1898,51 +2005,99 @@ struct PendingTag {
 /// finding 1), which forces one for a different reason than a block tag does: it is a
 /// genuine, void line-break element wherever it appears, block context or not, exactly
 /// the way `Event::InlineHtml`'s own `<br>` handling (round 37) already treats it.
+///
+/// Extracted from `visible_html_ranges` itself only to stay under clippy's line limit
+/// (Codex, pull request #138, round 45, the same reason `append_visible_html` and
+/// `track_non_rendering_html` were pulled out at rounds 30 and 33). Resolving a
+/// `PendingTag` against `line` either finds its own close and returns the cursor just
+/// past it, updating `open_non_rendering` on the way, or re-arms it (carrying `line`'s
+/// text onto what it already held) and hands it back unresolved.
+///
+/// A resolved tag that reopens or closes the element already on top of
+/// `open_non_rendering` (Codex, round 45, "Carry nested multiline tags through hidden
+/// blocks") pushes or pops even with no `hidden` attribute of its own — a reopen of a
+/// *nesting* element (`<template>`, or an arbitrary `hidden`-suppressed one) by its own
+/// name is still a reopen, and a matching close is still a close, neither of which the
+/// two checks below (written for the top-level, empty-stack case) know how to do.
+fn resolve_pending_tag(
+    line: &str,
+    open_non_rendering: &mut Vec<String>,
+    pending: PendingTag,
+) -> Result<usize, PendingTag> {
+    let PendingTag {
+        name,
+        closing,
+        mut quote,
+        text,
+    } = pending;
+    let Some(end) = scan_tag_close(line, 0, &mut quote) else {
+        let mut text = text;
+        text.push_str(line);
+        return Err(PendingTag {
+            name,
+            closing,
+            quote,
+            text,
+        });
+    };
+    let matches_open_top = open_non_rendering
+        .last()
+        .is_some_and(|top| *top == name && non_rendering_element_nests(top));
+    if closing {
+        if matches_open_top {
+            open_non_rendering.pop();
+        }
+    } else if matches!(name.as_str(), "script" | "style" | "template") || matches_open_top {
+        open_non_rendering.push(name);
+    } else if !is_void_element(&name) {
+        // The full tag text, not just this line's own portion (Codex, round 43,
+        // finding 3): `hidden` may sit on any line the tag spans, not only the last
+        // one.
+        let full_text = text + &line[..end];
+        if has_hidden_attribute(&full_text) {
+            open_non_rendering.push(name);
+        }
+    }
+    Ok(end)
+}
+
 fn visible_html_ranges(
     line: &str,
     in_html_comment: &mut bool,
     open_non_rendering: &mut Vec<String>,
     pending_tag: &mut Option<PendingTag>,
+    pending_raw_text_close: &mut bool,
 ) -> Vec<VisibleHtmlSpan> {
     let mut spans = Vec::new();
-    let mut cursor = 0usize;
-    // Resolved before anything else: a tag whose own close is still missing is, by
-    // construction, not inside a comment or a non-rendering element yet — those are
-    // states a *closed* tag can open — and everything up to its resolution (this
-    // line's own bytes) is markup the same way any other tag's is, never visible text
-    // (Codex, round 41, finding 1).
-    if let Some(pending) = pending_tag.take() {
-        let PendingTag {
-            name,
-            closing,
-            mut quote,
-            text,
-        } = pending;
-        if let Some(end) = scan_tag_close(line, 0, &mut quote) {
-            if !closing {
-                if matches!(name.as_str(), "script" | "style" | "template") {
-                    open_non_rendering.push(name);
-                } else if !is_void_element(&name) {
-                    // The full tag text, not just this line's own portion (Codex,
-                    // round 43, finding 3): `hidden` may sit on any line the tag
-                    // spans, not only the last one.
-                    let full_text = text + &line[..end];
-                    if has_hidden_attribute(&full_text) {
-                        open_non_rendering.push(name);
-                    }
-                }
-            }
-            cursor = end;
-        } else {
-            let mut text = text;
-            text.push_str(line);
-            *pending_tag = Some(PendingTag {
-                name,
-                closing,
-                quote,
-                text,
-            });
+    // Resolved before anything else, ahead of even `pending_tag` (Codex, pull request
+    // #138, round 45, "Finish multiline raw-text close tags before popping"): the two
+    // never hold at once, since a raw-text element's own end tag is not scanned like an
+    // ordinary one at all — but this is the more specific of the two mid-token states,
+    // and the more clearly resolved one first is the same ordering `in_html_comment`
+    // already gets below. A bare, unquoted search for `>`, matching the same-line
+    // search this mirrors: once a raw-text close tag's name has matched, a browser is
+    // still consuming its own markup, not evaluating quotes inside it.
+    let mut cursor = if *pending_raw_text_close {
+        let Some(offset) = line.find('>') else {
             return spans;
+        };
+        open_non_rendering.pop();
+        *pending_raw_text_close = false;
+        offset + 1
+    } else {
+        0
+    };
+    // A tag whose own close is still missing is, by construction, not inside a comment
+    // or a non-rendering element yet — those are states a *closed* tag can open — and
+    // everything up to its resolution (this line's own bytes) is markup the same way
+    // any other tag's is, never visible text (Codex, round 41, finding 1).
+    if let Some(pending) = pending_tag.take() {
+        match resolve_pending_tag(line, open_non_rendering, pending) {
+            Ok(end) => cursor = end,
+            Err(unresolved) => {
+                *pending_tag = Some(unresolved);
+                return spans;
+            }
         }
     }
     loop {
@@ -1962,7 +2117,14 @@ fn visible_html_ranges(
             }
         }
         if !open_non_rendering.is_empty() {
-            match advance_past_non_rendering(line, cursor, open_non_rendering, in_html_comment) {
+            match advance_past_non_rendering(
+                line,
+                cursor,
+                open_non_rendering,
+                in_html_comment,
+                pending_tag,
+                pending_raw_text_close,
+            ) {
                 Some(end) => {
                     cursor = end;
                     continue;
@@ -2047,10 +2209,20 @@ enum VisibleHtmlSpan {
 /// Appends `spans` (from `visible_html_ranges` over `html`) to `out`, extracted from
 /// `markdown_prose` itself only to stay under clippy's line limit (Codex, pull request
 /// #138, round 30, the same reason `track_non_rendering_html` was pulled out).
+///
+/// Each text span is decoded, not kept as raw source bytes (Codex, pull request #138,
+/// round 45, "Decode entities in visible raw-HTML text"): a browser resolves
+/// `<div>All &#54; recovery invariants</div>`
+/// to `All 6 recovery invariants` before a reader ever sees it, the same as it resolves
+/// an anchor's `href` before following it — [`decode_character_references`] is what
+/// [`anchor_href`]'s own caller already uses for that reason, reused here for visible
+/// block and inline HTML text.
 fn append_visible_html(out: &mut String, html: &str, spans: Vec<VisibleHtmlSpan>) {
     for span in spans {
         match span {
-            VisibleHtmlSpan::Text(range) => out.push_str(&html[range]),
+            VisibleHtmlSpan::Text(range) => {
+                out.push_str(&decode_character_references(&html[range]));
+            }
             VisibleHtmlSpan::Break => {
                 if !out.is_empty() && !out.ends_with('\n') {
                     out.push('\n');
@@ -2271,6 +2443,17 @@ fn decode_one_character_reference(entity: &str) -> Option<char> {
 /// Real HTML is not one of the three: `<a href="target">label</a>` is a link a
 /// reader (and a renderer) sees, not an example, so only HTML that is actually a
 /// comment is hidden.
+///
+/// A non-rendering (`<script>`, `<style>`, `<template>`) or `hidden`-suppressed
+/// element's body is a fourth thing hidden (Codex, pull request #138, round 45,
+/// "Suppress non-rendering blocks in `visible_source`"): a Markdown link written
+/// inside `<script>[one](0001-one.md)</script>`, or a wire-format path named inside a
+/// `hidden` container, is never rendered, but this function's callers read raw syntax
+/// rather than rendered output and could not otherwise tell the difference. Tracked
+/// per `Event::Html` line by `hide_non_rendering_in_html_line`, below, which keeps an
+/// ordinary tag's own markup untouched — `<a href="target">` included — for the same
+/// reason only a genuine comment is hidden above: the raw `href=` syntax is exactly
+/// what a caller like `linked_markdown_files` or the wire-format path check reads for.
 #[must_use]
 pub fn visible_source(contents: &str) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -2280,6 +2463,17 @@ pub fn visible_source(contents: &str) -> String {
     let mut quote_start: Option<usize> = None;
     let mut quote_depth: u32 = 0;
     let mut html_block_start: Option<usize> = None;
+    // The non-rendering/`hidden` elements open, and where the outermost began — one
+    // span per outermost element, deferred until its matching close resolves. See this
+    // function's own doc comment for why.
+    let mut open_non_rendering: Vec<String> = Vec::new();
+    let mut non_rendering_start: Option<usize> = None;
+    let mut pending_tag: Option<PendingTag> = None;
+    let mut pending_raw_text_close = false;
+    // A comment nested inside an open `<template>`, kept apart from the block-comment
+    // search below: that is a document-wide search over already-*closed* blocks, not a
+    // state a currently open nesting element carries across lines.
+    let mut in_template_comment = false;
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -2362,8 +2556,41 @@ pub fn visible_source(contents: &str) -> String {
             Event::InlineHtml(html) if html.starts_with("<!--") => {
                 hidden.push((range.start, range.end));
             }
+            // One raw HTML line — real block-level HTML passthrough, `pulldown-cmark`
+            // firing one `Event::Html` per source line, the same as every other
+            // function in this module reads it.
+            Event::Html(html) => {
+                hide_non_rendering_in_html_line(
+                    &html,
+                    range.start,
+                    &mut open_non_rendering,
+                    &mut non_rendering_start,
+                    &mut pending_tag,
+                    &mut pending_raw_text_close,
+                    &mut in_template_comment,
+                    &mut hidden,
+                );
+            }
+            // A non-rendering or `hidden`-suppressed element can open or close
+            // inline, mid-paragraph, too — sharing the same stack a block-level
+            // `<script>` or `<template>` already pushed onto, or pushing one of its
+            // own for a later block-level close to find.
+            Event::InlineHtml(html) => hide_non_rendering_in_inline_html(
+                &html,
+                range,
+                &mut open_non_rendering,
+                &mut non_rendering_start,
+                &mut hidden,
+            ),
             _ => {}
         }
+    }
+    // A non-rendering or `hidden` element that never closes hides everything after it,
+    // matching this function's own unterminated-comment handling above: a browser
+    // never leaves script-data (or template, or `hidden`) parsing once it enters it
+    // with nothing left in the document to end it.
+    if let Some(start) = non_rendering_start {
+        hidden.push((start, contents.len()));
     }
     hidden.sort_unstable();
 
@@ -2390,6 +2617,133 @@ pub fn visible_source(contents: &str) -> String {
     }
     out.push_str(&contents[cursor..]);
     out
+}
+
+/// [`visible_source`]'s twin of [`track_non_rendering_html`] — the inline construct
+/// can open or close a non-rendering/`hidden` element mid-paragraph the same way a
+/// block-level tag does, and this is where that transition becomes a hidden span:
+/// `range` is hidden in full when the construct closes the outermost element (or is
+/// itself the whole thing, opening and closing in one self-contained construct), and
+/// `non_rendering_start` is armed rather than pushed yet when it only opens one.
+/// Extracted from [`visible_source`] for the same clippy-line-limit reason
+/// [`hide_non_rendering_in_html_line`] was.
+fn hide_non_rendering_in_inline_html(
+    html: &str,
+    range: std::ops::Range<usize>,
+    open_non_rendering: &mut Vec<String>,
+    non_rendering_start: &mut Option<usize>,
+    hidden: &mut Vec<(usize, usize)>,
+) {
+    let was_open = !open_non_rendering.is_empty();
+    track_non_rendering_html(html, open_non_rendering);
+    let now_open = !open_non_rendering.is_empty();
+    if !was_open && now_open {
+        non_rendering_start.get_or_insert(range.start);
+    } else if was_open
+        && !now_open
+        && let Some(start) = non_rendering_start.take()
+    {
+        hidden.push((start, range.end));
+    }
+}
+
+/// Hides a non-rendering or `hidden`-suppressed element's body from `line`, extracted
+/// from [`visible_source`] itself only to stay under clippy's line limit (Codex, pull
+/// request #138, round 45, the same reason `append_visible_html`,
+/// `track_non_rendering_html` and `resolve_pending_tag` were pulled out). Reuses the
+/// block-level tracking every other function in this module shares
+/// (`next_hiding_marker`, `advance_past_non_rendering`, `resolve_pending_tag`) but only
+/// for the *span* — an ordinary tag's own markup is left untouched, `href="..."`
+/// included, unlike [`visible_html_ranges`], because a real raw anchor's destination is
+/// exactly the syntax [`visible_source`]'s callers read for.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one flag per piece of state visible_source already carries across lines \
+              for its own top-level comment search; bundling them loses the ability to \
+              read each mutation at its own call site"
+)]
+fn hide_non_rendering_in_html_line(
+    html: &str,
+    line_start: usize,
+    open_non_rendering: &mut Vec<String>,
+    non_rendering_start: &mut Option<usize>,
+    pending_tag: &mut Option<PendingTag>,
+    pending_raw_text_close: &mut bool,
+    in_template_comment: &mut bool,
+    hidden: &mut Vec<(usize, usize)>,
+) {
+    let mut cursor = if *pending_raw_text_close {
+        let Some(offset) = html.find('>') else {
+            return;
+        };
+        open_non_rendering.pop();
+        *pending_raw_text_close = false;
+        offset + 1
+    } else {
+        0
+    };
+    if let Some(pending) = pending_tag.take() {
+        match resolve_pending_tag(html, open_non_rendering, pending) {
+            Ok(end) => cursor = end,
+            Err(unresolved) => {
+                *pending_tag = Some(unresolved);
+                return;
+            }
+        }
+    }
+    if open_non_rendering.is_empty()
+        && let Some(start) = non_rendering_start.take()
+    {
+        hidden.push((start, line_start + cursor));
+    }
+    loop {
+        if !open_non_rendering.is_empty() {
+            match advance_past_non_rendering(
+                html,
+                cursor,
+                open_non_rendering,
+                in_template_comment,
+                pending_tag,
+                pending_raw_text_close,
+            ) {
+                Some(end) => {
+                    if open_non_rendering.is_empty()
+                        && let Some(start) = non_rendering_start.take()
+                    {
+                        hidden.push((start, line_start + end));
+                    }
+                    cursor = end;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        match next_hiding_marker(html, cursor) {
+            None => break,
+            // Skipped rather than hidden here: this function's caller has its own
+            // block-comment search, covering every comment in the block from its own
+            // opener to its real close (or to end of document), so this only has to
+            // step past it correctly rather than re-decide it.
+            Some(HidingMarker::Comment(start)) => match html[start..].find("-->") {
+                Some(offset) => cursor = start + offset + "-->".len(),
+                None => break,
+            },
+            Some(HidingMarker::Tag(start, end, tag)) => {
+                non_rendering_start.get_or_insert(line_start + start);
+                open_non_rendering.push(tag.to_owned());
+                cursor = end;
+            }
+            Some(HidingMarker::Hidden(start, end, name)) => {
+                non_rendering_start.get_or_insert(line_start + start);
+                open_non_rendering.push(name);
+                cursor = end;
+            }
+            // An ordinary tag's own markup — kept verbatim by this function's
+            // caller, `href="..."` included — so there is nothing to hide here, only
+            // to step past.
+            Some(HidingMarker::Markup(_, end)) => cursor = end,
+        }
+    }
 }
 
 /// The text after `prefix` in the first non-hidden list item marked with a literal `-`.
@@ -2453,6 +2807,10 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
     // lines the same way `in_html_comment` and `open_non_rendering_tag` already are.
     let mut pending_tag: Option<PendingTag> = None;
+    // A raw-text element's own close tag name matched but its terminating `>` had not
+    // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
+    // close tags before popping"), carried the same way `pending_tag` is.
+    let mut pending_raw_text_close = false;
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         let hidden = in_fence
@@ -2469,6 +2827,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                     &mut in_html_comment,
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
+                    &mut pending_raw_text_close,
                 );
             }
             // A fenced block or blockquote opening while an item is being collected
@@ -2649,6 +3008,10 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
     // lines the same way `in_html_comment` and `open_non_rendering_tag` already are.
     let mut pending_tag: Option<PendingTag> = None;
+    // A raw-text element's own close tag name matched but its terminating `>` had not
+    // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
+    // close tags before popping"), carried the same way `pending_tag` is.
+    let mut pending_raw_text_close = false;
     let mut collecting = false;
     let mut current = String::new();
     let mut lines = Vec::new();
@@ -2665,6 +3028,7 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
                     &mut in_html_comment,
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
+                    &mut pending_raw_text_close,
                 );
             }
             Event::InlineHtml(html) => {
@@ -2750,6 +3114,10 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
     // lines the same way `in_html_comment` and `open_non_rendering_tag` already are.
     let mut pending_tag: Option<PendingTag> = None;
+    // A raw-text element's own close tag name matched but its terminating `>` had not
+    // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
+    // close tags before popping"), carried the same way `pending_tag` is.
+    let mut pending_raw_text_close = false;
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
         let hidden = in_fence
@@ -2763,6 +3131,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                     &mut in_html_comment,
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
+                    &mut pending_raw_text_close,
                 );
             }
             Event::Start(Tag::CodeBlock(kind)) => {

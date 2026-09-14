@@ -6673,6 +6673,37 @@ mod tests {
     }
 
     #[test]
+    fn a_link_inside_a_script_tag_does_not_vouch_for_it_but_a_real_one_after_it_still_does() {
+        // Codex, pull request #138, round 45, "Suppress non-rendering blocks in
+        // visible_source": `<script>` content is never rendered, but `visible_source`
+        // only hid an HTML *comment* — a Markdown link written inside one, like
+        // `<script>[0002-two.md](0002-two.md)</script>`, satisfied
+        // `linked_markdown_files` even though a reader never sees it as a link.
+        let index = "<script>\n[0002-two.md](0002-two.md)\n</script>\n\n\
+                      - [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "the real link after the script tag was not seen: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link written only inside a script tag counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_quoted_comment_spelling_inside_a_real_tag_does_not_hide_the_real_links_after_it() {
         // Codex, pull request #138, round 40, finding 2: the per-block comment
         // search inside an `HtmlBlock` did a raw substring search for `<!--`, blind
@@ -7315,6 +7346,105 @@ mod tests {
             !violations.iter().any(|v| v.subject == first.id),
             "a decision after a quoted comment spelling inside a template child was \
              still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_a_raw_text_close_tags_own_split_markup_stays_hidden() {
+        // Codex, pull request #138, round 45, "Finish multiline raw-text close tags
+        // before popping": `find_raw_text_closing_tag` treated the tag's name having
+        // matched as the whole answer, so `</script` with no `>` before the line ran
+        // out was read as a complete close right there — even though a browser keeps
+        // consuming the end tag's own markup through to its own `>`, wherever that
+        // falls. `<script>\nhidden filler\n</script\n data-note="decision-id
+        // headline">\n` is one legal close tag split across two lines by
+        // `pulldown-cmark`; popping early exposed the second line's
+        // `data-note="..."` text — no `<` in it at all once the tag is
+        // (wrongly) considered closed — as ordinary visible prose. The decision
+        // written inside that still-open close tag's own attribute text must stay
+        // hidden until the real `>` is found.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script>\nhidden filler\n</script\n data-note=\"{} {}\">\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision inside a raw-text close tag's own markup, split across two \
+             lines, was wrongly exposed once the close was read as complete a line \
+             early: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_named_child_opened_across_lines_inside_a_hidden_element_stays_hidden() {
+        // Codex, pull request #138, round 45, "Carry nested multiline tags through
+        // hidden blocks": the nesting search for a reopen of the currently open
+        // element only recognized a *complete* one on the same line, so
+        // `<div hidden>\n<div\n class="x">\n</div>decision-id headline</div>` — an
+        // ordinary child `<div>` reopening the `hidden`-suppressed outer one, whose
+        // own `>` lands on a later line — was invisible to it. The inner element's
+        // close then popped what the scan believed was the *outer* one, exposing the
+        // decision that is really still inside it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden>\n<div\n class=\"x\">\n</div>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision still inside a hidden element, past an inner same-named \
+             child opened across lines, was wrongly exposed once the child's own \
+             close was read as the outer element's: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_named_child_reaching_inline_markdown_inside_a_hidden_element_stays_hidden() {
+        // Codex, pull request #138, round 45, "Preserve inline nesting for hidden
+        // elements": `track_non_rendering_html`'s nesting branch only recognized a
+        // reopen among the three fixed non-rendering names, so an ordinary
+        // same-named child of a `hidden`-suppressed element reaching *inline*
+        // Markdown — `<span hidden><span>x</span>decision-id headline</span>` — was
+        // never pushed, and its own close popped the outer element early, exposing
+        // the decision that is really still inside it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\nNote: <span hidden><span>x</span>{} {}</span> done.\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision still inside an inline hidden element, past an inner \
+             same-named child, was wrongly exposed once the child's own close was \
+             read as the outer element's: {violations:?}"
         );
     }
 
@@ -8340,6 +8470,33 @@ mod tests {
             !violations
                 .iter()
                 .any(|violation| violation.subject == clause.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_character_reference_in_visible_html_text_still_counts() {
+        // Codex, pull request #138, round 45, "Decode entities in visible raw-HTML
+        // text": a browser resolves `<div>All &#54; recovery invariants</div>` to
+        // `All 6 recovery invariants` before a reader ever sees it, but
+        // `append_visible_html` kept the unresolved source bytes, so the same count
+        // written inside real (non-comment) block HTML was reported as missing even
+        // though a reader sees the right number.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let digit = SPEC_CLAUSES.len().to_string();
+        assert_eq!(digit.len(), 1, "the encoding below assumes a single digit");
+        let code_point = u32::from(digit.as_bytes()[0]);
+        let encoded = format!(
+            "<div>{}</div>",
+            count.replacen(&digit, &format!("&#{code_point};"), 1)
+        );
+        let linked = claude_md.replacen(&count, &encoded, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
             "{violations:?}"
         );
     }
