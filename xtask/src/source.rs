@@ -1661,11 +1661,36 @@ fn check_clock_kind_constants(code: &str) -> Vec<Violation> {
         )];
     }
     let body = blocks.join("\n");
-    let declared: BTreeMap<String, String> = declared_associated_constant_values(&body)
-        .into_iter()
-        .collect();
 
+    // Grouped by name first, because a name declared twice — even under mutually exclusive
+    // `#[cfg]` attributes this scan does not evaluate — is ambiguous rather than resolved by
+    // whichever value a `BTreeMap::collect` happens to keep. Codex found that a target-gated
+    // `Self(0)` beside the pinned `Self(1)` sorted to the pinned value winning, with the
+    // build-time renumbering unreported.
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in declared_associated_constant_values(&body) {
+        grouped.entry(name).or_default().push(value);
+    }
     let mut violations = Vec::new();
+    let mut declared: BTreeMap<String, String> = BTreeMap::new();
+    for (name, mut values) in grouped {
+        values.dedup();
+        if let [value] = values.as_slice() {
+            declared.insert(name, value.clone());
+        } else {
+            violations.push(Violation::new(
+                RULE,
+                KERNEL,
+                format!(
+                    "`{CLOCK_KIND}` declares `{name}` {} times ({values:?}), not once; a name \
+                     declared twice is ambiguous, whatever gates each declaration, and cannot \
+                     be the one byte a `TimerScheduled` record carries",
+                    values.len()
+                ),
+            ));
+        }
+    }
+
     for (name, value) in CLOCK_KIND_CONSTANTS {
         match declared.get(*name) {
             None => violations.push(Violation::new(
@@ -3258,21 +3283,26 @@ fn declared_function_names(body: &str) -> Vec<String> {
 /// a second line reports an empty value rather than none: the name is still caught, because
 /// [`declared_associated_constants`] needs only that, and a caller that pins a value —
 /// [`check_clock_kind_constants`] — meets a mismatch rather than a silent pass.
+///
+/// A leading attribute is stripped before the line is read, [`next_impl_line`]'s reason:
+/// `#[rustfmt::skip] pub const BEST_EFFORT: Self = ..;` survives `cargo fmt` on one line, and
+/// a scan for a line starting `pub ` or `const ` does not see it. Codex found the same
+/// blindness here on this file's own PR.
 fn declared_associated_constant_values(body: &str) -> Vec<(String, String)> {
     let mut depth = 0_i32;
     let mut values = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim();
+        let bare = crate::size::without_leading_attributes(trimmed);
         if depth == 0
-            && let Some(rest) = trimmed
+            && let Some(rest) = bare
                 .strip_prefix("pub ")
                 .or_else(|| {
-                    trimmed
-                        .split_once(") ")
+                    bare.split_once(") ")
                         .filter(|(head, _)| head.starts_with("pub("))
                         .map(|(_, rest)| rest)
                 })
-                .or(Some(trimmed))
+                .or(Some(bare))
             && let Some(declaration) = rest.strip_prefix("const ")
             // `const fn` is a function, and `declared_function_names` owns those.
             && !declaration.starts_with("fn ")
@@ -11973,6 +12003,43 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("implements a trait")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_clock_kind_constant_declaration_is_reported() {
+        // Codex, on this change's own PR: two declarations of one name, even gated by
+        // mutually exclusive `#[cfg]` attributes this scan does not evaluate, must not
+        // silently resolve to whichever one a map collect happens to keep.
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n",
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);\n    \
+             pub const AT_PERSISTENT_TIME: Self = Self(0);\n",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("AT_PERSISTENT_TIME") && detail.contains("2 times")
+            }),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_attribute_on_the_same_line_does_not_hide_a_renumbered_clock_kind_constant() {
+        // Codex, on this change's own PR: `#[rustfmt::skip] pub const X: Self = ..;` on one
+        // line does not start with `pub ` or `const `, so the old scan saw nothing here at
+        // all — not even a mismatch.
+        let module = tests_support::clean_timer_module().replace(
+            "    pub const AT_PERSISTENT_TIME: Self = Self(2);",
+            "    #[rustfmt::skip] pub const AT_PERSISTENT_TIME: Self = Self(9);",
+        );
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("AT_PERSISTENT_TIME") && detail.contains("Self(9)")),
             "{details:?}"
         );
     }
