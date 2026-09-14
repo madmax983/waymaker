@@ -6,9 +6,9 @@ stage runs the tests on the in-memory model of NOR and on the power-cut rig.
 Both halves run on a host. The rig drives `waymaker-fault` rather than a part, and no board
 has run either half. See [the hardware compatibility matrix](hardware-matrix.md).
 
-The **rig** column says whether the rig reaches that row. The rig still owes four rows,
-because it has no bank-swap workload, no capacity refusal and no divergent replay. Issue
-[#96](https://github.com/madmax983/waymaker/issues/96) is where they arrive.
+The **rig** column says whether the rig reaches that row. It reaches all ten. Issue
+[#96](https://github.com/madmax983/waymaker/issues/96) closed the last four: a bank-swap
+workload for rows 7 and 8, a capacity refusal for row 9, and a divergent replay for row 10.
 
 | Id | Failure point | What happens | On the rig |
 | --- | --- | --- | --- |
@@ -18,10 +18,10 @@ because it has no bank-swap workload, no capacity refusal and no divergent repla
 | `after-activity-before-completion-barrier` | After physical activity, before completion barrier | The same id is redelivered. | Swept |
 | `during-completion-write` | During completion write | The torn completion is ignored and no partial result bytes are exposed. The bank has no append point, so the driver refuses it. | Swept |
 | `after-completion-barrier` | After completion barrier | The completion is replayed. The activity never runs again. | Swept |
-| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | The old bank stays authoritative and the old run continues. | Owed |
-| `after-new-bank-seal-barrier` | After new bank seal barrier | The new bank is authoritative and the old run is never current. | Owed |
-| `history-capacity-reached` | History capacity reached | A capacity error with no mutation, or an explicit continue_as_new. | Owed |
-| `replay-divergence` | Replay divergence | A deterministic fault. No further execution, and history untouched. | Owed |
+| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | The old bank stays authoritative and the old run continues. | Swept |
+| `after-new-bank-seal-barrier` | After new bank seal barrier | The new bank is authoritative and the old run is never current. | Swept |
+| `history-capacity-reached` | History capacity reached | A capacity error with no mutation, or an explicit continue_as_new. | Swept |
+| `replay-divergence` | Replay divergence | A deterministic fault. No further execution, and history untouched. | Swept |
 
 ## Row 5 does not hold as §14 writes it
 

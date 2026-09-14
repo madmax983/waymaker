@@ -724,7 +724,10 @@ fn authority_of(rig: &Rig, device: &mut Device, page: &mut [u8]) -> bank::Author
         unreachable!("the engine window")
     };
     let mut generations = [None, None];
-    for (slot, id) in generations.iter_mut().zip([bank::BankId::A, bank::BankId::B]) {
+    for (slot, id) in generations
+        .iter_mut()
+        .zip([bank::BankId::A, bank::BankId::B])
+    {
         let region = layout.bank(id);
         let Some(want) = usize::try_from(region.payload_bytes())
             .ok()
@@ -818,7 +821,9 @@ fn during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_th
  {
     let retiring: Vec<Injection> = rollover_sweep()
         .into_iter()
-        .filter_map(|(injection, row)| (row == Row::DuringInactiveBankEraseOrWrite).then_some(injection))
+        .filter_map(|(injection, row)| {
+            (row == Row::DuringInactiveBankEraseOrWrite).then_some(injection)
+        })
         .collect();
     assert!(
         !retiring.is_empty(),
@@ -935,7 +940,9 @@ const fn bounds(tail: u16) -> Bounds {
 /// Searched for rather than written down, so the number comes from the reserve's own
 /// arithmetic over real records instead of a figure copied out of a passing run.
 fn near_capacity() -> (Rig, Reserve, Device) {
-    for tail in [32_u16, 48, 64, 96, 128, 160, 192, 224, 256, 300, 350, 400, 450, 500] {
+    for tail in [
+        32_u16, 48, 64, 96, 128, 160, 192, 224, 256, 300, 350, 400, 450, 500,
+    ] {
         let rig = rig();
         let Ok(reserve) = Reserve::for_layout(bounds(tail), rig.layout()) else {
             continue;
@@ -1204,8 +1211,7 @@ fn row_nine() -> Row {
 }
 
 #[test]
-fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new()
- {
+fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new() {
     assert_eq!(row_nine(), Row::HistoryCapacityReached);
 }
 
@@ -1297,8 +1303,7 @@ fn row_ten() -> Row {
 }
 
 #[test]
-fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched()
- {
+fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched() {
     assert_eq!(row_ten(), Row::ReplayDivergence);
 }
 

@@ -2978,32 +2978,40 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         variant: "DuringInactiveBankEraseOrWrite",
         failure_point: "During inactive-bank erase/write",
         model_test: "during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues_on_the_rig",
+        ),
     },
     FailureRow {
         id: "after-new-bank-seal-barrier",
         variant: "AfterNewBankSealBarrier",
         failure_point: "After new bank seal barrier",
         model_test: "after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current_again_on_the_rig",
+        ),
     },
     FailureRow {
         id: "history-capacity-reached",
         variant: "HistoryCapacityReached",
         failure_point: "History capacity reached",
         model_test: "history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new",
+        ),
     },
     FailureRow {
         id: "replay-divergence",
         variant: "ReplayDivergence",
         failure_point: "Replay divergence",
         model_test: "replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched",
+        ),
     },
 ];
 
@@ -7141,8 +7149,8 @@ mod tests {
         tests.sort_unstable();
         tests.dedup();
         assert_eq!(tests.len(), 10, "two rows share a test");
-        assert!(FAILURE_ROWS.iter().any(|row| row.rig == RigStanding::Swept));
-        assert!(FAILURE_ROWS.iter().any(|row| row.rig == RigStanding::Owed));
+        // Issue #96 closed the rig's last four owed rows: every row is swept now.
+        assert!(FAILURE_ROWS.iter().all(|row| row.rig == RigStanding::Swept));
     }
 
     #[test]
@@ -7479,7 +7487,7 @@ mod tests {
         let mut wrong_standing = matrix_inputs();
         wrong_standing.claude_md = wrong_standing
             .claude_md
-            .map(|md| md.replace("| Owed |", "| Swept |"));
+            .map(|md| md.replacen("| Swept |", "| Owed |", 1));
         assert!(
             matrix_violations(&wrong_standing)
                 .iter()

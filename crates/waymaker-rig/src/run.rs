@@ -925,7 +925,8 @@ impl Rig {
             let Some(record) = workload.record(index, &mut record_page) else {
                 return Err(RigError::Workload);
             };
-            self.append(part, &mut journal, &record, page).map_err(widen)?;
+            self.append(part, &mut journal, &record, page)
+                .map_err(widen)?;
             self.mark(
                 part,
                 &mut witness,
@@ -1130,12 +1131,13 @@ impl Rig {
     ) -> Result<(), RigError<S::Error>> {
         {
             let mut engine = self.engine(part)?;
-            let staged = reserved
-                .stage(&mut engine, record, page)
-                .map_err(|error| match error {
-                    ReservedError::Capacity(refusal) => RigError::Capacity(refusal),
-                    ReservedError::Append(inner) => RigError::Append(unwindow_append(inner)),
-                })?;
+            let staged =
+                reserved
+                    .stage(&mut engine, record, page)
+                    .map_err(|error| match error {
+                        ReservedError::Capacity(refusal) => RigError::Capacity(refusal),
+                        ReservedError::Append(inner) => RigError::Append(unwindow_append(inner)),
+                    })?;
             let sealable = staged
                 .payload_barrier()
                 .map_err(|error| RigError::Append(unwindow_append(error)))?;

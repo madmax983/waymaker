@@ -402,12 +402,17 @@ stop naming the same set.
 The model half is `crates/waymaker-drive/tests/matrix.rs`: one test per row, named after it,
 and the rule reads the names out of the file. The rig half is
 `crates/waymaker-rig/tests/matrix.rs`: one test per swept row, named after it with
-`_on_the_rig`, which classifies every crash point the injector lists, resumes the run with
-`Rig::resume`, and holds it to the row. Both run in the `verification` job as the `matrix`
-stage. The rig half runs on the host through `waymaker-fault`; no board has run it, and
-[the boards](#what-the-boards-still-owe) stay `Not run`. The rig reaches six rows; the "On the
-rig" column says which, and `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap` requires
-the rig's census to refuse rather than to stop at six.
+`_on_the_rig` for the six effect rows and the two bank rows, resumes the run with
+`Rig::resume` (or, once a swap has moved authority, reads the bank it moved to directly),
+and holds it to the row. The two remaining rows are driven rather than swept — a capacity
+refusal and a declared-workflow mismatch are not media crashes the injector produces — and
+credit their row without the `_on_the_rig` suffix, matching the model half's own naming for
+its driven rows. Both run in the `verification` job as the `matrix` stage. The rig half runs
+on the host through `waymaker-fault`; no board has run it, and
+[the boards](#what-the-boards-still-owe) stay `Not run`. The rig reaches all ten rows; the
+"On the rig" column says how, and
+`every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned` pins every count so a
+sweep that quietly thinned fails closed.
 
 All 10 failure rows, with the id to cite when a change touches one:
 
@@ -419,10 +424,10 @@ All 10 failure rows, with the id to cite when a change touches one:
 | `after-activity-before-completion-barrier` | After physical activity, before completion barrier | `after_physical_activity_before_completion_barrier_the_same_id_is_redelivered` | Swept |
 | `during-completion-write` | During completion write | `during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed` | Swept |
 | `after-completion-barrier` | After completion barrier | `after_completion_barrier_the_completion_is_replayed_and_the_activity_never_runs_again` | Swept |
-| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Owed |
-| `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Owed |
-| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Owed |
-| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Owed |
+| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Swept |
+| `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Swept |
+| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Swept |
+| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Swept |
 
 Row 5 does not hold as §14 writes it. It says "redeliver": a torn completion leaves no append
 point ([ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)),
@@ -433,12 +438,24 @@ performed before the crash is performed again under another `(RunId, EffectSeq)`
 duplicate `stable-redelivery` forbids, and it is issue
 [#95](https://github.com/madmax983/waymaker/issues/95).
 
-The four `Owed` rows are the rig's, not the model's: a swap workload, a capacity refusal and a
-divergent replay are things this rig does not do — issue
-[#96](https://github.com/madmax983/waymaker/issues/96). To move a row to `Swept`: name its
-rig test in `FAILURE_ROWS`, reach it in the rig's census, and move the pinned gap test. The
-same issue records what a board cannot do: rows 2, 3 and 4 are told apart by whether the
-dispatcher was entered and returned, which the harness sees and a reset takes with the RAM.
+Issue [#96](https://github.com/madmax983/waymaker/issues/96) closed the four rows the rig
+used to owe. Rows 7 and 8 needed a workload that rolls over: `Rig::iterate_until_rollover`
+writes a run's opening records and stops before its `RunCompleted`, a test drives §10's
+seven-step swap directly against the bank it leaves off in, and the crash injector sweeps
+every point of the combined sequence. Which row a point lands in is read from
+`bank::select` alone — a swap writes no journal record and marks no witness, so the old
+bank still authoritative is row 7 and the new bank authoritative is row 8. That needed
+`Rig::judge` and `Rig::resume` to stop assuming `Rig::BANK` is always the bank a boot would
+choose: the fix is `Rig::authority`, and reverting it reproduces the defect the rows exist
+to catch — a resumed run answering as current from a bank a swap had already retired. Row 9
+gates `Rig::iterate_reserved`/`Rig::resume_reserved` with `waymaker_flash::capacity::Reserve`
+and finds a declared tail wide enough to refuse the second effect on the rig's own fixture,
+then drives the same explicit swap to show the exit past it. Row 10 gives `Workload` a
+`diverging` knob that changes one schedule's activity kind with everything else — shape, run
+identity, every other record — untouched, and `Rig::resume_declaring` audits history against
+it instead of the workload that wrote it. The same issue records what a board still cannot
+do: rows 2, 3 and 4 are told apart by whether the dispatcher was entered and returned, which
+the harness sees and a reset takes with the RAM.
 
 ## The book
 
@@ -3207,3 +3224,56 @@ about `Sealable` or `Staged` grew to make any of this easier: `commit-discipline
 `swap-discipline` both still hold "the one type that may program a seal should do nothing
 else," and a `storage_mut` accessor tried against both was rejected by the gate for exactly
 that reason.
+
+Issue #96 closes the four rows [the failure matrix](#the-failure-matrix-row-by-row) owed on
+the rig, and it does so without moving a single count of the six rows already swept. The
+insight it rests on is that `Rig::judge` and `Rig::resume` hardcoded `Rig::BANK` in a way
+that happened to be harmless, because nothing had ever asked this rig to install a second
+run: `bank::select`'s own answer was always `Rig::BANK`, so reading it by name and reading it
+by authority were the same read. `Rig::authority` is the fix — a new private method that
+keeps *which* bank `bank::select` named rather than only how many — and `installed_journal`
+now refuses a bank whose header names this run but is not the one currently authoritative,
+which a stale, unerased losing bank's header could otherwise still satisfy. Reverting that
+one check and rerunning the row 8 test reproduces the defect directly: a resumed run answers
+`Ok(Completed { recovered: 3, .. })` from the retiring bank's own three records, on a device
+whose authority had already moved to the bank a swap installed.
+
+Rows 7 and 8 needed a workload that rolls over, and `Rig::iterate_until_rollover` is the
+smallest addition that provides one: it writes a run's `RunStarted` and as many
+schedule/completion pairs as it is asked for, and stops — no `RunCompleted`, because the
+run's continuation is whichever bank a swap leaves authoritative rather than this bank's own
+end. `crates/waymaker-rig/tests/matrix.rs`'s `perform_rollover_swap` drives §10's seven
+steps directly against the bank the partial run left off in, the same way
+`crates/waymaker-fault/tests/swap.rs` drives them for the model; the whole sequence — the
+partial run, the swap, and a small complete run written into the bank it installs — runs
+through the crash injector once, and every point is classified by `bank::select`'s answer
+alone. A swap declares no journal record and marks no witness, so there is nothing else a
+row-7-or-8 point could be read from. Where the point lands *before* the swap's own
+operations began, it is one of rows 1 to 6 already, not a new one — `classify_rollover`
+reads the operation index against a boundary taken from a separate fault-free run of just
+the partial sequence, so the two counts stay apart.
+
+Rows 9 and 10 are driven rather than swept, matching the model half's own treatment of the
+same two rows: a capacity refusal and a declared-workflow mismatch are not media crashes the
+injector produces. `Rig::iterate_reserved` and `Rig::resume_reserved` gate every append with
+`waymaker_flash::capacity::Reserve` instead of the ungated writer, and a search over
+declared tail widths on the rig's own fixture finds one that refuses the second effect's
+schedule once the first has completed — the same shape of search `waymaker-drive`'s row nine
+already uses, run here against a real bound instead of a real geometry, because this rig's
+own construction-time check already prices every record at its worst case and only a
+reserve stricter than that check can refuse before the run's true end. The explicit exit
+past it is the same seven-step swap rows 7 and 8 drive, run once by hand rather than swept.
+`Workload::diverging` is row 10's whole addition: an index and a different activity kind at
+it, leaving the run's shape, its identity and every other record's bytes exactly as they
+were, so `Rig::resume_declaring` meets a genuine one-record disagreement rather than a
+shortened or corrupted run — and refuses it with `Breach::RecordDiffers`, before any effect
+runs again and before any byte is written, at every crash point that leaves the changed
+effect's schedule recovered and its completion outstanding.
+
+What is owed is written down rather than implied closed. The two bank rows are swept at one
+`effects_before_swap` value and one declared next-run input; `waymaker-fault`'s own swap
+sweep is the one that varies the geometry and the step at which every crash lands. Row 9's
+search is over declared bounds rather than over geometries, so it says nothing about a bank
+sized differently than the rig's shared fixture. And issue #96's board half — rows 2, 3 and
+4 need the dispatcher's own record of what it was entered for, which a reset takes with the
+RAM — is exactly as unmet as it was before this issue, and stays a board's to close.
