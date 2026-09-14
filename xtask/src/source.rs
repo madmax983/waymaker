@@ -15493,6 +15493,33 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_against_an_associated_constant_is_reported() {
+        // Codex's twenty-first-round finding: `Indices::P0` is spelled exactly like a
+        // module-qualified constant and resolves the same way in Rust, but nothing here
+        // had ever looked at a `syn::ImplItem::Const` — only free `syn::Item::Const`
+        // declarations, and a module's own inline consts, ever entered `qualified`. An
+        // inherent `impl Indices { const P0 = 0; .. }`'s own associated constants are now
+        // collected under `Indices::P0` the same way a module's are collected under
+        // `module::P0`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Indices;\n\nimpl Indices {\n    pub(crate) const P0: u8 = 0;\n    \
+             pub(crate) const P1: u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    \
+             pub(crate) const P3: u8 = 3;\n}\n\nconst fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        Indices::P0 => 0,\n        Indices::P1 => 1,\n        Indices::P2 \
+             => 2,\n        Indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_singleton_range_patterns_is_reported() {
         // Codex's seventeenth-round finding: `pattern_literal` answered `None` for every
         // `Pat::Range`, including an inclusive range whose two ends are the same integer —

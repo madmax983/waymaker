@@ -1607,6 +1607,27 @@ fn item_const_exprs(items: &[syn::Item]) -> std::collections::HashMap<String, sy
         .collect()
 }
 
+/// The unevaluated initializer of every associated `const` declared directly in an
+/// inherent `impl`'s own item list — `impl Indices { const P0: u8 = 0; ... }` — mirroring
+/// [`item_const_exprs`] for the other place a scannable constant is declared.
+///
+/// Codex's finding: `Indices::P0` is spelled exactly like a module-qualified constant and
+/// resolves the same way in Rust, but nothing here had ever looked at an
+/// [`syn::ImplItem::Const`] — every visited `impl` block's own consts went unrecorded, so
+/// a dense table keyed on associated constants read as unresolved on every arm.
+fn impl_const_exprs(items: &[syn::ImplItem]) -> std::collections::HashMap<String, syn::Expr> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let syn::ImplItem::Const(constant) = item else {
+                return None;
+            };
+            (!has_cfg_test(impl_item_attrs(item)))
+                .then(|| (ident_name(&constant.ident), constant.expr.clone()))
+        })
+        .collect()
+}
+
 /// The unevaluated initializer of every `const` declared *directly* as a local item
 /// statement in `block` — a function body's own `const P0: u8 = 0;`, which Codex found the
 /// first version of this scan missed entirely by only ever walking `syn::Item::Mod`.
@@ -1921,6 +1942,35 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         syn::visit::visit_item_mod(self, node);
         self.scopes.0.pop();
         self.module_path.pop();
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        // Codex's finding: `Indices::P0` is an associated constant, not a module-qualified
+        // one, and nothing here had ever read an `impl` block's own `const` items. Scoped
+        // to the shape the finding names and no wider: an inherent `impl` (no `trait_`,
+        // since a trait impl's own consts can come from the trait's default and this scan
+        // has no notion of one) over a plain, single-segment, non-generic `Self` type —
+        // `impl Indices<T> { .. }` or `impl some::Path { .. }` name no known type this way
+        // and are left unrecorded rather than guessed at.
+        if node.trait_.is_none() {
+            if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
+                if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
+                    if let Some(segment) = type_path.path.segments.first() {
+                        if matches!(segment.arguments, syn::PathArguments::None) {
+                            let scope =
+                                resolve_scope_consts(&impl_const_exprs(&node.items), &self.scopes);
+                            let mut path = self.module_path.clone();
+                            path.push(ident_name(&segment.ident));
+                            for (name, value) in &scope {
+                                self.qualified
+                                    .insert(format!("{}::{name}", path.join("::")), *value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        syn::visit::visit_item_impl(self, node);
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
