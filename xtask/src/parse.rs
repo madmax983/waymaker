@@ -3251,11 +3251,16 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
         // is what recognises one), and the last must be a semicolon-less tail
         // expression — a block holding a `let`, a loop, or any other statement shape
         // stays unresolved rather than guessed at, and so does a labelled block
-        // (`'a: { .. }`), whose tail a `break 'a value;` elsewhere in the block could
-        // also supply.
+        // (`'a: { .. }`) reaching here, whose tail a `break 'a value;` elsewhere in the
+        // block could also supply — [`evaluate_labelled_block`] is that narrower shape,
+        // tried below rather than folded into this arm's own guard.
         syn::Expr::Block(block_expr) if block_expr.label.is_none() => {
             evaluate_block(&block_expr.block, resolve)
         }
+        // [`evaluate_labelled_block`] holds the rationale for the one labelled-block shape
+        // this folds — [`evaluate_loop`]'s own self-targeted-break reasoning, applied to
+        // the other Rust construct a labelled `break` can exit.
+        syn::Expr::Block(block_expr) => evaluate_labelled_block(block_expr, resolve),
         // Codex's forty-fifth-round finding: `const P0: u8 = if SELECT_FIRST { 0 } else {
         // 100 };` is `Expr::If`, which fell to the wildcard `_ => None` case below and
         // left every such arm unresolved — and the const-call backstop
@@ -3381,6 +3386,33 @@ fn evaluate_loop(expr_loop: &syn::ExprLoop, resolve: &Resolve<'_>) -> Option<i12
         (Some(_), None) => false,
     };
     if !targets_this_loop {
+        return None;
+    }
+    literal_or_const_value(break_expr.expr.as_ref()?, resolve)
+}
+
+/// `block_expr`'s own value, for the one labelled-block shape this scan folds —
+/// [`evaluate_loop`]'s own reasoning, applied to the other Rust construct a labelled
+/// `break` can exit: a *labelled block* (`'a: { .. }`, stable since Rust 1.65), whose body
+/// is exactly one statement, an unlabelled-target-free `break` naming the block's own label
+/// and carrying a value.
+///
+/// Codex's next-round finding: `const P0: u8 = 'value: { break 'value 0 };` is exactly as
+/// resolvable as `'done: loop { break 'done 0 }` — the break targets this block itself, not
+/// some other construct this scan would have to interpret control flow to find — but the
+/// labelled-loop fix only ever touched `Expr::Loop`; `Expr::Block`'s own guard refuses
+/// *every* labelled block unconditionally, `evaluate_block` included, so every one of a
+/// table's numbered arms spelled this way stayed unresolved. Scoped identically to
+/// `evaluate_loop`: any other body shape — more than one statement, an unlabelled break, one
+/// naming a different label — stays unresolved rather than guessed at.
+fn evaluate_labelled_block(block_expr: &syn::ExprBlock, resolve: &Resolve<'_>) -> Option<i128> {
+    let label = block_expr.label.as_ref()?;
+    let [syn::Stmt::Expr(syn::Expr::Break(break_expr), _)] = block_expr.block.stmts.as_slice()
+    else {
+        return None;
+    };
+    let break_label = break_expr.label.as_ref()?;
+    if break_label.ident != label.name.ident {
         return None;
     }
     literal_or_const_value(break_expr.expr.as_ref()?, resolve)

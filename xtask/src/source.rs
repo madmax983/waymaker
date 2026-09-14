@@ -9144,6 +9144,83 @@ fn missing_value(numbered: &[crate::parse::FoundArm]) -> Option<i128> {
     Some(base.wrapping_add(i128::try_from(gap).ok()?))
 }
 
+/// The widest ratio of window width to named-value count [`compact_window_with_gaps`]
+/// still treats as compact enough to be a real lookup table, rather than a coincidentally
+/// evenly-spaced but genuinely sparse set of arms. Codex's own report is the concrete
+/// evidence this is sized against — eight explicit values spanning a fifteen-slot window,
+/// ratio `15 / 8 = 1.875` — not a figure read off LLVM's own undocumented density
+/// heuristic, which is neither stable across versions nor targets. Chosen with headroom
+/// above that report rather than pared to it exactly, the same reason every bound in this
+/// scan is a round, documented number rather than the tightest one the evidence in hand
+/// would allow.
+const SPARSE_WINDOW_SLOTS_PER_VALUE: usize = 3;
+
+/// Whether `numbered`'s own patterns, together with a trailing wildcard, span a window
+/// LLVM still compiles to an indexed table even though more than one value inside it is
+/// left for the wildcard — [`missing_value`]'s own single-gap window, generalised.
+///
+/// Codex's next-round finding: `missing_value` requires the window it finds to have
+/// *exactly* one slot the numbered arms leave uncovered, because it is built to answer a
+/// second question this function does not need — *which* value the wildcard covers, for
+/// [`call_shaped_uniformly`] to compare against [`INTEGRITY_CHECK_TABLES`]'s own pinned
+/// shape. But `0, 2, 4, .., 14` explicit with `_` covering every odd value in between is a
+/// nine-arm match spanning the identical `0..=14` window with *seven* slots uncovered
+/// rather than one, and `rustc` still lowers it to the same indexed `.rodata` table — the
+/// wildcard still names exactly one body, whatever share of the window it ends up
+/// answering for. This asks only whether the window is dense enough to be worth flagging,
+/// never which value the wildcard covers, so — unlike `missing_value` — it has no reason to
+/// insist on exactly one gap.
+///
+/// The window here is the exact span the arms' own values imply — `max` minus `min`, plus
+/// one — not a count fixed by the arm total the way `missing_value`'s is. Fixing the width
+/// at the numbered-arm count plus one is what `missing_value` needs in order to name a
+/// single covered gap, but this function only needs to know the values fit without
+/// colliding, which the true span always answers by construction: every offset from the
+/// minimum is inside the span by definition once nothing repeats. So no window-search is
+/// needed at all — a repeated value is refused by a straightforward duplicate check — and
+/// `SPARSE_WINDOW_SLOTS_PER_VALUE` bounds how much wider than the value count the resulting
+/// span may be before this declines it. That bound serves two purposes at once: it is the
+/// density floor a real table needs, and it guards against reasoning about a window as wide
+/// as two arbitrarily far-apart values would imply, for a spread `rustc` would never
+/// compile into a table either. Unlike `missing_value`, this does not chase the wrapping
+/// arithmetic `window_layout` uses for a `u128` literal reinterpreted near the `i128`
+/// boundary — that shape and this one are not expected to coincide, and this declines
+/// rather than guesses when they might.
+fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
+    let mut values = Vec::new();
+    for arm in numbered {
+        if arm.pattern.is_empty() {
+            return false;
+        }
+        values.extend(arm.pattern.iter().copied());
+    }
+    if values.len() < 2 {
+        return false;
+    }
+    let mut sorted = values.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != values.len() {
+        return false;
+    }
+    let (Some(&min), Some(&max)) = (sorted.first(), sorted.last()) else {
+        return false;
+    };
+    let Some(span) = max.checked_sub(min) else {
+        return false;
+    };
+    let Ok(span) = usize::try_from(span) else {
+        return false;
+    };
+    let Some(slots) = span.checked_add(1) else {
+        return false;
+    };
+    let Some(bound) = values.len().checked_mul(SPARSE_WINDOW_SLOTS_PER_VALUE) else {
+        return false;
+    };
+    slots <= bound
+}
+
 /// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
 /// into a lookup table: every value of some window of consecutive integers, as wide as
 /// the number of values the numbered arms cover plus one for the wildcard, named exactly
@@ -9177,6 +9254,9 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
             if wildcard.is_wild {
                 if let Some(numbered) = found.arms.get(..last) {
                     if missing_value(numbered).is_some() {
+                        return true;
+                    }
+                    if compact_window_with_gaps(numbered) {
                         return true;
                     }
                 }
@@ -18626,6 +18706,66 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_labelled_block_pattern_constants_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = 'value: { break 'value 0 };` is a
+        // *labelled block* (stable since Rust 1.65) — the other construct, beside a loop, a
+        // labelled `break` can exit — and it targets this block itself, not some other one
+        // this scan would have to interpret control flow to find, so it is exactly as
+        // resolvable as `'done: loop { break 'done 0 }` already is. But the labelled-loop
+        // fix only ever touched `Expr::Loop`; `Expr::Block`'s own guard
+        // (`block_expr.label.is_none()`) refuses every labelled block unconditionally, so
+        // every one of `P0` through `P3`'s initializers stayed unresolved and the dense
+        // `0..=3` window they pattern-match went undetected. `evaluate_labelled_block` is
+        // the same self-targeted-break reasoning `evaluate_loop` already has, applied here.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn labelled_block_pattern_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = 'value: { break 'value 0 };\n    \
+             const P1: u8 = 'value: { break 'value 1 };\n    \
+             const P2: u8 = 'value: { break 'value 2 };\n    \
+             const P3: u8 = 'value: { break 'value 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_sparse_but_compact_window_with_several_wildcard_covered_gaps_is_reported() {
+        // Codex's next-round finding: `missing_value` requires the numbered arms to leave
+        // *exactly* one slot uncovered for the wildcard, but `0, 2, 4, .., 14` explicit —
+        // eight arms, every even value from 0 to 14 — with `_` covering every odd value in
+        // between is a nine-arm match spanning the identical `0..=14` window with seven
+        // slots left for the wildcard rather than one, and a warning-free optimized Rust
+        // build still lowers it to the same indexed `.rodata` table `missing_value`'s own
+        // single-gap shape is pinned against — `has_dense_arm_patterns` read it as not
+        // dense and let it through undetected. `compact_window_with_gaps` is the
+        // generalisation: the window is the exact span the values imply, and any number of
+        // gaps inside it — not just one — still means the wildcard is one body covering
+        // everything the numbered arms did not name.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn sparse_even_pattern_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        2 => 1,\n        4 => 2,\n        \
+             6 => 3,\n        8 => 4,\n        10 => 5,\n        12 => 6,\n        \
+             14 => 7,\n        _ => 8,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
             "{violations:?}"
         );
     }
