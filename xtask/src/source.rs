@@ -8792,31 +8792,71 @@ fn split_top_level(text: &str, separator: char) -> Vec<&str> {
     parts
 }
 
+/// `arms`, with a synthetic `,` inserted immediately after every top-level `}`.
+///
+/// Rust lets a block-valued match arm — `0 => { VALUE }` — omit its trailing comma, because
+/// the block already delimits it; a whole match spelled that way, arm after arm, has no
+/// top-level comma anywhere in it. Codex found that [`split_top_level`] alone therefore
+/// read such a match as one single segment, which is not the shape [`parse_dense_arms`]
+/// expects and so is not dense — a comma-less, brace-valued sixteen-arm table passed
+/// unnoticed because the scan skipped it rather than because it was judged and allowed. A
+/// block is self-delimiting, so treating its own closing brace as an arm boundary — in
+/// addition to a real comma, never instead of one — is sound rather than a guess: a comma
+/// that *is* there just produces one empty segment, which [`parse_dense_arms`] already
+/// discards.
+#[must_use]
+fn with_synthetic_arm_separators(arms: &str) -> String {
+    let mut result = String::with_capacity(arms.len() + 8);
+    let mut depth = 0_i32;
+    for character in arms.chars() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '}' => {
+                depth -= 1;
+                result.push(character);
+                if depth == 0 {
+                    result.push(',');
+                }
+                continue;
+            }
+            _ => {}
+        }
+        result.push(character);
+    }
+    result
+}
+
 /// One parsed `match` arm: a pattern and the expression it maps to, exactly as source
 /// spells it — the expression's own shape (a call, a bare literal, anything else) is
 /// [`call_shape`]'s question rather than [`parse_dense_arms`]'s, so a table spelled as
 /// `0 => 0x0000_0000, 1 => 0x7707_3096, ..` is still parsed here rather than silently
 /// skipped for not being a call.
-struct DenseArm<'a> {
-    pattern: &'a str,
-    value: &'a str,
+struct DenseArm {
+    pattern: String,
+    value: String,
 }
 
 /// Parses `arms` as a sequence of [`DenseArm`]s, or `None` the moment one segment is not
 /// `pattern => expression` — a statement that is not an arm at all is not a `match`
 /// [`has_dense_arm_patterns`] has any business calling a table.
+///
+/// Owned strings rather than slices of `arms`, because [`with_synthetic_arm_separators`]
+/// builds a copy to split arms out of and a `DenseArm` cannot borrow from a value that does
+/// not outlive this call.
 #[must_use]
-fn parse_dense_arms(arms: &str) -> Option<Vec<DenseArm<'_>>> {
+fn parse_dense_arms(arms: &str) -> Option<Vec<DenseArm>> {
+    let widened = with_synthetic_arm_separators(arms);
     let mut parsed = Vec::new();
-    for segment in split_top_level(arms, ',') {
+    for segment in split_top_level(&widened, ',') {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
         }
         let (pattern, value) = segment.split_once("=>")?;
         parsed.push(DenseArm {
-            pattern: pattern.trim(),
-            value: value.trim(),
+            pattern: pattern.trim().to_string(),
+            value: value.trim().to_string(),
         });
     }
     Some(parsed)
@@ -8873,7 +8913,7 @@ fn parse_integer_literal(text: &str) -> Option<u128> {
 /// compiles into the same rodata and is invisible to the array ban, which never sees a
 /// `match` at all.
 #[must_use]
-fn has_dense_arm_patterns(parsed: &[DenseArm<'_>]) -> bool {
+fn has_dense_arm_patterns(parsed: &[DenseArm]) -> bool {
     let Some(last) = parsed.len().checked_sub(1) else {
         return false;
     };
@@ -8890,7 +8930,7 @@ fn has_dense_arm_patterns(parsed: &[DenseArm<'_>]) -> bool {
         let Ok(expected) = u128::try_from(index) else {
             return false;
         };
-        if parse_integer_literal(arm.pattern) != Some(expected) {
+        if parse_integer_literal(&arm.pattern) != Some(expected) {
             return false;
         }
     }
@@ -8922,10 +8962,10 @@ fn call_shape(expression: &str) -> Option<(&str, &str)> {
 /// happens to sit under. The argument is compared by [`parse_integer_literal`]'s value
 /// rather than by spelling, for [`has_dense_arm_patterns`]'s reason.
 #[must_use]
-fn call_shaped_uniformly<'a>(parsed: &[DenseArm<'a>]) -> Option<&'a str> {
-    let callee = call_shape(parsed.first()?.value)?.0;
+fn call_shaped_uniformly(parsed: &[DenseArm]) -> Option<&str> {
+    let callee = call_shape(&parsed.first()?.value)?.0;
     for (index, arm) in parsed.iter().enumerate() {
-        let (this_callee, argument) = call_shape(arm.value)?;
+        let (this_callee, argument) = call_shape(&arm.value)?;
         let expected = u128::try_from(index).ok()?;
         if this_callee != callee {
             return None;
@@ -14909,6 +14949,31 @@ mod deferred_answer_pins {
             "\nconst fn extra_nibble_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
              0 => crc32_nibble(0),\n        1 => crc32_nibble(1),\n        2 => crc32_nibble(2),\n        \
              3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_comma_less_block_arms_is_reported() {
+        // Codex's sixth-round finding: Rust lets a block-valued arm — `0 => { VALUE }` —
+        // omit its trailing comma, because the block already delimits it. A whole match
+        // spelled that way, arm after arm, has no top-level comma anywhere in it, so
+        // `split_top_level(arms, ',')` alone read it as one single segment — not the
+        // `pattern => expression` shape `parse_dense_arms` expects, so it was not dense and
+        // the scan skipped it rather than reporting it. A synthetic separator after every
+        // top-level `}` is what recovers the arm boundaries a comma-less match never wrote.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn block_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => { 0x0000_0000 }\n        1 => { 0x7707_3096 }\n        \
+             2 => { 0xEE0E_612C }\n        3 => { 0x9909_57BA }\n        \
+             _ => { 0x0000_0000 }\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
