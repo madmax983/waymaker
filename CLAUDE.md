@@ -3683,3 +3683,19 @@ installed. Row 8's own count moved from 167 to 175 crash points, the eight new o
 inside the erase and its barrier; row 7's count did not move, because reclaiming the
 retiring bank can only ever lose it `bank::select`'s vote, never regain it ahead of the
 bank the swap already installed.
+
+A further round found a fourth, in `require_own_authority` itself: it names the *bank* —
+`Rig::BANK` must be the current sole authority — and never the *run*, so a bank that is
+this rig's own and currently authoritative could still have been installed for a different
+iteration, and `iterate`, `iterate_until_rollover` and `iterate_reserved` would each write
+that iteration's records and witness marks into the wrong iteration's journal rather than
+refuse. `journal_region` — the write path's own twin of the run-id check
+`installed_journal` already holds `resume` and `recover_prefix` to — now takes the
+workload it means to write and refuses unless the bank's header names that workload's own
+run. Reproduced first by preparing a part for iteration 0 and calling `iterate(1, ..)` on
+it directly: the unfixed code answered `Ok(Stop::Completed)`, having written iteration 1's
+records and marks over iteration 0's bank, rather than `RigError::Bank`. Two existing tests
+had built their own fixtures by relying on exactly that gap — one in `resume`'s own test
+suite, one in the rig's crash-sweep judge test — and both now reach the same device states
+through the lower-level primitives `Rig` itself writes with, rather than through the write
+path this fix closes.

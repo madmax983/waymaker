@@ -61,7 +61,7 @@ use waymaker_rig::plan::Plan;
 use waymaker_rig::run::{Resumed, Rig, RigError, Stop, Verdict};
 use waymaker_rig::wear::Metered;
 use waymaker_rig::window::Window;
-use waymaker_rig::witness::{Progress as Marks, Witness, WitnessError};
+use waymaker_rig::witness::{Mark, Progress as Marks, Stage, Witness, WitnessError};
 use waymaker_rig::workload::{Role, Workload};
 
 const SEED: u64 = 0x0031_0031_0031_0031;
@@ -2050,21 +2050,34 @@ fn a_resume_refuses_a_short_page_an_uninstalled_part_and_another_runs_prefix() {
     let refused = rig.resume(0, &mut metered, &mut Log::default(), &mut page);
     assert!(matches!(refused, Err(RigError::Bank)), "{refused:?}");
 
-    // A bank installed for iteration 0 and written by iteration 1: the witness and the
-    // prefix are another run's, and the resume refuses before writing, with the breach
-    // `verify` reports.
+    // A bank installed for iteration 0, but a witness mark that belongs to iteration 1:
+    // the resume refuses before writing, with the breach `verify` reports. `Rig::iterate`
+    // no longer lets a mismatched iteration reach the witness at all — see
+    // `iterate_and_its_siblings_refuse_a_bank_installed_for_another_iteration` — so this
+    // plants the mark directly, through the same low-level API `Rig::iterate` itself uses,
+    // to exercise `resume`'s own protection against a witness that answers a different run.
     let mut device = Device::new(geometry());
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+    }
+    {
+        let Ok(mut instrument) =
+            Window::new(&mut device, rig.instrument_base(), geometry().erase_size())
+        else {
+            unreachable!("the instrument window")
+        };
+        let mut witness = Witness::new(rig.witness_region());
+        witness
+            .mark(
+                &mut instrument,
+                Mark::new(1, 0, Stage::Attempted),
+                &mut page,
+            )
+            .expect("a fault-free mark");
+    }
     let mut metered = Metered::new(&mut device);
-    rig.prepare(&mut metered, 0, &mut page)
-        .expect("a prepared part");
-    rig.iterate(
-        1,
-        &mut metered,
-        &mut Log::default(),
-        &mut NeverCut,
-        &mut page,
-    )
-    .expect("another iteration writes into the bank");
     let before = (metered.wear(), metered.rig_wear());
     let refused = rig.resume(0, &mut metered, &mut Log::default(), &mut page);
     assert!(
@@ -2337,6 +2350,70 @@ fn iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past()
     };
     let outcome = rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
     assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+}
+
+/// Round 7: `require_own_authority` named the bank but never checked whose run its header
+/// holds, so `iterate`, `iterate_until_rollover` and `iterate_reserved` would all happily
+/// write one iteration's records and witness marks into the authoritative bank's journal
+/// even when that bank was installed for a *different* iteration entirely.
+///
+/// `resume`/`recover_prefix` already refuse this shape, through `installed_journal`'s own
+/// run-id check; `journal_region` — the write path's twin — now takes the workload it means
+/// to write and refuses the same way before it hands back a region to append into.
+#[test]
+fn iterate_and_its_siblings_refuse_a_bank_installed_for_another_iteration() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+    }
+    let before = device.image().to_vec();
+
+    // The bank is authoritative and readable; it simply names iteration 0, not the
+    // iteration 1 each call below is asked to continue.
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate(1, &mut metered, &mut dispatcher, &mut NeverCut, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched"
+    );
+
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_until_rollover(
+        1,
+        &mut metered,
+        &mut dispatcher,
+        &mut page,
+        ROLLOVER_EFFECTS_BEFORE,
+    );
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched"
+    );
+
+    let Ok(reserve) = Reserve::for_layout(bounds(16), rig.layout()) else {
+        unreachable!("the shared fixture's own bounds price a valid reserve")
+    };
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_reserved(1, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched"
+    );
+
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "a mismatched iteration mutated the device"
+    );
 }
 
 /// Round 5, review finding B: `perform` used to rebuild its own workload from the iteration

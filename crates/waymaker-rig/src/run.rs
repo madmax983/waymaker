@@ -653,10 +653,20 @@ impl Rig {
         Ok(want)
     }
 
-    /// The journal region of the bank this rig writes into.
+    /// The journal region of the bank this rig writes into, refusing unless that bank's
+    /// header names `workload`'s own run.
+    ///
+    /// `require_own_authority` names the *bank*; this names the *run*. Review found the gap
+    /// between them: a bank that is this rig's own and currently authoritative can still
+    /// have been installed for a different iteration, and without this check `iterate` and
+    /// its siblings would write one iteration's records and witness marks into another
+    /// iteration's journal rather than refuse — the write-path twin of the check
+    /// [`installed_journal`](Self::installed_journal) already makes `resume` and
+    /// `recover_prefix` pass.
     fn journal_region<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
+        workload: Workload,
         page: &mut [u8],
     ) -> Result<JournalRegion, RigError<S::Error>> {
         let read = self.read_header(engine, Self::BANK, page)?;
@@ -666,6 +676,9 @@ impl Rig {
         let Ok(header) = bank::decode_header(bytes) else {
             return Err(RigError::Bank);
         };
+        if header.run != workload.run() {
+            return Err(RigError::Bank);
+        }
         JournalRegion::of(self.layout, Self::BANK, &header).map_err(RigError::Region)
     }
 
@@ -782,7 +795,8 @@ impl Rig {
             let mut engine = self.engine(part).map_err(widen)?;
             self.require_own_authority(&mut engine, page)
                 .map_err(widen)?;
-            self.journal_region(&mut engine, page).map_err(widen)?
+            self.journal_region(&mut engine, workload, page)
+                .map_err(widen)?
         };
         let mut journal = {
             let mut engine = self.engine(part).map_err(widen)?;
@@ -920,7 +934,8 @@ impl Rig {
             let mut engine = self.engine(part).map_err(widen)?;
             self.require_own_authority(&mut engine, page)
                 .map_err(widen)?;
-            self.journal_region(&mut engine, page).map_err(widen)?
+            self.journal_region(&mut engine, workload, page)
+                .map_err(widen)?
         };
         let mut journal = {
             let mut engine = self.engine(part).map_err(widen)?;
@@ -1015,7 +1030,8 @@ impl Rig {
             let mut engine = self.engine(part).map_err(widen)?;
             self.require_own_authority(&mut engine, page)
                 .map_err(widen)?;
-            self.journal_region(&mut engine, page).map_err(widen)?
+            self.journal_region(&mut engine, workload, page)
+                .map_err(widen)?
         };
         let mut reserved = {
             let mut engine = self.engine(part).map_err(widen)?;
