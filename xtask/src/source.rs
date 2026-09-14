@@ -21684,6 +21684,39 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_an_unsuffixed_bitwise_not_is_reported() {
+        // Codex's finding: `const P0: u8 = !255;` names an operand with no suffix, no cast
+        // and no path — `evaluate_bitwise_not`'s three fallbacks all correctly decline it,
+        // because the width really is nowhere in `!255` itself, only in `P0`'s own
+        // declaration. Verified against real rustc: `!255` as `u8` is `0`, `!254` is `1`,
+        // and so on through `!241` at `14` — the dense `0..14` sequence the outer match's
+        // patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let operand = 255 - n;
+            let _ = writeln!(constants, "    const P{n}: u8 = !{operand};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_unsuffixed_bitwise_not(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_with_an_if_let_bound_then_branch_is_reported() {
         // Codex's finding: `if let x @ 0 = 0u8 { x } else { 100 }` selects the `then`
         // branch, whose own body reads `x` — a name only the condition's own `Expr::Let`

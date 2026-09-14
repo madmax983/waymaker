@@ -3369,7 +3369,8 @@ fn resolve_scope_consts(
                 unsigned: &resolve_unsigned,
                 width: &resolve_width,
             };
-            if let Some(value) = literal_or_const_value(expr, &bundled) {
+            let declared_type = own.types.get(name).map(String::as_str);
+            if let Some(value) = resolve_declared_initializer(expr, declared_type, &bundled) {
                 resolved.insert(name.clone(), value);
                 progressed = true;
             }
@@ -3804,7 +3805,10 @@ fn resolve_block_locals(
                 unsigned: &local_resolve_unsigned,
                 width: &local_resolve_width,
             };
-            if let Some(value) = literal_or_const_value(local_expr, &local_resolve) {
+            let declared_type = local_types.get(name).map(String::as_str);
+            if let Some(value) =
+                resolve_declared_initializer(local_expr, declared_type, &local_resolve)
+            {
                 resolved.insert(name.clone(), value);
                 progressed = true;
             }
@@ -3901,7 +3905,11 @@ fn resolve_sequential_let(
             unsigned: &scoped_resolve_unsigned,
             width: &scoped_resolve_width,
         };
-        if let Some(value) = literal_or_const_value(&expr, &scoped_resolve) {
+        let declared_type = ascribed_type
+            .as_ref()
+            .filter(|(ascribed_name, _)| *ascribed_name == name)
+            .map(|(_, ty)| ty.as_str());
+        if let Some(value) = resolve_declared_initializer(&expr, declared_type, &scoped_resolve) {
             resolved.insert(name.clone(), value);
         }
         bound_names.push(name);
@@ -4800,6 +4808,60 @@ fn evaluate_bitwise_not(operand: &syn::Expr, resolve: &Resolve<'_>) -> Option<i1
         return Some(i128::from(raw == 0));
     }
     let ty = syn::parse_str::<syn::Type>(width_name).ok()?;
+    apply_integer_cast(!raw, &ty)
+}
+
+/// A named local or `const`'s own initializer, evaluated through [`literal_or_const_value`]
+/// first and, only when that declines, one more shape it cannot reach: a bare, unsuffixed
+/// bitwise-NOT whose width is written nowhere in the initializer at all — only in the
+/// declaration this *is* the initializer of.
+///
+/// Codex's finding: `const P0: u8 = !255;` names an operand with no suffix, no cast and no
+/// path to read a width from — [`evaluate_bitwise_not`]'s three fallbacks all correctly
+/// decline it, because none of them is lying: `255`'s own width really is nowhere in `!255`
+/// itself, the same way any other unsuffixed integer literal in Rust takes its type from the
+/// position it is used in rather than carrying one of its own. `P0`'s own declared type
+/// states it just as plainly as a literal's suffix would, but nothing here had ever read a
+/// name's *own* declaration as a width for its *own* initializer — `evaluate_bitwise_not`'s
+/// width search is scoped to what the operand names, and an initializer is not its own
+/// operand.
+///
+/// Called only where that declaration is already in view: [`resolve_scope_consts`]'s fixed
+/// point, [`resolve_block_locals`]'s, and [`resolve_sequential_let`], each of which already
+/// holds the name's own declared type before it ever asks for the initializer's value — the
+/// same three positions [`stmt_let_type`]'s own sequential fix already threads a declared
+/// type through. Scoped narrowly on purpose: a *suffixed* literal, a cast, or a path already
+/// have their own way to state a width and are declined here exactly as
+/// `evaluate_bitwise_not` already declines redoing work it already did — this is only for
+/// the one shape that has no width to find anywhere but the declaration.
+fn resolve_declared_initializer(
+    expr: &syn::Expr,
+    declared_type: Option<&str>,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    if let Some(value) = literal_or_const_value(expr, resolve) {
+        return Some(value);
+    }
+    let width = declared_type?;
+    let syn::Expr::Unary(unary) = strip_parens(expr) else {
+        return None;
+    };
+    if !matches!(unary.op, syn::UnOp::Not(_)) {
+        return None;
+    }
+    let operand = strip_parens(&unary.expr);
+    let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Int(int),
+        ..
+    }) = operand
+    else {
+        return None;
+    };
+    if !int.suffix().is_empty() {
+        return None;
+    }
+    let ty = syn::parse_str::<syn::Type>(width).ok()?;
+    let raw = lit_value(&syn::Lit::Int(int.clone()))?;
     apply_integer_cast(!raw, &ty)
 }
 
