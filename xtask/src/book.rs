@@ -25,6 +25,8 @@
 
 use core::fmt::Write as _;
 
+use syn::ext::IdentExt as _;
+
 use crate::Violation;
 use crate::docs::{Attestation, HARDWARE_TARGETS};
 use crate::wear::{PARTS, PartWear};
@@ -718,38 +720,92 @@ fn anchors(sample: &str) -> Vec<Anchor> {
 
 /// Where `sample` declares `#[test] fn name(`, or why it does not.
 ///
-/// The whole contiguous attribute run before the function is read, in both directions:
-/// attribute order is free, and review of this change put `#[ignore]` *above* the anchor
-/// marker, where a reader of the book never sees it and the test never runs.
-fn declares_test(sample: &str, name: &str) -> Result<usize, String> {
-    let opening = format!("fn {name}(");
-    let mut run: Vec<&str> = Vec::new();
-    for (at, line) in sample.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&opening) {
-            if !run.contains(&"#[test]") {
-                run.clear();
-                continue;
-            }
-            if let Some(refused) = run.iter().find(|attribute| {
-                attribute.starts_with("#[ignore")
-                    || attribute.starts_with("#[cfg(")
-                    || attribute.starts_with("#[cfg_attr(")
-            }) {
+/// Parsed structurally with `syn` rather than scanned line by line (issue #97, Codex review
+/// rounds 1 through 4): a line-based scan has to reinvent enough of Rust's grammar to answer
+/// "is this attribute really `#[cfg_attr(..)]`" that it kept losing — whitespace inside the
+/// attribute, a raw-identifier marker, two attributes sharing a line, an attribute spanning
+/// several lines, and a delimiter character sitting inside a string literal a naive bracket
+/// count cannot tell from a real one. `syn` has already solved all of that; asking it again
+/// each round was the mistake. [`crate::parse::fns_matching`] is the same structural lookup
+/// `crate::parse::declares_test` already uses for the `failure-matrix` rule, with
+/// `include_test_gated: true` for the same reason: a `#[cfg(test)]` on the enclosing module
+/// must not disqualify a test declaration.
+///
+/// Attribute order is free, and review of this change put `#[ignore]` *above* the anchor
+/// marker, where a reader of the book never sees it and the test never runs — `syn` reads
+/// every attribute on the function regardless of where it sits, so order was never actually
+/// load-bearing here.
+///
+/// The line index returned on success is [`crate::parse::NamedFn::line`], read off the same
+/// parsed function whose attributes decided the verdict — not found again by a second,
+/// independent text search. Two searches for "the same" declaration used to be able to
+/// answer about two different ones: `name` declared twice, once inside the anchor and once
+/// outside it, could pair one declaration's attributes with the other's position and wrongly
+/// vouch for either (issue #97, Codex review round 5).
+///
+/// `name` can be declared more than once — in different modules, or as a method of the same
+/// name in different `impl` blocks — and which declaration is *this anchor's* is a question
+/// only `anchor` can answer, not "whichever one `syn` found first." Taking the first match
+/// unconditionally fails in both directions: it can vouch for an unrelated real test while
+/// an untested decoy sits in the anchor (round 5), and it can just as wrongly refuse an
+/// anchor whose own declaration is real and runs, because some other same-named declaration
+/// earlier in the file happens not to be a test (round 6). And stopping at the first
+/// *in-anchor* candidate is the same mistake one level in: two same-named declarations can
+/// both sit inside one anchor — an ordinary helper in one nested module and a real `#[test]`
+/// in another — and the first one found need not be the qualifying one (Codex, review round
+/// 7). [`verdict`] is tried against every in-anchor candidate in turn, and the first that
+/// qualifies wins; only when *no* candidate sits inside `anchor` at all does the search widen
+/// to every declaration in the file, which keeps the existing "declared, but outside the
+/// anchor" report for a file with exactly one declaration of the name.
+fn declares_test(
+    sample: &str,
+    name: &str,
+    anchor: std::ops::RangeInclusive<usize>,
+) -> Result<usize, String> {
+    let candidates = crate::parse::fns_matching(sample, name, true);
+    let mut in_anchor = candidates
+        .iter()
+        .filter(|function| anchor.contains(&function.line.saturating_sub(1)))
+        .peekable();
+    let pool: Box<dyn Iterator<Item = &crate::parse::NamedFn>> = if in_anchor.peek().is_some() {
+        Box::new(in_anchor)
+    } else {
+        Box::new(candidates.iter())
+    };
+    let mut last_reason = None;
+    for function in pool {
+        match verdict(function, name) {
+            Ok(at) => return Ok(at),
+            Err(reason) => last_reason.get_or_insert(reason),
+        };
+    }
+    Err(last_reason.unwrap_or_else(|| format!("declares no `#[test] fn {name}`")))
+}
+
+/// Whether `function` is a test nothing can skip, and its position if it is.
+fn verdict(function: &crate::parse::NamedFn, name: &str) -> Result<usize, String> {
+    let at = function.line.saturating_sub(1);
+    let mut tested = false;
+    for attribute in &function.attrs {
+        let Some(ident) = attribute.path().get_ident() else {
+            continue;
+        };
+        match ident.unraw().to_string().as_str() {
+            "test" => tested = true,
+            "ignore" | "cfg" | "cfg_attr" => {
                 return Err(format!(
-                    "carries `{refused}`, so the test does not run and the sample the book \
-                     shows is compiled or executed by nothing"
+                    "carries `#[{}]`, so the test does not run and the sample the book shows \
+                     is compiled or executed by nothing",
+                    ident.unraw()
                 ));
             }
-            return Ok(at);
-        }
-        if trimmed.starts_with("#[") {
-            run.push(trimmed);
-        } else if !(trimmed.is_empty() || trimmed.starts_with("//")) {
-            run.clear();
+            _ => {}
         }
     }
-    Err(format!("declares no `#[test] fn {name}`"))
+    if !tested {
+        return Err(format!("declares no `#[test] fn {name}`"));
+    }
+    Ok(at)
 }
 
 /// Every link target a summary names that is not an absolute URL.
@@ -1091,7 +1147,7 @@ fn check_anchor(
         return violations;
     };
 
-    let at = match declares_test(sample, anchor) {
+    let at = match declares_test(sample, anchor, declared.start..=declared.end) {
         Ok(at) => Some(at),
         Err(why) => {
             violations.push(Violation::new(
@@ -2495,6 +2551,27 @@ mod tests {
             "#[ignore]",
             "#[ignore = \"why\"]",
             "#[cfg(feature = \"never\")]",
+            // Issue #97: `#[cfg_attr(..)]` must skip the test the same way.
+            "#[cfg_attr(all(), ignore)]",
+            // Issue #97 follow-up: a prefix match on the raw line missed a spelling with
+            // extra whitespace, or with a raw-identifier marker on the attribute name.
+            "#[ cfg_attr(all(), ignore) ]",
+            "#[cfg_attr (all(), ignore)]",
+            "#[ ignore ]",
+            "#[ cfg(any()) ]",
+            "#[r#ignore]",
+            "#[r#cfg(any())]",
+            "#[r#cfg_attr(all(), ignore)]",
+            // Codex, review round 2 of issue #97: a second outer attribute on the same
+            // line must not hide behind the first one checked.
+            "#[allow(dead_code)] #[cfg_attr(all(), ignore)]",
+            // Codex, review round 3 of issue #97: an attribute broken over several lines
+            // must not lose the run that came before it.
+            "#[cfg_attr(\n    all(),\n    ignore\n)]",
+            // Codex, review round 4 of issue #97: a delimiter character inside a string
+            // literal is not a real delimiter, and a line-based bracket count could not
+            // tell the two apart.
+            "#[cfg_attr(\n    all(),\n    doc = \")]\",\n    ignore\n)]",
         ] {
             let mut inputs = good_book();
             inputs.samples[0].1 = inputs.samples[0].1.replace(
@@ -2519,6 +2596,89 @@ mod tests {
             "// ANCHOR: a_first_sample\n// Waymaker guarantees exactly-once delivery.\n// ANCHOR_END: a_first_sample\n#[test]",
         );
         assert!(fired(&check(&inputs), BOOK));
+    }
+
+    #[test]
+    fn a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name() {
+        // Codex, review round 5 of issue #97: `declares_test` used to pair the attributes
+        // of the *first* function `syn` found with the position of the *first* line a
+        // separate text search found — two independent "first" answers that can name two
+        // different declarations when a name is declared twice. A real, running
+        // `#[test] pub fn a_first_sample()` declared earlier in the file has its
+        // attributes checked; a later, non-test `fn a_first_sample()` — no `#[test]` at
+        // all — sits inside the anchor the book actually shows. The real test's
+        // attributes must not vouch for the decoy's position.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "#[test]\npub fn a_first_sample() {\n    assert!(true);\n}\n\n\
+             // ANCHOR: a_first_sample\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            fired(&check(&inputs), BOOK),
+            "a real test outside the anchor vouched for an untested decoy inside it"
+        );
+    }
+
+    #[test]
+    fn a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor() {
+        // Codex, review round 6 of issue #97: the mirror image of round 5. An earlier
+        // declaration of the same name that is not a test — a plain helper `fn`, not
+        // `#[test]` — must not stop `declares_test` from finding the real, running test
+        // that is the anchor's own content. The old line scanner tolerated this because it
+        // kept scanning past a same-named non-test; `fns_matching(..).next()` alone does
+        // not, because it stops at the first declaration whatever it is.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "fn a_first_sample() {}\n\n\
+             // ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            !fired(&check(&inputs), BOOK),
+            "a real test in the anchor was refused because of an earlier non-test of the \
+             same name"
+        );
+    }
+
+    #[test]
+    fn a_qualifying_test_is_found_even_behind_a_non_test_inside_the_same_anchor() {
+        // Codex, review round 7 of issue #97: stopping at the first *in-anchor* candidate
+        // is round 6's mistake one level in. Two same-named declarations can both sit
+        // inside one anchor — an ordinary helper first, a real `#[test]` second — and the
+        // first is not the qualifying one.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "// ANCHOR: a_first_sample\nfn a_first_sample() {}\n#[test]\nfn a_first_sample() {\n    \
+             assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            !fired(&check(&inputs), BOOK),
+            "a real test was refused because a non-test of the same name shares its anchor"
+        );
+    }
+
+    #[test]
+    fn an_anchor_marker_between_fn_and_the_name_does_not_count_as_containing_the_test() {
+        // Codex, review round 7 of issue #97: a line comment between `fn` and its
+        // identifier is legal Rust, so `declares_test` used to read the *identifier's*
+        // line as the test's position — inside the anchor here — while the `fn` keyword
+        // itself sits outside it. mdBook would then render `a_first_sample() { .. }` with
+        // no `fn` at all: not the tested function the book claims to show.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "#[test]\nfn\n// ANCHOR: a_first_sample\na_first_sample() {\n    assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            fired(&check(&inputs), BOOK),
+            "an anchor missing its own `fn` keyword was accepted as showing a real test"
+        );
     }
 
     #[test]

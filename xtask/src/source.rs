@@ -3121,7 +3121,7 @@ fn implements_trait_for(code: &str, type_name: &str) -> bool {
 /// execution, and `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has
 /// no braces at all: three pinned calls, in order, at brace depth zero, in a closure nothing
 /// runs.
-fn nesting_depth_at(code: &str, index: usize) -> usize {
+pub(crate) fn nesting_depth_at(code: &str, index: usize) -> usize {
     let before = code.get(..index).unwrap_or_default();
     let opened = before.matches(['{', '(', '[']).count();
     let closed = before.matches(['}', ')', ']']).count();
@@ -8591,7 +8591,7 @@ pub(crate) fn braced_body<'a>(code: &'a str, header: &str) -> Option<&'a str> {
 /// by `use ...::Step as S;`, and it fires on an unrelated `BootStep::`. This compares both
 /// sides, so `Step` matches the type and nothing else.
 #[must_use]
-fn names_identifier(code: &str, identifier: &str) -> bool {
+pub(crate) fn names_identifier(code: &str, identifier: &str) -> bool {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
     code.match_indices(identifier).any(|(index, _)| {
         let before = code
@@ -8612,7 +8612,7 @@ fn names_identifier(code: &str, identifier: &str) -> bool {
 /// `impl` "declared twice — a decoy above the real one is what a first-match scan reads",
 /// and the pin here is the same shape and needs the same guard.
 #[must_use]
-fn declaration_count(code: &str, header: &str) -> usize {
+pub(crate) fn declaration_count(code: &str, header: &str) -> usize {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
     code.match_indices(header)
         .filter(|(index, _)| {
@@ -12731,6 +12731,84 @@ mod deferred_answer_pins {
             "a conforming decoy `fn {}` nested in another module went unreported: \
              {violations:?}",
             SCAN_STEP.0
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_string_literal_is_not_a_call() {
+        // A string literal's content is data to `rustc`, never a call. The old
+        // `block_text` kept a literal's exact source text. A callee name spelled
+        // inside a string then read as a real call. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = \"route via {callee}(input)\
+             .into() for humans\";\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a string literal was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_c_string_literal_is_not_a_call() {
+        // A C-string literal (`c"..."`, stable since Rust 1.77) is a string form too.
+        // Codex found it missing from `is_string_literal` on review of the fix above:
+        // the same exploit, spelled with a `c` prefix instead of none. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = c\"route via {callee}(input)\
+             .into() for humans\";\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a C-string literal was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_macro_argument_is_not_a_call() {
+        // `syn` does not expand macros. `stringify!` never runs its argument; it turns
+        // the argument's tokens into a string at compile time. Codex found this on
+        // review of the fix above: the callee's name inside a macro argument rendered
+        // the same as a real call. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    let _spoof = stringify!({callee}(input)\
+             .into());\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a macro argument was read as a real call: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_callee_name_inside_a_local_macro_rules_body_is_not_a_call() {
+        // `macro_rules! spoof { .. }` is a different token shape from a macro call:
+        // identifier, `!`, a second identifier (the macro's own name), then the group.
+        // Codex found the earlier fix missed it: the group's tokens rendered even
+        // though nothing runs them unless the macro is invoked. See issue #158.
+        let contents = format!(
+            "fn {name}(input: &[u8]) -> u32 {{\n    macro_rules! spoof {{\n        () \
+             => {{ {callee}(input).into() }};\n    }}\n    0\n}}\n",
+            name = SCAN_STEP.0,
+            callee = SCAN_STEP.1
+        );
+        let violations = used_call(&contents, SCAN_STEP.0, SCAN_STEP.1, "consequence");
+        assert!(
+            !violations.is_empty(),
+            "a callee name spelled inside a local macro_rules! body was read as a real \
+             call: {violations:?}"
         );
     }
 
