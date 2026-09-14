@@ -11427,6 +11427,22 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_hex_or_unicode_escape_in_a_character_literal_is_still_one_literal() {
+        // Codex review of #164. `'\x41'` and `'\u{41}'` take more than one character after
+        // the `\`, so a scan that always takes exactly one leaves each literal's real
+        // closing `'` unread. That leftover quote can then pair with the *next* literal's
+        // opening quote, swallowing it and leaving that literal's own bracket unprotected.
+        let hex = "#[foo(seps = ['\\x41', ']'])] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(hex).contains(&"raw".to_owned()), "{hex}");
+        // Codex's own fixture, byte for byte: no spaces, two attributes, and no braces
+        // needed to trigger it.
+        let codex = "#[rustfmt::skip] #[foo(seps=['\\x41',']'])] pub fn raw(){}\n";
+        assert!(counted(codex).contains(&"raw".to_owned()), "{codex}");
+        let unicode = "#[foo(seps = ['\\u{41}', ']'])] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(unicode).contains(&"raw".to_owned()), "{unicode}");
+    }
+
+    #[test]
     fn an_unterminated_raw_string_leaves_the_item_unclassified() {
         // Same fail-closed direction as an unterminated ordinary string: no `"` plus the
         // right hash count ever closes it, so the scan never finds the real `]` and leaves

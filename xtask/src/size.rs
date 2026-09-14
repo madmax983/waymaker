@@ -3539,10 +3539,11 @@ fn skip_raw_string(chars: &[(usize, char)], quote: usize, hashes: usize) -> Opti
 /// one.
 ///
 /// Returns `None` for a lifetime. `'a` is a character literal only if a plain `'` closes
-/// it. A `\` takes exactly one more character as its escaped value, whatever that
-/// character is. So `'\''`, an escaped quote, reads as one four-character literal — its
-/// close is the fourth character, not the third. This tells a character literal (`'a'`)
-/// from a lifetime (`impl<'a>`), with no token boundary to read either one by.
+/// it. A `\` takes its escaped value next: two hex digits after `\x`, a `{...}` code
+/// point after `\u`, or one character for anything else, `\'` included. So `'\''`, an
+/// escaped quote, and `'\x41'`, a hex escape, each read as one whole literal, with the
+/// real closing `'` past the escape rather than inside it. This tells a character literal
+/// (`'a'`) from a lifetime (`impl<'a>`), with no token boundary to read either one by.
 fn char_literal_end(chars: &[(usize, char)], quote: usize) -> Option<usize> {
     let mut index = quote.saturating_add(1);
     let first = chars.get(index)?.1;
@@ -3551,9 +3552,37 @@ fn char_literal_end(chars: &[(usize, char)], quote: usize) -> Option<usize> {
     }
     index = index.saturating_add(1);
     if first == '\\' {
+        let escaped = chars.get(index)?.1;
         index = index.saturating_add(1);
+        index = match escaped {
+            'x' => index.saturating_add(2),
+            'u' => skip_unicode_escape_body(chars, index)?,
+            _ => index,
+        };
     }
     (chars.get(index)?.1 == '\'').then_some(index.saturating_add(1))
+}
+
+/// Index in `chars` just past a `\u{...}` escape's braced code point, given the index
+/// right after the `u`.
+///
+/// `None` if no `{` follows, or if no `}` closes it within a few characters — a code point
+/// is at most six hex digits, so a longer run is not one.
+fn skip_unicode_escape_body(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    if chars.get(start)?.1 != '{' {
+        return Some(start);
+    }
+    let mut index = start.saturating_add(1);
+    while chars
+        .get(index)
+        .is_some_and(|&(_, character)| character != '}')
+    {
+        index = index.saturating_add(1);
+        if index > start.saturating_add(8) {
+            return None;
+        }
+    }
+    Some(index.saturating_add(1))
 }
 
 /// Whether a declaration's prefix marks it `pub`, and not `pub(crate)`.
