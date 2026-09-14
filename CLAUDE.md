@@ -3446,6 +3446,26 @@ own `(bool, Vec<&syn::Item>)` entry gated by `variant_gated || has_cfg_test(fiel
 matching the two sibling helpers; the discriminant, having no per-part gate of its own
 to combine with, keeps its single entry at the variant's own gate.
 
+Round 27 found two more. The first: `impl T for X { type A<U: Marker<{ impl Clone for
+Recovery { .. }; 0 }>> = (); }` is legal Rust — a generic associated-type
+*implementation*'s own type-parameter bound can bury a block through a const generic
+argument, matching the trait's own declared bound for coherence, exactly the way an
+impl's own generic *declarations* already could since round 24 — and both
+`impl_member_scope_roots`'s and `impl_member_bodies`'s `ImplItem::Type` arms read only
+`assoc_type.ty`, never `assoc_type.generics`. Both gained a
+`direct_blocks_in_generics`/`generics_items` pass over the associated type's own
+generics alongside its existing type pass. The second was a false positive in
+`declares_item_macro` rather than a false negative in the Clone scan: its visitor
+checked `#[cfg(test)]` only on the enclosing `syn::Item`, so `#[cfg(test)] fn helper()
+{ generate_clone!(); }` inside an otherwise-production `impl` or `trait` block was
+still reached by the default descent into the *member*, because `syn::visit::Visit`
+dispatches a member through `visit_impl_item`/`visit_trait_item` rather than through
+`visit_item` again — the one override this visitor had. A macro that only ever
+compiles under `#[cfg(test)]` therefore failed the whole file closed over code that
+ships with nothing generated at all. The visitor gained `visit_impl_item` and
+`visit_trait_item` overrides, mirroring its existing `visit_item` one, backed by a new
+`trait_item_attrs` alongside the existing `impl_item_attrs`.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

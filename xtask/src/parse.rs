@@ -106,6 +106,17 @@ fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
     }
 }
 
+/// The attributes on a trait member, whatever kind of member it is.
+fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
 /// Strips a raw marker from every identifier in `stream`.
 ///
 /// `#![allow(r#missing_docs)]` renders as `allow(r#missing_docs)` through
@@ -940,8 +951,14 @@ fn impl_member_scope_roots(implementation: &syn::ItemImpl) -> Vec<&syn::Block> {
             // Round 23: an associated type's own type can bury a block the
             // same way a type alias's or a struct field's can — `impl T for X
             // { type A = [(); { impl Clone for Recovery { .. }; 0 }]; }` —
-            // and this member was dropped on the floor before.
+            // and this member was dropped on the floor before. Round 27: a
+            // generic associated type's own generics — a type parameter's
+            // bounds, exactly the shape round 24 already reads on the impl's
+            // own generics — can bury one too: `impl T for X { type A<U:
+            // Marker<{ impl Clone for Recovery { .. }; 0 }>> = (); }` reached
+            // `assoc_type.ty` and never `assoc_type.generics`.
             syn::ImplItem::Type(assoc_type) if !has_cfg_test(&assoc_type.attrs) => {
+                roots.extend(direct_blocks_in_generics(&assoc_type.generics));
                 roots.extend(direct_blocks_in_type(&assoc_type.ty));
             }
             _ => {}
@@ -1241,6 +1258,28 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
                 return;
             }
             syn::visit::visit_item(self, item);
+        }
+
+        // Round 27: an item's own `#[cfg(test)]` was the only gate this visitor read,
+        // but a *member* of an otherwise-production `impl` or `trait` can carry its own
+        // `#[cfg(test)]` too — `#[cfg(test)] fn helper() { generate_clone!(); }` inside
+        // a production `impl` does not exist in a shipped build, and the default
+        // traversal `visit_item`'s override does not reach past the enclosing `impl`
+        // or `trait` to see it, so a macro inside such a member reached
+        // `visit_item_macro`/`visit_stmt_macro` regardless and rejected valid
+        // production code.
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, item);
+        }
+
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            if has_cfg_test(trait_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, item);
         }
 
         fn visit_item_macro(&mut self, _node: &'ast syn::ItemMacro) {
@@ -2624,7 +2663,10 @@ fn impl_member_bodies(
             )),
             syn::ImplItem::Type(assoc_type) => Some((
                 impl_gated || has_cfg_test(&assoc_type.attrs),
-                type_items(&assoc_type.ty),
+                generics_items(&assoc_type.generics)
+                    .into_iter()
+                    .chain(type_items(&assoc_type.ty))
+                    .collect(),
             )),
             _ => None,
         })

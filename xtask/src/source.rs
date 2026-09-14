@@ -12386,6 +12386,77 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_impl_inside_an_associated_types_own_generic_bound_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 27: a generic
+        // associated-type *implementation*'s own type-parameter bound can bury a
+        // block through a const generic argument — `impl T for X { type A<U:
+        // Marker<{ impl Clone for Recovery { .. }; 0 }>> = (); }` is legal Rust —
+        // and `impl_member_scope_roots`'s `ImplItem::Type` arm walked only
+        // `assoc_type.ty`, never `assoc_type.generics`, the same gap round 24 closed
+        // for an item's own generics and round 26 for a trait's own associated type
+        // declaration.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Marker<const N: usize> {}\n",
+                "trait T { type A<U>; }\n",
+                "struct Holder;\n",
+                "impl T for Holder {\n",
+                "    type A<U: Marker<{\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }>> = ();\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_in_a_cfg_test_gated_impl_member_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 27:
+        // `declares_item_macro`'s visitor checked `#[cfg(test)]` only on the
+        // enclosing `syn::Item`, so `#[cfg(test)] fn helper() { generate_clone!(); }`
+        // inside an otherwise-production `impl` block was still reached by the
+        // default descent into the member — the visitor had no override for
+        // `visit_impl_item`/`visit_trait_item` to stop at a test-gated *member* the
+        // way it already stops at a test-gated item. A macro that only ever compiles
+        // under `#[cfg(test)]` was therefore read as reachable in production and
+        // failed the whole file closed over code that ships with nothing generated
+        // at all.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    #[cfg(test)]\n",
+            "    #[allow(dead_code)]\n",
+            "    fn helper() {\n",
+            "        generate_clone!();\n",
+            "    }\n",
+            "}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
