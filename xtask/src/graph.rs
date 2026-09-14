@@ -684,6 +684,51 @@ pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
     violations
 }
 
+/// Rule: `waymaker-drive` declares no dependency on an Embassy crate, in any table.
+///
+/// `ctx-facade`'s other half — `check_facade_free_driver` in `source.rs` — reads identifiers
+/// in Rust source, so it cannot see a dependency a manifest declares and no `use` ever
+/// names. This is the half issue [#106](https://github.com/madmax983/waymaker/issues/106)
+/// asked for: `waymaker-drive`'s independence from the façade as a fact `cargo metadata`
+/// states, not a scanner's opinion about what its source happens to import today. The edge
+/// belongs in `waymaker-facade-demo`, one crate above.
+///
+/// Declared rather than transitive, on purpose: `waymaker-drive` dev-depends on
+/// `waymaker-rig`, and `waymaker-rig` normal-depends on `waymaker-embassy` for the
+/// `PersistentClock` two board clocks implement (issue #34, ADR 0031) — a legitimate edge
+/// that predates and is unrelated to this one. Walking the full transitive graph would flag
+/// that dev-only test dependency as though it were the façade edge; declared dependencies
+/// are what the firmware library build actually links, and what issue #106 promises about.
+///
+/// `waymaker-drive` is not in [`LAYERS`], so [`check_embassy_stays_above_flash`] does not
+/// reach it; this is that check's declared-only cousin, narrowed to the one test-support
+/// crate issue #106 makes a promise about.
+#[must_use]
+pub fn check_driver_reaches_no_embassy(graph: &PackageGraph) -> Vec<Violation> {
+    const DRIVER: &str = "waymaker-drive";
+
+    let Some(package) = graph.find(DRIVER) else {
+        return Vec::new();
+    };
+
+    package
+        .manifest_deps
+        .iter()
+        .filter(|dep| policy::is_embassy_package(&dep.name))
+        .map(|dep| {
+            Violation::new(
+                "ctx-facade",
+                DRIVER,
+                format!(
+                    "declares `{}` in [{}]; the façade edge belongs in \
+                     waymaker-facade-demo, above this crate",
+                    dep.name, dep.kind
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Rule: every layer and every test-support crate has empty default features.
 #[must_use]
 pub fn check_empty_default_features(graph: &PackageGraph) -> Vec<Violation> {
@@ -800,6 +845,7 @@ mod tests {
         let mut all = check_dependency_direction(graph);
         all.extend(check_kernel_has_no_dependencies(graph));
         all.extend(check_embassy_stays_above_flash(graph));
+        all.extend(check_driver_reaches_no_embassy(graph));
         all.extend(check_empty_default_features(graph));
         all
     }
@@ -987,6 +1033,100 @@ mod tests {
                 .with_dependency("waymaker-flash", DepKind::Normal),
         ]);
         assert!(check_embassy_stays_above_flash(&graph).is_empty());
+    }
+
+    #[test]
+    fn the_driver_may_not_reach_embassy_even_though_it_is_not_a_layer() {
+        // Issue #106: `check_embassy_stays_above_flash` iterates `LAYERS`, and
+        // `waymaker-drive` is not one, so it would otherwise be free to declare the edge
+        // the crate split exists to remove — a manifest change a source scanner cannot see,
+        // since it never has to appear as a `use`.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+        ]);
+
+        let violations = rules(&graph);
+        assert!(
+            fired(&violations, "ctx-facade", "waymaker-drive"),
+            "an undeclared façade edge on the driver must be caught: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn the_driver_may_not_dev_depend_on_embassy_either() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Development),
+        ]);
+
+        let violations = rules(&graph);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule == "ctx-facade"
+                    && violation.subject == "waymaker-drive"
+                    && violation.detail.contains("waymaker-embassy")
+                    && violation.detail.contains("dev-dependencies")),
+            "a dev-dependency on the façade is still the façade edge: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_legitimate_dev_dependency_that_itself_reaches_embassy_is_not_the_drivers_edge() {
+        // `waymaker-rig` normal-depends on `waymaker-embassy` for `PersistentClock` (issue
+        // #34, ADR 0031), and `waymaker-drive` dev-depends on `waymaker-rig` for
+        // `tests/matrix.rs`'s shared vocabulary. Neither edge is issue #106's façade edge,
+        // and a transitive walk would wrongly flag the second because of the first.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-rig")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal)
+                .with_dependency("waymaker-rig", DepKind::Development),
+        ]);
+
+        assert!(
+            check_driver_reaches_no_embassy(&graph).is_empty(),
+            "waymaker-rig's own edge to the fa\u{e7}ade must not be attributed to waymaker-drive"
+        );
+    }
+
+    #[test]
+    fn the_driver_with_no_facade_edge_is_not_flagged() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+            Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+        ]);
+        assert!(check_driver_reaches_no_embassy(&graph).is_empty());
     }
 
     #[test]

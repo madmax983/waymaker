@@ -338,6 +338,7 @@ pub fn check_inputs(inputs: &WorkspaceInputs) -> Result<Vec<Violation>, CheckErr
     violations.extend(graph::check_dependency_direction(&graph));
     violations.extend(graph::check_kernel_has_no_dependencies(&graph));
     violations.extend(graph::check_embassy_stays_above_flash(&graph));
+    violations.extend(graph::check_driver_reaches_no_embassy(&graph));
     violations.extend(graph::check_empty_default_features(&graph));
     violations.extend(graph::check_workspace_membership(&graph));
     violations.extend(graph::check_layers_are_local(&graph));

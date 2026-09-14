@@ -166,9 +166,15 @@ restructure taken at the end of a review round is one no round has reviewed.
 **Superseded by issue #106.** `without-facade` and the `drive-facadeless` stage are gone.
 `waymaker-facade-demo` now holds `facade`, `ota` and `provisioning` above `waymaker-drive`,
 which names no dependency on `waymaker-embassy` at all — a fact `cargo metadata` states
-rather than a claim a feature flag argued for. `ctx-facade`'s driver half keeps its shape,
-holding every `waymaker-drive` module to naming no façade, but its exemption list is now
-empty because there is no in-crate module left to exempt. Moving `ota` and `provisioning`
+rather than a claim a feature flag argued for, and `ctx-facade` now reads that graph
+directly rather than only the identifiers Rust source spells: Codex's review of this change
+found that a manifest edit alone, naming no crate in any `use`, passed every check here
+before this half existed. Declared dependencies only, not the full transitive closure —
+`waymaker-drive` dev-depends on `waymaker-rig`, which itself normal-depends on
+`waymaker-embassy` for `PersistentClock` (issue #34), and that edge is neither new nor the
+façade's. `ctx-facade`'s source-level driver half keeps its shape, holding every
+`waymaker-drive` module to naming no façade, but its exemption list is now empty because
+there is no in-crate module left to exempt. Moving `ota` and `provisioning`
 also moved the one place either built a `Suspended`: a private field an in-crate module
 could reach directly, that a crate above `waymaker-drive` cannot. `Bridge` now keeps the
 real value the boundary returned and hands it back after a poll, rather than a value the
