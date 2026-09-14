@@ -21684,6 +21684,48 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_whose_block_declares_a_let_after_a_mutation_is_reported() {
+        // Codex's finding: the previous fix for a compound-assignment statement resolved
+        // every `let` in a block first, against the block's own *declared* values, and only
+        // applied every mutation afterward in a second pass — sound for `let mut x = 0; x +=
+        // 1; x - 1`, where the mutated name is also the tail expression, but not for a `let`
+        // statement that reads a name *after* an earlier mutation to it: `{ let mut x: u8 = n
+        // * 10; x /= 10; let y = x; y }` evaluates to `n` in real Rust, since `y` binds to
+        // `x`'s value after the division, but the two-pass shape resolved `y` from `x`'s
+        // freshly declared value (`n * 10`) before the mutation pass ever ran. Using this
+        // shape for constants `P0` through `P14` therefore made the scanner see sparse,
+        // wrong-valued patterns and report success over a dense table it could not see.
+        // `resolve_block_sequential` now walks every `let` and every mutation together, in
+        // the single order they actually execute, so `y` sees exactly the mutations that
+        // precede it.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = {n} * 10; x /= 10; let y = x; y }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_whose_block_lets_a_mutated_name(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_qualified_dependency_enum_variants_is_reported() {
         // Codex's finding: a dense match over a *dependency* crate's own enum variants —
         // `waymaker_core::transition::Divergence`'s real `Sequence`, `Kind`, `Digest` and

@@ -3712,6 +3712,15 @@ fn resolved_local_name(
 /// another declared after it in source order (`let a = b; let b = 1;` is not legal Rust, but
 /// two names each usable in the other's initializer inside one `const` block's worth of
 /// mutually-referencing constants is) does not depend on declaration order.
+///
+/// Codex's ordering finding: this fixed point is sound for `locals` filled with a block's own
+/// `const` items alone — order-independent statics, exactly like the top-level constants the
+/// doc comment above already describes — and unsound for a plain `let` statement, which
+/// executes in source order and can be reassigned by a mutation between its own declaration
+/// and a later statement that reads it. `evaluate_block` now calls this only with `block`'s
+/// `const` items; every `let` and every mutation statement is [`resolve_block_sequential`]'s,
+/// walked together in the one order they actually run in rather than folded into this
+/// fixed point.
 fn resolve_block_locals(
     locals: &std::collections::HashMap<String, syn::Expr>,
     local_types: &std::collections::HashMap<String, String>,
@@ -3763,30 +3772,96 @@ fn resolve_block_locals(
     resolved
 }
 
-/// Applies every compound-assignment statement `block` declares, in source order, to
-/// `resolved` — factored out of [`evaluate_block`] to keep that function under clippy's line
-/// count, not because this half is any less part of the identical fix.
+/// Walks `block`'s own `let` and compound-assignment statements together, in source order,
+/// updating `resolved` as each one is reached — factored out of [`evaluate_block`] to keep
+/// that function under clippy's line count.
 ///
-/// Codex's finding: `let mut x = 0; x += 1; x - 1` names a mutation [`evaluate_block`]'s own
-/// local-resolution loop has no way to represent — that loop resolves each local from one
-/// static initializer expression, and a statement that changes a local afterward is a fact
-/// about *sequence* that map has no room for. Applied here instead, once every declaration
-/// has had its own chance to resolve: each mutation's own right-hand side is resolved
-/// against the local scope as it stands *at that point* — the identical shape
-/// `evaluate_block`'s own `block_resolve` reads for the tail expression — and `resolved` is
-/// updated in place before the next mutation (or the tail) is evaluated, so `x += 1; x +=
-/// 1;` compounds rather than only the last write being seen. A mutation naming a local this
-/// scan never resolved a declaration for at all — an out-of-order reference, or one this
-/// scan's own fixed point gave up on — is refused rather than silently skipped, since
-/// skipping it would leave `x` at its *declared* value and every later read of it a value
-/// `rustc` would never produce.
-fn apply_block_mutations(
+/// Codex's finding: `let mut x = 0; x += 1; x - 1` names a mutation the previous version of
+/// this scan had no way to represent — a fixed point over every `let`'s own static
+/// initializer, run to completion, *then* every mutation applied afterward in a second pass.
+/// That second pass was itself real progress over resolving no mutation at all, but it kept
+/// the two kinds of statement in two different passes rather than one order, and Codex's
+/// next-round finding is what that costs: `{ let mut x: u8 = n * 10; x /= 10; let y = x; y
+/// }` evaluates to `n` in real Rust, because `y` binds to whatever `x` holds *after* the
+/// division that precedes it — but the old two-pass shape resolved every `let` first, so `y`
+/// bound to `x`'s freshly *declared* value (`n * 10`) before the mutation pass ever ran, and
+/// the division that should have applied to `y`'s own view of `x` never touched it. This
+/// function is the fix: a single walk over `block.stmts`, in order, threading one `resolved`
+/// map through both statement kinds, so a `let` sees exactly the mutations that precede it
+/// in source order and none that follow — the identical thing `rustc` does when it executes
+/// the block one statement at a time.
+///
+/// `resolved` on entry already holds `block`'s own resolved `const` items from
+/// [`resolve_block_locals`]'s own fixed point: a local `const` is an order-independent
+/// static rather than a statement this walk executes, so two mutually-referencing constants
+/// keep the fixed point that finding local `const`s at all needed in the first place, and
+/// this walk never lets a `let` or a mutation feed back into it.
+///
+/// A `let` whose initializer this scan cannot resolve is left out of `resolved` rather than
+/// failing the whole walk — the same leniency every other unresolved local in this scan
+/// gets, since a later reference to it will simply fail to resolve in its own turn rather
+/// than being credited with a wrong answer. A mutation naming a local with no resolved value
+/// yet is refused outright instead, for the reason [`apply_compound_assignment`]'s own doc
+/// comment already gives for skipping being worse than refusing: silently leaving that local
+/// at a value `rustc` would never have produced there would credit every later read of it
+/// with an answer rather than with no answer at all.
+fn resolve_block_sequential(
     block: &syn::Block,
     resolve: &Resolve<'_>,
     local_types: &std::collections::HashMap<String, String>,
     resolved: &mut std::collections::HashMap<String, i128>,
 ) -> Option<()> {
-    for (name, op, rhs_expr) in block_mutation_stmts(block) {
+    for stmt in &block.stmts {
+        if stmt_is_cfg_test(stmt) {
+            continue;
+        }
+        if let syn::Stmt::Local(local) = stmt {
+            let Some(init) = local.init.as_ref() else {
+                continue;
+            };
+            if init.diverge.is_some() {
+                continue;
+            }
+            for (name, expr) in destructured_binding(&local.pat, &init.expr) {
+                let scoped_resolve_value = |path: &syn::Path| {
+                    path.get_ident()
+                        .map(ident_name)
+                        .and_then(|candidate| resolved.get(&candidate).copied())
+                        .or_else(|| (resolve.value)(path))
+                };
+                let scoped_resolve_unsigned = |path: &syn::Path| {
+                    resolved_local_name(path, resolved).map_or_else(
+                        || (resolve.unsigned)(path),
+                        |candidate| {
+                            local_types
+                                .get(&candidate)
+                                .is_some_and(|name| is_unsigned_type_name(name))
+                        },
+                    )
+                };
+                let scoped_resolve_width = |path: &syn::Path| {
+                    resolved_local_name(path, resolved).map_or_else(
+                        || (resolve.width)(path),
+                        |candidate| local_types.get(&candidate).map(String::as_str),
+                    )
+                };
+                let scoped_resolve = Resolve {
+                    value: &scoped_resolve_value,
+                    unsigned: &scoped_resolve_unsigned,
+                    width: &scoped_resolve_width,
+                };
+                if let Some(value) = literal_or_const_value(&expr, &scoped_resolve) {
+                    resolved.insert(name, value);
+                }
+            }
+            continue;
+        }
+        let syn::Stmt::Expr(expr, Some(_)) = stmt else {
+            continue;
+        };
+        let Some((name, op, rhs_expr)) = mutation_target(expr) else {
+            continue;
+        };
         let &current_value = resolved.get(&name)?;
         let mutation_resolve_value = |path: &syn::Path| {
             path.get_ident()
@@ -3829,16 +3904,22 @@ fn apply_block_mutations(
 }
 
 fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
-    let mut locals = block_const_exprs(block);
-    let const_item_count = locals.len();
+    let const_locals = block_const_exprs(block);
+    let const_item_count = const_locals.len();
     let lets = block_let_exprs(block);
-    let combined_len = locals.len() + lets.len();
-    for (name, expr) in lets {
-        locals.insert(name, expr);
+    let combined_len = const_locals.len() + lets.len();
+    // Codex's ordering finding is about *resolution*, not about this collision check: a
+    // `let` name and a `const` item name sharing one block still have to be counted as two
+    // separate declarations rather than one silently overwriting the other in this map, so
+    // the check stays exactly what it always compared — it is only the merged map's role in
+    // *resolving* values that `resolve_block_sequential` below takes over instead.
+    let mut name_collision_check = const_locals.clone();
+    for (name, expr) in &lets {
+        name_collision_check.insert(name.clone(), expr.clone());
     }
     let mut local_types = block_const_types(block);
     local_types.extend(block_let_types(block));
-    if locals.len() != combined_len {
+    if name_collision_check.len() != combined_len {
         return None;
     }
     let ignored_lets = block_ignored_let_count(block);
@@ -3881,11 +3962,13 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     let syn::Stmt::Expr(tail_expr, None) = tail else {
         return None;
     };
-    let mut resolved = resolve_block_locals(&locals, &local_types, resolve);
-    // [`apply_block_mutations`]'s own doc comment holds the rationale: a compound assignment
-    // is a fact about *sequence* the loop above has no room for, so it is applied separately
-    // and afterward, once every declaration has had its own chance to resolve.
-    apply_block_mutations(block, resolve, &local_types, &mut resolved)?;
+    let mut resolved = resolve_block_locals(&const_locals, &local_types, resolve);
+    // [`resolve_block_sequential`]'s own doc comment holds the rationale: a `let` and a
+    // mutation are both facts about *sequence*, which `resolve_block_locals`'s own
+    // order-independent fixed point (correct for `const` items alone) has no room for, so
+    // the two statement kinds are walked together afterward, in the order they actually
+    // execute.
+    resolve_block_sequential(block, resolve, &local_types, &mut resolved)?;
     let block_resolve_value = |path: &syn::Path| {
         path.get_ident()
             .map(ident_name)
