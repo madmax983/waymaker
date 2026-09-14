@@ -20779,6 +20779,32 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_crate_root_path_inside_a_match_guard_is_reported() {
+        // Codex's next-round finding: `_ if crate::ALWAYS => value, _ => fallback` names a
+        // crate-root path in a match *guard*, which `CrateRootPatterns` had never reached —
+        // its own `crate_anchored_paths` was called only from a `const` item's initializer
+        // and from `visit_pat`'s own pattern-position check, neither of which is a guard.
+        // The guard's own path resolves to nothing (`resolve_anchored_single_segment`
+        // declines `crate::NAME` on purpose), so the arm it guards is neither provably dead
+        // nor the real wildcard and the outer match reads as not dense — but the hidden
+        // path itself went unreported, unlike the identical shape in a `const` initializer
+        // or a pattern. `visit_expr_match` now searches every arm's own guard the same way.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn crate_root_guard_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        _ if crate::ALWAYS => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("matches the pattern `crate::ALWAYS`")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

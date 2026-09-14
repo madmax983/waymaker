@@ -1168,6 +1168,31 @@ pub fn crate_root_pattern_uses(contents: &str) -> Result<Vec<String>, syn::Error
             }
             syn::visit::visit_pat(self, node);
         }
+
+        // Codex's next-round finding: `_ if crate::ALWAYS => value, _ => fallback` names a
+        // crate-root path in a match *guard*, which is neither a `const` initializer
+        // `visit_item`/`visit_impl_item` reach through `crate_anchored_paths`, nor a
+        // pattern `visit_pat` reaches — a guard is `syn::Arm`'s own `guard` field, a plain
+        // expression sitting beside the pattern rather than inside it. `resolve_pattern_path`
+        // already declines a `crate::` path the identical way `resolve_anchored_single_segment`
+        // does for one in pattern position, so the guard resolves to nothing and the arm it
+        // guards reads as neither provably dead nor the real wildcard — but that only stops
+        // *this* scan from mistaking a hidden table for a dense one, it does not report the
+        // hidden path the way a pattern or a `const` initializer spelled the same way already
+        // does. Every arm's own guard is searched the identical way a `const`'s initializer
+        // already is, closing the one expression position within a `match` this visitor had
+        // not reached yet.
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            for arm in &node.arms {
+                if has_cfg_test(&arm.attrs) {
+                    continue;
+                }
+                if let Some((_, guard_expr)) = &arm.guard {
+                    self.found.extend(crate_anchored_paths(guard_expr));
+                }
+            }
+            syn::visit::visit_expr_match(self, node);
+        }
     }
 
     let file = parse_rust(contents)?;
