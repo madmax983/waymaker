@@ -17922,6 +17922,37 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_a_provably_true_guarded_wildcard_is_reported() {
+        // Codex's next-round finding: `_ if true => ..`, followed by the
+        // exhaustiveness-required `_ => ..`, unconditionally matches every remaining input
+        // exactly as an unguarded `_` would — but `is_catchall_pattern` was handed
+        // `arm.guard.is_some()` unconditionally, so this arm read as an ordinary guarded,
+        // non-wild arm, and the *real* trailing wildcard after it (dead code `rustc`
+        // eliminates, since the guarded arm already claims everything) was the one
+        // `has_dense_arm_patterns` looked at — leaving the numbered prefix in front of it
+        // carrying the guarded arm's own empty pattern, exactly the shape the forty-sixth
+        // round's false-guard fix already refuses. A guard this scan resolves to anything
+        // but `0` is now treated as absent, so the guarded arm reads as the real wildcard
+        // and the scan stops there, dropping the truly unreachable arm after it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn true_guarded_wildcard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn true_guarded_wildcard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => true_guarded_wildcard_helper(0),\n        \
+             1 => true_guarded_wildcard_helper(1),\n        2 => true_guarded_wildcard_helper(2),\n        \
+             _ if true => true_guarded_wildcard_helper(3),\n        \
+             _ => true_guarded_wildcard_helper(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

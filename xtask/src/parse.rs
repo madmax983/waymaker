@@ -4433,23 +4433,41 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // is ever built, the same way `rustc`'s own dead-code elimination would drop it.
         // A guard this scan cannot resolve, or that resolves to anything but `0`, is left
         // exactly as before: not provably dead, so not excluded.
-        let arms = node
-            .arms
-            .iter()
-            .filter(|arm| !has_cfg_test(&arm.attrs))
-            .filter(|arm| {
-                !matches!(
-                    &arm.guard,
-                    Some((_, guard_expr))
-                        if literal_or_const_value(guard_expr, &resolve) == Some(0)
-                )
-            })
-            .map(|arm| FoundArm {
+        //
+        // Codex's next-round finding: the mirror image of a provably dead guard is a
+        // provably *true* one — `_ if true => 15` unconditionally matches every input a
+        // guard evaluates at all, exactly as an unguarded `_ => 15` would, but
+        // `is_catchall_pattern` was still handed `arm.guard.is_some()` unconditionally, so
+        // this arm read as an ordinary guarded, non-wild arm rather than the real
+        // terminating wildcard `rustc` treats it as — and a genuine trailing `_ => 16`
+        // after it, required only for exhaustiveness against a guard `rustc` cannot prove
+        // total at compile time, is dead code this scan had no way to discount. A guard
+        // this scan resolves to anything but `0` is now treated as absent for exactly the
+        // purpose `is_catchall_pattern`'s own `guarded` flag serves: an always-true guard
+        // over a wildcard or an unbound, unconstrained binding reads as the real wildcard.
+        // The moment that happens, every arm still to come is exactly the dead code a
+        // provably-false guard already drops — unreachable, because this one already
+        // claims every value — so the scan stops there instead of recording them.
+        let mut arms = Vec::new();
+        for arm in node.arms.iter().filter(|arm| !has_cfg_test(&arm.attrs)) {
+            let guard_value = arm
+                .guard
+                .as_ref()
+                .and_then(|(_, guard_expr)| literal_or_const_value(guard_expr, &resolve));
+            if guard_value == Some(0) {
+                continue;
+            }
+            let effectively_guarded = arm.guard.is_some() && guard_value.is_none();
+            let is_wild = is_catchall_pattern(&arm.pat, effectively_guarded, &resolve);
+            arms.push(FoundArm {
                 pattern: pattern_literal(&arm.pat, &resolve, &self.qualified),
-                is_wild: is_catchall_pattern(&arm.pat, arm.guard.is_some(), &resolve),
+                is_wild,
                 call: call_shape_of(&arm.body, &resolve),
-            })
-            .collect();
+            });
+            if is_wild {
+                break;
+            }
+        }
         self.found.push(FoundMatch { selector, arms });
         syn::visit::visit_expr_match(self, node);
     }
