@@ -116,13 +116,8 @@ impl World {
 }
 
 impl Activities for World {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        kind: ActivityKind,
-        _input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, intent: DurableIntent, _input: &[u8], out: &mut [u8]) -> Performed {
+        let kind = intent.kind();
         self.performed += 1;
         let reading = self.clock.to_le_bytes();
         let answer: &[u8] = if kind == FETCH { BODY } else { &reading };

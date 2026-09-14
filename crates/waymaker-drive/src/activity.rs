@@ -7,7 +7,6 @@
 //! [`Clocks`] is the same half of the boundary for design document §11's deadlines: the
 //! world is what a run asks things of, and time is one of them.
 
-use waymaker_core::ActivityKind;
 use waymaker_core::timer::{ClockCapability, ClockKind};
 
 use crate::effect::DurableIntent;
@@ -76,7 +75,12 @@ pub trait Activities {
     ///
     /// `intent` is design document §07 step 4's argument. Some boot committed the schedule
     /// record for it before this call — this one, or an earlier one that a reset or a retry
-    /// redelivered.
+    /// redelivered. [`DurableIntent::kind`] is which activity to run; there is no second
+    /// argument that could name a different one.
+    ///
+    /// `input` reaches an implementor only through [`Dispatchable::perform`](crate::Dispatchable::perform),
+    /// which checks it against the digest `intent` was scheduled under first — so by the
+    /// time this call happens, `input` is the same bytes the schedule record names.
     ///
     /// # Postconditions
     ///
@@ -88,13 +92,7 @@ pub trait Activities {
     /// [`Performed::Exhausted`] when the answer is wider. An implementor that writes what
     /// fits and reports `Completed(out.len())` records a short result, and every replay of
     /// the run returns that short result: the driver cannot tell it from a complete one.
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        input: &[u8],
-        out: &mut [u8],
-    ) -> Performed;
+    fn perform(&mut self, intent: DurableIntent, input: &[u8], out: &mut [u8]) -> Performed;
 }
 
 /// The clocks a driver may read.

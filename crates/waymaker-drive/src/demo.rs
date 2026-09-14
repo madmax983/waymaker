@@ -484,13 +484,8 @@ impl Default for World {
 }
 
 impl Activities for World {
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        _input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, intent: DurableIntent, _input: &[u8], out: &mut [u8]) -> Performed {
+        let kind = intent.kind();
         // Recorded before anything is decided, so a declined attempt is an offer like any
         // other. Counted whether or not the log had room, for the reason `count` is.
         if let Some(slot) = self.offers.get_mut(self.offered) {

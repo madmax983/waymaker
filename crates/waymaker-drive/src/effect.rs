@@ -6,7 +6,7 @@
 //!
 //! # What makes step 4 unreachable
 //!
-//! [`DurableIntent`] is the only value a dispatch accepts, and its field is private. This
+//! [`DurableIntent`] is the only value a dispatch accepts, and its fields are private. This
 //! module builds one in two bodies only. [`Effect::schedule`] builds one after step 3's
 //! commit barrier returned. `Effect::redelivering` builds one for a schedule record that an
 //! earlier boot committed; it is `pub(crate)`, because its evidence is the kernel's
@@ -15,38 +15,52 @@
 //! So no caller outside this crate can name the identity of an effect it has not committed,
 //! and inside it the one exception is one function with one caller.
 //!
+//! # What makes step 4 unmistakable
+//!
+//! A [`DurableIntent`] carries the kind and the input digest step 3 committed, not only the
+//! sequence. [`Dispatchable::perform`] is the one route from that value and raw bytes to a
+//! dispatched effect, and it checks the bytes against the digest first. So a caller cannot
+//! dispatch effect A's identity under effect B's kind or input, by construction — see
+//! [issue #92](https://github.com/madmax983/waymaker/issues/92).
+//!
 //! # Why this crate
 //!
 //! `waymaker-flash` owns steps 1 to 3 and 5 to 7, and must not own activities. Step 4 is an
 //! activity. The protocol that joins them therefore sits above the layers, beside the
 //! driver that runs it.
 
-use waymaker_core::{EffectId, EffectRequest, EffectSeq, Outcome, RecordRef, RunId};
+use waymaker_core::{ActivityKind, EffectId, EffectRequest, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_flash::capacity::{Reserved, ReservedError};
+use waymaker_flash::frame;
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 use waymaker_flash::storage::StableStorage;
 
+use crate::activity::{Activities, Performed};
 use crate::drive::DriveError;
 
-/// Proof that §07 step 3 completed for one effect.
+/// Proof that §07 step 3 completed for one effect, for one request.
 ///
-/// Step 4 accepts no other proof.
+/// Step 4 accepts no other proof. It carries the [`EffectRequest`] step 3 committed, so the
+/// kind an activity dispatches under cannot be some other kind: there is no second way to
+/// name one. See [`Dispatchable::perform`] for the same guarantee over the input bytes.
 ///
 /// # Why the field is private
 ///
 /// So that a dispatch before a durable intent does not compile:
 ///
 /// ```compile_fail,E0451
-/// use waymaker_core::{EffectId, EffectSeq, RunId};
+/// use waymaker_core::{ActivityKind, EffectId, EffectRequest, EffectSeq, RunId};
 /// use waymaker_drive::DurableIntent;
 ///
 /// let forged = DurableIntent {
 ///     id: EffectId { run: RunId(1), seq: EffectSeq(0) },
+///     request: EffectRequest { kind: ActivityKind(1), input_len: 0, input_crc: 0 },
 /// };
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DurableIntent {
     id: EffectId,
+    request: EffectRequest,
 }
 
 impl DurableIntent {
@@ -58,6 +72,15 @@ impl DurableIntent {
     #[must_use]
     pub const fn id(self) -> EffectId {
         self.id
+    }
+
+    /// Which activity step 3 scheduled.
+    ///
+    /// The one kind [`Dispatchable::perform`] may dispatch this identity under. There is no
+    /// second argument an implementor or a caller can read a different kind from.
+    #[must_use]
+    pub const fn kind(self) -> ActivityKind {
+        self.request.kind
     }
 }
 
@@ -203,6 +226,7 @@ impl<C: IntegrityCheck> Effect<C> {
             dispatch: Dispatchable {
                 intent: DurableIntent {
                     id: EffectId { run: self.run, seq },
+                    request,
                 },
                 writer: self.writer,
             },
@@ -215,23 +239,41 @@ impl<C: IntegrityCheck> Effect<C> {
     /// §08's redelivery row. Committed history holds the schedule record and no outcome, so
     /// steps 1 to 3 already happened and this writes nothing.
     ///
+    /// `request` is the caller's *current* call, already checked against that schedule
+    /// record by [`waymaker_core::ReplayMachine::intent`] — a replay that disagreed would
+    /// have stopped there rather than reach this function. Passing it through binds the
+    /// redelivered identity to the same kind and input the schedule record names, with no
+    /// second read of media.
+    ///
     /// # Why it is not public
     ///
-    /// It mints a proof from a sequence number. The evidence is the kernel's
-    /// `Resolve::Redeliver`, which the driver reads and this function cannot see, so in any
-    /// hand but that one it is a forge. `pub(crate)` confines the trust to the one caller.
-    /// See
+    /// It mints a proof from a sequence number. The evidence that the sequence is real is
+    /// the kernel's `Resolve::Redeliver`, which the driver reads and this function cannot
+    /// see, so in any hand but that one it is a forge. `pub(crate)` confines the trust to
+    /// the one caller. See
     /// [what is not checked](https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#what-is-not-checked).
     #[must_use]
-    pub(crate) const fn redelivering(self, seq: EffectSeq) -> Dispatchable<C> {
+    pub(crate) const fn redelivering(
+        self,
+        seq: EffectSeq,
+        request: EffectRequest,
+    ) -> Dispatchable<C> {
         Dispatchable {
             intent: DurableIntent {
                 id: EffectId { run: self.run, seq },
+                request,
             },
             writer: self.writer,
         }
     }
 }
+
+/// Step 4 was asked for `input` that disagrees with what step 3 committed.
+///
+/// [`Dispatchable::perform`] refuses before the activity runs. A caller offered bytes other
+/// than the ones the identity was scheduled with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InputMismatch;
 
 /// An effect whose intent is durable: step 4 is legal, and steps 5 to 7 end it.
 #[derive(Debug, PartialEq, Eq)]
@@ -245,6 +287,33 @@ impl<C: IntegrityCheck> Dispatchable<C> {
     #[must_use]
     pub const fn intent(&self) -> DurableIntent {
         self.intent
+    }
+
+    /// §07 step 4: ask `activities` to perform this identity's effect.
+    ///
+    /// Checks `input` against what step 3 committed before `activities` ever sees it. This
+    /// is the whole of the guarantee [`DurableIntent`] states: the kind cannot be a
+    /// different kind, because there is no second argument to read one from, and the input
+    /// cannot be different bytes, because this is the one route from a [`Dispatchable`] and
+    /// raw bytes to a [`Performed`] answer, and it checks first.
+    ///
+    /// # Errors
+    ///
+    /// [`InputMismatch`] when `input`'s length or digest disagrees with the request step 3
+    /// recorded. `activities` is not called.
+    pub fn perform<A: Activities>(
+        &self,
+        activities: &mut A,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> Result<Performed, InputMismatch> {
+        let request = self.intent.request;
+        if input.len() != usize::from(request.input_len)
+            || frame::input_digest_with::<C>(input) != request.input_crc
+        {
+            return Err(InputMismatch);
+        }
+        Ok(activities.perform(self.intent, input, out))
     }
 
     /// §07 steps 5, 6 and 7: the outcome frame, the payload barrier, and the seal.
@@ -303,7 +372,9 @@ mod tests {
     use waymaker_flash::recovery::{JournalRegion, Recovery};
     use waymaker_flash::storage::Geometry;
 
-    use super::{Effect, Resolution};
+    use super::{Effect, InputMismatch, Resolution};
+    use crate::activity::{Activities, Performed};
+    use crate::effect::DurableIntent;
 
     const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
 
@@ -369,10 +440,84 @@ mod tests {
             .expect("the outcome fits");
         let before = device.image().to_vec();
 
-        let redelivered = resolved.next.redelivering(EffectSeq(0));
+        let redelivered = resolved.next.redelivering(EffectSeq(0), request);
 
         assert_eq!(redelivered.intent().id().run, RUN);
         assert_eq!(redelivered.intent().id().seq, EffectSeq(0));
+        assert_eq!(redelivered.intent().kind(), request.kind);
         assert_eq!(device.image(), before.as_slice());
+    }
+
+    /// A world that records what it was asked and always completes with `b"ok"`.
+    #[derive(Default)]
+    struct Recording {
+        asked: Option<(DurableIntent, [u8; 3])>,
+    }
+
+    impl Activities for Recording {
+        fn perform(&mut self, intent: DurableIntent, input: &[u8], out: &mut [u8]) -> Performed {
+            let mut bytes = [0_u8; 3];
+            let taken = input.len().min(bytes.len());
+            if let (Some(from), Some(into)) = (input.get(..taken), bytes.get_mut(..taken)) {
+                into.copy_from_slice(from);
+            }
+            self.asked = Some((intent, bytes));
+            let answer = b"ok";
+            if let Some(dst) = out.get_mut(..answer.len()) {
+                dst.copy_from_slice(answer);
+            }
+            Performed::Completed(answer.len())
+        }
+    }
+
+    /// `Dispatchable::perform` is the guarantee issue #92 asks for: the kind travels with
+    /// the identity because `Activities::perform` has no separate argument to read one from,
+    /// and the input is checked against what step 3 recorded before the world ever sees it.
+    #[test]
+    fn perform_refuses_input_that_disagrees_with_what_was_scheduled() {
+        let mut device = Device::new(geometry());
+        let mut page = [0_u8; 128];
+        let request = waymaker_core::EffectRequest {
+            kind: ActivityKind(1),
+            input_len: 3,
+            input_crc: 0x0BAD_F00D,
+        };
+        let scheduled = Effect::over(RUN, writer(&mut device))
+            .schedule(&mut device, EffectSeq(0), request, &mut page)
+            .expect("the schedule fits the journal");
+
+        let mut world = Recording::default();
+        let mut out = [0_u8; 8];
+        let refused = scheduled.dispatch.perform(&mut world, b"xyz", &mut out);
+
+        assert_eq!(refused, Err(InputMismatch));
+        assert_eq!(world.asked, None, "a refused input never reaches the world");
+    }
+
+    #[test]
+    fn perform_binds_the_kind_and_forwards_matching_input() {
+        let mut device = Device::new(geometry());
+        let mut page = [0_u8; 128];
+        let kind = ActivityKind(7);
+        let input = b"abc";
+        let request = waymaker_core::EffectRequest {
+            kind,
+            input_len: 3,
+            input_crc: waymaker_flash::frame::input_digest_with::<
+                waymaker_flash::integrity::Catalogued,
+            >(input),
+        };
+        let scheduled = Effect::over(RUN, writer(&mut device))
+            .schedule(&mut device, EffectSeq(0), request, &mut page)
+            .expect("the schedule fits the journal");
+
+        let mut world = Recording::default();
+        let mut out = [0_u8; 8];
+        let performed = scheduled.dispatch.perform(&mut world, input, &mut out);
+
+        assert_eq!(performed, Ok(Performed::Completed(2)));
+        let (asked_intent, asked_input) = world.asked.expect("the world was asked");
+        assert_eq!(asked_intent.kind(), kind);
+        assert_eq!(&asked_input, input);
     }
 }

@@ -186,7 +186,6 @@ impl Activities for Unused {
     fn perform(
         &mut self,
         _intent: waymaker_drive::DurableIntent,
-        _kind: ActivityKind,
         _input: &[u8],
         _out: &mut [u8],
     ) -> Performed {

@@ -3976,9 +3976,23 @@ pub const EFFECT_PROTOCOL_PATH: &str = "waymaker-drive/src/effect.rs";
 /// from a sequence number — which is a forge in any hand but the driver's beside it. It is
 /// `pub(crate)`, and [`EFFECT_TYPE_METHODS`] is what keeps it declared.
 ///
+/// `kind` and `perform` are issue [#92](https://github.com/madmax983/waymaker/issues/92)'s:
+/// `DurableIntent::kind` reads the activity step 3 committed rather than a second argument
+/// naming one, and `Dispatchable::perform` is the one route from a proof and raw bytes to a
+/// dispatch — it checks the bytes against the digest step 3 committed before an activity
+/// ever sees them.
+///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
-pub const EFFECT_PROTOCOL_SURFACE: &[&str] =
-    &["id", "intent", "into_writer", "over", "resolve", "schedule"];
+pub const EFFECT_PROTOCOL_SURFACE: &[&str] = &[
+    "id",
+    "intent",
+    "into_writer",
+    "kind",
+    "over",
+    "perform",
+    "resolve",
+    "schedule",
+];
 
 /// Every type §07's protocol is made of, and every method it may declare — at any visibility.
 ///
@@ -3992,8 +4006,8 @@ pub const EFFECT_PROTOCOL_SURFACE: &[&str] =
 ///
 /// Each list is sorted, so the comparison can be a set comparison.
 pub const EFFECT_TYPE_METHODS: [(&str, &[&str]); 3] = [
-    ("DurableIntent", &["id"]),
-    ("Dispatchable", &["intent", "resolve"]),
+    ("DurableIntent", &["id", "kind"]),
+    ("Dispatchable", &["intent", "perform", "resolve"]),
     (
         "Effect",
         &["into_writer", "over", "redelivering", "schedule"],
@@ -15168,6 +15182,11 @@ impl DurableIntent {
     pub const fn id(self) -> EffectId {
         self.id
     }
+
+    /// The kind step 3 scheduled.
+    pub const fn kind(self) -> u8 {
+        0
+    }
 }
 
 /// The protocol between effects.
@@ -15223,6 +15242,11 @@ impl<C: IntegrityCheck> Dispatchable<C> {
     /// What step 4 dispatches under.
     pub const fn intent(&self) -> DurableIntent {
         self.intent
+    }
+
+    /// Step 4, checked against what step 3 recorded.
+    pub fn perform(&self) -> u8 {
+        0
     }
 
     /// Steps 5, 6 and 7.

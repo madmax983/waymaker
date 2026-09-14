@@ -218,13 +218,7 @@ struct Unused {
 }
 
 impl Activities for Unused {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _intent: DurableIntent, _input: &[u8], _out: &mut [u8]) -> Performed {
         self.performed += 1;
         Performed::Pending
     }
