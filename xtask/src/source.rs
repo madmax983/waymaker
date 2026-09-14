@@ -20497,6 +20497,37 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_negated_boolean_constant_path_is_reported() {
+        // Codex's next-round finding: `const OFF: bool = false; .. _ if !OFF => .., _ =>
+        // ..` negates a *bare path* to a boolean constant, not a literal — `evaluate_bitwise_not`
+        // already handled `!true`/`!false` written directly, but a match arm's own guard was
+        // always resolved with a `resolve.width` stub answering `None` unconditionally, on
+        // the reasoning that only a `const`'s own initializer ever needed a referenced
+        // constant's declared width. That reasoning held for an *integer* width, where a
+        // value alone cannot say how many bits to mask to, but excluded `bool`, which this
+        // scan already represents unambiguously as `0` or `1` either way — the only fact
+        // missing was that `OFF` is a `bool` at all. `MatchVisitor` now carries its own
+        // `scopes_types` (the same stack `scopes_unsigned` already is, mirrored), and every
+        // match arm's own guard or pattern answers `resolve.width` through it, so `!OFF`
+        // folds to `true` and the guarded arm reads as the real wildcard — the identical
+        // dead-code elimination a `_ if true => ..` guard already gets.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst OFF: bool = false;\n\n\
+             const fn negated_boolean_constant_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        \
+             _ if !OFF => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

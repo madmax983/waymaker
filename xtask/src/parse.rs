@@ -1994,6 +1994,7 @@ pub fn match_expressions_with_prefix(
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
         scopes_unsigned: UnsignedConstScopes(vec![item_const_unsigned(&file.items)]),
+        scopes_types: ConstTypeScopes(vec![item_const_types(&file.items)]),
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
@@ -2167,6 +2168,7 @@ pub fn qualified_constants_with_prefix(
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
         scopes_unsigned: UnsignedConstScopes(vec![item_unsigned]),
+        scopes_types: ConstTypeScopes(vec![item_const_types(&file.items)]),
         use_scopes: UseScopes(vec![item_use_imports(&file.items)]),
         module_path: prefix.to_vec(),
         module_scope_depths: Vec::new(),
@@ -2250,6 +2252,38 @@ impl UnsignedConstScopes {
             .rev()
             .find_map(|scope| scope.get(name).copied())
             .unwrap_or(false)
+    }
+}
+
+/// [`UnsignedConstScopes`]'s own mirror for a bare name's declared *type name* rather than
+/// only whether it is unsigned — [`ConstScopes`]'s own twin for the fact
+/// [`evaluate_bitwise_not`] needs a match arm's own guard or pattern to answer too, not only
+/// a `const`'s own sibling initializer.
+///
+/// Codex's next-round finding: `const OFF: bool = false; .. _ if !OFF => value, _ =>
+/// fallback` names a guard `evaluate_bitwise_not` cannot fold — `OFF` is a bare path, not a
+/// literal, and the `resolve.width` a match arm's own guard is resolved with had always been
+/// a stub answering `None` unconditionally, on the reasoning that only a `const`'s own
+/// initializer (resolved by [`resolve_scope_consts`]) ever needed a referenced constant's
+/// declared width. That reasoning held for an *integer* width, where guessing wrong from a
+/// value alone risks masking to the wrong number of bits, but excluded the one type this
+/// scan already represents unambiguously either way: a `bool` is `0` or `1` in this scan's
+/// own storage regardless of which way `!` is read, so the only thing missing was knowing
+/// `OFF` is a `bool` at all. Pushed and popped at the identical points `scopes_unsigned` is,
+/// from the identical declarations — [`item_const_types`] beside [`item_const_unsigned`],
+/// [`block_const_types`] beside [`block_const_unsigned`].
+#[derive(Default)]
+struct ConstTypeScopes(Vec<std::collections::HashMap<String, String>>);
+
+impl ConstTypeScopes {
+    /// `name`'s own declared type name at the innermost scope that declares it, searching
+    /// outward exactly as [`ConstScopes::resolve`] does — `None` once nothing records it,
+    /// which only ever declines to fold a `!` operand rather than guessing its width.
+    fn resolve(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).map(String::as_str))
     }
 }
 
@@ -3790,8 +3824,16 @@ fn evaluate_bitwise_not(operand: &syn::Expr, resolve: &Resolve<'_>) -> Option<i1
         return None;
     }
     let width_name = (resolve.width)(&path.path)?;
-    let ty = syn::parse_str::<syn::Type>(width_name).ok()?;
     let raw = literal_or_const_value(operand, resolve)?;
+    // Codex's next-round finding: `const OFF: bool = false; .. !OFF` names an operand whose
+    // declared type is `bool`, not an integer — `apply_integer_cast` has no width for it and
+    // declines, which is sound but not the answer Rust gives: a `bool` negation flips `0`
+    // and `1` exactly, the same values this scan already stores `false`/`true` as
+    // ([`lit_value`]'s own `Lit::Bool` case), with no masking of any kind involved.
+    if width_name == "bool" {
+        return Some(i128::from(raw == 0));
+    }
+    let ty = syn::parse_str::<syn::Type>(width_name).ok()?;
     apply_integer_cast(!raw, &ty)
 }
 
@@ -5193,6 +5235,9 @@ struct ResolutionContext<'a> {
     /// `qualified`'s own unsignedness mirror — [`path_is_definitely_unsigned`]'s qualified
     /// case, the way `scopes_unsigned` is its bare-identifier one.
     qualified_unsigned: &'a std::collections::HashMap<String, bool>,
+    /// [`ConstTypeScopes`]'s own mirror of `scopes` — [`path_declared_type`]'s
+    /// bare-identifier case, the way `scopes_unsigned` is [`path_is_definitely_unsigned`]'s.
+    scopes_types: &'a ConstTypeScopes,
 }
 
 /// `path`'s own value against `qualified`, searched at every depth a bare or qualified
@@ -5521,6 +5566,28 @@ fn path_is_definitely_unsigned(path: &syn::Path, ctx: &ResolutionContext<'_>) ->
     well_known_integer_bound(type_name, member).is_some()
 }
 
+/// `path`'s own declared type name (`"u8"`, `"bool"`, ..), when `path` is a bare identifier
+/// naming a `const` whose own type ascription [`ConstTypeScopes`] recorded — `None` for a
+/// qualified path or a well-known bound, which decline rather than guess, the identical
+/// narrowing [`Resolve::width`]'s own doc comment states.
+///
+/// Codex's next-round finding: `const OFF: bool = false; .. _ if !OFF => value, _ =>
+/// fallback` named a guard [`evaluate_bitwise_not`] could not fold, because every match
+/// arm's own `resolve.width` had been a stub answering `None` unconditionally — the
+/// reasoning that only a `const`'s own initializer ever needed one held for an *integer*
+/// width, where a value alone cannot say how many bits to mask to, but not for `bool`,
+/// which this scan already represents as exactly `0` or `1` regardless of which way `!` is
+/// read: the only fact missing was that `OFF` is a `bool` at all. This is that fact,
+/// answered the identical bare-name-only way [`ConstTypeScopes::resolve`] already carries
+/// it — a qualified reference stays undeclined by design, the same narrowing
+/// `resolve_scope_consts`'s own `resolve_width` closure already applies for the identical
+/// reason: a wrong guess about which bits a qualified `!` operand's width covers is not a
+/// risk worth taking to fold a case this scan can simply decline.
+fn path_declared_type<'a>(path: &syn::Path, ctx: &ResolutionContext<'a>) -> Option<&'a str> {
+    let ident = path.get_ident()?;
+    ctx.scopes_types.resolve(&ident_name(ident))
+}
+
 /// `trait_name`'s own default associated constants, found by the identical
 /// most-specific-first search [`resolve_pattern_path`]'s own fallback already makes over
 /// `module_path`, `function_path` and `block_path` — mirroring it exactly, rather than
@@ -5700,6 +5767,9 @@ struct MatchVisitor {
     /// points, from the identical declarations — [`ResolutionContext::scopes_unsigned`]'s
     /// source.
     scopes_unsigned: UnsignedConstScopes,
+    /// [`ConstTypeScopes`]'s own mirror of `scopes`, pushed and popped at the identical
+    /// points `scopes_unsigned` is — [`ResolutionContext::scopes_types`]'s source.
+    scopes_types: ConstTypeScopes,
     use_scopes: UseScopes,
     module_path: Vec<String>,
     module_scope_depths: Vec<usize>,
@@ -5843,11 +5913,13 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         }
         self.scopes.0.push(scope);
         self.scopes_unsigned.0.push(unsigned_names);
+        self.scopes_types.0.push(item_const_types(items));
         self.use_scopes.0.push(item_use_imports(items));
         self.module_scope_depths.push(self.scopes.0.len());
         syn::visit::visit_item_mod(self, node);
         self.module_scope_depths.pop();
         self.use_scopes.0.pop();
+        self.scopes_types.0.pop();
         self.scopes_unsigned.0.pop();
         self.scopes.0.pop();
         self.module_path.pop();
@@ -6134,14 +6206,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 self_type_path: &self.self_type_path,
                 scopes_unsigned: &self.scopes_unsigned,
                 qualified_unsigned: &self.qualified_unsigned,
+                scopes_types: &self.scopes_types,
             };
             let resolve_value = |path: &syn::Path| resolve_pattern_path(path, &ctx);
             let resolve_unsigned = |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
-            // [`Resolve::width`]'s own doc comment holds the rationale: a match arm's own
-            // guard or pattern has no use for a referenced constant's declared width, only
-            // `evaluate_bitwise_not` does, and that is reached only through a `const`'s own
-            // initializer, resolved by [`resolve_scope_consts`] rather than here.
-            let resolve_width = |_: &syn::Path| None;
+            let resolve_width = |path: &syn::Path| path_declared_type(path, &ctx);
             let resolve = Resolve {
                 value: &resolve_value,
                 unsigned: &resolve_unsigned,
@@ -6200,6 +6269,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         );
         self.scopes.0.push(scope);
         self.scopes_unsigned.0.push(block_const_unsigned(node));
+        self.scopes_types.0.push(block_const_types(node));
         self.use_scopes.0.push(block_use_imports(node));
         // Codex's finding: two sibling blocks of one function each declaring their own
         // local `mod indices { .. }` collided under `function_path`'s own key exactly the
@@ -6227,6 +6297,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         }
         self.block_path.pop();
         self.use_scopes.0.pop();
+        self.scopes_types.0.pop();
         self.scopes_unsigned.0.pop();
         self.scopes.0.pop();
     }
@@ -6243,10 +6314,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             self_type_path: &self.self_type_path,
             scopes_unsigned: &self.scopes_unsigned,
             qualified_unsigned: &self.qualified_unsigned,
+            scopes_types: &self.scopes_types,
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
-        let resolve_width = |_: &syn::Path| None;
+        let resolve_width = move |path: &syn::Path| path_declared_type(path, &ctx);
         let resolve = Resolve {
             value: &resolve_value,
             unsigned: &resolve_unsigned,
@@ -6352,10 +6424,11 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             self_type_path: &self.self_type_path,
             scopes_unsigned: &self.scopes_unsigned,
             qualified_unsigned: &self.qualified_unsigned,
+            scopes_types: &self.scopes_types,
         };
         let resolve_value = move |path: &syn::Path| resolve_pattern_path(path, &ctx);
         let resolve_unsigned = move |path: &syn::Path| path_is_definitely_unsigned(path, &ctx);
-        let resolve_width = |_: &syn::Path| None;
+        let resolve_width = move |path: &syn::Path| path_declared_type(path, &ctx);
         let resolve = Resolve {
             value: &resolve_value,
             unsigned: &resolve_unsigned,
