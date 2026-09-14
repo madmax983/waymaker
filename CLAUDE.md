@@ -1166,11 +1166,11 @@ Stated so that nobody mistakes silence for coverage:
   through as many levels of nested sibling module as the path names. Three narrower limits are
   left where descent cannot go. An out-of-line declaration (`mod traits;`, no body in this
   file) and a module gated on exactly `#[cfg(test)]` are both left unresolved rather than
-  guessed at, the first because the module's real content lives in a file this per-file scan
-  never reads and the second for `own_aliases`'s own reason (issue #51: test code is not
-  shipped code). And once resolution has stepped into a module by name it is off the lexical
-  ancestor stack, so `self::` still resolves inside it but `super::` does not — the same
-  residual-limit shape as `crate::` and a top-level `super::` above, and the same reason:
+  guessed at. The first is because the module's real content lives in a file this per-file
+  scan never reads. The second is for `own_aliases`'s own reason (issue #51: test code is not
+  shipped code). Once resolution has stepped into a module by name it is off the lexical
+  ancestor stack, so `self::` still resolves inside it but `super::` does not. That is the
+  same residual-limit shape as `crate::` and a top-level `super::` above, and the same reason:
   a module reached by name has no ancestor this per-file scan can identify past the point it
   was entered from. An alias declared in one module
   and reached through a `use` in another *file* is invisible outright, the same limit
@@ -3570,11 +3570,28 @@ of its precomputed aliases, and `resolve_segments` derives `own_aliases` from it
 plus a new `own_modules`: when no alias matches, it steps into a same-named sibling `mod`
 block and keeps resolving there, chained through as many levels as the path names. `self::`
 still resolves inside an entered module; `super::` does not, once resolution is off the
-lexical ancestor stack, the same residual-limit shape as `crate::` and a top-level `super::`
-above rather than a guess. An out-of-line `mod name;` and a `#[cfg(test)]`-gated module are
-both left unresolved for the same reason those are already residual limits elsewhere. The
-five call sites sharing this stack (`resolved_path_uses`, `future_trait_implementors`,
-`struct_literal_counts`, `name_uses`, and the `fn_blocks`/`inherent_impls` pair beneath it)
-moved to the new representation together, since they all resolve through one function; the
-existing `alias_scope_tests` suite covers every one of them unchanged. No new ADR: nothing
-here moves a must-not-own cell, a dependency edge, or a rule id.
+lexical ancestor stack. That is the same residual-limit shape as `crate::` and a top-level
+`super::` above rather than a guess. An out-of-line `mod name;` and a `#[cfg(test)]`-gated
+module are both left unresolved for the same reason those are already residual limits
+elsewhere. The five call sites sharing this stack (`resolved_path_uses`,
+`future_trait_implementors`, `struct_literal_counts`, `name_uses`, and the
+`fn_blocks`/`inherent_impls` pair beneath it) moved to the new representation together, since
+they all resolve through one function; the existing `alias_scope_tests` suite covers every
+one of them.
+
+Codex review of this pull request found two real gaps in the fix, both closed here rather
+than carried forward. The first is the loop's own bound: it had moved from counting every
+alias reachable across the ancestor stack to counting *items*, which undercounts a chain
+packed into one grouped `use`, `use m::{a as b, b as c, ...};` — a single item can declare as
+many hops as it likes. The bound is now the file's total item count *plus* its total alias
+count, the same recursive walk `use_aliases` already does, so a grouped chain nine hops long
+from four items resolves in full rather than stopping three hops short. The second is sharper:
+a one-segment path — `impl Future for X`, no further segments — was still checked against
+`own_modules`, and a same-named sibling `mod Future { .. }` anywhere in scope made resolution
+step into it and throw the name away, leaving `segments` empty and the genuine `impl` invisible
+to `future_trait_implementors`. A path with nothing left to resolve past its head never names a
+module to step into, so descent is now only attempted when a segment remains behind it.
+`alias_scope_tests` gained a case for each, plus a same-named-module-in-a-different-branch
+scope-leakage test, a crafted-alias-cycle termination test, and a direct test of the descent
+through `resolved_path_uses` and `name_uses` rather than through `future_trait_implementors`
+alone. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.

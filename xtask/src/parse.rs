@@ -296,14 +296,13 @@ fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
         .collect()
 }
 
-/// A cap on how many alias hops and module descents [`resolve_segments`]
-/// tries before it gives up.
+/// Every item anywhere in `items`, at any nesting depth, `mod` blocks
+/// included.
 ///
-/// Every hop either shrinks `segments` or moves to a strictly smaller item
-/// subtree, so a real path never needs more hops than there are items in the
-/// file. The only way to need more is a crafted alias cycle
-/// (`use a as b; use b as a;`); this stops that rather than looping forever
-/// (issue #109).
+/// Half of [`resolve_segments`]'s loop bound: a module descent (issue #169)
+/// always moves to a strictly smaller, physically nested item subtree, so
+/// it can never need more steps than there are items in the file.
+/// [`total_alias_count`] is the other half, for alias hops.
 fn item_count(items: &[syn::Item]) -> usize {
     items
         .iter()
@@ -317,6 +316,20 @@ fn item_count(items: &[syn::Item]) -> usize {
             _ => 1,
         })
         .sum()
+}
+
+/// Every `use` alias anywhere in `items`, at any nesting depth — every leaf
+/// of every group, unlike [`own_aliases`], which reads one scope's own
+/// direct declarations only.
+///
+/// [`resolve_segments`]'s loop bound needs this count, not [`item_count`]'s:
+/// one `use` item can declare many chained aliases in a single group
+/// (`use m::{a as b, b as c, c as d};`), so counting items alone undercounts
+/// how many alias hops a real chain may need (Codex review, PR #176).
+fn total_alias_count(items: &[syn::Item]) -> usize {
+    let mut aliases = Vec::new();
+    collect_item_aliases(items, &mut Vec::new(), &mut aliases);
+    aliases.len()
 }
 
 fn collect_tree_aliases(
@@ -465,9 +478,13 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 /// (issue #169). Stepping into that module this way leaves the lexical
 /// ancestor stack behind: a module reached by name has no ancestor this
 /// per-file scan can identify past the point it was entered from, so
-/// `self::` still resolves inside it but `super::` does not — the segments
-/// are left as written from there, the same residual-limit shape as
-/// `crate::` and a top-level `super::` above.
+/// `self::` still resolves inside it but `super::` does not. That is the
+/// same residual-limit shape as `crate::` and a top-level `super::` above.
+/// A path of one segment never steps into a module: `impl Future for X`
+/// names a trait or type called `Future`, not the module block, even when
+/// one exists by that name in the same scope (Codex review, PR #176) —
+/// there is nothing left to resolve inside it, so descending would only
+/// throw the name away.
 fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
     let mut segments: Vec<String> = path
         .segments
@@ -484,12 +501,19 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
     let mut entered: Option<&[syn::Item]> = None;
     // A renamed re-export chains one alias to another, and a plain
     // relative path can step into a sibling module (issue #169), possibly
-    // more than once. Bounded by the file's own item count: enough for any
-    // real chain or descent, and it stops a crafted alias cycle
-    // (`use a as b; use b as a;`) from looping forever — module descent
-    // cannot cycle on its own, since each step moves to a strictly
-    // smaller, physically nested subtree.
-    let bound = stack.first().map_or(0, |items| item_count(items)) + 1;
+    // more than once. Bounded by the whole file's own alias count plus its
+    // item count: enough for any real chain or descent, and it stops a
+    // crafted alias cycle (`use a as b; use b as a;`) from looping forever.
+    // The item count alone is not enough (Codex review, PR #176): one `use`
+    // item can pack many chained hops into a single group,
+    // `use m::{a as b, b as c, ...};`, so counting items undercounts how
+    // many hops a real, acyclic chain may need. Module descent cannot
+    // cycle on its own, since each step moves to a strictly smaller,
+    // physically nested subtree — the item count alone bounds that half.
+    let bound = stack
+        .first()
+        .map_or(0, |items| item_count(items) + total_alias_count(items))
+        + 1;
     for _ in 0..=bound {
         let items = if let Some(items) = entered {
             consume_self_prefix(&mut segments);
@@ -518,14 +542,20 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
             }
             continue;
         }
-        let Some((_, module_items)) = own_modules(items)
-            .into_iter()
-            .find(|(name, _)| *name == first)
-        else {
-            break;
-        };
-        segments.remove(0);
-        entered = Some(module_items);
+        // A one-segment path names an item, not a module to step into
+        // (Codex review, PR #176): `own_modules` is not even consulted
+        // once `segments` has nothing left past the head.
+        if segments.len() > 1 {
+            if let Some((_, module_items)) = own_modules(items)
+                .into_iter()
+                .find(|(name, _)| *name == first)
+            {
+                segments.remove(0);
+                entered = Some(module_items);
+                continue;
+            }
+        }
+        break;
     }
     match entered {
         Some(_) => consume_self_prefix(&mut segments),
@@ -2252,6 +2282,88 @@ mod alias_scope_tests {
             "a `super`-qualified alias inside an entered module resolved as though it were \
              still on the lexical ancestor stack: {implementors:?}"
         );
+    }
+
+    #[test]
+    fn a_grouped_use_chain_longer_than_the_item_count_still_resolves() {
+        // Codex review, PR #176: one `use` item can pack many chained
+        // renames into a single group, so an item count alone undercounts
+        // the hops a real chain may need. `I` chains through eight renames
+        // declared in one group, plus one more item, to reach `Future` —
+        // nine hops from four syntax items, more hops than the old,
+        // item-count-only bound allowed.
+        let code = "use core::future::Future as A;\nuse self::{A as B, B as C, C as D, D as E, \
+             E as F, F as G, G as H, H as I};\nstruct Sneaky;\nimpl I for Sneaky {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Sneaky"], "{implementors:?}");
+    }
+
+    #[test]
+    fn a_bare_path_naming_an_item_is_not_swallowed_by_a_same_named_sibling_module() {
+        // Codex review, PR #176: `impl Future for RealFuture` names a
+        // trait called `Future`, not a module — even when `mod Future`
+        // also exists in the same scope. A one-segment path has nothing
+        // left to resolve once it names the module, so stepping into it
+        // would only throw the name away and drop a genuine impl.
+        let code = "mod Future {\n    pub struct Whatever;\n}\nstruct RealFuture;\nimpl Future \
+             for RealFuture {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["RealFuture"], "{implementors:?}");
+    }
+
+    #[test]
+    fn a_crafted_alias_cycle_terminates_without_reporting_a_false_match() {
+        // `a` and `b` rename each other with no real target anywhere. The
+        // loop bound must stop this rather than loop forever, and the
+        // cycle must not somehow read as `Future`.
+        let code = "use a as b;\nuse b as a;\nstruct Sneaky;\nimpl b for Sneaky {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            !implementors.contains(&"Sneaky".to_owned()),
+            "a crafted alias cycle resolved to a false match: {implementors:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_relative_path_follows_a_sibling_modules_alias_in_every_caller() {
+        // The stack representation changed for all five callers that share
+        // `resolve_segments`, not just `future_trait_implementors`. Each
+        // one must follow the same sibling-module descent on its own path,
+        // not only inherit it by accident through a shared helper.
+        let code = "mod traits {\n    pub use core::future::Future as Pollable;\n}\nfn f() {\n    \
+             let _ = traits::Pollable::x;\n}\n";
+        let resolved = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            resolved
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future", "x"]),
+            "resolved_path_uses missed the sibling-module descent: {resolved:?}"
+        );
+        let names = name_uses(code).expect("the fixture parses");
+        assert!(
+            names
+                .paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future", "x"]),
+            "name_uses missed the sibling-module descent: {:?}",
+            names.paths
+        );
+    }
+
+    #[test]
+    fn a_same_named_sibling_module_in_a_different_branch_does_not_leak_across_scopes() {
+        // Module `a` and module `b` each declare their own `mod traits`,
+        // one re-exporting the real `Future` and one an unrelated trait
+        // under the same local name. `b`'s own module must not resolve
+        // through `a`'s, the module-descent counterpart of
+        // `an_unrelated_trait_in_a_sibling_module_is_not_a_fifth_future`.
+        let code = "mod a {\n    mod traits {\n        pub use core::future::Future as \
+             Pollable;\n    }\n    pub use traits::Pollable as Awaitable;\n    struct Real;\n    \
+             impl Awaitable for Real {}\n}\nmod b {\n    mod traits {\n        trait Unrelated \
+             {}\n        pub use Unrelated as Pollable;\n    }\n    use traits::Pollable as \
+             Awaitable;\n    struct Innocent;\n    impl Awaitable for Innocent {}\n}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Real"], "{implementors:?}");
     }
 
     #[test]
