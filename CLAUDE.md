@@ -3562,9 +3562,13 @@ permanent: §08 has no edge back from a resolved effect to an unresolved one. So
 firmware could complete that effect, no matter how many rows it gained. `dispatch::Produced`
 gains a third answer, `Unserviceable`, carrying no payload — the same shape §11's
 `KernelError` already uses for "this firmware cannot service this now", as distinct from
-"this firmware can never replay this history". `Ctx`'s `ActivityFuture` stops for it exactly
-as it stops for `Poll::Pending`. Neither calls `Journal::resolve`. The effect stays
-outstanding under the identity its schedule record already committed. `wiring::Table`
+"this firmware can never replay this history". `Ctx`'s `ActivityFuture` stops for it as it
+stops for `Poll::Pending` — neither calls `Journal::resolve`, so the effect stays outstanding
+under the identity its schedule record already committed — but it is not a retry: `stage`
+moves to `Ended` rather than staying at `Dispatching`, so a future retained across a spurious
+repoll within the same boot never asks a dispatcher already known to have no answer for this
+kind. Codex found the gap on review of this change: the first version left `stage` where a
+retry leaves it, and a repoll would have asked again. `wiring::Table`
 answers it for a kind no row declares, in place of the `Unhandled::NoSuchActivity` it used to
 construct; since that was `Unhandled`'s only reason to exist beside wrapping a row's own
 error, `Unhandled<E>` is gone and `Table<W, E>::Error` is `E` itself. Two tests are the "done

@@ -41,13 +41,17 @@ identity changes. A firmware update that adds the row should still be able to co
 asked for is already known to whatever drove the boot, and §14's own catalogue of "named
 reasons" (`KernelError`'s variants) carries none either.
 
-**`Ctx` stops the boot the same way it stops for `Poll::Pending`, and for the same reason.**
+**`Ctx` stops the boot for `Produced::Unserviceable`, but does not treat it as a retry.**
 `ActivityFuture::poll`'s `Stage::Dispatching` arm answers `Poll::Pending` for both
 `dispatched == Poll::Pending` and `dispatched == Poll::Ready(Ok(Produced::Unserviceable))`.
 Neither calls `Journal::resolve`. Nothing is written, so the effect stays outstanding under
-the identity its schedule record already committed. A later boot — the same run, replayed
-against a dispatcher that has gained the row — reaches the same `Handoff::Dispatch` and may
-complete it.
+the identity its schedule record already committed. The two differ in what they do to
+`stage`: `Poll::Pending` leaves it at `Dispatching`, so a retained future keeps asking on
+every poll — the ordinary shape of "the world is slow". `Unserviceable` moves it to `Ended`,
+so a future retained across a spurious repoll within the same boot never asks a dispatcher
+already known to have no answer for this kind. A later boot — the same run, replayed against
+a fresh `ActivityFuture` and a dispatcher that has gained the row — starts over at
+`Stage::Scheduling`, reaches the same `Handoff::Dispatch`, and may complete it.
 
 **`wiring::Table::poll_dispatch` answers `Produced::Unserviceable` for a kind no row
 declares**, in place of the `Unhandled::NoSuchActivity` it used to construct. That was

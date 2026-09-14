@@ -26,9 +26,10 @@ pub enum Produced {
     Failed(usize),
     /// This firmware cannot service the requested kind.
     ///
-    /// It writes no record. [`Ctx`](crate::ctx::Ctx) stops the boot here, the same as
-    /// [`Poll::Pending`]. The effect stays outstanding under its committed identity. A
-    /// later boot may still complete it, if its dispatcher can service this kind. Issue
+    /// It writes no record. [`Ctx`](crate::ctx::Ctx) stops the boot here, and asks this
+    /// dispatcher nothing more for this boundary: unlike [`Poll::Pending`], this is not a
+    /// retry. The effect stays outstanding under its committed identity. A later boot may
+    /// still complete it, if its dispatcher can service this kind. Issue
     /// [#111](https://github.com/madmax983/waymaker/issues/111).
     Unserviceable,
 }

@@ -376,6 +376,29 @@ fn an_unserviceable_kind_records_nothing_and_leaves_the_effect_outstanding() {
 }
 
 #[test]
+fn an_unserviceable_kind_is_not_a_retry_even_when_the_future_is_polled_again() {
+    // Issue #111. Unlike `Poll::Pending`, an unserviceable kind is not a retry: nothing
+    // about it changes before a reboot. A second poll within the same boot -- a spurious
+    // wake, say -- must not ask the dispatcher again.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let mut future = pin!(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let mut task = Task::from_waker(Waker::noop());
+    let first = future.as_mut().poll(&mut task);
+    let second = future.as_mut().poll(&mut task);
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Pending);
+    assert_eq!(
+        world.polls, 1,
+        "the dispatcher answered once, and was not asked again"
+    );
+}
+
+#[test]
 fn a_dispatcher_that_fails_records_a_failure_with_no_payload_and_keeps_the_typed_error() {
     // A failed activity has to reach media, or §08 strands the run: there is no edge from
     // an unresolved effect to a terminal record. The error value itself cannot, because a

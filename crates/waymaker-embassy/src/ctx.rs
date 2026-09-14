@@ -375,13 +375,19 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                         .dispatcher
                         .poll_dispatch(task, id, me.kind, me.input, into);
                     let answer = match dispatched {
-                        // Two cases return `Poll::Pending` here. `Poll::Pending`: the world
-                        // asked to be tried again. `Produced::Unserviceable`: this firmware
-                        // cannot service `kind`. Nothing will change that before a reboot
-                        // (issue #111). Either way, the code records nothing. The effect
-                        // stays outstanding under its committed identity. A later boot may
-                        // still complete it.
-                        Poll::Pending | Poll::Ready(Ok(Produced::Unserviceable)) => {
+                        // The world asked to be tried again. Nothing is recorded, so the
+                        // effect stays outstanding under the identity it was committed with.
+                        // `stage` does not move: an executor that polls again asks again.
+                        Poll::Pending => return Poll::Pending,
+                        // This firmware cannot service `kind` at all. Not a retry: nothing
+                        // about `id` changes before a reboot (issue #111). The code records
+                        // nothing, and the effect stays outstanding under its committed
+                        // identity. `stage` moves to `Ended` so a spurious repoll within
+                        // this boot never asks a dispatcher already known to have no answer
+                        // for it. A reboot's fresh `ActivityFuture` starts over at
+                        // `Stage::Scheduling` and tries the dispatcher again.
+                        Poll::Ready(Ok(Produced::Unserviceable)) => {
+                            me.stage = Stage::Ended;
                             return Poll::Pending;
                         }
                         // The activity failed with nothing to record. It is recorded as a
