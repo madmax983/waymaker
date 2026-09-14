@@ -319,7 +319,7 @@ them as such.
 Call-chain depth is measured elsewhere rather than left unmeasured everywhere: `cargo xtask
 emulate` paints each emulated boot's own unused stack before the rig runs and reports how far
 the paint was disturbed after, gated by `emulate::StackUsage`
-([ADR 0043](docs/adr/0043-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md)).
+([ADR 0045](docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md)).
 It is not this gate's figure: that image links `waymaker-rig` and `waymaker-conformance`
 alongside the three layers, so what it reports is the whole call chain's depth on one run, on
 one core, not the engine's share of it — the two numbers answer different questions and
@@ -403,7 +403,7 @@ optional feature, a rename, or one level of indirection. Its rules:
 | `embassy-below-facade` | anything under `waymaker-embassy` reaches an Embassy crate |
 | `layer-not-local` | a crate with a layer's name resolves to a registry rather than a path here |
 | `workspace-membership` | a workspace member is neither a layer, declared host tooling, a measurement fixture, an emulation image, nor declared test support |
-| `emulation-boot` | the emulated image stops being firmware, writes hand-written `unsafe` outside the two functions and one linker-symbol block ADR 0043 names, loses the reasoned `allow` its one exception rests on, disagrees with the harness about the prefix it prints, declares a binary that is not behind its feature, or names a core the toolchain does not pin and no stage runs |
+| `emulation-boot` | the emulated image stops being firmware, writes hand-written `unsafe` outside the two functions and one linker-symbol block ADR 0045 names, loses the reasoned `allow` its one exception rests on, disagrees with the harness about the prefix it prints, declares a binary that is not behind its feature, or names a core the toolchain does not pin and no stage runs |
 | `no-build-scripts` | a layer or a test-support crate has a `build.rs` |
 | `empty-default-features` | a layer or a test-support crate has a non-empty `default` feature |
 | `crate-attributes` | a firmware crate root drops `#![no_std]` or declares `extern crate std`/`alloc`, or any crate the layering covers drops `#![forbid(unsafe_code)]` or allows unsafe code |

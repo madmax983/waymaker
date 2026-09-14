@@ -217,14 +217,23 @@ pub enum CapacityError {
     ///
     /// From [`Reserved::over`] only.
     WrongGranularity,
-    /// The journal is on a different device than the reserve was priced for.
+    /// The journal was priced against a different bank size than the reserve declares.
     ///
-    /// The granularity check above is not enough on its own, and Codex found the gap: two
-    /// devices can share a program unit and not a bank size. A reserve priced for a large
-    /// bank carries a `continue_as_new` header figure that bank could hold; applied to a
-    /// journal on a smaller device, the tail and the floor may both fit while the header the
-    /// roll-over would write does not — so the gate would promise an exit that is not there.
-    /// The same refusal [`AppendError::WrongDevice`] makes, one layer up.
+    /// Issue [#84](https://github.com/madmax983/waymaker/issues/84) treats this variant
+    /// differently from this crate's three other `WrongDevice` variants: those refuse a
+    /// storage *instance* that changed between two calls of one protocol, held to it by a
+    /// borrow rather than a comparison. This one refuses no instance at all — [`Reserve::for_layout`]
+    /// and [`Reserved::over`] take no `&mut S` argument between them, only a [`Journal`] and
+    /// derived numbers, so there is no second device a caller could substitute here. What it
+    /// catches is two *values* that disagree: the
+    /// granularity check above is not enough on its own, and Codex found the gap — two devices
+    /// can share a program unit and not a bank size. A reserve priced for a large bank carries
+    /// a `continue_as_new` header figure that bank could hold; applied to a journal on a
+    /// smaller device, the tail and the floor may both fit while the header the roll-over
+    /// would write does not — so the gate would promise an exit that is not there. The name is
+    /// shared with [`AppendError::WrongDevice`], one layer up, but the shape of the check is
+    /// not: see
+    /// [ADR 0044](https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md).
     ///
     /// From [`Reserved::over`] only.
     WrongDevice,
@@ -752,12 +761,12 @@ impl<C: IntegrityCheck> Reserved<C> {
     ///
     /// [`ReservedError::Capacity`] for §10's refusals — see [`Reserve::admits`] — and
     /// [`ReservedError::Append`] for everything [`Journal::stage`] can refuse.
-    pub fn stage<'journal, 'page, S: StableStorage>(
+    pub fn stage<'journal, 'page, 'storage, S: StableStorage>(
         &'journal mut self,
-        storage: &mut S,
+        storage: &'storage mut S,
         record: &RecordRef<'_>,
         page: &'page mut [u8],
-    ) -> Result<Staged<'journal, 'page, C>, ReservedError<S::Error>> {
+    ) -> Result<Staged<'journal, 'page, 'storage, S, C>, ReservedError<S::Error>> {
         // First, and before anything that could touch media. §12: a failed program may still
         // have changed media, so the only refusal that changes nothing is one taken before
         // the device is called at all.

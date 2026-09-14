@@ -32,7 +32,7 @@ use waymaker_flash::bank::{
 use waymaker_flash::frame::{self, ProgramAlign, Scan};
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_spec::explore::{BankShape, explore};
-use waymaker_spec::model::{BANKS, Bank, BankId, Bound, Guards, Journal, Role};
+use waymaker_spec::model::{BANKS, Bank, BankId, Bound, Guards, Journal, Role, Transition};
 use waymaker_spec::reader::{Mutant, Reader, Specified};
 use waymaker_spec::refine::{
     Observation, abstraction, bank_after_erase, bank_after_seal, call_touched,
@@ -284,12 +284,36 @@ where
 }
 
 /// Every observation the model says a run can end in.
+///
+/// Scoped to states where every record is in `BankId::A` — matching [`abstraction`]'s own
+/// convention and this file's own claim that "no writer here touches a bank" — rather than
+/// every explored state. `explore` does not know that claim: nothing here stops the model's
+/// *first* seal landing on bank B while records already sit in A, so `REFINEMENT`'s reachable
+/// set includes states whose records are split across both banks, which no writer this file
+/// drives (all single-bank) could ever produce. Including one here would make assertion 1
+/// below accept a real crash against an observation no run of these writers could match,
+/// since `abstraction` always tags every record `BankId::A`. Codex found the reachability gap
+/// this filter closes on review of issue #67's pull request, which is what gave the model a
+/// bank dimension to split across in the first place; a later round found that
+/// `Observation`'s per-record tuple carried no bank identity at all, which this filter's own
+/// correctness happened to hide since it always compared same-bank observations — see
+/// `Observation::records`'s doc comment.
 fn reachable_observations() -> BTreeSet<Observation> {
     let explored = match explore(REFINEMENT, Guards::ENFORCED, CEILING) {
         Ok(explored) => explored,
         Err(error) => unreachable!("{error}"),
     };
-    explored.states().iter().map(Journal::observation).collect()
+    explored
+        .states()
+        .iter()
+        .filter(|state| {
+            state
+                .records()
+                .iter()
+                .all(|record| record.bank == BankId::A)
+        })
+        .map(Journal::observation)
+        .collect()
 }
 
 /// Runs the three refinement questions over `runs`, and reports what it saw.
@@ -391,7 +415,11 @@ fn the_refinement_reaches_the_dimensions_the_guarantees_are_about() {
         for geometry in [geometry(), blocks()] {
             for run in drive_on(geometry, |session| writer(session)) {
                 let observed = abstraction(run.ledger(), &[], role_of);
-                if observed.records.iter().any(|(.., torn_here)| *torn_here) {
+                if observed
+                    .records
+                    .iter()
+                    .any(|(_, _, _, torn_here, _)| *torn_here)
+                {
                     torn += 1;
                 }
                 let history = recovered(run.image());
@@ -459,10 +487,15 @@ fn the_refinement_check_can_tell_the_specified_reader_from_a_wrong_one() {
     //
     // `Mutant::SkipsGaps` is excluded, and `tests/teeth.rs` is where that is established:
     // under the append-only precondition it is not a wrong reader at all, because no
-    // reachable state has anything behind a gap for it to find.
+    // reachable state has anything behind a gap for it to find. `Mutant::BootsTheRetiredBank`
+    // is excluded for the parallel reason this file's own module doc gives: no writer here
+    // drives the two-bank adapter, so every reconstructed state has never sealed and the
+    // mutant's "boot the other bank" branch never triggers — it falls back to `Specified` and
+    // agrees with it everywhere, which is a gap in what this file exercises rather than in the
+    // mutant.
     let runs = drive(journal);
     for mutant in Mutant::ALL {
-        if mutant == Mutant::SkipsGaps {
+        if matches!(mutant, Mutant::SkipsGaps | Mutant::BootsTheRetiredBank) {
             continue;
         }
         let disagreements = runs
@@ -488,9 +521,9 @@ fn a_reconstructed_state_cannot_falsify_the_fourth_guarantee() {
     // Written down as a test rather than left to be discovered. `Observation` carries no
     // banks, so `reconstructed` builds a state that has never sealed, and `SingleAuthority`
     // returns `Ok` for it whatever history it is handed — including one that is pure
-    // invention. A caller with real banks to abstract — issue #22's `waymaker_flash::bank` is one, and abstracting it is still owed — gets three
-    // guarantees judged and the fourth answered for free, and this is the assertion that
-    // says so out loud.
+    // invention. A caller with real banks to abstract — issue #22's `waymaker_flash::bank`
+    // is one, and abstracting it is still owed — gets three guarantees judged and the fourth
+    // answered for free, and this is the assertion that says so out loud.
     let nonsense = [RecordId(99), RecordId(7)];
     for run in drive(journal) {
         let observed = abstraction(run.ledger(), &[], role_of);
@@ -518,7 +551,13 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     // claims a barrier returned for a half-written record describes nothing, and the state
     // builder says so instead of quietly repairing it.
     let impossible = Observation {
-        records: vec![(RecordId(0), Role::Schedule, Durability::Acknowledged, true)],
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Acknowledged,
+            true,
+            BankId::A,
+        )],
         dispatched: Vec::new(),
         ..Observation::default()
     };
@@ -529,12 +568,109 @@ fn the_abstraction_refuses_an_observation_no_run_could_have_produced() {
     );
 
     let also_impossible = Observation {
-        records: vec![(RecordId(0), Role::Schedule, Durability::Attempted, true)],
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Attempted,
+            true,
+            BankId::A,
+        )],
         dispatched: Vec::new(),
         ..Observation::default()
     };
     let error = Journal::reconstructed(&also_impossible).expect_err("torn and absent");
     assert!(error.to_string().contains("never reached media"), "{error}");
+}
+
+#[test]
+fn reconstruction_never_reissues_an_id_an_erase_already_spent() {
+    // Codex, PR #135's merge round: `next_id` used to be inferred from `records.max_id + 1`,
+    // which cannot see an id `BeginErase` dropped along with its record. A caller that
+    // erased anything and then reported an observation with no surviving record at all would
+    // reconstruct a state that believed no id had ever been issued, and the very next
+    // `Declare` would reissue one a real device's counter had already moved past —
+    // `Observation::next_id` exists so the caller reports the real counter instead of
+    // leaving it to be inferred.
+    let no_records_but_two_ids_spent = Observation {
+        records: Vec::new(),
+        dispatched: Vec::new(),
+        next_id: Some(2),
+        ..Observation::default()
+    };
+    let state = Journal::reconstructed(&no_records_but_two_ids_spent)
+        .expect("an empty, unpowered observation is never impossible");
+    let state = state
+        .step(Transition::Reboot, Guards::ENFORCED, Bound::PROOF)
+        .expect("reboot is legal from an unpowered state");
+    let declared = state
+        .step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("declaring from a fresh bank is legal");
+    assert_eq!(
+        declared.records().last().map(|record| record.id),
+        Some(RecordId(2)),
+        "reconstruction reissued an id the real device's counter had already spent"
+    );
+}
+
+#[test]
+fn reconstruction_refuses_a_next_id_that_reissues_a_resident() {
+    // Codex, PR #135's next round: the erase-only version of this check let a `next_id`
+    // collide with a record named in the *same* observation, rather than only with one an
+    // earlier erase had dropped. Records 0 and 1 with `next_id: Some(1)` used to reconstruct
+    // successfully; a `Reboot` then a `Declare(Schedule)` minted a second `RecordId(1)`, and
+    // the `Program` after it found the older record already whole and refused with
+    // `RecordAlreadyWritten` — stranding the new declaration on the identity collision issue
+    // #67's whole counter scheme exists to forbid.
+    let colliding = Observation {
+        records: vec![
+            (
+                RecordId(0),
+                Role::Schedule,
+                Durability::Acknowledged,
+                false,
+                BankId::A,
+            ),
+            (
+                RecordId(1),
+                Role::Outcome,
+                Durability::Acknowledged,
+                false,
+                BankId::A,
+            ),
+        ],
+        dispatched: Vec::new(),
+        next_id: Some(1),
+        ..Observation::default()
+    };
+    let error =
+        Journal::reconstructed(&colliding).expect_err("next_id collides with resident record 1");
+    assert!(error.to_string().contains("resident record 1"), "{error}");
+
+    // The floor is exact, not merely "somewhere higher": one past the highest resident id is
+    // accepted, and the next legal declaration gets that id rather than reissuing 0 or 1.
+    let just_past = Observation {
+        next_id: Some(2),
+        ..colliding
+    };
+    let state = Journal::reconstructed(&just_past).expect("next_id past every resident id");
+    let declared = state
+        .step(Transition::Reboot, Guards::ENFORCED, Bound::PROOF)
+        .expect("reboot is legal from an unpowered state")
+        .step(
+            Transition::Declare(Role::Schedule),
+            Guards::ENFORCED,
+            Bound::PROOF,
+        )
+        .expect("record 1 is the Outcome that resolves record 0's Schedule, so a fresh Schedule is legal here");
+    assert_eq!(
+        declared.records().last().map(|record| record.id),
+        Some(RecordId(2)),
+        "next_id: Some(2) should hand out RecordId(2), not reissue 0 or 1"
+    );
 }
 
 #[test]
@@ -547,7 +683,7 @@ fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
             run.ledger().len(),
             "the abstraction invented or dropped a record"
         );
-        for (id, _, state, torn) in &observed.records {
+        for (id, _, state, torn, _) in &observed.records {
             assert_eq!(run.ledger().state(*id), Some(*state));
             assert_eq!(run.ledger().torn(*id), Some(*torn));
         }
@@ -556,6 +692,205 @@ fn the_abstraction_reports_what_the_ledger_says_and_nothing_else() {
             vec![RecordId(0)],
             "the abstraction did not deduplicate the dispatch log"
         );
+    }
+}
+
+#[test]
+fn observation_and_reconstruction_agree_on_a_state_with_records_in_two_banks() {
+    // Codex, PR #135's round on commit 76dab02: `Observation`'s per-record tuple carried no
+    // bank identity at all, so `Journal::reconstructed` hardcoded every record to `BankId::A`
+    // regardless of which bank `observation()` actually read it from. A device that retires a
+    // record in bank A behind its very first seal (landing on B), then declares a fresh
+    // record in B, recovers `[1]` directly — but round-tripped through `observation()` and
+    // `reconstructed()`, both records land in `BankId::A`, `recovering_bank()` stays `B`, and
+    // neither record's bank matches it, so the reconstructed state recovers `[]` instead.
+    let bound = Bound {
+        records: 4,
+        generations: 2,
+    };
+    let state = Journal::new()
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare record 0 in bank A")
+        .step(Transition::Program(RecordId(0)), Guards::ENFORCED, bound)
+        .expect("program record 0")
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier over record 0")
+        .step(Transition::BeginSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("the device's very first seal, on bank B")
+        .step(Transition::CommitSeal(BankId::B), Guards::ENFORCED, bound)
+        .expect("commit the seal; B is now sole authority")
+        .step(Transition::Declare(Role::Schedule), Guards::ENFORCED, bound)
+        .expect("declare record 1 in bank B, now current")
+        .step(Transition::Program(RecordId(1)), Guards::ENFORCED, bound)
+        .expect("program record 1")
+        .step(Transition::Barrier, Guards::ENFORCED, bound)
+        .expect("barrier over record 1");
+
+    let direct = Specified.recover(&state);
+    assert_eq!(
+        direct,
+        vec![RecordId(1)],
+        "record 0 sits in a bank that lost authority, so only record 1 should recover"
+    );
+
+    let observed = state.observation();
+    assert_eq!(
+        observed
+            .records
+            .iter()
+            .map(|(id, .., bank)| (*id, *bank))
+            .collect::<Vec<_>>(),
+        vec![(RecordId(0), BankId::A), (RecordId(1), BankId::B)],
+        "observation() must report each record's real bank"
+    );
+
+    let reconstructed =
+        Journal::reconstructed(&observed).expect("a real state is never impossible");
+    assert_eq!(
+        Specified.recover(&reconstructed),
+        direct,
+        "round-tripping through observation()/reconstructed() changed what recovery returns"
+    );
+}
+
+#[test]
+fn reconstruction_refuses_the_same_id_declared_in_two_banks() {
+    // Codex, PR #135's next round: `Journal::bank_of` — which `single_authority` and
+    // `durable_intent` both use to ask "which bank is this id's record really in" — answers
+    // with the *first* matching record it finds, ignoring bank. A hand-built `Observation`
+    // naming `RecordId(0)` once in a retired bank and again in the sole authoritative bank
+    // made `single_authority` misreport a legitimately recovered record (from the
+    // authoritative bank) as belonging to the retired one, breaching a guarantee that in fact
+    // held. This id scheme has a single, device-wide counter — no legal transition sequence
+    // ever declares the same id twice, in one bank or two — so the fix is to refuse the
+    // observation rather than to make every by-id lookup bank-aware.
+    let observed = Observation {
+        records: vec![
+            (
+                RecordId(0),
+                Role::Schedule,
+                Durability::Acknowledged,
+                false,
+                BankId::A,
+            ),
+            (
+                RecordId(0),
+                Role::Schedule,
+                Durability::Acknowledged,
+                false,
+                BankId::B,
+            ),
+        ],
+        dispatched: vec![RecordId(0)],
+        banks: [Bank::Erased, Bank::Sealed(1)],
+        sealed_once: true,
+        next_id: Some(1),
+    };
+    let error =
+        Journal::reconstructed(&observed).expect_err("the same id names two different records");
+    assert!(error.to_string().contains("named twice"), "{error}");
+}
+
+#[test]
+fn reconstruction_refuses_a_sealed_bank_with_sealed_once_left_false() {
+    // Codex, PR #135's next round: the only place a bank becomes `Bank::Sealed` is
+    // `commit_seal`, which sets `sealed_once` true in the same step — so a bank reported as
+    // `Sealed` while `sealed_once` is `false` describes two different devices at once. Left
+    // unchecked, `recovering_bank()` takes the pre-seal convention at face value and answers
+    // `BankId::A` regardless of which bank is really sealed, and `has_sealed()` then exempts
+    // the state from `SingleAuthority` entirely — so a legitimately-sealed bank B's record
+    // could be ignored in favor of a stale bank A, with the one guarantee built to catch
+    // exactly that never even consulted.
+    let observed = Observation {
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Acknowledged,
+            false,
+            BankId::B,
+        )],
+        banks: [Bank::Erased, Bank::Sealed(1)],
+        sealed_once: false,
+        next_id: Some(1),
+        ..Observation::default()
+    };
+    let error = Journal::reconstructed(&observed)
+        .expect_err("a bank cannot be durably sealed on a device that has never sealed one");
+    assert!(
+        error.to_string().contains("sealed_once is false"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_dispatch_with_no_record_at_all_is_a_breach_rather_than_moot() {
+    // Codex, PR #135's next round: `durable_intent`'s "moot" exemption for a dispatch from a
+    // retired bank compared `bank_of(intent) != recovering_bank()`, and `bank_of` answers
+    // `None` when `intent` names no record at all — not only when it names one in the wrong
+    // bank. `None != Some(bank)` took the same branch as a real retired-bank mismatch, so a
+    // dispatched effect with *no* schedule record anywhere was silently exempted instead of
+    // breaching. `refine::abstraction`'s `dispatched` parameter is documented to report
+    // exactly this shape — "an effect that reached the world" independent of the ledger — so
+    // the model has to be able to judge it: a run whose effect left no record on media at all
+    // is the sharpest violation of "no dispatched effect lacks a recoverable schedule record".
+    let observed = Observation {
+        records: vec![(
+            RecordId(0),
+            Role::Schedule,
+            Durability::Acknowledged,
+            false,
+            BankId::A,
+        )],
+        dispatched: vec![RecordId(1)],
+        next_id: Some(2),
+        ..Observation::default()
+    };
+    let state = Journal::reconstructed(&observed).expect("a real state is never impossible");
+    assert_eq!(
+        state.bank_of(RecordId(1)),
+        None,
+        "record 1 was never declared"
+    );
+    let recovered = vec![RecordId(0)];
+    let breach = waymaker_spec::invariant::holds(
+        waymaker_spec::invariant::Invariant::DurableIntent,
+        &state,
+        &recovered,
+    )
+    .expect_err("an effect dispatched with no record at all is a durable-intent breach");
+    assert!(
+        breach.detail.contains("no record 1 to account for it"),
+        "{breach}"
+    );
+}
+
+#[test]
+fn no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave() {
+    // Codex, PR #135 round 6: nothing stops `REFINEMENT`'s exploration reaching a state whose
+    // first-ever seal lands on bank B while records already sit in A — `Observation` carries
+    // no bank identity, so flattening one of those in declaration order can produce a `Whole`
+    // record following a gap, a shape `Guard::AppendOnly` forbids within a single bank and no
+    // writer this file drives (all single-bank) could ever leave. `reachable_observations`
+    // filters those states out before projecting; this is the check that it actually works,
+    // over every observation the filtered set contains rather than over one example.
+    for observation in reachable_observations() {
+        let mut saw_gap = false;
+        for (id, _, state, torn, _) in &observation.records {
+            let whole = matches!(
+                state,
+                Durability::PossiblyDurable | Durability::Acknowledged
+            ) && !torn;
+            if whole {
+                assert!(
+                    !saw_gap,
+                    "record {} is whole after a gap in {observation:?}, which no single-bank \
+                     writer could have left",
+                    id.0
+                );
+            } else {
+                saw_gap = true;
+            }
+        }
     }
 }
 

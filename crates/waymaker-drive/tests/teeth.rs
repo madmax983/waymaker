@@ -75,10 +75,10 @@ fn boot<W: Workflow, A: Activities + Clocks>(
 
 /// How many records the journal holds.
 fn records(device: &mut Device) -> usize {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut count = 0;
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         if step.is_err() {
             break;
         }

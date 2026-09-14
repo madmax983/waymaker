@@ -1798,12 +1798,22 @@ pub const RECOVERY_SURFACE_PATH: &str = "waymaker-flash/src/recovery.rs";
 /// anything. `fmt` is on the list because a trait `impl`'s methods are callable without
 /// `pub`, and `message` because a device with no console still has to report something.
 ///
+/// `into_storage` is on this list for issue
+/// [#84](https://github.com/madmax983/waymaker/issues/84): once a [`Recovery`] borrows its
+/// device for its own life instead of taking it fresh at every call, a caller moving on to
+/// [`Journal::after`] needs the device back as well as the finished scan. It hands out only
+/// the reference `new`/`with_integrity` were given, so it is `after`'s escape hatch and not
+/// a second `append_offset`.
+///
 /// What it does **not** catch: this compares *names*. An `offset` widened to `u64`, or an
 /// `append_offset` that started answering for a damaged journal, are both invisible to it —
 /// `crates/waymaker-flash/tests/recovery.rs` and `waymaker-fault`'s crash sweep are what
 /// hold the behaviour.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
+///
+/// [`Recovery`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/recovery.rs
+/// [`Journal::after`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
 pub const RECOVERY_SURFACE: &[&str] = &[
     "align",
     "append_offset",
@@ -1811,6 +1821,7 @@ pub const RECOVERY_SURFACE: &[&str] = &[
     "bytes",
     "ending",
     "fmt",
+    "into_storage",
     "message",
     "new",
     "next",
@@ -2040,14 +2051,22 @@ pub const APPEND_SURFACE_PATH: &str = "waymaker-flash/src/append.rs";
 /// `pub(crate)`: a same-crate caller is served without widening the surface this rule exists
 /// to make expensive, and without obliging the size probe to link a call it has no use for.
 ///
+/// `after_taking_storage` is on this list for issue
+/// [#84](https://github.com/madmax983/waymaker/issues/84)'s reason: a caller moving from a
+/// finished [`Recovery`] to a [`Journal`] needs the device back as well as the writer, once
+/// [`Recovery`] itself stopped handing it out for free at every call. It is `after` with one
+/// more return value, not a second way to skip the scan `after` already requires.
+///
 /// What it does **not** catch: this compares *names*. It is the surface half of the rule;
 /// [`check_commit_discipline`] also checks the shape the names sit in.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
 ///
 /// [`Journal`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
+/// [`Recovery`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/recovery.rs
 pub const APPEND_SURFACE: &[&str] = &[
     "after",
+    "after_taking_storage",
     "amplification",
     "barriers",
     "commit",
@@ -2562,7 +2581,7 @@ pub const SWAP_SURFACE: &[&str] = &[
     "payload_barrier",
     "prepare",
     "reclaim",
-    "region",
+    "recovery",
     "stage",
 ];
 
@@ -10473,6 +10492,14 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_trait_name_is_still_the_forbidden_trait() {
+        // Issue #90: `r#TryFrom` and `TryFrom` name the same trait. This rule must
+        // catch the raw spelling too.
+        let source = kernel_source("impl r#TryFrom<&[u8]> for RecordKind {}\n");
+        assert_eq!(check_kernel_owns_no_encoding(&source).len(), 1);
+    }
+
+    #[test]
     fn a_char_literal_is_not_a_lifetime() {
         // Issue #108: the textual scan ate the `'a` of the char literal and left its
         // closing quote behind, mangling the header. `syn` reads a const generic's
@@ -11529,6 +11556,21 @@ mod deferred_answer_pins {
         assert!(
             details.iter().any(|detail| detail.contains("Sneaky")),
             "an aliased `Future` impl went unreported: {details:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_future_trait_name_is_still_a_fifth_future() {
+        // Issue #90: `r#Future` and `Future` name the same trait. This rule must
+        // catch a fifth future written with the raw spelling.
+        let sneaky = format!(
+            "{}\nimpl core::future::r#Future for Sneaky {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &sneaky);
+        assert!(
+            details.iter().any(|detail| detail.contains("Sneaky")),
+            "a raw `Future` impl went unreported: {details:?}"
         );
     }
 
@@ -13874,13 +13916,15 @@ mod deferred_answer_pins {
         // the path: `self::Sealable { .. }` builds the same value the bare name does.
         for spelling in ["Sealable {", "self::Sealable {"] {
             let contents = real_append_module().replace(
-                "impl<C: IntegrityCheck> Sealable<'_, '_, C> {",
+                "impl<S: StableStorage, C: IntegrityCheck> Sealable<'_, '_, '_, S, C> {",
                 &format!(
-                    "impl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {{\n\
-                     fn assume(self) -> Sealable<'journal, 'page, C> {{ {spelling} \
-                     journal: self.journal, seal: self.seal, seal_at: self.seal_at, \
-                     stride: self.stride, record: self.record }} }} }}\n\
-                     impl<C: IntegrityCheck> Sealable<'_, '_, C> {{"
+                    "impl<'journal, 'page, 'storage, S: StableStorage, C: IntegrityCheck> \
+                     Staged<'journal, 'page, 'storage, S, C> {{\n\
+                     fn assume(self) -> Sealable<'journal, 'page, 'storage, S, C> {{ \
+                     {spelling} journal: self.journal, storage: self.storage, \
+                     seal: self.seal, seal_at: self.seal_at, stride: self.stride, \
+                     record: self.record }} }} }}\n\
+                     impl<S: StableStorage, C: IntegrityCheck> Sealable<'_, '_, '_, S, C> {{"
                 ),
             );
             let violations = check_commit_discipline(&[layer(APPEND_SURFACE_PATH, &contents)]);
@@ -13898,7 +13942,8 @@ mod deferred_answer_pins {
         // The rule reads *every* inherent block for the type, not the first: a second
         // `impl Staged` further down the file was invisible until review said so.
         let contents = format!(
-            "{}\nimpl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {{\n\
+            "{}\nimpl<'journal, 'page, 'storage, S: StableStorage, C: IntegrityCheck> \
+             Staged<'journal, 'page, 'storage, S, C> {{\n\
              fn sneak(&self) {{}}\n}}\n",
             real_append_module()
         );

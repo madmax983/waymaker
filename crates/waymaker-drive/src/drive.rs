@@ -307,19 +307,13 @@ impl<C: IntegrityCheck> Driver<C> {
             });
         }
         let mut machine = ReplayMachine::new(self.run);
-        let mut source = Source::Scanning(Recovery::<C>::with_integrity(self.region));
+        // `storage` moves in here rather than staying a field of `Context`: see `Source`'s
+        // own documentation for why one caller cannot hold it in both places at once.
+        let mut source = Source::Scanning(Recovery::<_, C>::with_integrity(self.region, storage));
 
-        let recorded_version = begin(
-            &mut source,
-            &mut machine,
-            storage,
-            workflow,
-            page,
-            self.reserve,
-        )?;
+        let recorded_version = begin(&mut source, &mut machine, workflow, page, self.reserve)?;
 
         let mut context = Context {
-            storage,
             activities: world,
             machine: &mut machine,
             page,
@@ -342,9 +336,8 @@ impl<C: IntegrityCheck> Driver<C> {
 /// [`Boundary::recorded_version`] hands the workflow: the recorded one where history held a
 /// `RunStarted`, and the one this image writes where it did not.
 fn begin<S, C, W>(
-    source: &mut Source<C>,
+    source: &mut Source<'_, S, C>,
     machine: &mut ReplayMachine,
-    storage: &mut S,
     workflow: &W,
     page: &mut [u8],
     reserve: Reserve,
@@ -359,7 +352,7 @@ where
         let Source::Scanning(recovery) = &mut *source else {
             return Err(DriveError::NoAppendPoint);
         };
-        match recovery.next(storage, &mut *page) {
+        match recovery.next(&mut *page) {
             Some(Ok(record)) => {
                 let RecordRef::RunStarted {
                     workflow_kind,
@@ -406,7 +399,7 @@ where
         input: identity.input,
     };
     open(source, reserve)?;
-    write(source, storage, &record, page)?;
+    write(source, &record, page)?;
     machine
         .advance(record)
         .map(|_| ())
@@ -419,49 +412,102 @@ where
 /// One value rather than two fields, because the two are exclusive by construction:
 /// [`Journal::after`] consumes the [`Recovery`] that positioned it, so a driver cannot hold
 /// a reader and a writer over one region at once.
-enum Source<C: IntegrityCheck> {
+///
+/// # Why the device lives here rather than in a field of `Context`
+///
+/// Issue [#84](https://github.com/madmax983/waymaker/issues/84) has [`Recovery`] hold the
+/// device for the whole of a scan rather than take it fresh at every call. That is right for
+/// the scan and wrong for a `Context` that also wants the device for §07's writer: a struct
+/// cannot have one field borrow another field of the same instance. So the device travels
+/// with whichever state is using it — inside the [`Recovery`] while
+/// [`Scanning`](Self::Scanning), inside this enum directly once there is a writer or none at
+/// all — and [`Context`] never holds it on its own.
+enum Source<'storage, S, C: IntegrityCheck> {
     /// Replaying committed history.
-    Scanning(Recovery<C>),
+    Scanning(Recovery<'storage, S, C>),
     /// History is exhausted; the journal is being extended, through §10's gate.
-    Writing(Reserved<C>),
-    /// The scan ended somewhere a writer cannot be opened at.
-    Spent,
+    Writing(&'storage mut S, Reserved<C>),
+    /// The scan ended somewhere a writer cannot be opened at, or the writer is out for one
+    /// effect's protocol — see [`Context::dispatch`].
+    Spent(&'storage mut S),
+    /// A transient placeholder [`mem::replace`] needs while a state above is decided.
+    ///
+    /// Never observed by a caller: every function below that matches on this treats it the
+    /// way [`Spent`](Self::Spent) is treated once its device has been taken for good.
+    Taken,
 }
 
 /// Turns a finished scan into a gated writer, or refuses.
-fn open<E, C: IntegrityCheck>(
-    source: &mut Source<C>,
+fn open<E, S: StableStorage, C: IntegrityCheck>(
+    source: &mut Source<'_, S, C>,
     reserve: Reserve,
 ) -> Result<(), DriveError<E>> {
-    match mem::replace(source, Source::Spent) {
+    match mem::replace(source, Source::Taken) {
         // `None` is the scan that stopped at damage, at an unsealed frame, or was
         // abandoned. §14: the recovered prefix stands, and nothing may be appended after it.
         Source::Scanning(recovery) => {
-            let Some(journal) = Journal::after(recovery) else {
+            let (storage, journal) = Journal::after_taking_storage(recovery);
+            let Some(journal) = journal else {
+                *source = Source::Spent(storage);
                 return Err(DriveError::NoAppendPoint);
             };
             // §10's gate, taken here so that every append below goes through it. A journal
             // whose region cannot hold the reserve is refused before a record is staged.
-            let reserved = Reserved::over(journal, reserve).map_err(DriveError::Reserve)?;
-            *source = Source::Writing(reserved);
+            let reserved = match Reserved::over(journal, reserve) {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    *source = Source::Spent(storage);
+                    return Err(DriveError::Reserve(error));
+                }
+            };
+            *source = Source::Writing(storage, reserved);
             Ok(())
         }
-        Source::Writing(reserved) => {
-            *source = Source::Writing(reserved);
+        Source::Writing(storage, reserved) => {
+            *source = Source::Writing(storage, reserved);
             Ok(())
         }
-        Source::Spent => Err(DriveError::NoAppendPoint),
+        Source::Spent(storage) => {
+            *source = Source::Spent(storage);
+            Err(DriveError::NoAppendPoint)
+        }
+        Source::Taken => Err(DriveError::NoAppendPoint),
     }
 }
 
-/// Takes the writer out of `source`, or refuses.
+/// Takes the writer and the device out of `source`, or refuses.
 ///
 /// §07's protocol consumes the writer for the length of one effect, which is what makes a
-/// second appender over one journal unrepresentable. `source` is left [`Source::Spent`]
-/// until [`Context::dispatch`] puts the writer back.
-const fn take<E, C: IntegrityCheck>(source: &mut Source<C>) -> Result<Reserved<C>, DriveError<E>> {
-    match mem::replace(source, Source::Spent) {
-        Source::Writing(reserved) => Ok(reserved),
+/// second appender over one journal unrepresentable. `source` is left holding only the
+/// device, in [`Source::Spent`], until [`Context::dispatch`] puts the writer back.
+const fn take<'storage, E, S, C: IntegrityCheck>(
+    source: &mut Source<'storage, S, C>,
+) -> Result<(&'storage mut S, Reserved<C>), DriveError<E>> {
+    match mem::replace(source, Source::Taken) {
+        Source::Writing(storage, reserved) => Ok((storage, reserved)),
+        Source::Scanning(recovery) => {
+            let storage = recovery.into_storage();
+            *source = Source::Spent(storage);
+            Err(DriveError::NoAppendPoint)
+        }
+        Source::Spent(storage) => {
+            *source = Source::Spent(storage);
+            Err(DriveError::NoAppendPoint)
+        }
+        Source::Taken => Err(DriveError::NoAppendPoint),
+    }
+}
+
+/// Takes the device out of `source`, which must be [`Source::Spent`] — the state §07's
+/// protocol leaves it in while an effect is outstanding, whether dispatched immediately or
+/// split across [`Boundary::schedule`](crate::Boundary::schedule) and
+/// [`Boundary::resolve`](crate::Boundary::resolve). Refuses, restoring what was there,
+/// otherwise.
+const fn spent<'storage, E, S, C: IntegrityCheck>(
+    source: &mut Source<'storage, S, C>,
+) -> Result<&'storage mut S, DriveError<E>> {
+    match mem::replace(source, Source::Taken) {
+        Source::Spent(storage) => Ok(storage),
         other => {
             *source = other;
             Err(DriveError::NoAppendPoint)
@@ -474,8 +520,7 @@ const fn take<E, C: IntegrityCheck>(source: &mut Source<C>) -> Result<Reserved<C
 /// The one place the scan and the kernel are kept in step: an exhausted scan becomes a
 /// writer here, so the transition happens exactly once and at the moment history runs out.
 fn peek<'page, S, C>(
-    source: &mut Source<C>,
-    storage: &mut S,
+    source: &mut Source<'_, S, C>,
     page: &'page mut [u8],
     reserve: Reserve,
 ) -> Result<Next<'page>, DriveError<S::Error>>
@@ -485,14 +530,14 @@ where
 {
     match &mut *source {
         // A writer is open, so history really has run out.
-        Source::Writing(_) => return Ok(Next::EndOfHistory),
+        Source::Writing(..) => return Ok(Next::EndOfHistory),
         // A scan that ended somewhere no writer could be opened at. `EndOfHistory` is the
         // input that produces `Intent::Schedule` and `Resolve::Redeliver` — the two rows
         // that lead to dispatch — so answering it here would offer the world an effect this
         // bank can never record. Unreachable today because every `open` failure sets `stop`
         // first; spelled as the refusal it has to be rather than left to the call graph.
-        Source::Spent => return Err(DriveError::NoAppendPoint),
-        Source::Scanning(recovery) => match recovery.next(storage, page) {
+        Source::Spent(_) | Source::Taken => return Err(DriveError::NoAppendPoint),
+        Source::Scanning(recovery) => match recovery.next(page) {
             Some(Ok(record)) => return Ok(Next::Record(record)),
             Some(Err(error)) => return Err(DriveError::Recovery(error)),
             None => {}
@@ -526,8 +571,7 @@ where
 /// "nothing follows", they say the driver could not find out. Reporting a clean finish on
 /// one of those is the same mistake as reporting it on a record that does follow.
 fn nothing_follows<S, C>(
-    source: &mut Source<C>,
-    storage: &mut S,
+    source: &mut Source<'_, S, C>,
     page: &mut [u8],
 ) -> Result<(), DriveError<S::Error>>
 where
@@ -536,8 +580,8 @@ where
 {
     match source {
         // The scan ran to erased media before either of these existed, so nothing follows.
-        Source::Writing(_) | Source::Spent => Ok(()),
-        Source::Scanning(recovery) => match recovery.next(storage, page) {
+        Source::Writing(..) | Source::Spent(_) | Source::Taken => Ok(()),
+        Source::Scanning(recovery) => match recovery.next(page) {
             Some(Ok(_)) => Err(DriveError::HistoryContinues),
             Some(Err(RecoveryError::Decode(_))) | None => Ok(()),
             Some(Err(error)) => Err(DriveError::Recovery(error)),
@@ -547,8 +591,7 @@ where
 
 /// Design document §07's three steps, for one record.
 fn write<S, C>(
-    source: &mut Source<C>,
-    storage: &mut S,
+    source: &mut Source<'_, S, C>,
     record: &RecordRef<'_>,
     page: &mut [u8],
 ) -> Result<(), DriveError<S::Error>>
@@ -556,18 +599,18 @@ where
     S: StableStorage,
     C: IntegrityCheck,
 {
-    let Source::Writing(reserved) = source else {
+    let Source::Writing(storage, reserved) = source else {
         return Err(DriveError::NoAppendPoint);
     };
     reserved
-        .stage(storage, record, page)
+        .stage(*storage, record, page)
         .map_err(|error| match error {
             ReservedError::Capacity(refusal) => DriveError::Capacity(refusal),
             ReservedError::Append(error) => DriveError::Append(error),
         })?
-        .payload_barrier(storage)
+        .payload_barrier()
         .map_err(DriveError::Append)?
-        .commit(storage)
+        .commit()
         .map_err(DriveError::Append)?;
     Ok(())
 }
@@ -651,12 +694,11 @@ enum Stop<E> {
 
 /// The driver, as the workflow sees it.
 struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> {
-    storage: &'a mut S,
     activities: &'a mut A,
     machine: &'a mut ReplayMachine,
     page: &'a mut [u8],
     result: &'a mut [u8],
-    source: Source<C>,
+    source: Source<'a, S, C>,
     reserve: Reserve,
     stop: Option<Stop<S::Error>>,
     /// The effect §07 step 3 committed, while a caller performs step 4 for itself.
@@ -682,7 +724,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         ended: Result<Outcome<'_>, Suspended>,
     ) -> Result<Progress, DriveError<S::Error>> {
         let Self {
-            storage,
             machine,
             page,
             result,
@@ -708,7 +749,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             }) => {
                 // §08 row 5 was reached at an effect boundary, so the terminal record is
                 // already consumed and nothing may follow it.
-                nothing_follows(&mut source, storage, page)?;
+                nothing_follows(&mut source, page)?;
                 return Ok(Progress::Finished {
                     conclusion,
                     result_len,
@@ -747,7 +788,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
 
         // Bound and collapsed in one statement: a `Next` that stayed alive across the
         // match would hold the page borrow into the arm that has to write through it.
-        let terminated = match peek(&mut source, storage, &mut *page, reserve)? {
+        let terminated = match peek(&mut source, &mut *page, reserve)? {
             // §08 row 5 reached outside an effect boundary: the workflow and history agree
             // that the run is over, and history is what the caller is told.
             Next::Record(record) => {
@@ -779,13 +820,13 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             // §08 has no edge from an unresolved effect to a terminal record, so this is
             // where a run that ended with one outstanding is refused rather than recorded.
             machine.advance(record).map_err(DriveError::Kernel)?;
-            write(&mut source, storage, &record, page)?;
+            write(&mut source, &record, page)?;
             recorded
         };
         // Both branches above, in one place: the run that ended in this boot and the run
         // whose terminal record history already held. Free on the first — a writer is open,
         // so the scan is behind it — and one read on the second.
-        nothing_follows(&mut source, storage, page)?;
+        nothing_follows(&mut source, page)?;
         Ok(Progress::Finished {
             conclusion,
             result_len,
@@ -837,8 +878,7 @@ enum Decision<C: IntegrityCheck> {
 /// §02 decision 3 is about: the writer leaves `source` here and comes back only in
 /// [`Context::dispatch`], so a run with an effect in flight has no appender.
 fn scheduling<S, C>(
-    source: &mut Source<C>,
-    storage: &mut S,
+    source: &mut Source<'_, S, C>,
     machine: &mut ReplayMachine,
     page: &mut [u8],
     stop: &mut Option<Stop<S::Error>>,
@@ -849,14 +889,17 @@ where
     S: StableStorage,
     C: IntegrityCheck,
 {
-    let writer = match take(source) {
-        Ok(writer) => writer,
+    let (storage, writer) = match take(source) {
+        Ok(pair) => pair,
         Err(error) => {
             *stop = Some(Stop::Failed(error));
             return Decision::Stop;
         }
     };
-    let scheduled = Effect::over(id.run, writer).schedule(storage, id.seq, request, page);
+    let scheduled = Effect::over(id.run, writer).schedule(&mut *storage, id.seq, request, page);
+    // The device goes back into `source` regardless: it is still there whether or not the
+    // schedule succeeded, and `take` already left nowhere else for it to live.
+    *source = Source::Spent(storage);
     let Scheduled { dispatch, record } = match scheduled {
         Ok(scheduled) => scheduled,
         Err(error) => {
@@ -879,7 +922,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     /// is [`Suspended`].
     fn decide(&mut self, kind: ActivityKind, input: &[u8]) -> Decision<C> {
         let Self {
-            storage,
             machine,
             page,
             result,
@@ -920,7 +962,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             input_crc,
         };
 
-        let half = match peek(source, *storage, page, *reserve) {
+        let half = match peek(source, page, *reserve) {
             Err(error) => Half::Failed(error),
             Ok(next) => match machine.intent(request, next) {
                 Ok(Intent::Schedule { id }) => Half::Schedule(id),
@@ -950,9 +992,9 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             }
             // §02 decision 3, as §07 steps 1 to 3: the intent crosses two barriers before
             // the effect, and the value step 4 needs does not exist until they returned.
-            Half::Schedule(id) => scheduling(source, *storage, machine, page, stop, id, request),
+            Half::Schedule(id) => scheduling(source, machine, page, stop, id, request),
             Half::Recorded => {
-                let answer = match peek(source, *storage, page, *reserve) {
+                let answer = match peek(source, page, *reserve) {
                     Err(error) => Answer::Failed(error),
                     Ok(next) => match machine.outcome(next) {
                         Ok(Resolve::Replayed { outcome, .. }) => {
@@ -970,7 +1012,12 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                     // §07 steps 1 to 3 completed in an earlier boot: committed history holds
                     // the schedule record and no outcome, which is what the kernel just said.
                     Answer::Redeliver(id) => match take(source) {
-                        Ok(writer) => {
+                        Ok((storage, writer)) => {
+                            // Redelivery mints no new record, so nothing here writes — but
+                            // the device is still with this run for as long as the effect
+                            // it is about to dispatch is outstanding, exactly as the
+                            // scheduled path leaves it in `Spent` for `Context::dispatch`.
+                            *source = Source::Spent(storage);
                             Decision::Dispatch(Effect::over(id.run, writer).redelivering(id.seq))
                         }
                         Err(error) => {
@@ -1000,7 +1047,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         input: &[u8],
     ) -> Result<Outcome<'_>, Suspended> {
         let Self {
-            storage,
             activities,
             machine,
             page,
@@ -1066,23 +1112,33 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         };
 
         // §07 steps 5, 6 and 7. The writer comes back only here, so a run with an effect in
-        // flight has no appender.
-        let Resolved {
-            next,
-            record,
-            outcome,
-        } = match dispatchable.resolve(*storage, resolution, page) {
-            Ok(resolved) => resolved,
+        // flight has no appender. The device comes back from the same place it was parked
+        // when the effect was scheduled — see `Source`'s own documentation.
+        let storage = match spent(source) {
+            Ok(storage) => storage,
             Err(error) => {
                 *stop = Some(Stop::Failed(error));
                 return Err(Suspended::NEW);
             }
         };
+        let Resolved {
+            next,
+            record,
+            outcome,
+        } = match dispatchable.resolve(&mut *storage, resolution, page) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                *stop = Some(Stop::Failed(error));
+                *source = Source::Spent(storage);
+                return Err(Suspended::NEW);
+            }
+        };
         if let Err(error) = machine.advance(record) {
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+            *source = Source::Spent(storage);
             return Err(Suspended::NEW);
         }
-        *source = Source::Writing(next.into_writer());
+        *source = Source::Writing(storage, next.into_writer());
         // The bytes the record holds, and no others. An exhausted answer shows nothing, and
         // this is the only outcome §07 lets a caller reach.
         Ok(outcome)
@@ -1131,13 +1187,8 @@ enum TimerHalf<E> {
 /// precedes its committed intent, and this driver performs none for a deadline: it records
 /// the intent and then compares readings. A dispatcher that armed a hardware alarm would
 /// have a physical act to order, and that is rung 0.4's.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "every argument is one of the driver's fields, destructured by its caller"
-)]
 fn arming<S, C, K>(
-    source: &mut Source<C>,
-    storage: &mut S,
+    source: &mut Source<'_, S, C>,
     machine: &mut ReplayMachine,
     clocks: &mut K,
     page: &mut [u8],
@@ -1164,7 +1215,7 @@ where
     // Through §10's gate, like every other append: a deadline committed into a journal with
     // no room for the firing that resolves it strands the run, because §08 has no edge from
     // an open boundary to a terminal record.
-    if let Err(error) = write(source, storage, &record, page) {
+    if let Err(error) = write(source, &record, page) {
         *stop = Some(Stop::Failed(error));
         return TimerDecision::Stop;
     }
@@ -1189,7 +1240,7 @@ where
     // defensively and masked the fault it was meant to leave visible. Re-arming a *recorded*
     // deadline is the only place a reset can have intervened, and that path still uses it.
     measure(
-        source, storage, machine, page, stop, id, spec, capability, now, reading,
+        source, machine, page, stop, id, spec, capability, now, reading,
     )
 }
 
@@ -1203,8 +1254,7 @@ where
     reason = "every argument is one of the driver's fields, destructured by its caller"
 )]
 fn measure<S, C>(
-    source: &mut Source<C>,
-    storage: &mut S,
+    source: &mut Source<'_, S, C>,
     machine: &mut ReplayMachine,
     page: &mut [u8],
     stop: &mut Option<Stop<S::Error>>,
@@ -1251,7 +1301,7 @@ where
     };
 
     let record = RecordRef::TimerFired { seq: id.seq };
-    if let Err(error) = write(source, storage, &record, page) {
+    if let Err(error) = write(source, &record, page) {
         *stop = Some(Stop::Failed(error));
         return TimerDecision::Stop;
     }
@@ -1268,7 +1318,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     /// [`decide`](Self::decide)'s twin, row for row.
     fn decide_timer(&mut self, spec: TimerSpec) -> TimerDecision {
         let Self {
-            storage,
             activities,
             machine,
             page,
@@ -1295,7 +1344,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             capability: activities.capability(),
         };
 
-        let half = match peek(source, *storage, page, *reserve) {
+        let half = match peek(source, page, *reserve) {
             Err(error) => TimerHalf::Failed(error),
             Ok(next) => match machine.timer_intent(request, next) {
                 Ok(TimerIntent::Schedule { id }) => TimerHalf::Arm(id),
@@ -1322,11 +1371,9 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                 });
                 TimerDecision::Stop
             }
-            TimerHalf::Arm(id) => {
-                arming(source, *storage, machine, *activities, page, stop, id, spec)
-            }
+            TimerHalf::Arm(id) => arming(source, machine, *activities, page, stop, id, spec),
             TimerHalf::Recorded => {
-                let resolved = match peek(source, *storage, page, *reserve) {
+                let resolved = match peek(source, page, *reserve) {
                     Err(error) => Err(error),
                     Ok(next) => machine.timer_outcome(next).map_err(DriveError::Kernel),
                 };
@@ -1356,7 +1403,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                         let floor = recorded.rearmed_at(armed_at, reading);
                         measure(
                             source,
-                            *storage,
                             machine,
                             page,
                             stop,
@@ -1384,7 +1430,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     /// only thing a [`Boundary`] method may hand a workflow is [`Suspended`].
     fn record_answer(&mut self, answered: Answered<'_>) -> Option<(Conclusion, usize)> {
         let Self {
-            storage,
             machine,
             page,
             result,
@@ -1420,22 +1465,33 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             Answered::Failed(bytes) => Resolution::Failed(bytes),
         };
 
-        let Resolved {
-            next,
-            record,
-            outcome,
-        } = match dispatchable.resolve(*storage, resolution, page) {
-            Ok(resolved) => resolved,
+        // The device comes back from where scheduling parked it — see `Source`'s own
+        // documentation.
+        let storage = match spent(source) {
+            Ok(storage) => storage,
             Err(error) => {
                 *stop = Some(Stop::Failed(error));
                 return None;
             }
         };
+        let Resolved {
+            next,
+            record,
+            outcome,
+        } = match dispatchable.resolve(&mut *storage, resolution, page) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                *stop = Some(Stop::Failed(error));
+                *source = Source::Spent(storage);
+                return None;
+            }
+        };
         if let Err(error) = machine.advance(record) {
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
+            *source = Source::Spent(storage);
             return None;
         }
-        *source = Source::Writing(next.into_writer());
+        *source = Source::Writing(storage, next.into_writer());
         // Copied into the caller's result buffer, because the bytes the workflow observes
         // must outlive the answer they were handed in.
         match store(outcome, result, reserve.bounds().effect_result_bytes) {
@@ -1477,7 +1533,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     /// [`decide`](Self::decide)'s twin, row for row, minus the world.
     fn decide_gate(&mut self, gate: GateId) -> GateDecision {
         let Self {
-            storage,
             machine,
             page,
             result,
@@ -1504,7 +1559,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             supported: *versions,
         };
 
-        let half = match peek(source, *storage, page, *reserve) {
+        let half = match peek(source, page, *reserve) {
             Err(error) => GateHalf::Failed(error),
             Ok(next) => match machine.version_intent(request, next) {
                 Ok(VersionIntent::Recorded { version, .. }) => GateHalf::Recorded(version),
@@ -1543,7 +1598,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                     gate,
                     version,
                 };
-                if let Err(error) = write(source, *storage, &record, page) {
+                if let Err(error) = write(source, &record, page) {
                     *stop = Some(Stop::Failed(error));
                     return GateDecision::Stop;
                 }

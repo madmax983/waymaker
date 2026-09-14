@@ -10,64 +10,79 @@
 //! an x86 test binary.
 //!
 //! This image closes that. It is linked — with a reset vector, a vector table and a memory
-//! map — started on two QEMU machines, and required to run the rig's three moments and say
-//! so. `cargo xtask emulate` is the harness; [`crate::boot`] is what runs.
+//! map — for three QEMU machines, started on whichever of them the harness selects, and
+//! required to run the rig's three moments and say so. `cargo xtask emulate` is the
+//! harness; [`crate::boot`] is what runs.
 //!
-//! # Why two machines
+//! # Why three machines
 //!
 //! `-machine microbit` is an nRF51822, whose core is a Cortex-M0: **ARMv6-M**, the
 //! architecture `thumbv6m-none-eabi` targets and the one design document §04's budgets are
 //! stated for. `-machine mps2-an386` is a Cortex-M4: **ARMv7E-M**, which is the second of the
-//! two cores `docs::HARDWARE_TARGETS` names. Between them the rig's code is executed on both
-//! instruction sets it is written for, which one machine could not do — a rig that had only
-//! ever run on one encoding has measured that encoding.
+//! two cores `docs::HARDWARE_TARGETS` names. `-machine esp32s3` is an ESP32-S3, whose core is
+//! an Xtensa LX7: a third encoding from a different vendor lineage. Between them the rig's
+//! code is executed on every instruction set it is written for, which one machine could not
+//! do — a rig that had only ever run on one encoding has measured that encoding — and two
+//! ARM cores agreeing is a weaker statement than three cores from two families agreeing.
 //!
 //! # What it is not
 //!
-//! A board run. There is no NOR part in either machine, no supply to remove, no reset-cause
-//! register, no backup domain and no retained-RAM question, so the two power-cut rows and the
-//! RTC row of `docs::HARDWARE_TARGETS` stay `Not run` and this image may not be cited to move
-//! them. The Cortex-M0 is also not a Cortex-M0+: the architecture is the same and the core is
-//! not. [ADR 0040] argues all of that rather than leaving a green check to imply otherwise.
+//! A board run. There is no NOR part in any of the three machines, no supply to remove, no
+//! reset-cause register, no backup domain and no retained-RAM question, so the two power-cut
+//! rows and the RTC row of `docs::HARDWARE_TARGETS` stay `Not run` and this image may not be
+//! cited to move them. The Cortex-M0 is also not a Cortex-M0+: the architecture is the same
+//! and the core is not. [ADR 0040] argues all of that rather than leaving a green check to
+//! imply otherwise.
 //!
 //! # Why there is `unsafe` here, and nowhere else
 //!
-//! Three reasons, and no more. `#[cortex_m_rt::entry]` expands to the exported symbol the
-//! reset vector points at, and `cortex_m_semihosting::debug::exit` is how a guest tells QEMU
-//! what to exit with — neither can be written without the attribute the workspace denies.
-//! [`crate::stack`] is the third: reading how far a run disturbed a painted stack needs a raw
-//! fill and a raw read, named by [ADR 0043]. The workspace manifest names this exact escape —
-//! *"`deny` keeps a documented exception a reviewable one-line `#![allow(unsafe_code)]` plus
-//! an ADR"* — and this is the one crate that takes it. It is a crate nothing depends on, that
-//! is never published, and that no layer, test-support crate or firmware image links.
+//! On ARM, `#[cortex_m_rt::entry]` expands to the exported symbol the reset vector points at,
+//! and `cortex_m_semihosting::debug::exit` is how a guest tells QEMU what to exit with.
+//! Neither can be written without the attribute the workspace denies. [`crate::stack`] is a
+//! third, ARM-only reason: reading how far a run disturbed a painted stack needs a raw fill
+//! and a raw read, named by [ADR 0045]. On Xtensa there is no `cortex-m-rt` to expand and no
+//! `stack` module to link: the startup in `xtensa` — installing the stack pointer, zeroing
+//! `.bss`, poking the UART registers — is hand-written, and hand-written it must be. The
+//! workspace manifest names this exact escape — *"`deny` keeps a documented exception a
+//! reviewable one-line `#![allow(unsafe_code)]` plus an ADR"* — and this is the one crate
+//! that takes it. It is a crate nothing depends on, that is never published, and that no
+//! layer, test-support crate or firmware image links.
 //!
 //! [ADR 0040]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md
-//! [ADR 0043]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0043-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
+//! [ADR 0045]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
 
 #![no_std]
 #![no_main]
 #![warn(missing_docs)]
+// The Xtensa startup is hand-written assembly — a naked entry point installing the
+// stack — the compiler only knows for that architecture under this feature. Gated,
+// so no other target ever sees the attribute: on stable it would be a hard error.
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 // The one exception in the workspace, argued in the module documentation above and in
-// ADR 0040 and ADR 0043. `allow` rather than the `forbid` every other crate carries, because
-// a reset vector, a semihosting exit and a stack high-water mark cannot be spelled without
-// it — and scoped to a crate nothing depends on and no image links.
+// ADR 0040 and ADR 0045. `allow` rather than the `forbid` every other crate carries, because
+// a reset vector, a semihosting exit and (on ARM) a stack high-water mark cannot be spelled
+// without it — and scoped to a crate nothing depends on and no image links. The Xtensa half
+// of the exception is hand-written rather than macro-expanded, and lives behind the
+// `#[cfg(target_arch = "xtensa")]` gate on the module below, so no ARM image can contain it.
 #![allow(
     unsafe_code,
-    reason = "the reset vector, the semihosting exit, and the stack high-water mark; see ADR 0040 and ADR 0043"
+    reason = "the reset vector and the semihosting exit on ARM, and there the stack high-water mark; the Xtensa startup's stack install, .bss zeroing and UART MMIO, gated to that target; see ADR 0040 and ADR 0045"
 )]
 
 pub mod boot;
 pub mod nor;
+
+// One startup per target family. The ARM half links against `cortex-m-rt` and is the only
+// one that links `stack`, since the high-water-mark reading is a `cortex-m` register read
+// with no Xtensa equivalent. The Xtensa half spells out what `cortex-m-rt` expands, because
+// no equivalent exists for Xtensa. `boot` and `nor` stay shared and target-independent: the
+// rig the harness measures is the same rig on all three machines.
+#[cfg(target_arch = "arm")]
+mod arm;
+#[cfg(target_arch = "arm")]
 pub mod stack;
-
-use core::panic::PanicInfo;
-
-use cortex_m_rt::entry;
-use cortex_m_semihosting::{debug, hprintln};
-use waymaker_rig::run::Rig;
-
-use crate::boot::{Census, Trouble};
-use crate::nor::Nor;
+#[cfg(target_arch = "xtensa")]
+mod xtensa;
 
 /// The prefix every line this image writes carries.
 ///
@@ -77,112 +92,12 @@ use crate::nor::Nor;
 /// drift apart over a space.
 pub const PREFIX: &str = "waymaker-emu:";
 
-#[entry]
-fn main() -> ! {
-    // Read before anything else. Every byte below this reading is unused stack at the
-    // moment `stack::paint` is called. `measured_run` is `#[inline(never)]` for the same
-    // reason: its locals, `part` and `page` among them, must sit in a frame of their own,
-    // below this one, and must never share this frame with anything read here.
-    let depth_from = stack::current_stack_pointer();
-    let headroom = stack::available_bytes(depth_from);
-    if headroom <= u32::try_from(stack::GUARD_BYTES).unwrap_or(u32::MAX) {
-        hprintln!(
-            "{} failed the stack region between the linker's `_stack_end` and the current stack pointer leaves no room to paint or measure",
-            PREFIX
-        );
-        debug::exit(debug::EXIT_FAILURE);
-        halt();
-    }
-
-    let resolved = stack::paint(depth_from);
-    let outcome = measured_run();
-    // Both figures come from this one call, against `resolved` — the bound `paint` actually
-    // used — rather than two separate calls each re-deriving their own live reading. Two
-    // calls could disagree by the few bytes each one's own frame costs, which could report
-    // `used` short of `available` even where a run disturbed every byte `paint` painted.
-    let (used, available) = stack::high_water_mark(resolved);
-
-    match outcome {
-        Ok(census) => {
-            report(&census, used, available);
-            hprintln!("{} ok", PREFIX);
-            debug::exit(debug::EXIT_SUCCESS);
-        }
-        Err(trouble) => {
-            hprintln!("{} failed {}", PREFIX, trouble.message());
-            if let Trouble::Breach(outcome) = trouble {
-                hprintln!("{} breach code={}", PREFIX, outcome.code());
-            }
-            debug::exit(debug::EXIT_FAILURE);
-        }
-    }
-
-    // `debug::exit` does not return under QEMU. Reached only if this image is ever started
-    // somewhere semihosting is not enabled, where hanging is the honest thing to do: exiting
-    // zero would report a pass for a run whose result nobody could read.
-    halt()
-}
-
-/// Runs the boot's own locals in a frame of their own.
-///
-/// Both locals, not statics. `cortex-m-rt` puts the stack at the top of the 16 KiB the memory
-/// map declares, and a `static` would need interior mutability this crate has no way to spell
-/// without more of the exception it already carries. This function is kept out of `main`'s
-/// own frame, and marked so the compiler cannot fold it back in: `stack::paint` must not reach
-/// memory `main` still holds. `part` and `page` live in this frame instead, below the stack
-/// pointer `main` read before calling it.
-#[inline(never)]
-fn measured_run() -> Result<Census, Trouble> {
-    let mut part = Nor::new();
-    let mut page = [0_u8; Rig::PAGE_BYTES];
-    boot::run(&mut part, &mut page)
-}
-
-/// Writes the census as three lines the harness parses and a person can read.
-fn report(census: &Census, stack_used: u32, stack_available: u32) {
-    hprintln!(
-        "{} cases passed={} exempt={}",
-        PREFIX,
-        census.cases_passed,
-        census.cases_exempt
-    );
-    hprintln!(
-        "{} rig iterations={} cuts={} resumes={} unextendable={} redeliveries={} verdicts={} dispatched={}",
-        PREFIX,
-        census.iterations,
-        census.cuts,
-        census.resumes,
-        census.unextendable,
-        census.redeliveries,
-        census.verdicts_passed,
-        census.dispatched
-    );
-    hprintln!(
-        "{} stack used={} available={}",
-        PREFIX,
-        stack_used,
-        stack_available
-    );
-}
-
-/// Exits non-zero, so that a panic anywhere in the rig fails the stage rather than hanging it.
-///
-/// The default `cortex-m-rt` handler loops, which under a harness with a timeout is a
-/// *timeout* rather than a failure — the same result for a rig that panicked and a rig that
-/// took too long, which is one distinction too few for a gate.
-#[panic_handler]
-fn panic(info: &PanicInfo<'_>) -> ! {
-    hprintln!("{} panicked: {}", PREFIX, info);
-    debug::exit(debug::EXIT_FAILURE);
-    halt()
-}
-
-/// Stops, for the two callers above that are only reached where `debug::exit` did not exit.
+/// Parks the core, for the callers that are only reached where the exit did not exit.
 ///
 /// A spinning hint rather than a bare `loop {}`, which is what the lint asks for and what a
-/// core would rather be told: this is reached only outside a semihosting host, where there is
-/// nothing left to do and nothing left to say.
-fn halt() -> ! {
+/// core would rather be told. Reached only where there is nothing left to do and nothing
+/// left to say: outside a semihosting host on ARM, after the census — drained — on Xtensa.
+pub(crate) fn halt() -> ! {
     loop {
         core::hint::spin_loop();
     }

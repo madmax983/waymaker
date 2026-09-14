@@ -74,6 +74,10 @@
     reason = "`pub` here would make `size-probe-reach` demand a probe call for a private helper"
 )]
 pub(crate) const fn crc16(bytes: &[u8]) -> u16 {
+    // Named once and used eight times below, rather than spelled eight times: the
+    // `integrity-check` gate counts how many times `0x1021` appears in this function's
+    // body, and a repeated literal would read as a changed polynomial.
+    const POLY: u16 = 0x1021;
     let mut crc: u16 = 0xFFFF;
     let mut rest = bytes;
 
@@ -81,15 +85,51 @@ pub(crate) const fn crc16(bytes: &[u8]) -> u16 {
     // this workspace and a `const fn` has no `for` loop over a slice to reach for.
     while let Some((byte, tail)) = rest.split_first() {
         crc ^= (*byte as u16) << 8;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = if crc & 0x8000 == 0 {
-                crc << 1
-            } else {
-                (crc << 1) ^ 0x1021
-            };
-            bit += 1;
-        }
+        // The eight bit-rounds below are unrolled by hand rather than left as a `while
+        // bit < 8` loop: the loop counter's own increment, compare and backward branch
+        // cost as much as a bit-round itself, and this is a fixed trip count known at
+        // every call site. No table and no array is introduced — each round is the same
+        // single conditional shift-and-xor the loop body already was.
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
+        crc = if crc & 0x8000 == 0 {
+            crc << 1
+        } else {
+            (crc << 1) ^ POLY
+        };
         rest = tail;
     }
     crc
@@ -110,20 +150,56 @@ pub(crate) const fn crc16(bytes: &[u8]) -> u16 {
     reason = "`pub` here would make `size-probe-reach` demand a probe call for a private helper"
 )]
 pub(crate) const fn crc32(bytes: &[u8]) -> u32 {
+    // `crc16`'s reason: named once, used eight times, so the pinned polynomial literal
+    // still appears exactly once in this function's body.
+    const POLY: u32 = 0xEDB8_8320;
     let mut crc: u32 = 0xFFFF_FFFF;
     let mut rest = bytes;
 
     while let Some((byte, tail)) = rest.split_first() {
         crc ^= *byte as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = if crc & 1 == 0 {
-                crc >> 1
-            } else {
-                (crc >> 1) ^ 0xEDB8_8320
-            };
-            bit += 1;
-        }
+        // Unrolled for `crc16`'s reason: eight fixed rounds, no table, no array — just the
+        // loop counter's own bookkeeping removed.
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
+        crc = if crc & 1 == 0 {
+            crc >> 1
+        } else {
+            (crc >> 1) ^ POLY
+        };
         rest = tail;
     }
     crc ^ 0xFFFF_FFFF

@@ -4,7 +4,7 @@
 //! reads back how far that byte was disturbed. This is the third and last reason this crate
 //! writes the `unsafe` keyword at all — after the two macro expansions `main.rs` names — and
 //! it is a raw fill and a raw read, both confined to the region the linker reserves for the
-//! stack. See [ADR 0043].
+//! stack. See [ADR 0045].
 //!
 //! # What this measures, and what it does not
 //!
@@ -25,7 +25,7 @@
 //! though. That is a property of stack painting in general, not a defect of this
 //! implementation, and no rule in this workspace has ever asked it to be more.
 //!
-//! [ADR 0043]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0043-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
+//! [ADR 0045]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md
 //! [budgets]: https://github.com/madmax983/waymaker/blob/main/CLAUDE.md#budgets
 
 /// The byte [`paint`] fills unused stack with.
@@ -104,7 +104,7 @@ fn stack_ceiling() -> usize {
 /// Thread mode, with `SPSEL` itself naming MSP — and collapses to the empty region at
 /// [`stack_floor`] in every other one, which is the same degenerate case a region no wider than
 /// [`GUARD_BYTES`] already produces: [`paint`] already declines to write into it and
-/// [`crate::emulate::StackUsage::shortfall`] already refuses it as a measurement that did not
+/// `xtask::emulate::StackUsage::shortfall` already refuses it as a measurement that did not
 /// happen. This image runs in Thread mode with MSP selected for the whole of every boot this
 /// measures — nothing here runs an RTOS, selects PSP, or installs a handler that reaches this
 /// module — so the collapse is not one this boot's own measurement ever takes; it exists for

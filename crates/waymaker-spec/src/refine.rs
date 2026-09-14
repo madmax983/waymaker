@@ -28,7 +28,7 @@
 use waymaker_fault::{Durability, Interruption, Ledger, Op, Progress, RecordId, Run};
 use waymaker_flash::storage::Geometry;
 
-use crate::model::{BANKS, Bank, Journal, OnMedia, Record, Role};
+use crate::model::{BANKS, Bank, BankId, Journal, OnMedia, Record, Role};
 
 /// The part of a ghost state a crash harness can report.
 ///
@@ -39,12 +39,21 @@ use crate::model::{BANKS, Bank, Journal, OnMedia, Record, Role};
 /// defaulting them.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Observation {
-    /// Each record in declaration order, as `(id, role, state, torn)`.
+    /// Each record in declaration order, as `(id, role, state, torn, bank)`.
     ///
     /// The role comes from the caller rather than from the ledger: `waymaker-fault` names no
     /// record type, which is exactly what makes the harness reusable, so what a record is
     /// *for* is something only the writer under test knows.
-    pub records: Vec<(RecordId, Role, Durability, bool)>,
+    ///
+    /// The bank is real, not a hardcoded `BankId::A` — the earlier version of this field
+    /// carried no bank at all, so a device with record 0 retired in bank A and record 1
+    /// authoritative in bank B abstracted to `observation()`'s correct
+    /// `recover() == [1]` but `reconstructed()`'s wrong `[]`, because every record landed in
+    /// `BankId::A` regardless of which bank it was really in. Codex found it on review of the
+    /// pull request that closed the erase/reboot version of the reboot gap, one round after
+    /// `next_id`'s own missing floor. [`abstraction`] tags every record `BankId::A`, matching
+    /// the module docs' "no writer this function abstracts ever touches a second bank".
+    pub records: Vec<(RecordId, Role, Durability, bool, BankId)>,
     /// The schedule records of effects the run really handed to the world.
     pub dispatched: Vec<RecordId>,
     /// Both banks, read off the crashed run.
@@ -55,6 +64,20 @@ pub struct Observation {
     ///
     /// `false` for a writer that never touches a bank.
     pub sealed_once: bool,
+    /// The record-id counter, exactly as the real device's own reads.
+    ///
+    /// Not inferred from `records`: an id an erase dropped is not one `records.max_id + 1`
+    /// can see, and inferring it would hand that id out a second time on the next `Declare`
+    /// — the collision issue #67's identity scheme exists to forbid. Codex found this on
+    /// review of the pull request that closed issue #67, on the observation/reconstruction
+    /// path specifically. `Some(0)` for a writer that has declared nothing, matching
+    /// [`crate::model::Journal::new`]; `None` only once the counter itself is exhausted.
+    ///
+    /// Must be strictly past every id in `records`, or [`Journal::reconstructed`] refuses it
+    /// with [`Impossible::NextIdReissuesAResident`] — a floor `reconstructed` checks rather
+    /// than trusts, since a caller can misreport this field within one observation and not
+    /// only across the erase this doc comment's first paragraph is about.
+    pub next_id: Option<u32>,
 }
 
 impl Default for Observation {
@@ -64,6 +87,7 @@ impl Default for Observation {
             dispatched: Vec::new(),
             banks: [Bank::Erased; BANKS],
             sealed_once: false,
+            next_id: Some(0),
         }
     }
 }
@@ -82,12 +106,14 @@ impl Journal {
                         record.role,
                         record.durability(),
                         record.media == OnMedia::Partial,
+                        record.bank,
                     )
                 })
                 .collect(),
             dispatched: self.dispatched().to_vec(),
             banks: *self.banks(),
             sealed_once: self.has_sealed(),
+            next_id: self.next_id(),
         }
     }
 
@@ -110,12 +136,47 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// [`Impossible`] when the observation describes a record no media could hold. Refused
-    /// rather than normalised: a state builder that quietly repaired its input would answer
-    /// questions about a record the caller did not describe, and answer them cheerfully.
+    /// [`Impossible`] when the observation describes a record no media could hold, or a
+    /// `next_id` that lands at or before a resident record's own id. Refused rather than
+    /// normalised: a state builder that quietly repaired its input would answer questions
+    /// about a record the caller did not describe, and answer them cheerfully.
+    ///
+    /// The second check exists because the first round of review that added `next_id` to this
+    /// struct closed only half the gap: a caller can still report a `next_id` that collides
+    /// with a record it is naming in the very same observation, rather than one an erase
+    /// dropped from an earlier one. Records 0 and 1 with `next_id: Some(1)` used to reconstruct
+    /// without complaint; the next `Declare` then minted a second `RecordId(1)`, and the
+    /// `Program` after it found the *older* record already whole and refused with
+    /// `RecordAlreadyWritten`, stranding the new declaration — the identity collision issue
+    /// #67's whole counter scheme exists to forbid, reached without ever going through an
+    /// erase at all. Codex found it on review of the pull request that closed the erase/reboot
+    /// version of this gap. The floor is exactly `reboot`'s own: `next_id` must be past every
+    /// record this observation names, the same way a real device's counter can never point at
+    /// an id something on media already holds.
+    ///
+    /// The third check is `record.id` itself: `next_id` is a single counter over the whole
+    /// device, so no legal transition sequence can ever declare the same id twice, in one bank
+    /// or two. `Journal::bank_of` — which `single_authority` and `durable_intent` both use to
+    /// ask "which bank is this id's record really in" — answers with the *first* matching
+    /// record it finds, so an `Observation` naming `RecordId(0)` once in a retired bank and
+    /// again in the sole authoritative one made `single_authority` misreport a legitimately
+    /// recovered record as coming from the wrong bank, and could equally make `durable_intent`
+    /// skip checking a dispatch that genuinely needed checking. Codex found it on the same
+    /// review round that gave records a real bank field. The real firmware's own effect
+    /// sequence *does* restart at zero across a swap ([`waymaker_core::id::EffectIdAllocator`]
+    /// via `Installed::allocator`), but that is a different identity space from this one:
+    /// `RecordId` is this crate's own bookkeeping label, invented by issue #67 specifically to
+    /// never be reused, and a caller bridging a real device into it has to assign each real
+    /// record a distinct label the way [`abstraction`] already does — reusing the real
+    /// restarting sequence number directly is a translation mistake, not a state the model can
+    /// or should represent.
     pub fn reconstructed(observation: &Observation) -> Result<Self, Impossible> {
         let mut records = Vec::with_capacity(observation.records.len());
-        for (id, role, state, torn) in &observation.records {
+        let mut seen = std::collections::BTreeSet::new();
+        for (id, role, state, torn, bank) in &observation.records {
+            if !seen.insert(*id) {
+                return Err(Impossible::RecordIdDeclaredTwice { record: *id });
+            }
             let media = match (state, torn) {
                 (Durability::Attempted, false) => OnMedia::Absent,
                 (Durability::Attempted, true) => {
@@ -132,13 +193,31 @@ impl Journal {
                 role: *role,
                 media,
                 acknowledged: *state == Durability::Acknowledged,
+                bank: *bank,
             });
+        }
+        if let Some(next_id) = observation.next_id {
+            if let Some(resident) = records.iter().map(|record| record.id).max() {
+                if next_id <= resident.0 {
+                    return Err(Impossible::NextIdReissuesAResident { resident });
+                }
+            }
+        }
+        if !observation.sealed_once {
+            if let Some((bank, _)) = BankId::ALL
+                .into_iter()
+                .zip(observation.banks)
+                .find(|(_, state)| state.authoritative_generation().is_some())
+            {
+                return Err(Impossible::SealedBeforeAnyHistoryOfSealing { bank });
+            }
         }
         Ok(Self::from_parts(
             records,
             observation.dispatched.clone(),
             observation.banks,
             observation.sealed_once,
+            observation.next_id,
         ))
     }
 }
@@ -156,6 +235,32 @@ pub enum Impossible {
         /// The record that claimed both.
         record: RecordId,
     },
+    /// `next_id` names an id at or before a record this observation already holds.
+    NextIdReissuesAResident {
+        /// The highest resident record's id, which `next_id` must be strictly past.
+        resident: RecordId,
+    },
+    /// The same `RecordId` names two different records, in one bank or two.
+    RecordIdDeclaredTwice {
+        /// The id declared more than once.
+        record: RecordId,
+    },
+    /// A bank is durably [`Bank::Sealed`], but the device has never sealed anything.
+    ///
+    /// The only place a bank becomes [`Bank::Sealed`] is the model's own `commit_seal`, which
+    /// sets `sealed_once` true in the same step — so a currently-sealed bank is itself proof
+    /// that some seal has happened, and a caller reporting `sealed_once: false` beside one is
+    /// describing two different devices at once. Left unchecked, [`Journal::recovering_bank`]
+    /// takes the pre-seal convention at face value and answers
+    /// [`BankId::A`] regardless of which bank the observation actually
+    /// shows sealed, and [`Journal::has_sealed`] then exempts the state from
+    /// [`crate::invariant::Invariant::SingleAuthority`] entirely — so a reconstructed state
+    /// could recover a stale bank's records while the truly sealed bank's are ignored, with the
+    /// one guarantee that would catch it never even consulted.
+    SealedBeforeAnyHistoryOfSealing {
+        /// The bank the observation reports as sealed.
+        bank: BankId,
+    },
 }
 
 impl core::fmt::Display for Impossible {
@@ -170,6 +275,22 @@ impl core::fmt::Display for Impossible {
                 formatter,
                 "record {} is torn and never reached media, and half of it cannot be both",
                 record.0
+            ),
+            Self::NextIdReissuesAResident { resident } => write!(
+                formatter,
+                "next_id is not past resident record {}, so the next declaration would reissue \
+                 an id this observation already holds",
+                resident.0
+            ),
+            Self::RecordIdDeclaredTwice { record } => write!(
+                formatter,
+                "record {} is named twice, and this crate's id scheme never reuses one",
+                record.0
+            ),
+            Self::SealedBeforeAnyHistoryOfSealing { bank } => write!(
+                formatter,
+                "{bank:?} is sealed, but sealed_once is false, and a bank cannot be durably \
+                 sealed on a device that has never sealed one"
             ),
         }
     }
@@ -190,8 +311,18 @@ impl core::error::Error for Impossible {}
 /// [`waymaker_fault::Recovery::dispatched`] is: an oracle that only admitted an effect once
 /// its intent was durable could not describe the violation it exists to catch.
 ///
-/// Reports no bank: a caller with one to report builds an [`Observation`] directly and folds
-/// [`bank_after_erase`] and [`bank_after_seal`] into its `banks` field instead.
+/// Reports every record in `BankId::A`, and no bank *state*: a caller with a bank to report
+/// builds an [`Observation`] directly and folds [`bank_after_erase`] and [`bank_after_seal`]
+/// into its `banks` field instead. Exact here and only here, for the same reason `next_id`'s
+/// own inference is — no writer this function abstracts ever touches a second bank.
+///
+/// `next_id` is inferred from `ledger.records()`'s highest id, which is exact here and only
+/// here: no writer this function abstracts ever erases anything, so nothing is ever dropped
+/// from what the ledger still holds for `records.max_id + 1` to lose track of — see
+/// `Journal::from_parts`'s docs for the caller that does erase and cannot take this shortcut.
+/// `checked_add` rather than `saturating_add`: an id already at `u32::MAX` has no id left to
+/// set `next_id` *to*, and saturating back to
+/// `u32::MAX` would hand that same id out a second time.
 pub fn abstraction(
     ledger: &Ledger,
     dispatched: &[RecordId],
@@ -200,12 +331,27 @@ pub fn abstraction(
     let mut sorted = dispatched.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    let records: Vec<_> = ledger
+        .records()
+        .map(|(id, state)| {
+            (
+                id,
+                role(id),
+                state,
+                ledger.torn(id).unwrap_or(false),
+                BankId::A,
+            )
+        })
+        .collect();
+    let next_id = records
+        .iter()
+        .map(|(id, ..)| id.0)
+        .max()
+        .map_or(Some(0), |highest| highest.checked_add(1));
     Observation {
-        records: ledger
-            .records()
-            .map(|(id, state)| (id, role(id), state, ledger.torn(id).unwrap_or(false)))
-            .collect(),
+        records,
         dispatched: sorted,
+        next_id,
         ..Observation::default()
     }
 }
@@ -320,7 +466,25 @@ pub fn bank_after_erase(
 /// `Generation::FIRST` is `0`, because the firmware has a `Bank`-shaped `None` for that case
 /// and does not need the reservation. A caller passes `real_generation.0 + 1` here, and the
 /// two schemes agree from there: both increment by one per seal, so the shift is exact at
-/// every later generation too.
+/// every later generation too — except the last one. The real `Generation::successor` refuses
+/// only at `Generation::MAX`, so the firmware can validly seal a bank *at* `Generation::MAX`;
+/// this shift has no model number left for it (`u32::MAX + 1` does not exist), and
+/// `Journal::step`'s own `begin_seal` refuses one generation earlier than that for the same
+/// reason, at model generation `u32::MAX` rather than `u32::MAX + 1`. Codex found this reading
+/// the shift on review of the pull request that gave records a real bank field, and it is real
+/// — but removing the reservation (numbering the model's first seal `0` instead of `1`, since
+/// [`Bank`] already tells "unsealed" apart from `Sealed(0)` through its own variants rather
+/// than through the number) would change how many distinct generation values
+/// [`Bound::generations`](crate::model::Bound::generations) admits at any given cap, which
+/// `tests/census.rs`'s pinned counts would have to absorb for a boundary nothing here comes
+/// anywhere near: `Bound::PROOF` caps generations at 3, `tests/refinement.rs`'s bank-swap
+/// sweep at 3 more, and the one place this crate drives a real `u32::MAX` at all is
+/// `model.rs`'s own hand-built `a_generation_at_the_ceiling_is_refused_rather_than_tied_with_the_other_bank`,
+/// which exercises the model's ceiling entirely on its own terms and never through this shift.
+/// This is the same standing `obligation.rs` already records for `single-authority`'s
+/// generation dimension — "a generation is an unbounded integer, where the firmware refuses at
+/// the ceiling rather than proving the refusal unnecessary" — one integer narrower than stated
+/// there, and stated here rather than silently inherited.
 #[must_use]
 pub fn bank_after_seal(
     prior: Bank,

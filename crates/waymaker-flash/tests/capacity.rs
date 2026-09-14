@@ -340,8 +340,8 @@ fn sealed_generation(device: &mut Nor, id: BankId) -> Option<Generation> {
 /// A writer over `region`, positioned where a recovery of it says it may write.
 fn opened(device: &mut Nor, region: JournalRegion) -> Journal {
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region);
-    while recovery.next(device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region, device);
+    while recovery.next(&mut page).is_some() {}
     let Some(journal) = Journal::after(recovery) else {
         unreachable!("a journal that ends cleanly has an append point")
     };
@@ -370,9 +370,9 @@ fn commit(
     let mut page = [0_u8; PAGE];
     writer
         .stage(device, record, &mut page)?
-        .payload_barrier(device)
+        .payload_barrier()
         .map_err(ReservedError::Append)?
-        .commit(device)
+        .commit()
         .map_err(ReservedError::Append)
 }
 
@@ -385,8 +385,8 @@ fn commit_unreserved(
     let mut page = [0_u8; PAGE];
     journal
         .stage(device, record, &mut page)?
-        .payload_barrier(device)?
-        .commit(device)
+        .payload_barrier()?
+        .commit()
 }
 
 /// Fills `writer` with schedule/outcome pairs until a schedule is refused.
@@ -1294,9 +1294,9 @@ fn a_bank_at_the_boundary_still_reads_back_as_the_history_it_committed() {
     let offset = writer.journal().offset();
 
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region);
+    let mut recovery = Recovery::new(region, &mut device);
     let mut seen = 0_u32;
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("every frame this writer committed is sound")
         };

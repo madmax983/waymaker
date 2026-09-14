@@ -183,10 +183,10 @@ fn written(run: &Run) -> Option<(Record, Step, bool)> {
 
 /// The committed history an image recovers to, and how the scan ended.
 fn history_of(device: &mut Device, region: JournalRegion) -> (Vec<Record>, Option<Ending>) {
-    let mut recovery = Recovery::new(region);
+    let mut recovery = Recovery::new(region, device);
     let mut page = [0_u8; PAGE];
     let mut history = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else { break };
         history.push(Record::of(&record));
     }
@@ -207,10 +207,10 @@ fn restored(image: &[u8]) -> Device {
 /// Every outcome payload an image recovers to.
 fn payloads(image: &[u8]) -> Vec<Vec<u8>> {
     let mut device = restored(image);
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; PAGE];
     let mut out = Vec::new();
-    while let Some(Ok(record)) = recovery.next(&mut device, &mut page) {
+    while let Some(Ok(record)) = recovery.next(&mut page) {
         match record {
             RecordRef::EffectCompleted { result, .. } => out.push(result.to_vec()),
             RecordRef::EffectFailed { error, .. } => out.push(error.to_vec()),
@@ -823,18 +823,18 @@ fn swap_writer(session: &mut Session) -> Result<(), String> {
         layout,
         booted,
         RUN,
-        Retired::Recovery(Recovery::new(region)),
+        Retired::Recovery(Recovery::new(region, session)),
         next,
     )
     .map_err(|e| format!("{e:?}"))?;
     let mut page = [0_u8; PAGE];
     let installed = swap
         .prepare(session)
-        .and_then(|prepared| prepared.stage(session, &mut page))
-        .and_then(|staged| staged.payload_barrier(session))
-        .and_then(|sealable| sealable.commit(session))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
         .map_err(|e| format!("{e:?}"))?;
-    installed.reclaim(session).map_err(|e| format!("{e:?}"))
+    installed.reclaim().map_err(|e| format!("{e:?}"))
 }
 
 /// Requires `row` to have been reached by a power cut and by a watchdog reset.
@@ -1172,27 +1172,33 @@ fn row_nine() -> Row {
         layout,
         booted,
         RUN,
-        Retired::Recovery(Recovery::new(region)),
+        Retired::Recovery(Recovery::new(region, &mut device)),
         next,
     ) else {
         unreachable!("a swap can be planned from the near-capacity state")
     };
     let Ok(installed) = swap
         .prepare(&mut device)
-        .and_then(|prepared| prepared.stage(&mut device, &mut page))
-        .and_then(|staged| staged.payload_barrier(&mut device))
-        .and_then(|sealable| sealable.commit(&mut device))
+        .and_then(|prepared| prepared.stage(&mut page))
+        .and_then(waymaker_flash::swap::Staged::payload_barrier)
+        .and_then(waymaker_flash::swap::Sealable::commit)
     else {
         unreachable!("the seven steps complete on a fault-free device")
     };
-    assert_eq!(authority(&mut device, layout), installed.authority());
+    // Captured before `device` is read directly: `installed` borrows it for as long as it
+    // lives (issue #84), and `recovery()` consumes it to hand that borrow onward, so the two
+    // borrows cannot overlap.
+    let installed_authority = installed.authority();
+    let installed_region = installed.recovery().region();
+
+    assert_eq!(authority(&mut device, layout), installed_authority);
     let mut new_world = World::new();
     let mut new_workflow = Pipeline::new();
     let ended = boot(
         &mut device,
         &mut new_world,
         &mut new_workflow,
-        installed.region(),
+        installed_region,
         NEXT_RUN,
         reserve,
     );
@@ -1202,7 +1208,7 @@ fn row_nine() -> Row {
         "the new run starts and does work"
     );
     assert_eq!(
-        history_of(&mut device, installed.region()).0,
+        history_of(&mut device, installed_region).0,
         [Record::Started, Record::Schedule(0), Record::Outcome(0)]
     );
     assert!(

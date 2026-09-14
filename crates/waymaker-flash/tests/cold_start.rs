@@ -691,9 +691,9 @@ fn a_cold_boot_selects_a_bank_recovers_its_prefix_and_replays_it() {
     assert_eq!(&run_input[..run_input_len], b"run-input");
 
     let mut cursor = ReplayCursor::new(header.run);
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut device);
     let mut results: Vec<Vec<u8>> = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let record = step.expect("every frame in this journal is sound");
         // Step 5: each record either resolves an effect or identifies the first unresolved
         // one. The cursor is the only thing that knows which.
@@ -747,10 +747,10 @@ fn an_out_of_sequence_frame_stops_a_cold_boot_and_withholds_the_append_point() {
     let journal = JournalRegion::of(layout, id, &header).expect("this bank has a journal");
 
     let mut cursor = ReplayCursor::new(header.run);
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut device);
     let mut accepted = 0_usize;
     let mut refusal = None;
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let record = step.expect("every frame in this journal is sound");
         match cursor.advance(record) {
             Ok(_) => accepted += 1,
