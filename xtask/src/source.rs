@@ -20865,7 +20865,7 @@ mod deferred_answer_pins {
         // any name already resolved as one of the block's own locals, on the reasoning that
         // this function never read a declared type for one. True before `block_let_exprs`'s
         // own `binding_name` was joined by a mirror that keeps the type ascription rather
-        // than discarding it: `block_let_types` reads `q`'s own `u8` the same way
+        // than discarding it: `stmt_let_type` reads `q`'s own `u8` the same way
         // `block_const_types` already reads a local `const`'s.
         let mut source = tests_support::clean_checksum_module();
         source.push_str(
@@ -21668,6 +21668,83 @@ mod deferred_answer_pins {
         let _ = write!(
             source,
             "\nconst fn dense_table_over_constants_with_a_compound_assignment(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_shift_before_a_shadowing_typed_let_is_reported() {
+        // Codex's finding: `let mut x: u8 = 128 + n; x <<= 1; let x: u16 = if x < 100 { n }
+        // else { 10 * n + 1 }; x` declares `x` twice with two different widths, and the
+        // previous flat, whole-block `local_types` map folded both into one entry keyed by
+        // name — whichever declaration `HashMap::collect` visited last (the second, `u16`)
+        // answered for the *first* statement's own shift too. Real Rust shifts an 8-bit `x`,
+        // which truncates `(128 + n) << 1` to `((128 + n) * 2) % 256`; every value of that
+        // for `n` in `0..=14` is under 100, so the `if` takes its `then` arm and every
+        // constant resolves to `n`. Crediting the shift to a 16-bit `x` instead skips the
+        // truncation, so `(128 + n) * 2` is never under 100, the `if` takes its `else` arm,
+        // and every constant resolves to the sparse `10 * n + 1` instead — masking the dense
+        // `0..14` sequence the real, compiled constants actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u16 = {{ let mut x: u8 = 128 + {n}; x <<= 1; let x: u16 = \
+                 if x < 100 {{ {n} }} else {{ 10 * {n} + 1 }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_shift_before_a_shadowing_typed_let(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_plain_assignment_statement_in_their_block_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 100u8; x = x - 100; x };` names a
+        // plain `=` assignment — `syn::Expr::Assign`, a distinct shape from every one of the
+        // ten compound-assignment operators `mutation_target` used to recognise exclusively
+        // — so this block refused as unresolved the same way an unhandled compound
+        // assignment used to. `mutation_target` now recognises both shapes, and a plain
+        // assignment's own new value is its right-hand side evaluated against the scope as
+        // it stood before the write, with no synthetic binary needed.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8; x = x - (100 - {n}); x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_with_a_plain_assignment(nibble: u32) -> u32 {{\n{constants}    \
              match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
              P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
              P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \

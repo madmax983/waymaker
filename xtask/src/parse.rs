@@ -2887,46 +2887,43 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
     }
 }
 
-/// [`block_let_exprs`]'s own mirror for a *width*-aware sibling of [`ConstTypeScopes`]:
-/// every plain `let NAME: TYPE = EXPR;` declared *directly* as a statement in `block`, by
-/// name, against its own type ascription's single-segment name — `None` when a binding
-/// carries no type ascription at all, which [`block_let_exprs`]'s own `binding_name` accepts
-/// (`Pat::Type` is optional there) but this cannot answer a width for.
+/// `local`'s own name and declared type, when it is a plain `let NAME: TYPE = EXPR;` with no
+/// tuple and no `@` sub-pattern — `None` when a binding carries no type ascription at all,
+/// or ascribes anything but a single, bare name, which [`block_let_exprs`]'s own
+/// `destructured_binding` accepts (`Pat::Type` is optional there, and a tuple or `@` pattern
+/// is not) but this cannot answer a width for.
 ///
 /// Codex's next-round finding: `const P0: u8 = { let q: u8 = 255; !q };` names an operand
 /// [`evaluate_block`]'s own `local_resolve_width`/`block_resolve_width` closures declined
 /// unconditionally for any name already resolved as one of the block's own locals, on the
 /// reasoning that this function never read a declared type for one — true before this
-/// existed, since [`block_let_exprs`]'s own `binding_name` unwraps and discards `Pat::Type`
-/// rather than keeping it. `q`'s own ascription states the width `evaluate_bitwise_not`
-/// needs exactly as plainly as a local `const`'s own type does.
-fn block_let_types(block: &syn::Block) -> std::collections::HashMap<String, String> {
-    block
-        .stmts
-        .iter()
-        .filter_map(|stmt| {
-            let syn::Stmt::Local(local) = stmt else {
-                return None;
-            };
-            if has_cfg_test(&local.attrs) {
-                return None;
-            }
-            let init = local.init.as_ref()?;
-            if init.diverge.is_some() {
-                return None;
-            }
-            let syn::Pat::Type(pat_type) = &local.pat else {
-                return None;
-            };
-            let syn::Pat::Ident(ident) = pat_type.pat.as_ref() else {
-                return None;
-            };
-            if ident.subpat.is_some() {
-                return None;
-            }
-            single_segment_type_name(&pat_type.ty).map(|name| (ident_name(&ident.ident), name))
-        })
-        .collect()
+/// existed, since [`block_let_exprs`]'s own `destructured_binding` unwraps and discards
+/// `Pat::Type` rather than keeping it. `q`'s own ascription states the width
+/// `evaluate_bitwise_not` needs exactly as plainly as a local `const`'s own type does.
+///
+/// Codex's next finding: a whole-block collector answering this once per *name*, the way an
+/// earlier version of this function did, is sound for a block declaring each name once and
+/// unsound for one that shadows a name — `let mut x: u8 = 128 + n; x <<= 1; let x: u16 = if
+/// x < 100 { n } else { 10 * n + 1 }; x` has two declarations of `x` with two different
+/// widths, and folding both into one `HashMap` entry keyed by name let whichever declaration
+/// [`std::iter::Iterator::collect`] visited *last* answer for both — the second, wider `x:
+/// u16` was credited to the *first* `x <<= 1`, which really shifts an 8-bit value and
+/// truncates where a 16-bit shift would not. [`resolve_block_sequential`] now calls this once
+/// per `let` statement and updates its own `local_types` map at exactly the point the
+/// statement executes, so a read before the shadow sees the old width and a read after it
+/// sees the new one — the identical ordering fix already applied to *values*, extended to
+/// the type metadata a value's own arithmetic is read against.
+fn stmt_let_type(local: &syn::Local) -> Option<(String, String)> {
+    let syn::Pat::Type(pat_type) = &local.pat else {
+        return None;
+    };
+    let syn::Pat::Ident(ident) = pat_type.pat.as_ref() else {
+        return None;
+    };
+    if ident.subpat.is_some() {
+        return None;
+    }
+    single_segment_type_name(&pat_type.ty).map(|name| (ident_name(&ident.ident), name))
 }
 
 /// The count of every plain `let _ = EXPR;` declared *directly* as a statement in `block` —
@@ -3034,30 +3031,51 @@ fn apply_compound_assignment(
     literal_or_const_value(&synthetic, resolve)
 }
 
-/// `expr`'s own compound-assignment target, operator and right-hand side, when it is one —
-/// a bare, single-segment path on the left of one of the ten [`plain_assign_operator_text`]
-/// recognises, seen through any nesting of parentheses. `None` for anything else: a compound
-/// assignment to a field, an index, or a dereference names no single local this scan tracks
-/// at all, and a plain `=` assignment (`syn::Expr::Assign`, a distinct shape from every one
-/// of these) replaces rather than folds, which is a different question this function does
-/// not answer.
-fn mutation_target(expr: &syn::Expr) -> Option<(String, syn::BinOp, syn::Expr)> {
-    let syn::Expr::Binary(binary) = strip_parens(expr) else {
-        return None;
-    };
-    plain_assign_operator_text(&binary.op)?;
-    let syn::Expr::Path(path) = strip_parens(&binary.left) else {
-        return None;
-    };
-    let ident = path.path.get_ident()?;
-    Some((ident_name(ident), binary.op, (*binary.right).clone()))
+/// `expr`'s own assignment target and right-hand side, when it is one — a bare,
+/// single-segment path on the left of a plain `=` or one of the ten compound-assignment
+/// operators [`plain_assign_operator_text`] recognises, seen through any nesting of
+/// parentheses. The operator is `None` for a plain `=` (`syn::Expr::Assign`) and `Some` for
+/// a compound one (`syn::Expr::Binary`, one of the ten `*Assign` variants) — two distinct
+/// `syn` shapes unified here because both replace a single local's value in source order,
+/// which is all [`resolve_block_sequential`] needs to treat them identically. `None` for
+/// anything else: an assignment to a field, an index, or a dereference names no single local
+/// this scan tracks at all.
+///
+/// Codex's finding: `x = x - 100;` is `syn::Expr::Assign`, a shape this function used to
+/// decline outright — its own previous doc comment named it explicitly as "a different
+/// question this function does not answer", which stopped being true the moment a plain
+/// reassignment needed answering too. A plain assignment's own new value needs no
+/// synthesised binary the way a compound one does: its right-hand side is evaluated against
+/// the scope exactly as any other expression here already is, and a self-reference on that
+/// right-hand side (`x = x - 100`) reads the *pre-assignment* value of `x` correctly for the
+/// identical reason a compound assignment's own right-hand side does — [`resolve_block_sequential`]
+/// resolves both against `resolved` before this statement's own write lands in it.
+fn mutation_target(expr: &syn::Expr) -> Option<(String, Option<syn::BinOp>, syn::Expr)> {
+    match strip_parens(expr) {
+        syn::Expr::Assign(assign) => {
+            let syn::Expr::Path(path) = strip_parens(&assign.left) else {
+                return None;
+            };
+            let ident = path.path.get_ident()?;
+            Some((ident_name(ident), None, (*assign.right).clone()))
+        }
+        syn::Expr::Binary(binary) => {
+            plain_assign_operator_text(&binary.op)?;
+            let syn::Expr::Path(path) = strip_parens(&binary.left) else {
+                return None;
+            };
+            let ident = path.path.get_ident()?;
+            Some((ident_name(ident), Some(binary.op), (*binary.right).clone()))
+        }
+        _ => None,
+    }
 }
 
-/// Every compound-assignment statement `block` declares directly, in source order — the
+/// Every assignment statement `block` declares directly, in source order — the
 /// mutation-statement twin of [`block_let_exprs`]/[`block_const_exprs`], read the identical
 /// way: a `#[cfg(test)]`-gated one is skipped, matching every other collector here and
 /// `MatchVisitor::visit_block`'s own production walk.
-fn block_mutation_stmts(block: &syn::Block) -> Vec<(String, syn::BinOp, syn::Expr)> {
+fn block_mutation_stmts(block: &syn::Block) -> Vec<(String, Option<syn::BinOp>, syn::Expr)> {
     block
         .stmts
         .iter()
@@ -3805,10 +3823,75 @@ fn resolve_block_locals(
 /// comment already gives for skipping being worse than refusing: silently leaving that local
 /// at a value `rustc` would never have produced there would credit every later read of it
 /// with an answer rather than with no answer at all.
+/// [`resolve_block_sequential`]'s own `let`-statement half, factored out to keep that
+/// function under clippy's line count: resolves every name `local` binds against the scope
+/// as it stands *before* this statement, then updates `local_types` to match.
+///
+/// Codex's finding: a name this statement (re)binds has to shed whatever type an *earlier*
+/// declaration of the same name left in `local_types` before this statement's own
+/// initializer is read against it — `stmt_let_type` is asked first, before either map
+/// changes, so the initializer's own right-hand side still sees the *old* binding's type (a
+/// self-referential shadow, `let x: u16 = x as u16 + 1;`, needs the outer `x`'s width to
+/// fold correctly), and the type update lands only after every name this statement binds has
+/// had its own chance to resolve against the scope as it stood before the shadow. Every name
+/// bound sheds whatever type an earlier declaration left behind — a bare `let x = ..;`
+/// shadowing a typed `x` has to lose that type exactly as much as a typed shadow has to
+/// replace it, since a shadow this scan cannot ascribe a type to is a shadow whose type is
+/// unknown, not one that inherits its predecessor's.
+fn resolve_sequential_let(
+    local: &syn::Local,
+    init: &syn::LocalInit,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) {
+    let ascribed_type = stmt_let_type(local);
+    let mut bound_names = Vec::new();
+    for (name, expr) in destructured_binding(&local.pat, &init.expr) {
+        let scoped_resolve_value = |path: &syn::Path| {
+            path.get_ident()
+                .map(ident_name)
+                .and_then(|candidate| resolved.get(&candidate).copied())
+                .or_else(|| (resolve.value)(path))
+        };
+        let scoped_resolve_unsigned = |path: &syn::Path| {
+            resolved_local_name(path, resolved).map_or_else(
+                || (resolve.unsigned)(path),
+                |candidate| {
+                    local_types
+                        .get(&candidate)
+                        .is_some_and(|name| is_unsigned_type_name(name))
+                },
+            )
+        };
+        let scoped_resolve_width = |path: &syn::Path| {
+            resolved_local_name(path, resolved).map_or_else(
+                || (resolve.width)(path),
+                |candidate| local_types.get(&candidate).map(String::as_str),
+            )
+        };
+        let scoped_resolve = Resolve {
+            value: &scoped_resolve_value,
+            unsigned: &scoped_resolve_unsigned,
+            width: &scoped_resolve_width,
+        };
+        if let Some(value) = literal_or_const_value(&expr, &scoped_resolve) {
+            resolved.insert(name.clone(), value);
+        }
+        bound_names.push(name);
+    }
+    for name in &bound_names {
+        local_types.remove(name);
+    }
+    if let Some((name, ty)) = ascribed_type {
+        local_types.insert(name, ty);
+    }
+}
+
 fn resolve_block_sequential(
     block: &syn::Block,
     resolve: &Resolve<'_>,
-    local_types: &std::collections::HashMap<String, String>,
+    local_types: &mut std::collections::HashMap<String, String>,
     resolved: &mut std::collections::HashMap<String, i128>,
 ) -> Option<()> {
     for stmt in &block.stmts {
@@ -3822,38 +3905,7 @@ fn resolve_block_sequential(
             if init.diverge.is_some() {
                 continue;
             }
-            for (name, expr) in destructured_binding(&local.pat, &init.expr) {
-                let scoped_resolve_value = |path: &syn::Path| {
-                    path.get_ident()
-                        .map(ident_name)
-                        .and_then(|candidate| resolved.get(&candidate).copied())
-                        .or_else(|| (resolve.value)(path))
-                };
-                let scoped_resolve_unsigned = |path: &syn::Path| {
-                    resolved_local_name(path, resolved).map_or_else(
-                        || (resolve.unsigned)(path),
-                        |candidate| {
-                            local_types
-                                .get(&candidate)
-                                .is_some_and(|name| is_unsigned_type_name(name))
-                        },
-                    )
-                };
-                let scoped_resolve_width = |path: &syn::Path| {
-                    resolved_local_name(path, resolved).map_or_else(
-                        || (resolve.width)(path),
-                        |candidate| local_types.get(&candidate).map(String::as_str),
-                    )
-                };
-                let scoped_resolve = Resolve {
-                    value: &scoped_resolve_value,
-                    unsigned: &scoped_resolve_unsigned,
-                    width: &scoped_resolve_width,
-                };
-                if let Some(value) = literal_or_const_value(&expr, &scoped_resolve) {
-                    resolved.insert(name, value);
-                }
-            }
+            resolve_sequential_let(local, init, resolve, local_types, resolved);
             continue;
         }
         let syn::Stmt::Expr(expr, Some(_)) = stmt else {
@@ -3891,13 +3943,23 @@ fn resolve_block_sequential(
             width: &mutation_resolve_width,
         };
         let declared_type = local_types.get(&name).map(String::as_str);
-        let updated = apply_compound_assignment(
-            current_value,
-            declared_type,
-            &op,
-            &rhs_expr,
-            &mutation_resolve,
-        )?;
+        // Codex's finding: `x = x - 100;` is `syn::Expr::Assign` rather than one of the ten
+        // compound-assignment `syn::Expr::Binary` shapes, so `op` is `None` here exactly
+        // when `mutation_target` recognised a plain `=` — its new value is `rhs_expr`'s own,
+        // evaluated against the scope as it stands *before* this statement's write, with no
+        // synthetic binary needed at all; `current_value` above still gates it on the target
+        // already being a local this scan resolved, the identical refusal a compound
+        // assignment to an untracked name already gets, for the identical reason.
+        let updated = match &op {
+            Some(assign_op) => apply_compound_assignment(
+                current_value,
+                declared_type,
+                assign_op,
+                &rhs_expr,
+                &mutation_resolve,
+            )?,
+            None => literal_or_const_value(&rhs_expr, &mutation_resolve)?,
+        };
         resolved.insert(name, updated);
     }
     Some(())
@@ -3917,8 +3979,14 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     for (name, expr) in &lets {
         name_collision_check.insert(name.clone(), expr.clone());
     }
+    // Codex's shadowing finding: a block's own `let` types are no longer merged in here.
+    // Two declarations of one name folded into a single flat entry answered for *both* —
+    // whichever `resolve_block_sequential` below is not free to un-collapse once collection
+    // has already discarded which declaration a given read actually fell under. Starting
+    // from `const` types alone and letting the sequential walk maintain this map itself,
+    // one `let` at a time, is what keeps a read between two shadows seeing the type that
+    // was really in scope for it.
     let mut local_types = block_const_types(block);
-    local_types.extend(block_let_types(block));
     if name_collision_check.len() != combined_len {
         return None;
     }
@@ -3968,7 +4036,7 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // order-independent fixed point (correct for `const` items alone) has no room for, so
     // the two statement kinds are walked together afterward, in the order they actually
     // execute.
-    resolve_block_sequential(block, resolve, &local_types, &mut resolved)?;
+    resolve_block_sequential(block, resolve, &mut local_types, &mut resolved)?;
     let block_resolve_value = |path: &syn::Path| {
         path.get_ident()
             .map(ident_name)
