@@ -20867,6 +20867,40 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_with_at_binding_tuple_destructuring_lets_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let _whole @ (x,) = (0u8,); x };`
+        // names a `let` whose pattern is `Pat::Ident` carrying a `subpat` — an irrefutable
+        // `@` binding, where `_whole` and `(x,)` both bind against the same value.
+        // `destructured_binding`'s own `Pat::Ident` arm was guarded to fire only when
+        // `subpat.is_none()`, so this shape fell through to `_ => None` the same way an
+        // unhandled `Pat::Tuple` used to — not merely leaving `x` unresolved, but dropping
+        // the whole statement from `block_let_exprs`'s map while `block_ignored_let_count`
+        // does not count it either, since `_whole` is a real identifier rather than the
+        // wildcard `_` that function looks for. The statement therefore went uncounted
+        // anywhere and the whole block read as unresolved. `destructured_binding` now
+        // recurses into the sub-pattern of an `@` binding against the same initializer the
+        // outer name would have bound to, the same way it already recurses through a
+        // one-element tuple pattern.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_tuple_destructuring_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let _whole @ (x,) = (0u8,); x };\n    \
+             const P1: u8 = { let _whole @ (x,) = (1u8,); x };\n    \
+             const P2: u8 = { let _whole @ (x,) = (2u8,); x };\n    \
+             const P3: u8 = { let _whole @ (x,) = (3u8,); x };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

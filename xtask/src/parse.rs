@@ -2626,11 +2626,12 @@ fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn:
 }
 
 /// `pat`'s own bound name and the value `expr` initializes it to, unwrapping a type
-/// ascription (`Pat::Type`) and a one-element tuple destructure (`Pat::Tuple`) the same way
-/// [`literal_or_const_value`]'s own `Expr::Tuple` case and [`match_arm_matches_constant`]'s
-/// own `Pat::Tuple` case already do for a scrutinee and a pattern — `None` for anything else,
-/// `_` and any destructuring wider than one element included, since neither binds a single
-/// name this scan could later resolve a reference to.
+/// ascription (`Pat::Type`), an `@` sub-pattern (`Pat::Ident` with `subpat: Some(..)`) and a
+/// one-element tuple destructure (`Pat::Tuple`) the same way [`literal_or_const_value`]'s own
+/// `Expr::Tuple` case and [`match_arm_matches_constant`]'s own `Pat::Tuple` case already do
+/// for a scrutinee and a pattern — `None` for anything else, `_` and any destructuring wider
+/// than one element included, since neither binds a single name this scan could later
+/// resolve a reference to.
 ///
 /// Codex's next-round finding: `const P0: u8 = { let (x,) = (0u8,); x };` names a `let` whose
 /// pattern is `Pat::Tuple` rather than `Pat::Ident`, which the version of this function
@@ -2644,11 +2645,29 @@ fn block_let_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn:
 /// scrutinee or an arm pattern already is; an initializer that is not itself a literal
 /// one-element tuple expression is declined rather than guessed at, since this scan folds
 /// no other tuple shape into a value it could hand back here.
+///
+/// Codex's next-round finding: `let _whole @ (x,) = (0u8,); x;` is `Pat::Ident` naming
+/// `_whole` with a `subpat` of `(x,)` — an irrefutable `@` binding, where the outer name and
+/// the sub-pattern both bind against the identical value. The guard above was written to
+/// decline a sub-pattern outright rather than to recurse into it, which fell through to
+/// `_ => None` the same way an unhandled `Pat::Tuple` used to: not merely leaving `x`
+/// unresolved, but dropping the whole statement from [`block_let_exprs`]'s map while
+/// [`block_ignored_let_count`] does not count it either — an `@` binding is not the wildcard
+/// `is_wildcard` looks for — so the statement went uncounted anywhere and the whole block
+/// read as unresolved. This function now recurses into the sub-pattern against the same
+/// `expr` an outer bare identifier would have bound to, the same way it already recurses
+/// into a one-element tuple's own inner pattern; the outer name itself (`_whole`) is not
+/// separately recorded, since this function returns one binding per call and a name meant
+/// to be discarded is the far more common shape of an `@` binding used only to destructure.
 fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Option<(String, syn::Expr)> {
     match pat {
         syn::Pat::Type(pat_type) => destructured_binding(&pat_type.pat, expr),
         syn::Pat::Ident(ident) if ident.subpat.is_none() => {
             Some((ident_name(&ident.ident), expr.clone()))
+        }
+        syn::Pat::Ident(ident) => {
+            let (_, subpat) = ident.subpat.as_ref()?;
+            destructured_binding(subpat, expr)
         }
         syn::Pat::Tuple(pat_tuple) if pat_tuple.elems.len() == 1 => {
             let syn::Expr::Tuple(expr_tuple) = strip_parens(expr) else {
