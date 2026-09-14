@@ -603,10 +603,10 @@ fn drive_rollover_prefix(session: &mut waymaker_fault::Session) -> Result<(), St
 }
 
 /// §10's seven-step swap from the retiring bank into the other one, driven directly the
-/// way [`row_nine`]'s explicit exit is. Returns the engine window — still borrowing
-/// `session`, so the caller can keep writing into the bank it installed — and that bank's
-/// journal, positioned after whatever [`Journal::after`] found there.
-fn perform_rollover_swap(
+/// way [`row_nine`]'s explicit exit is. Returns the engine window and the installed
+/// bank's journal, positioned after whatever [`Journal::after`] found there. The window
+/// still borrows `session`, so the caller can keep writing into the bank it installed.
+fn drive_rollover_swap(
     session: &mut waymaker_fault::Session,
 ) -> Result<(Window<'_, waymaker_fault::Session>, Journal), String> {
     let rig = rig();
@@ -660,7 +660,7 @@ fn perform_rollover_swap(
 /// written into the bank it installs.
 fn drive_rollover(session: &mut waymaker_fault::Session) -> Result<(), String> {
     drive_rollover_prefix(session)?;
-    let (mut engine, mut new_journal) = perform_rollover_swap(session)?;
+    let (mut engine, mut new_journal) = drive_rollover_swap(session)?;
     try_write_tiny_run(&mut engine, &mut new_journal)?;
     Ok(())
 }
@@ -700,6 +700,19 @@ where
     let input = b"i";
     let records = tiny_run_records(input);
     let mut dispatcher = Log::default();
+
+    // The schedule (index 1) is durable and its completion (index 2) is not: the effect
+    // is outstanding, and it is redelivered under the same index before anything else is
+    // written — the redelivery `resume_as` requires of a real resume. Without this, the
+    // loop below would skip both the write *and* the dispatch at index 1 and go straight
+    // to writing the completion at index 2, reporting an effect as done that this call
+    // never ran.
+    if recovered == 2 {
+        let Ok(()) = dispatcher.dispatch(0, input) else {
+            unreachable!("the new run's own dispatcher accepts effect 0")
+        };
+    }
+
     for (index, record) in records.iter().enumerate() {
         let Ok(index) = u16::try_from(index) else {
             unreachable!("four records index in a u16")
@@ -906,9 +919,14 @@ fn after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_
         }
         if let Some(mut journal) = Journal::after(recovery) {
             let ran = continue_tiny_run(&mut engine, &mut journal, recovered);
+            // Below `recovered == 3` the effect's completion is not yet durable, so this
+            // call owes it a dispatch — either fresh or redelivered. At `recovered >= 3`
+            // the completion already landed in an earlier attempt, and this call owes it
+            // nothing: an empty `ran` there is correct, not vacuous.
             assert!(
-                recovered > 0 || !ran.is_empty(),
-                "the new run never started, at {injection:?}"
+                recovered >= 3 || !ran.is_empty(),
+                "the new run's effect was never dispatched, at {injection:?} \
+                 (recovered={recovered})"
             );
         }
     }
@@ -918,10 +936,10 @@ fn after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_
 // Row 9: history capacity reached
 // ---------------------------------------------------------------------------------------
 
-/// §10's exits, priced for a run whose records are all at most
-/// [`Workload::MAX_PAYLOAD_BYTES`] wide, plus `tail` for the outcome and terminal record —
-/// a bound wider than any record this workload ever writes, so the room it reserves is
-/// never spent on a real payload and always on the reserve's own floor.
+/// §10's exits, priced for a run whose records are at most
+/// [`Workload::MAX_PAYLOAD_BYTES`] wide. `tail` covers the outcome and terminal record.
+/// This bound is wider than any real record. The reserve never spends the room on a real
+/// payload — only on its own floor.
 // Guards the literal `bounds` uses below: a `usize as u16` cast cannot prove at compile
 // time that it fits, so the width is asserted here instead of cast there.
 const _: () = assert!(Workload::MAX_PAYLOAD_BYTES == 16);
@@ -937,8 +955,8 @@ const fn bounds(tail: u16) -> Bounds {
 /// A declared tail wide enough that the reserve refuses the second effect's schedule once
 /// the first effect has completed, on the rig's own standard fixture.
 ///
-/// Searched for rather than written down, so the number comes from the reserve's own
-/// arithmetic over real records instead of a figure copied out of a passing run.
+/// This searches for the value rather than hard-coding one. The number comes from the
+/// reserve's own arithmetic on real records, not from a figure copied out of a passing run.
 fn near_capacity() -> (Rig, Reserve, Device) {
     for tail in [
         32_u16, 48, 64, 96, 128, 160, 192, 224, 256, 300, 350, 400, 450, 500,
@@ -1219,15 +1237,15 @@ fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_
 // Row 10: replay divergence
 // ---------------------------------------------------------------------------------------
 
-/// Row 10, driven: at every crash point that leaves the second effect's schedule
-/// recoverable and its completion outstanding, a declared workload naming a different
-/// activity for that schedule is refused, twice in a row, with nothing dispatched and
-/// nothing rewritten. Returns the row it credits.
+/// Row 10, driven. Take every crash point where the second effect's schedule is
+/// recoverable and its completion is not. A declared workload naming a different activity
+/// for that schedule is refused there, twice in a row. Nothing is dispatched and nothing
+/// is rewritten. Returns the row it credits.
 ///
-/// Not swept through [`classified`]: that function resumes each point as it classifies
-/// it, and a resumed device is no longer the crash image this test needs. This runs its
-/// own pass over the harness instead, stopping at [`evidence`] — which only reads the
-/// device — so every device checked here is untouched.
+/// Not swept through [`classified`]. That function resumes each point as it classifies
+/// it, so a resumed device is no longer the crash image this test needs. This runs its own
+/// pass over the harness instead, and stops at [`evidence`], which only reads the device —
+/// so every device checked here stays untouched.
 fn row_ten() -> Row {
     let harness = Harness::new(geometry());
     let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());

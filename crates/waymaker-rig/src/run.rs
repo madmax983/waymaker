@@ -44,7 +44,7 @@ use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, R
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
 use crate::audit::{Audit, Breach};
-use crate::cutter::{Cutter, Dispatcher};
+use crate::cutter::{Cutter, Dispatcher, NeverCut};
 use crate::log::{Entry, Outcome};
 use crate::phase::Phase;
 use crate::plan::{Cut, Plan};
@@ -677,12 +677,11 @@ impl Rig {
     ///
     /// * no bank is authoritative, or two are — preparation was cut before its generation
     ///   seal landed, which is the state every part is in before its first one;
-    /// * a bank *is* authoritative, but it is not [`Rig::BANK`] — a swap has moved authority
-    ///   to the other bank, and [`Rig::BANK`]'s own header, whatever it still says, is a
-    ///   retired run's rather than this one's (issue
+    /// * a bank *is* authoritative, but it is not [`Rig::BANK`]. A swap moved authority to
+    ///   the other bank. [`Rig::BANK`]'s header still names the retired run (issue
     ///   [#96](https://github.com/madmax983/waymaker/issues/96): `Rig::judge` and
-    ///   `Rig::resume` used to read [`Rig::BANK`] on the strength of its run id alone, which
-    ///   a swap's own header being left untouched on the losing bank made a false positive);
+    ///   `Rig::resume` used to trust [`Rig::BANK`] by run id alone. A swap leaves the losing
+    ///   bank's header untouched, so that check gave a false positive);
     /// * the authoritative bank's header does not decode — there is no journal region to
     ///   derive, and §14's `frame ignored; previous history prefix wins` is about frames
     ///   inside a journal rather than about the header that names one;
@@ -847,24 +846,23 @@ impl Rig {
         Ok(Stop::Completed)
     }
 
-    /// Writes `effects_before_swap` of this iteration's scheduled effects — `RunStarted`
-    /// and that many schedule/completion pairs — then stops, without writing the rest of
-    /// the run or its `RunCompleted`.
+    /// Writes `RunStarted` and `effects_before_swap` schedule/completion pairs. Then it
+    /// stops. It does not write the rest of the run, or `RunCompleted`.
     ///
-    /// Issue [#96](https://github.com/madmax983/waymaker/issues/96)'s swap workload: a
-    /// caller that means to roll over mid-run writes this much normally, then drives
-    /// [`waymaker_flash::swap`] itself. This bank's `RunCompleted` is never written; the
-    /// run's continuation is whichever bank the swap leaves authoritative.
+    /// This is issue [#96](https://github.com/madmax983/waymaker/issues/96)'s swap
+    /// workload. A caller that means to roll over mid-run writes this much normally, then
+    /// drives [`waymaker_flash::swap`] itself. This bank's `RunCompleted` is never written.
+    /// The run's continuation is whichever bank the swap leaves authoritative.
     ///
-    /// No cutter: rows 7 and 8 of the failure matrix are swept by running the whole
+    /// No cutter. Rows 7 and 8 of the failure matrix are swept by running the whole
     /// sequence — this call, the swap, and the run it installs — through the crash
     /// injector, the way the six other rows are swept through [`iterate`](Self::iterate).
     ///
     /// # Errors
     ///
-    /// As [`iterate`](Self::iterate), and [`RigError::Workload`] when
-    /// `effects_before_swap` is not strictly less than [`effects`](Self::effects): a run
-    /// that reaches its own end has nothing left to roll over.
+    /// As [`iterate`](Self::iterate). [`RigError::Workload`] if `effects_before_swap` is
+    /// not less than [`effects`](Self::effects): a finished run has nothing left to roll
+    /// over.
     pub fn iterate_until_rollover<S: StableStorage, D: Dispatcher>(
         &self,
         iteration: u32,
@@ -935,14 +933,18 @@ impl Rig {
             )
             .map_err(widen)?;
             if let Role::Schedule(effect) = role {
-                self.mark(
-                    part,
-                    &mut witness,
-                    Mark::new(iteration, index, Stage::Dispatched),
+                self.after_schedule(
+                    iteration,
+                    index,
+                    effect,
+                    DispatchStep {
+                        part,
+                        witness: &mut witness,
+                        dispatcher,
+                        cutter: &mut NeverCut,
+                    },
                     page,
-                )
-                .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                )?;
             }
             if matches!(role, Role::Completion(_)) {
                 part.credit_effect();
@@ -955,14 +957,14 @@ impl Rig {
     /// refusal.
     ///
     /// As [`iterate`](Self::iterate), through [`Reserved`] instead of the ungated writer.
-    /// No cutter: issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
-    /// history-capacity-reached row is a refusal §10's reserve produces on its own, not one
-    /// a crash injector finds.
+    /// No cutter. Issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// history-capacity-reached row is a refusal §10's reserve produces on its own. A crash
+    /// injector does not find this refusal.
     ///
     /// # Errors
     ///
-    /// As [`iterate`](Self::iterate), and [`RigError::Capacity`] when the reserve refuses a
-    /// record: the run stops there, having read, programmed and barriered nothing for it.
+    /// As [`iterate`](Self::iterate). [`RigError::Capacity`] if the reserve refuses a
+    /// record. The run stops. It reads, programs, and barriers nothing for that record.
     pub fn iterate_reserved<S: StableStorage, D: Dispatcher>(
         &self,
         iteration: u32,
@@ -1030,14 +1032,18 @@ impl Rig {
             .map_err(widen)?;
 
             if let Role::Schedule(effect) = role {
-                self.mark(
-                    part,
-                    &mut witness,
-                    Mark::new(iteration, index, Stage::Dispatched),
+                self.after_schedule(
+                    iteration,
+                    index,
+                    effect,
+                    DispatchStep {
+                        part,
+                        witness: &mut witness,
+                        dispatcher,
+                        cutter: &mut NeverCut,
+                    },
                     page,
-                )
-                .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                )?;
             }
             if matches!(role, Role::Completion(_)) {
                 part.credit_effect();
@@ -1352,14 +1358,15 @@ impl Rig {
     /// Resumes as [`resume`](Self::resume), but gates every record this run still owes with
     /// `reserve`.
     ///
-    /// Issue [#96](https://github.com/madmax983/waymaker/issues/96)'s history-capacity-reached
-    /// row, on replay: a run whose next record the reserve already refused meets the same
-    /// refusal again here, having read, programmed and barriered nothing for it.
+    /// This is issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// history-capacity-reached row, on replay. A run whose next record the reserve
+    /// already refused meets the same refusal here. It reads, programs, and barriers
+    /// nothing for that record.
     ///
     /// # Errors
     ///
-    /// As [`resume`](Self::resume), [`RigError::Capacity`] when the reserve refuses the next
-    /// record this run owes, and [`RigError::Reserve`] when `reserve` does not describe this
+    /// As [`resume`](Self::resume). [`RigError::Capacity`] if the reserve refuses the next
+    /// record this run owes. [`RigError::Reserve`] if `reserve` does not describe this
     /// journal.
     pub fn resume_reserved<S: StableStorage, D: Dispatcher>(
         &self,
