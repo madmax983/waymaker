@@ -975,17 +975,29 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
                     // `dispatch.intent.request.kind = x;` assigns to `kind`, but `intent`
                     // and `request` are guarded *ancestors* in the same chain, and rewriting
                     // through either is the rewrite this whole family of checks exists to
-                    // catch (issue #92, Codex's tenth round). Stops at the first non-field
-                    // expression, which is the root the chain is built on.
+                    // catch (issue #92, Codex's tenth round). A parenthesized ancestor —
+                    // `(dispatch.intent.request).kind = x;` — is unwrapped rather than
+                    // stopping the walk (Codex's thirteenth round): `.base` there is an
+                    // `Expr::Paren`, not the `Expr::Field` a plain `while let` only matched,
+                    // so `intent` and `request` were invisible to it. Stops at the first
+                    // expression that is neither a field access nor a paren/group wrapper,
+                    // which is the root the chain is built on.
                     let mut current = expr;
-                    while let syn::Expr::Field(field) = current {
-                        if let syn::Member::Named(ident) = &field.member {
-                            let name = ident_name(ident);
-                            if self.names.contains(&name.as_str()) {
-                                self.found.push(name);
+                    loop {
+                        match current {
+                            syn::Expr::Field(field) => {
+                                if let syn::Member::Named(ident) = &field.member {
+                                    let name = ident_name(ident);
+                                    if self.names.contains(&name.as_str()) {
+                                        self.found.push(name);
+                                    }
+                                }
+                                current = &field.base;
                             }
+                            syn::Expr::Paren(paren) => current = &paren.expr,
+                            syn::Expr::Group(group) => current = &group.expr,
+                            _ => break,
                         }
-                        current = &field.base;
                     }
                 }
                 // `(dispatch.bytes,) = (replacement,);` is a destructuring assignment: the
@@ -2860,6 +2872,38 @@ mod raw_identifier_tests {
         let found = mutated_field_names(
             "fn tamper(dispatch: Foo, other: u8) {\n\
              \x20   dispatch.intent.request.kind.clone_from(&other);\n}",
+            &["intent", "request"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_ancestor_in_the_field_chain_is_reported() {
+        // Codex, issue #92's thirteenth round: `(dispatch.intent.request).kind = x;` puts
+        // the guarded ancestors behind an `Expr::Paren`, so `note`'s chain walk — a
+        // `while let Expr::Field` loop over `field.base` — stopped the moment it met the
+        // parenthesized prefix rather than seeing `intent` and `request` inside it.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, x: u8) {\n\
+             \x20   (dispatch.intent.request).kind = x;\n}",
+            &["intent", "request"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_doubly_parenthesized_ancestor_in_the_field_chain_is_reported() {
+        // Nested parens unwrap in more than one hop, the same shape as a doubly
+        // parenthesized type alias.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, x: u8) {\n\
+             \x20   ((dispatch.intent).request).kind = x;\n}",
             &["intent", "request"],
         )
         .expect("the fixture parses");

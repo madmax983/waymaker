@@ -211,6 +211,21 @@ of a tuple or array and each field's value in a struct literal — arbitrarily n
 tuple can hold another tuple — before falling back to the field-chain walk, so
 `(x, (dispatch.bytes,)) = (x, (replacement,));` is still caught two levels down.
 
+**A thirteenth round found a gap in the tenth round's own chain walk, not in the eleventh's
+or twelfth's fixes: a parenthesized ancestor.** `(dispatch.intent.request).kind = x;` is a
+plain field assignment, and its outermost field is `kind` — not a guarded name — but
+`intent` and `request` are guarded ancestors in the same chain, which is exactly what the
+tenth round's walk exists to catch. The walk is `while let Expr::Field(field) = current {
+.. current = &field.base; }`, and here `field.base` is an `Expr::Paren` rather than another
+`Expr::Field`, so the loop stopped there and never saw either ancestor. The walk now
+unwraps `Expr::Paren` and `Expr::Group` as it descends, the same two wrappers
+`type_alias_target` already unwraps for the sixth round's reason, so a doubly parenthesized
+ancestor (`((dispatch.intent).request).kind = x;`) still resolves in two hops. This is the
+third round of Codex findings since this branch's merge with a concurrent one, and this
+project's own review-depth guidance is to stop past two or three rounds and open an issue
+once a fourth still finds real bugs — so a fourteenth finding of this shape goes to issue
+[#171](https://github.com/madmax983/waymaker/issues/171) rather than a fourteenth round here.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
