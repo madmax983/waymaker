@@ -1016,8 +1016,8 @@ pub fn macro_uses(contents: &str) -> Result<Vec<String>, syn::Error> {
     Ok(visitor.found)
 }
 
-/// Every `crate::NAME` pattern `contents` writes — a bare two-segment path, anchored at
-/// the crate root, with no qualified-self half — in source order.
+/// Every crate-anchored pattern `contents` writes — a path of two or more segments,
+/// starting with `crate`, with no qualified-self half — in source order.
 ///
 /// Items and `impl` members under exactly `#[cfg(test)]` are skipped, the same
 /// structural exclusion [`macro_uses`] makes.
@@ -1037,6 +1037,18 @@ pub fn macro_uses(contents: &str) -> Result<Vec<String>, syn::Error> {
 /// `check_checksum_module_crate_root_patterns` (also in `crate::source`) refuses its mere
 /// presence outright, the same way [`macro_uses`]'s caller refuses a macro rather than
 /// trying to see through it.
+///
+/// Codex's next-round finding: the original refusal only caught the *shortest* such
+/// spelling — exactly `crate::NAME` — leaving a longer chain (`crate::indices::P0`) free
+/// to name a constant just as far outside this scan's own tree, silently unresolved for
+/// the identical reason. Widened to every crate-anchored path of two or more segments,
+/// which is deliberately wider than strictly necessary: `crate::crc::indices::P0`,
+/// explicitly re-stating the checksum module's own real prefix, is the one shape that
+/// can legitimately resolve through the ordinary qualified-path lookup, and this refuses
+/// it too rather than trying to tell the two apart — idiomatic Rust has no reason to
+/// spell a path that way from inside the very module it names, and reasoning about which
+/// crate-anchored chains are "real" is exactly the kind of resolving-instead-of-refusing
+/// this function exists to avoid.
 ///
 /// # Errors
 ///
@@ -1089,7 +1101,17 @@ pub fn crate_root_pattern_uses(contents: &str) -> Result<Vec<String>, syn::Error
                         .iter()
                         .map(|segment| ident_name(&segment.ident))
                         .collect();
-                    if segments.len() == 2 && segments.first().map(String::as_str) == Some("crate")
+                    // Codex's next-round finding: a chain of three or more segments
+                    // (`crate::indices::P0`) is anchored at the crate root exactly as
+                    // much as the bare two-segment form is, and is just as capable of
+                    // naming a constant outside this scan's own tree — `crate::crc::X`,
+                    // explicitly re-stating the tree's own real prefix, is the one shape
+                    // that can legitimately resolve through the ordinary qualified-path
+                    // lookup, and idiomatic Rust has no reason to spell a path that way
+                    // from inside the very module it names. Widened from exactly two
+                    // segments to two or more, so every crate-anchored pattern is refused
+                    // outright rather than only its shortest spelling.
+                    if segments.len() >= 2 && segments.first().map(String::as_str) == Some("crate")
                     {
                         self.found.push(segments.join("::"));
                     }
@@ -1798,6 +1820,7 @@ pub fn match_expressions_with_prefix(
         block_path: Vec::new(),
         next_block_id: 0,
         self_type_path: Vec::new(),
+        trait_defaults: std::collections::HashMap::new(),
         qualified: external_qualified.clone(),
         found: Vec::new(),
     };
@@ -1875,6 +1898,7 @@ pub fn qualified_constants_with_prefix(
         block_path: Vec::new(),
         next_block_id: 0,
         self_type_path: Vec::new(),
+        trait_defaults: std::collections::HashMap::new(),
         qualified,
         found: Vec::new(),
     };
@@ -2003,6 +2027,34 @@ fn impl_const_exprs(items: &[syn::ImplItem]) -> std::collections::HashMap<String
             };
             (!has_cfg_test(impl_item_attrs(item)))
                 .then(|| (ident_name(&constant.ident), constant.expr.clone()))
+        })
+        .collect()
+}
+
+/// The unevaluated initializer of every associated `const` a `trait`'s own body gives a
+/// *default* value — `trait Indices { const P0: u8 = 0; .. }` — mirroring
+/// [`impl_const_exprs`] for the other place an associated constant's value can come from.
+///
+/// Codex's finding: `impl Indices for u8 {}`, implementing a trait every one of whose
+/// constants already carries a default, redeclares none of them — legal Rust, and the
+/// unqualified spelling `u8::P0` (or the qualified `<u8 as Indices>::P0`) still names the
+/// trait's own default value `0` — but `impl_const_exprs` reads only what an impl's own
+/// item list *redeclares*, so an impl that overrides nothing indexed nothing at all, and
+/// every arm of a table keyed this way read as unresolved. `MatchVisitor::visit_item_trait`
+/// is what indexes these, once per trait, so `MatchVisitor::visit_item_impl` can start a
+/// trait impl's own scope from the trait's defaults and let the impl's own redeclarations
+/// (if any) override them. A constant the trait leaves with no default at all
+/// (`const P0: u8;`, `constant.default` is `None`) is not this function's to guess a value
+/// for; it stays unresolved unless the impl itself supplies one, exactly as before.
+fn trait_const_exprs(items: &[syn::TraitItem]) -> std::collections::HashMap<String, syn::Expr> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let syn::TraitItem::Const(constant) = item else {
+                return None;
+            };
+            let (_, default) = constant.default.as_ref()?;
+            (!has_cfg_test(&constant.attrs)).then(|| (ident_name(&constant.ident), default.clone()))
         })
         .collect()
 }
@@ -2476,6 +2528,16 @@ fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&syn::Path) -> Option<i1
         // this scan could point a table row at, and is left unresolved rather than
         // guessed at.
         syn::Pat::TupleStruct(tuple_struct) if tuple_struct.elems.len() == 1 => tuple_struct
+            .elems
+            .first()
+            .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
+        // Codex's next-round finding: a plain one-tuple pattern (`(0,)` through `(14,)`)
+        // is `Pat::Tuple` rather than `Pat::TupleStruct` — no constructor name, just a
+        // single parenthesized, comma-terminated field — and `rustc` lowers a match built
+        // from it to the identical indexed table the tuple-struct form gets. The identical
+        // single-field scoping applies for the identical reason: a multi-field tuple's
+        // pattern has no one value to point a table row at.
+        syn::Pat::Tuple(tuple) if tuple.elems.len() == 1 => tuple
             .elems
             .first()
             .map_or_else(Vec::new, |elem| pattern_literal(elem, resolve)),
@@ -3058,6 +3120,14 @@ struct MatchVisitor {
     /// recorded that `Self` currently *meant* `u8` while that impl's body was being
     /// walked, so every such arm read as unresolved.
     self_type_path: Vec<String>,
+    /// Every trait's own default associated-constant values seen so far, keyed by the
+    /// trait's own name — populated by `visit_item_trait`, consulted by `visit_item_impl`
+    /// as the starting point for a trait impl's own scope, before that impl's own
+    /// redeclarations (if any) are laid over it. Codex's finding: `impl Indices for u8 {}`
+    /// redeclares none of `Indices`'s own constants, all of which already carry a default,
+    /// and indexed nothing at all — `u8::P0` named the trait's own default value `0`, but
+    /// `impl_const_exprs` only ever read what the impl's own item list redeclared.
+    trait_defaults: std::collections::HashMap<String, std::collections::HashMap<String, i128>>,
     qualified: std::collections::HashMap<String, i128>,
     found: Vec<FoundMatch>,
 }
@@ -3128,6 +3198,21 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         self.module_path.pop();
     }
 
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        // Codex's finding: `impl Indices for u8 {}`, implementing a trait every one of
+        // whose constants already carries a default, redeclares none of them — legal
+        // Rust — but `visit_item_impl` only ever read an impl's own item list, so a trait
+        // impl that overrode nothing indexed nothing. Every default this trait declares is
+        // recorded here, once, under the trait's own name, for `visit_item_impl` to start
+        // a trait impl's own scope from before the impl's own redeclarations (if any) are
+        // laid over it.
+        if !has_cfg_test(&node.attrs) {
+            let scope = resolve_scope_consts(&trait_const_exprs(&node.items), &self.scopes);
+            self.trait_defaults.insert(ident_name(&node.ident), scope);
+        }
+        syn::visit::visit_item_trait(self, node);
+    }
+
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         // Codex's finding: `Indices::P0` is an associated constant, not a module-qualified
         // one, and nothing here had ever read an `impl` block's own `const` items. Scoped
@@ -3144,12 +3229,21 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // Codex's next finding after that: a *trait* impl's own constants (`impl Indices
         // for u8 { const P0 = 0; .. }`) were skipped outright, on the reasoning that a
         // const the impl does not redeclare could be the trait's own default, which this
-        // scan has no notion of — true, and still the standing for that one case, but it
-        // does not justify skipping the constants a trait impl *does* declare. Indexed
-        // under the *implementing type's* own name (`u8::P0`) exactly like an inherent
-        // impl's, since that is also the unqualified spelling Rust itself accepts when
-        // the trait is unambiguous, and it is what [`resolve_qself_associated_const`]
-        // looks up for the qualified `<u8 as Indices>::P0` spelling too.
+        // scan had no notion of. Indexed under the *implementing type's* own name
+        // (`u8::P0`) exactly like an inherent impl's, since that is also the unqualified
+        // spelling Rust itself accepts when the trait is unambiguous, and it is what
+        // [`resolve_qself_associated_const`] looks up for the qualified
+        // `<u8 as Indices>::P0` spelling too.
+        //
+        // Codex's next-round finding is the case the round before it left standing:
+        // `impl Indices for u8 {}`, redeclaring *none* of a trait all of whose constants
+        // already carry a default, indexed nothing at all, even though `u8::P0` still
+        // names the trait's own default value. `self.trait_defaults`, populated by
+        // `visit_item_trait`, is consulted here by the trait path's own last segment —
+        // the trait's name is unambiguous the same way the type's is, since a `Self` type
+        // implementing two traits of the same name is not something Rust itself allows —
+        // and seeded as the starting scope for a trait impl before the impl's own
+        // redeclarations are layered over it, so an override still wins where one exists.
         // Codex's next-round finding: `Self::P0`, written inside this very impl, named no
         // module `resolve_pattern_path` could ever find — the constant below is indexed
         // under the concrete type's own name, but nothing recorded that `Self` currently
@@ -3161,7 +3255,17 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
             if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
                 if let Some(segment) = type_path.path.segments.first() {
-                    let scope = resolve_scope_consts(&impl_const_exprs(&node.items), &self.scopes);
+                    let mut scope = node
+                        .trait_
+                        .as_ref()
+                        .and_then(|(_, trait_path, _)| trait_path.segments.last())
+                        .and_then(|segment| self.trait_defaults.get(&ident_name(&segment.ident)))
+                        .cloned()
+                        .unwrap_or_default();
+                    scope.extend(resolve_scope_consts(
+                        &impl_const_exprs(&node.items),
+                        &self.scopes,
+                    ));
                     let mut path = self.module_path.clone();
                     path.extend(self.function_path.iter().cloned());
                     path.extend(self.block_path.iter().cloned());

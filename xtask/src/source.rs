@@ -16832,6 +16832,80 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_single_field_tuple_patterns_is_reported() {
+        // Codex's thirty-seventh-round finding: a plain one-tuple pattern (`(0,)`
+        // through `(14,)`) is `Pat::Tuple` rather than `Pat::TupleStruct` — no
+        // constructor name, just a single parenthesized, comma-terminated field — and
+        // fell to the wildcard `_ => Vec::new()` case exactly the way the tuple-struct
+        // form did before the previous round's fix, even though `rustc` lowers it to
+        // the identical indexed table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn one_tuple_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn one_tuple_table(nibble: (u8,)) -> u32 {\n    match nibble \
+             {\n        (0,) => one_tuple_helper(0),\n        (1,) => \
+             one_tuple_helper(1),\n        (2,) => one_tuple_helper(2),\n        \
+             _ => one_tuple_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_default_associated_constant_is_reported() {
+        // Codex's thirty-seventh-round finding: `impl Indices for u8 {}`, implementing
+        // a trait every one of whose constants already carries a default, redeclares
+        // none of them — legal Rust — but `impl_const_exprs` only ever read what the
+        // impl's own item list redeclared, so `<u8 as Indices>::P0` stayed unresolved
+        // even though it still names the trait's own default value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\ntrait Indices {\n    const P0: u8 = 0;\n    const P1: u8 = 1;\n    \
+             const P2: u8 = 2;\n    const P3: u8 = 3;\n}\n\nimpl Indices for u8 \
+             {}\n\nconst fn trait_default_pattern_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        <u8 as Indices>::P0 => 0,\n        \
+             <u8 as Indices>::P1 => 1,\n        <u8 as Indices>::P2 => 2,\n        \
+             <u8 as Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_pattern_naming_a_multi_segment_crate_root_path_is_reported() {
+        // Codex's thirty-seventh-round finding: the crate-root-pattern scan only ever
+        // caught the shortest spelling, `crate::NAME` — a longer chain
+        // (`crate::indices::P0`) is anchored at the crate root exactly as much, and is
+        // just as capable of naming a constant outside this scan's own tree, but was
+        // not recognised as a crate-anchored pattern at all and stayed silently
+        // unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn multi_segment_crate_pattern_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        crate::indices::P0 => 0,\n        \
+             crate::indices::P1 => 1,\n        crate::indices::P2 => 2,\n        \
+             crate::indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("matches the pattern `crate::indices::P0`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
