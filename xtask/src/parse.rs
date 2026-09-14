@@ -1731,14 +1731,18 @@ fn resolve_scope_consts(
     resolved
 }
 
-/// A literal's own integer value: an integer of any base or suffix, or a byte literal
-/// (`b'\0'`), which is exactly as numeric a singleton as `0` is and compiles to the
-/// identical lookup-table entry — Codex's finding, since neither [`literal_or_const_value`]
-/// nor [`pattern_literal`] had ever looked past `syn::Lit::Int`.
+/// A literal's own integer value: an integer of any base or suffix, a byte literal
+/// (`b'\0'`), or a `char` literal (`'\0'`, by its scalar value) — each exactly as numeric
+/// a singleton as a bare `0` is and compiling to the identical lookup-table entry.
+/// Codex's finding, twice over: neither [`literal_or_const_value`] nor [`pattern_literal`]
+/// had ever looked past `syn::Lit::Int`, and a `char`'s own discriminant is no less a
+/// number than a byte's — `rustc` lowers a dense `char` match to the same indexed `.rodata`
+/// a `u8` one gets.
 fn lit_value(lit: &syn::Lit) -> Option<u128> {
     match lit {
         syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
         syn::Lit::Byte(byte) => Some(u128::from(byte.value())),
+        syn::Lit::Char(char) => Some(u128::from(char.value())),
         _ => None,
     }
 }
@@ -1756,6 +1760,37 @@ fn literal_or_const_value(
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
         syn::Expr::Path(path) => resolve(&path.path),
+        // Codex's finding: a `const` initializer that is real, MSRV-legal arithmetic over
+        // literals or other constants (`BASE + 1`) is evaluated by `rustc` before the match
+        // it feeds ever lowers, and compiles to the identical table a literal would — this
+        // was refusing every such initializer as unresolved rather than doing the same
+        // constant folding. Checked throughout, so overflow, a shift wider than the value's
+        // own bits, or division and remainder by zero each fail closed to `None` rather
+        // than wrapping to a value `rustc` itself would have rejected at a different one.
+        // A call to a user-defined `const fn` (`index(1)`) is not evaluated — doing that in
+        // general means interpreting an arbitrary function body, which this scan does not
+        // attempt — so a table whose numbered arms are spelled that way stays unresolved.
+        syn::Expr::Binary(binary) => {
+            let left = literal_or_const_value(&binary.left, resolve)?;
+            let right = literal_or_const_value(&binary.right, resolve)?;
+            match binary.op {
+                syn::BinOp::Add(_) => left.checked_add(right),
+                syn::BinOp::Sub(_) => left.checked_sub(right),
+                syn::BinOp::Mul(_) => left.checked_mul(right),
+                syn::BinOp::Div(_) => left.checked_div(right),
+                syn::BinOp::Rem(_) => left.checked_rem(right),
+                syn::BinOp::BitAnd(_) => Some(left & right),
+                syn::BinOp::BitOr(_) => Some(left | right),
+                syn::BinOp::BitXor(_) => Some(left ^ right),
+                syn::BinOp::Shl(_) => u32::try_from(right)
+                    .ok()
+                    .and_then(|shift| left.checked_shl(shift)),
+                syn::BinOp::Shr(_) => u32::try_from(right)
+                    .ok()
+                    .and_then(|shift| left.checked_shr(shift)),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

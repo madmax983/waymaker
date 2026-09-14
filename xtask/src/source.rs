@@ -9163,8 +9163,24 @@ fn module_tree(
     Ok((production_reachable, test_only))
 }
 
+/// [`INTEGRITY_CHECK_PATH`]'s own module name within `waymaker-flash` — the last path
+/// segment before `.rs`, which is what `mod crc;` in that crate's own root names it as by
+/// the ordinary convention a file with no `#[path = "..."]` attribute follows. Not read
+/// from `waymaker-flash`'s own crate root, which is outside the tree this rule scans at
+/// all — a stated assumption rather than a certainty, the same standing every heuristic in
+/// this module already has for the tree it *does* read.
+fn root_module_name() -> String {
+    INTEGRITY_CHECK_PATH
+        .trim_end_matches(".rs")
+        .rsplit('/')
+        .next()
+        .unwrap_or(INTEGRITY_CHECK_PATH)
+        .to_owned()
+}
+
 /// Every file reachable from `root` through an out-of-line `mod` declaration, paired with
-/// the module-path segments that declaration chain gives it — empty for `root` itself.
+/// the module-path segments that declaration chain gives it — [`root_module_name`] alone
+/// for `root` itself.
 ///
 /// Codex's finding: `qualified_constants` only ever sees one file, so a `mod indices;`
 /// pointing at a sibling file is never added to that file's own `qualified` map at
@@ -9181,6 +9197,14 @@ fn module_tree(
 /// `ChildModule` its own `inline_ancestors` field and extending the chain with it here
 /// rather than pushing only `child.name`.
 ///
+/// `root` itself is seeded with [`root_module_name`] rather than an empty prefix — Codex's
+/// finding after *that*: every prefix here used to be relative to `root`'s own file as if
+/// it were the crate's root module, when it is really one submodule of `waymaker-flash`
+/// named after its own file stem. A `crate::`-absolute reference has to cross that module
+/// too, so `crate::crc::outer::indices::P0` is the real path to something `outer::indices`
+/// records here — and without the seed, this tree recorded it one segment short, under a
+/// key no absolute reference could ever name.
+///
 /// Paths use `/` separators, the way the scan compares them.
 fn module_path_prefixes(
     sources: &[crate::size::LayerSource],
@@ -9188,7 +9212,7 @@ fn module_path_prefixes(
 ) -> Result<Vec<(String, Vec<String>)>, ModuleTreeError> {
     let mut prefixes = Vec::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
-    let mut stack = vec![(root.path.replace('\\', "/"), Vec::new())];
+    let mut stack = vec![(root.path.replace('\\', "/"), vec![root_module_name()])];
     while let Some((path, prefix)) = stack.pop() {
         if !visited.insert(path.clone()) {
             continue;
@@ -15480,6 +15504,52 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_char_literal_patterns_is_reported() {
+        // Codex's twenty-sixth-round finding: a `char` literal's own scalar value is
+        // exactly as numeric a singleton as a byte literal's, and `rustc` lowers a dense
+        // `char` match to the same indexed rodata a `u8` one gets. `lit_value` now reads
+        // `syn::Lit::Char` alongside `syn::Lit::Int` and `syn::Lit::Byte`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn char_literal_table(nibble: char) -> u32 {\n    match nibble {\n        \
+             '\\0' => crc32_nibble(0),\n        '\\u{1}' => crc32_nibble(1),\n        \
+             '\\u{2}' => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_arithmetic_constant_patterns_is_reported() {
+        // Codex's twenty-sixth-round finding: a `const` initializer that is real,
+        // MSRV-legal arithmetic (`BASE + 1`) is evaluated by `rustc` before the match it
+        // feeds ever lowers, and compiles to the identical table a literal initializer
+        // would. `literal_or_const_value` now folds `Expr::Binary` over already-resolved
+        // operands instead of refusing every arithmetic initializer as unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst BASE: u8 = 0;\nconst P0: u8 = BASE;\nconst P1: u8 = BASE + 1;\nconst \
+             P2: u8 = BASE + 2;\nconst P3: u8 = 1 * 3;\n\nconst fn \
+             arithmetic_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => crc32_nibble(0),\n        P1 => crc32_nibble(1),\n        \
+             P2 => crc32_nibble(2),\n        P3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_at_binding_patterns_is_reported() {
         // Codex's twenty-third-round finding: `_p0 @ 0` is exactly as singleton a pattern
         // as `0` alone — the binding name is incidental to the value the arm matches, and
@@ -15588,13 +15658,15 @@ mod deferred_answer_pins {
     #[test]
     fn a_dense_match_qualified_with_crate_never_resolves_relative_to_the_current_module() {
         // Codex's twenty-fifth-round finding: stripping `crate` the same way `self` is
-        // stripped lost the one fact that made it worth reading — `crate::indices::P0`
+        // stripped lost the one fact that made it worth reading — `crate::crc::indices::P0`
         // names the crate root exclusively in real Rust, never the current module. The old
         // code still tried the current-module-relative form *first*, so a same-named
         // `outer::indices` with non-dense values answered before the root ever got a
         // chance, hiding a dense table at the root. `indices` at the file root is dense
         // (0..3); `outer::indices`, deliberately non-dense (200..203), is what a wrong
-        // resolution would find instead.
+        // resolution would find instead. The reference names `crc` explicitly — round 26's
+        // finding — because `crc.rs` is itself one submodule of `waymaker-flash`, not the
+        // crate's own root, so the real absolute path has to cross it too.
         let mut source = tests_support::clean_checksum_module();
         source.push_str(
             "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
@@ -15603,9 +15675,38 @@ mod deferred_answer_pins {
              200;\n        pub(crate) const P1: u8 = 201;\n        pub(crate) const P2: \
              u8 = 202;\n        pub(crate) const P3: u8 = 203;\n    }\n\n    const fn \
              qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
-             0xF {\n            crate::indices::P0 => 0,\n            crate::indices::P1 \
-             => 1,\n            crate::indices::P2 => 2,\n            crate::indices::P3 \
-             => 3,\n            _ => 4,\n        }\n    }\n}\n",
+             0xF {\n            crate::crc::indices::P0 => 0,\n            \
+             crate::crc::indices::P1 => 1,\n            crate::crc::indices::P2 => 2,\n            \
+             crate::crc::indices::P3 => 3,\n            _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_crate_reaches_a_nested_module_through_crc() {
+        // Codex's twenty-sixth-round finding: constants inside `mod outer { mod indices
+        // {..} }` are recorded as `outer::indices::P0`, but the *real* absolute path to
+        // them is `crate::crc::outer::indices::P0` — `crc.rs` is one submodule of
+        // `waymaker-flash`, not the crate's own root. Seeding the checksum module tree's
+        // root with its own module name (`root_module_name`, derived from
+        // `INTEGRITY_CHECK_PATH`'s file stem) is what makes this resolve: every
+        // module-qualified key in the tree, this one included, now carries a leading
+        // `crc::` the way the real crate does.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = 0;\n        \
+             pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = 2;\n        \
+             pub(crate) const P3: u8 = 3;\n    }\n}\n\nconst fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        crate::crc::outer::indices::P0 => 0,\n        \
+             crate::crc::outer::indices::P1 => 1,\n        crate::crc::outer::indices::P2 \
+             => 2,\n        crate::crc::outer::indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
