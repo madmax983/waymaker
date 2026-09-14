@@ -1116,8 +1116,23 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             // tracker call still runs unconditionally, for every construct including a
             // comment, so a non-rendering element's open/close (and, since round 33,
             // finding 3, a comment never being mistaken for either) is still recorded.
+            //
+            // `<br>` is the one inline tag whose absence *does* change what a reader
+            // sees (Codex, pull request #138, round 37, finding 1): it renders as a
+            // real line break, so `decision-id head<br>line` shows as two separate
+            // lines, `head` and `line`, and joining them with no separator at all fused
+            // them into `headline` — a literal substring a `.contains` scan could match
+            // even though no reader ever sees those characters run together. A real
+            // line break is pushed for it instead, the same as `Event::SoftBreak` and
+            // `Event::HardBreak` already get — but only when the tag was not itself
+            // swallowed by an open non-rendering element (`!consumed`) and nothing else
+            // is already hiding this text, since a `<br>` inside a hidden span renders
+            // no break a reader would see either.
             Event::InlineHtml(html) => {
-                track_non_rendering_html(&html, &mut open_non_rendering_tag);
+                let consumed = track_non_rendering_html(&html, &mut open_non_rendering_tag);
+                if !consumed && !hidden && is_line_break_tag(&html) {
+                    out.push('\n');
+                }
             }
             _ => {}
         }
@@ -1139,13 +1154,22 @@ fn non_rendering_element_nests(tag: &str) -> bool {
 }
 
 /// The byte range of the first well-formed opening tag for `tag` at or after `from` in
-/// `line`, case-insensitively — from `<` through the tag's own closing `>` (or the end
-/// of `line`, if the tag is not closed on this line).
+/// `line`, case-insensitively — from `<` through the tag's own unquoted closing `>` (or
+/// the end of `line`, if the tag is not closed on this line).
 ///
 /// Matched anywhere in `line`, not only at its start, since a nested element can open
 /// partway through an enclosing `HtmlBlock`'s own `Event::Html` line; only where the tag
 /// name ends right there rather than continuing into a longer one (`<scriptx>` does not
 /// match).
+///
+/// A `>` inside a quoted attribute value does not end the tag (Codex, pull request
+/// #138, round 37, finding 3, closing the gap round 36's own fix for `find_any_tag`
+/// left in this sibling): `<script title="></script>">hidden</script>` has a `title`
+/// attribute whose value happens to contain the literal text `></script>`, and ending
+/// the *opening* tag there made the block scanner accept that quoted text as the
+/// element's real close — exposing the genuinely hidden body after it. Byte-scanned
+/// rather than searched, the same way `find_any_tag` now is, tracking whichever quote
+/// character is currently open so a `>` inside one is skipped.
 fn find_opening_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)> {
     let lower = line.to_ascii_lowercase();
     let marker = format!("<{tag}");
@@ -1162,10 +1186,19 @@ fn find_opening_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)
             if !boundary {
                 return None;
             }
-            let end = lower[start..]
-                .find('>')
-                .map_or(line.len(), |offset| start + offset + 1);
-            Some((start, end))
+            let bytes = line.as_bytes();
+            let mut quote: Option<u8> = None;
+            let mut index = after;
+            while let Some(&byte) = bytes.get(index) {
+                match quote {
+                    Some(open) if byte == open => quote = None,
+                    None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+                    None if byte == b'>' => return Some((start, index + 1)),
+                    Some(_) | None => {}
+                }
+                index += 1;
+            }
+            Some((start, line.len()))
         })
 }
 
@@ -1546,38 +1579,51 @@ fn is_line_break_tag(html: &str) -> bool {
 /// nothing this function returns.
 ///
 /// The match is required to start a fresh attribute name — the byte right before it must
-/// be absent or HTML whitespace (Codex, pull request #138, round 36, finding 2): a bare
-/// substring search for `href=` also matches inside `data-href=`, so `<a
+/// be absent or HTML whitespace, and it must sit outside any quoted attribute value
+/// currently open (Codex, pull request #138, rounds 36 and 37, finding 2 of each). Round
+/// 36: a bare substring search for `href=` also matched inside `data-href=`, so `<a
 /// data-href="tests/spine.rs">elsewhere</a>` — an anchor with no link destination at all
-/// — returned that unrelated attribute's value as if it were the real one. A rejected
-/// candidate resumes the search past it rather than giving up, since a real `href` can
-/// still follow a decoy one in the same tag.
+/// — returned that unrelated attribute's value as if it were the real one; a leading
+/// whitespace check closed that. Round 37: whitespace alone is not a real attribute
+/// boundary — `<a title=" href='tests/spine.rs'">proof</a>` has no link destination
+/// either, but the `href=` inside `title`'s own quoted value is *preceded* by
+/// whitespace too (the space right after `title`'s opening quote), so the whitespace
+/// check alone accepted it. The scan now tracks whichever quote character is currently
+/// open, the same way `find_any_tag` and `find_opening_tag` do, and only tests for
+/// `href=` while no attribute value is open — text inside one is never a fresh
+/// attribute name, whatever byte precedes it.
 fn anchor_href(html: &str) -> Option<&str> {
     find_opening_tag(html, 0, "a")?;
+    let bytes = html.as_bytes();
     let lower = html.to_ascii_lowercase();
     let marker = "href=";
-    let mut search_from = 0;
-    loop {
-        let start = search_from + lower.get(search_from..)?.find(marker)?;
-        let fresh_attribute = start == 0
-            || lower
-                .as_bytes()
-                .get(start - 1)
-                .is_some_and(u8::is_ascii_whitespace);
-        if !fresh_attribute {
-            search_from = start + marker.len();
-            continue;
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+            None if lower.as_bytes().get(index..index + marker.len())
+                == Some(marker.as_bytes())
+                && index.checked_sub(1).is_none_or(|before| {
+                    bytes.get(before).is_some_and(u8::is_ascii_whitespace)
+                }) =>
+            {
+                let value_start = index + marker.len();
+                let value_quote = *bytes.get(value_start)?;
+                if value_quote != b'"' && value_quote != b'\'' {
+                    index = value_start;
+                    continue;
+                }
+                let value_start = value_start + 1;
+                let end = value_start + html.get(value_start..)?.find(value_quote as char)?;
+                return Some(&html[value_start..end]);
+            }
+            Some(_) | None => {}
         }
-        let value_start = start + marker.len();
-        let quote = *html.as_bytes().get(value_start)?;
-        if quote != b'"' && quote != b'\'' {
-            search_from = value_start;
-            continue;
-        }
-        let value_start = value_start + 1;
-        let end = value_start + html.get(value_start..)?.find(quote as char)?;
-        return Some(&html[value_start..end]);
+        index += 1;
     }
+    None
 }
 
 /// `contents` with every fenced code block, blockquote and HTML comment removed,

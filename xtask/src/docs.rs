@@ -7125,6 +7125,76 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_id_split_by_a_line_break_tag_does_not_count() {
+        // Codex, pull request #138, round 37, finding 1: `markdown_prose`'s
+        // `Event::InlineHtml` arm dropped a `<br>` with no separator at all, so text
+        // split across it — a real, rendered line break — fused back into one
+        // contiguous run a `.contains` scan could match, even though no reader ever
+        // sees those characters run together: they render as two separate lines. A
+        // real line break is pushed for `<br>` now, the same as `Event::SoftBreak` and
+        // `Event::HardBreak` already get.
+        let mut inputs = clean_inputs(RULES);
+        let third = SETTLED_DECISIONS[2];
+        let (first_half, second_half) = third.id.split_at(third.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", third.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\n{first_half}<br>{second_half} {}\n",
+                    third.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == third.id),
+            "a decision id split by a `<br>` still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_behind_a_quoted_close_tag_inside_a_scripts_own_attribute_does_not_count() {
+        // Codex, pull request #138, round 37, finding 3: only `find_any_tag` became
+        // quote-aware in round 36 — this sibling, used to find a non-rendering
+        // element's own *opening* tag, still ended it at the first `>` regardless of
+        // whether that `>` sat inside a quoted attribute value. `<script
+        // title="></script>">` has a `title` attribute whose value happens to be the
+        // literal text `></script>` — legal HTML — and ending the opening tag there
+        // (right after the spurious `>` inside the quote) left the *real* text
+        // `</script>` immediately following it on the same line, which the tracker
+        // then read as a genuine close — clearing `open_non_rendering_tag` before the
+        // next line's actually-hidden script body was ever reached. Verified via a
+        // throwaway `pulldown-cmark` probe: `pulldown-cmark`'s own CommonMark block
+        // parser already ends the `HtmlBlock` after this one line (its raw-text
+        // termination rule matches any line *containing* the literal text
+        // `</script>`, quoting or not), so the following line — the genuinely hidden
+        // body — always arrives as ordinary paragraph text, and whether it renders
+        // depends entirely on `open_non_rendering_tag` still being open when this
+        // module reaches it.
+        let mut inputs = clean_inputs(RULES);
+        let fourth = SETTLED_DECISIONS[3];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fourth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script title=\"></script>\">\n{} {}\n</script>\n",
+                    fourth.id, fourth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fourth.id),
+            "a decision hidden behind a quoted close tag inside a script's own attribute \
+             still counted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn the_settled_decision_ids_are_unique() {
         let mut ids: Vec<&str> = SETTLED_DECISIONS.iter().map(|d| d.id).collect();
         let count = ids.len();
@@ -8166,6 +8236,41 @@ mod tests {
             violations.iter().any(|v| v.subject == clause.id),
             "a data-href lookalike attribute still supplied the table cell's evidence: \
              {violations:?}"
+        );
+    }
+
+    #[test]
+    fn href_text_inside_another_quoted_attribute_does_not_supply_a_table_cells_evidence() {
+        // Codex, pull request #138, round 37, finding 2: a leading-whitespace check
+        // alone is not a real attribute boundary — `<a title=" href='...'">proof</a>`
+        // has no link destination either, but the `href=` inside `title`'s own quoted
+        // value is *preceded* by whitespace too (the space right after `title`'s
+        // opening quote), so the whitespace check alone still accepted it. The scan
+        // now tracks whichever quote character is currently open and only tests for
+        // `href=` while no attribute value is open, so text inside one — whatever
+        // precedes it — is never read as a fresh attribute name.
+        let (claude_md, mut adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES[0];
+        for adr in &mut adrs {
+            if adr.name == STORAGE_CONFORMANCE_ADR {
+                let real_row = format!("| `{}` | {} |", clause.id, clause.discharge.message());
+                let decoy_row = format!(
+                    "| `{}` | <a title=\" href='{}'\">elsewhere</a> |",
+                    clause.id,
+                    clause.discharge.message()
+                );
+                assert!(
+                    adr.contents.contains(&real_row),
+                    "fixture row not found: {real_row}"
+                );
+                adr.contents = adr.contents.replace(&real_row, &decoy_row);
+            }
+        }
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&clauses));
+        assert!(
+            violations.iter().any(|v| v.subject == clause.id),
+            "href text inside another quoted attribute still supplied the table cell's \
+             evidence: {violations:?}"
         );
     }
 
