@@ -6277,6 +6277,22 @@ mod tests {
     }
 
     #[test]
+    fn adr_status_reads_a_valid_field_with_trailing_hidden_markup() {
+        // Codex, pull request #138, round 49, "Preserve complete fields before
+        // trailing hidden markup": round 30 disqualified the item outright the
+        // moment any non-rendering or `hidden`-suppressed element opened, which
+        // closed a real gap (`- Status: <script>accepted</script>` strips to an
+        // empty value that would otherwise still trivially match) but went too far
+        // in the other direction — `- Status: accepted <span hidden></span>` is a
+        // real, complete, one-line field with an empty, trailing hidden element
+        // after it, and disqualifying it discarded a value that had already been
+        // fully collected before the hidden markup ever appeared, the identical
+        // shape of overreach round 24 corrected for a trailing comment.
+        let contents = "# ADR\n\n- Status: accepted <span hidden></span>\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("accepted"));
+    }
+
+    #[test]
     fn adr_status_ignores_a_decoy_field_split_by_a_break_tag() {
         // Codex, pull request #138, round 25: a real (non-comment) inline tag is not
         // invisible the way a comment is, so `- Sta<br>tus: accepted` renders as two
@@ -7567,6 +7583,38 @@ mod tests {
                     .replace(&format!("({})", first.id), "(elsewhere)");
                 adr.contents = format!(
                     "{without_heading_id}\n<div>\n<svg\n hidden />{} {}</svg>\n</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_inside_svg_still_counts() {
+        // Codex, pull request #138, round 49, "Avoid pushing self-closing scripts
+        // in foreign content": HTML5 acknowledges the self-closing flag on *any*
+        // start tag — not only `<svg>`/`<math>` themselves — once the parser is
+        // inside foreign content, so `<svg><script /></svg>` never opens a
+        // genuinely unclosed `<script>` the way a bare `<script />` does outside
+        // one, where the slash is ignored and a real `</script>` is still needed.
+        // The fixed non-rendering list pushed `script` unconditionally regardless
+        // of foreign content, waiting forever for a `</script>` this document
+        // never writes and hiding everything after it — including the decision
+        // that immediately follows `</svg>` — to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><script /></svg>{} {}\n",
                     first.id, first.headline
                 );
             }

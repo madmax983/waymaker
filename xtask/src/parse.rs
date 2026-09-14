@@ -972,6 +972,9 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
     let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
+    // Foreign-content depth for self-closing scripts (Codex, round 49) — see
+    // `track_non_rendering_html`'s own doc comment.
+    let mut foreign_content: u32 = 0;
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
@@ -994,9 +997,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
         let hidden = container_hidden || in_html_comment || !open_non_rendering_tag.is_empty();
         match event {
             Event::Start(Tag::List(kind)) => ordered_lists.push(kind.is_some()),
-            Event::End(TagEnd::List(_)) => {
-                ordered_lists.pop();
-            }
+            Event::End(TagEnd::List(_)) => drop(ordered_lists.pop()),
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_add(1);
             }
@@ -1054,9 +1055,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     if !out.is_empty() && !out.ends_with('\n') {
                         out.push('\n');
                     }
-                    for _ in 0..level as usize {
-                        out.push('#');
-                    }
+                    out.push_str(&"#".repeat(level as usize));
                     out.push(' ');
                 }
             }
@@ -1077,8 +1076,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                         // range starts at its marker, so read the real one back from
                         // the source rather than guessing.
                         let marker = contents[range.start..].chars().next().unwrap_or('-');
-                        out.push(marker);
-                        out.push(' ');
+                        out.extend([marker, ' ']);
                     }
                 }
             }
@@ -1140,7 +1138,11 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             // is already hiding this text, since a `<br>` inside a hidden span renders
             // no break a reader would see either.
             Event::InlineHtml(html) => {
-                let consumed = track_non_rendering_html(&html, &mut open_non_rendering_tag);
+                let consumed = track_non_rendering_html(
+                    &html,
+                    &mut open_non_rendering_tag,
+                    &mut foreign_content,
+                );
                 if !consumed && !hidden && is_line_break_tag(&html) {
                     out.push('\n');
                 }
@@ -1361,28 +1363,81 @@ fn is_void_element(name: &str) -> bool {
 /// Narrower than real foreign content, which extends to every element nested inside
 /// an `<svg>` or `<math>` subtree, not only the two root names themselves — a
 /// residual limit worth documenting rather than building full namespace-region
-/// tracking for the one construct ([`find_any_hidden_opening_tag`]) that needs this
-/// distinction at all.
+/// tracking for [`find_any_hidden_opening_tag`], the one construct that still relies
+/// on this narrower, root-only check. [`in_foreign_content`] closes the same gap for
+/// the fixed non-rendering elements (round 49), where the concrete case — a
+/// `<script>` or `<style>` nested inside an open `<svg>` — is common enough, and
+/// cheap enough to detect one line at a time, to be worth tracking properly instead.
 fn is_foreign_content_root(name: &str) -> bool {
     name.eq_ignore_ascii_case("svg") || name.eq_ignore_ascii_case("math")
 }
 
 /// Whether `span` — a complete, well-formed opening tag's own markup, ending at its
-/// own unquoted `>`, for the element named `name` — is self-closing: a `/`
-/// immediately before that `>`, outside any quoted attribute value (Codex, pull
-/// request #138, round 44, finding 2), and only for [`is_foreign_content_root`]
-/// (round 46): `<svg hidden />` has no body and no `</svg>` a document ever writes,
-/// so [`find_any_hidden_opening_tag`] must not wait forever for one, the same way it
-/// already never does for a [`VOID_ELEMENTS`] member — but `<div hidden />` is not
-/// SVG or `MathML`, and a browser gives its `div` a real, still-open body regardless
-/// of the trailing slash.
+/// own unquoted `>` — carries a self-closing `/` immediately before that `>`,
+/// outside any quoted attribute value (Codex, pull request #138, round 44, finding
+/// 2). Whether that slash is *honored* — bodyless XML-style syntax, rather than
+/// ignored the way ordinary HTML ignores it everywhere outside foreign content — is
+/// the caller's question, answered by [`is_self_closing_tag`] (a fixed tag name) or
+/// [`in_foreign_content`] (an ambient parsing context) depending on which one needs
+/// it.
+fn ends_with_self_closing_slash(span: &str) -> bool {
+    span.len()
+        .checked_sub(2)
+        .and_then(|index| span.as_bytes().get(index))
+        .is_some_and(|&byte| byte == b'/')
+}
+
+/// Whether `span` — a complete, well-formed opening tag's own markup for the element
+/// named `name` — is self-closing: [`ends_with_self_closing_slash`], and only for
+/// [`is_foreign_content_root`] (round 46): `<svg hidden />` has no body and no
+/// `</svg>` a document ever writes, so [`find_any_hidden_opening_tag`] must not wait
+/// forever for one, the same way it already never does for a [`VOID_ELEMENTS`]
+/// member — but `<div hidden />` is not SVG or `MathML`, and a browser gives its
+/// `div` a real, still-open body regardless of the trailing slash.
 fn is_self_closing_tag(span: &str, name: &str) -> bool {
-    is_foreign_content_root(name)
-        && span
-            .len()
-            .checked_sub(2)
-            .and_then(|index| span.as_bytes().get(index))
-            .is_some_and(|&byte| byte == b'/')
+    is_foreign_content_root(name) && ends_with_self_closing_slash(span)
+}
+
+/// Whether byte offset `at` in `line` sits inside a still-open `<svg>` or `<math>`
+/// subtree opened earlier on the *same* line (Codex, pull request #138, round 49,
+/// "Avoid pushing self-closing scripts in foreign content").
+///
+/// HTML5 acknowledges the self-closing flag on *any* start tag — not only `<svg>` or
+/// `<math>` themselves — once the parser is inside foreign content: `<svg><script
+/// /></svg>` (likewise an SVG `<style />`) never opens a genuinely unclosed
+/// `<script>` the way a bare `<script />` does outside one, where the slash is
+/// ignored and a real `</script>` is still needed. Scanned tag by tag through the
+/// same quote-aware [`find_any_tag`] every other search in this module uses,
+/// tracking the open/close balance of the two foreign-content roots up to `at`; a
+/// root's own self-closing form (`<svg />`) never opens one, the same
+/// [`is_self_closing_tag`] check [`find_any_hidden_opening_tag`] already applies to
+/// the root itself.
+///
+/// Same-line only, a narrower residual limit than even [`is_foreign_content_root`]'s
+/// own: `<svg>\n<script />\n</svg>`, with the root's own open tag on an earlier
+/// line, is invisible to this function the way a cross-line comment opener would be
+/// to a search with no memory of the lines before it — closing that would need
+/// foreign-content depth carried across lines the way `open_non_rendering_tag`
+/// already is, for a residual this narrow, single-line case does not yet need.
+fn in_foreign_content(line: &str, at: usize) -> bool {
+    let mut depth: u32 = 0;
+    let mut cursor = 0;
+    while let Some((start, end)) = find_any_tag(line, cursor) {
+        if start >= at {
+            break;
+        }
+        let span = &line[start..end];
+        let name = markup_tag_name(span);
+        if span.starts_with("</") {
+            if is_foreign_content_root(name) {
+                depth = depth.saturating_sub(1);
+            }
+        } else if is_foreign_content_root(name) && !ends_with_self_closing_slash(span) {
+            depth += 1;
+        }
+        cursor = end;
+    }
+    depth > 0
 }
 
 /// Whether `span` — a complete, well-formed opening tag's own markup — carries the
@@ -1545,10 +1600,34 @@ fn opens_hidden_element(line: &str) -> Option<String> {
 /// plain nesting, or a different one, for a `<script>` or `<style>` nested inside a
 /// `<template>`), and only a close matching the *top* of the stack pops it, the same
 /// "close only what actually opened" discipline round 30 already applies one level up.
-fn track_non_rendering_html(html: &str, stack: &mut Vec<String>) -> bool {
+///
+/// `foreign_content` is a second, independent depth — `<svg>`/`<math>` are ordinary,
+/// visible elements, never hidden by this alone, but HTML5 acknowledges the
+/// self-closing flag on *any* start tag while the parser is inside one (Codex, pull
+/// request #138, round 49, "Avoid pushing self-closing scripts in foreign content"):
+/// `<svg><script /></svg>` never opens a genuinely unclosed `<script>` the way a bare
+/// `<script />` does outside one, where the slash is ignored and a real `</script>`
+/// is still needed. Each self-contained `Event::InlineHtml` construct arrives with no
+/// memory of the ones around it, unlike a block-level line this module can re-scan
+/// from its own start, so this depth has to be carried the same way `stack` already
+/// is, tracked here unconditionally so every caller gets it for free.
+fn track_non_rendering_html(
+    html: &str,
+    stack: &mut Vec<String>,
+    foreign_content: &mut u32,
+) -> bool {
     if html.starts_with("<!--") {
         return true;
     }
+    if is_foreign_content_root(markup_tag_name(html)) {
+        if html.starts_with("</") {
+            *foreign_content = foreign_content.saturating_sub(1);
+        } else if !ends_with_self_closing_slash(html) {
+            *foreign_content += 1;
+        }
+    }
+    let self_closing_in_foreign_content =
+        *foreign_content > 0 && ends_with_self_closing_slash(html);
     // Cloned rather than borrowed, for the reason `advance_past_non_rendering` now
     // does the same (Codex, pull request #138, round 42, finding 3): `stack` holds
     // owned names since it can carry an arbitrary `hidden`-suppressed one, not only
@@ -1557,7 +1636,9 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<String>) -> bool {
     match stack.last().cloned() {
         Some(top) if non_rendering_element_nests(&top) => {
             if let Some(tag) = opens_non_rendering_element(html) {
-                stack.push(tag.to_owned());
+                if !self_closing_in_foreign_content {
+                    stack.push(tag.to_owned());
+                }
             } else if opens_tag_named(html, &top) {
                 if implicitly_closes_same_name(&top) {
                     // Codex, pull request #138, round 48, "Honor implicit
@@ -1595,8 +1676,12 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<String>) -> bool {
         // visible documentation evidence even though no browser ever displays it.
         None => {
             if let Some(tag) = opens_non_rendering_element(html) {
-                stack.push(tag.to_owned());
-                true
+                if self_closing_in_foreign_content {
+                    false
+                } else {
+                    stack.push(tag.to_owned());
+                    true
+                }
             } else if let Some(name) = opens_hidden_element(html) {
                 stack.push(name);
                 true
@@ -1853,7 +1938,17 @@ fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
         candidates.push((start, HidingMarker::Comment(start)));
     }
     if let Some((start, end, tag)) = find_any_opening_tag(line, from) {
-        candidates.push((start, HidingMarker::Tag(start, end, tag)));
+        // Self-closing inside foreign content is not an opener at all (Codex, pull
+        // request #138, round 49, "Avoid pushing self-closing scripts in foreign
+        // content"): `<svg><script /></svg>` has no body and no `</script>` a
+        // document ever writes, so treating it as one waited forever for a close
+        // that hid everything after it to end of document. Omitted here rather
+        // than pushed as `Markup` directly, so the ordinary `find_any_tag` search
+        // below still finds and strips its markup the normal way.
+        let span = &line[start..end];
+        if !(ends_with_self_closing_slash(span) && in_foreign_content(line, start)) {
+            candidates.push((start, HidingMarker::Tag(start, end, tag)));
+        }
     }
     if let Some((start, end, name)) = find_any_hidden_opening_tag(line, from) {
         candidates.push((start, HidingMarker::Hidden(start, end, name)));
@@ -1939,8 +2034,18 @@ fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<Non
     }
     let close = find_closing_tag(line, cursor, top)
         .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
-    let fixed_open = find_any_opening_tag(line, cursor)
-        .map(|(start, end, tag)| (start, NonRenderingAdvance::Open(end, tag.to_owned())));
+    // Self-closing inside foreign content is not a further open either (Codex, pull
+    // request #138, round 49): `<template><svg><script /></svg></template>` has no
+    // body and no `</script>` for this nested `<script>`, the same as at the top
+    // level.
+    let fixed_open = find_any_opening_tag(line, cursor).and_then(|(start, end, tag)| {
+        let span = &line[start..end];
+        if ends_with_self_closing_slash(span) && in_foreign_content(line, start) {
+            None
+        } else {
+            Some((start, NonRenderingAdvance::Open(end, tag.to_owned())))
+        }
+    });
     let top_reopen = find_opening_tag(line, cursor, top).map(|(start, end)| {
         if implicitly_closes_same_name(top) {
             (start, NonRenderingAdvance::Close(start))
@@ -2621,6 +2726,14 @@ pub fn visible_source(contents: &str) -> String {
     let mut non_rendering_start: Option<usize> = None;
     let mut pending_tag: Option<PendingTag> = None;
     let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
+    // How many `<svg>`/`<math>` foreign-content roots are currently open, carried
+    // across `Event::InlineHtml` constructs the same way `open_non_rendering` is
+    // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
+    // foreign content") — see `track_non_rendering_html`'s own doc comment. The
+    // block-level path needs no twin of its own: `hide_non_rendering_in_html_line`
+    // reads `next_hiding_marker` directly, which already re-derives this from `html`
+    // itself one line at a time.
+    let mut foreign_content: u32 = 0;
     // A comment nested inside an open `<template>`, kept apart from the block-comment
     // search below: that is a document-wide search over already-*closed* blocks, not a
     // state a currently open nesting element carries across lines.
@@ -2731,6 +2844,7 @@ pub fn visible_source(contents: &str) -> String {
                 range,
                 &mut open_non_rendering,
                 &mut non_rendering_start,
+                &mut foreign_content,
                 &mut hidden,
             ),
             _ => {}
@@ -2783,10 +2897,11 @@ fn hide_non_rendering_in_inline_html(
     range: std::ops::Range<usize>,
     open_non_rendering: &mut Vec<String>,
     non_rendering_start: &mut Option<usize>,
+    foreign_content: &mut u32,
     hidden: &mut Vec<(usize, usize)>,
 ) {
     let was_open = !open_non_rendering.is_empty();
-    track_non_rendering_html(html, open_non_rendering);
+    track_non_rendering_html(html, open_non_rendering, foreign_content);
     let now_open = !open_non_rendering.is_empty();
     if !was_open && now_open {
         non_rendering_start.get_or_insert(range.start);
@@ -2934,6 +3049,14 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // one closes disqualifies the item, whatever kind of block it is.
     let mut paragraph_closed = false;
     let mut item = String::new();
+    // Whether a non-rendering or `hidden`-suppressed element opened somewhere in the
+    // item being collected (Codex, pull request #138, round 49, "Preserve complete
+    // fields before trailing hidden markup"): unlike a real line break or a fenced
+    // block, such an element's own span carries no text a reader ever sees, so its
+    // own opening alone says nothing about whether the field is still complete —
+    // only whether the stripped value comes out empty once it is excluded does, and
+    // that can only be answered once the item's own text has all been gathered.
+    let mut hidden_markup_seen = false;
     // Whether an HTML comment opened earlier is still open (Codex, pull request #138,
     // round 20): `pulldown-cmark` ends an `HtmlBlock` at a blank line even when a
     // comment inside it never closed, so an item appearing right after reads as an
@@ -2963,6 +3086,11 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
     let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
+    // How many `<svg>`/`<math>` foreign-content roots are currently open, carried
+    // across `Event::InlineHtml` constructs the same way `open_non_rendering_tag` is
+    // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
+    // foreign content") — see `track_non_rendering_html`'s own doc comment.
+    let mut foreign_content: u32 = 0;
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         let hidden = in_fence
@@ -3008,6 +3136,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                 if marker == Some('-') {
                     collecting = true;
                     paragraph_closed = false;
+                    hidden_markup_seen = false;
                     item.clear();
                 }
             }
@@ -3016,7 +3145,17 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                 if collecting {
                     collecting = false;
                     if let Some(value) = item.strip_prefix(prefix) {
-                        return Some(value.trim().to_owned());
+                        let value = value.trim();
+                        // A hidden element's own span never contributes text a
+                        // reader sees, so its opening alone does not disqualify a
+                        // field that was already complete before it (Codex, round
+                        // 49) — only an *empty* result does, the same failure
+                        // round 30 closed by disqualifying outright: `- Status:
+                        // <script>accepted</script>` strips to an empty value that
+                        // would otherwise still trivially match.
+                        if !(hidden_markup_seen && value.is_empty()) {
+                            return Some(value.to_owned());
+                        }
                     }
                 }
             }
@@ -3072,17 +3211,24 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // separately above and cannot occur while a paragraph is still open.
             //
             // A non-rendering element — `<script>`, `<style>`, `<title>`, `<template>` —
-            // disqualifies the item too (Codex, round 30): `- Status:
-            // <script>accepted</script>` has a real, visible `Status: ` prefix ahead
-            // of the tag, so merely *excluding* the hidden value (rather than
-            // disqualifying the item) would leave `item` at `"Status: "`, which still
-            // strips and trims to an empty value that still trivially matches —
-            // exactly the failure round 15 already closed for a nested fence or
-            // blockquote. Disqualifying outright, the same way `<br>` and a nested
-            // fence or blockquote already do, is what actually closes it: `collecting`
-            // drops before `End(TagEnd::Item)` can try matching an empty prefix.
-            // Checked by the tag *opening* alone — a stray, unmatched close needs no
-            // separate case, since the item is already disqualified by then.
+            // marks the item rather than disqualifying it outright (Codex, round 30,
+            // narrowed round 49, "Preserve complete fields before trailing hidden
+            // markup"): `- Status: <script>accepted</script>` has a real, visible
+            // `Status: ` prefix ahead of the tag, so merely *excluding* the hidden
+            // value (rather than recording that one was excluded) would leave `item`
+            // at `"Status: "`, which still strips and trims to an empty value that
+            // still trivially matches — exactly the failure round 15 already closed
+            // for a nested fence or blockquote. But `- Status: accepted <span
+            // hidden></span>` is a real, complete, one-line field with nothing but an
+            // empty, trailing hidden element after it — round 30's own fix
+            // disqualified this too, discarding a value that had already been fully
+            // collected, the identical shape of overreach round 24 corrected for a
+            // trailing comment. `hidden_markup_seen` records that a hidden element
+            // was involved without dropping `collecting` outright; `End(TagEnd::Item)`
+            // is what tells complete from incomplete, since only it has the item's
+            // whole text to strip and check for emptiness. Checked by the tag
+            // *opening* alone — a stray, unmatched close needs no separate case,
+            // since the flag is sticky for the rest of the item either way.
             //
             // A comment is checked first and exclusively (Codex, round 35, finding 2):
             // `opens_non_rendering_element`/`is_line_break_tag` read `html`'s raw text
@@ -3107,14 +3253,25 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // returned `opened` is `true` exactly when this construct just pushed a
             // genuine non-rendering opener — the same condition
             // `opens_non_rendering_element(&html).is_some()` checked before, now with
-            // the side effect that actually closes the gap.
+            // the side effect that actually closes the gap. It sets
+            // `hidden_markup_seen` rather than dropping `collecting` directly (round
+            // 49): unlike `<br>` and a spanning comment, which are real, rendered
+            // breaks nothing can undo, a non-rendering element's own opening says
+            // nothing about completeness on its own.
             Event::InlineHtml(html) => {
-                let opened = track_non_rendering_html(&html, &mut open_non_rendering_tag);
+                let opened = track_non_rendering_html(
+                    &html,
+                    &mut open_non_rendering_tag,
+                    &mut foreign_content,
+                );
+                if opened {
+                    hidden_markup_seen = true;
+                }
                 if collecting
                     && if html.starts_with("<!--") {
                         html.contains('\n')
                     } else {
-                        is_line_break_tag(&html) || opened
+                        is_line_break_tag(&html)
                     }
                 {
                     collecting = false;
@@ -3164,6 +3321,11 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
     let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
+    // How many `<svg>`/`<math>` foreign-content roots are currently open, carried
+    // across `Event::InlineHtml` constructs the same way `open_non_rendering_tag` is
+    // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
+    // foreign content") — see `track_non_rendering_html`'s own doc comment.
+    let mut foreign_content: u32 = 0;
     let mut collecting = false;
     let mut current = String::new();
     let mut lines = Vec::new();
@@ -3184,7 +3346,7 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
                 );
             }
             Event::InlineHtml(html) => {
-                track_non_rendering_html(&html, &mut open_non_rendering_tag);
+                track_non_rendering_html(&html, &mut open_non_rendering_tag, &mut foreign_content);
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_add(1);
@@ -3271,6 +3433,11 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // yet appeared (Codex, pull request #138, round 45, "Finish multiline raw-text
     // close tags before popping"), carried the same way `pending_tag` is.
     let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
+    // How many `<svg>`/`<math>` foreign-content roots are currently open, carried
+    // across `Event::InlineHtml` constructs the same way `open_non_rendering_tag` is
+    // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
+    // foreign content") — see `track_non_rendering_html`'s own doc comment.
+    let mut foreign_content: u32 = 0;
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
         let hidden = in_fence
@@ -3382,8 +3549,11 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // still fused into `headline` here, a literal substring a `.contains` scan
             // could match though no reader ever sees it run together.
             Event::InlineHtml(html)
-                if !track_non_rendering_html(&html, &mut open_non_rendering_tag)
-                    && in_row
+                if !track_non_rendering_html(
+                    &html,
+                    &mut open_non_rendering_tag,
+                    &mut foreign_content,
+                ) && in_row
                     && !html.starts_with("<!--") =>
             {
                 if let Some(href) = anchor_href(&html) {
