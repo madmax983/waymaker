@@ -7856,6 +7856,23 @@ fn check_effect_types(code: &str, contents: &str) -> Vec<Violation> {
         ));
     }
 
+    // `syn::Visit` does not descend into a `macro_rules!` body — it is an opaque token
+    // stream — so a local macro expanding to `CheckedDispatch { intent, bytes }` builds the
+    // pinned type under a construction site none of the scans below can see (Codex review).
+    // The same shape `ctx-facade` already refuses outright for the same reason: a scanner
+    // cannot expand a macro, so it refuses the construct.
+    if names_identifier(code, "macro_rules") {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} declares a `macro_rules!`, which can expand a \
+                 `CheckedDispatch` literal or a proof-field rebinding where no scan below \
+                 can read it"
+            ),
+        ));
+    }
+
     for (type_name, methods) in EFFECT_TYPE_METHODS {
         let header = format!("pub struct {type_name}");
         if !names_identifier(code, &header) {
@@ -12831,6 +12848,21 @@ mod deferred_answer_pins {
                 .iter()
                 .any(|detail| detail.contains("is not built inside")),
             "an aliased proof construction went unseen: {details:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_rules_in_the_effect_protocol_file_is_reported() {
+        // Codex: `syn::Visit` never descends into a `macro_rules!` body, so a local macro
+        // expanding to `CheckedDispatch { intent, bytes }` builds the pinned type at a
+        // construction site none of the scans above can see. Refused outright, the same
+        // shape `ctx-facade` already refuses for the same reason.
+        let source = tests_support::clean_effect_module()
+            + "macro_rules! escape_hatch {\n    () => {};\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("macro_rules")),
+            "{details:?}"
         );
     }
 

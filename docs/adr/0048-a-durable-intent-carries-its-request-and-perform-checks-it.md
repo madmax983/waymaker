@@ -259,6 +259,20 @@ descent returns, the same discipline `self.stack`'s own push/pop already has.
 `a_blocks_local_alias_does_not_leak_into_a_nested_module` is the regression, confirmed RED
 against the unpatched visitor.
 
+**Codex then found a gap in a different mechanism, not in the alias scanner's scope
+discipline at all.** `syn::Visit` never descends into a `macro_rules!` body — to a
+syntax-only scan it is an opaque token stream — so a local macro defined and invoked inside
+`effect.rs` and expanding to `CheckedDispatch { intent, bytes }` builds the pinned type at a
+construction site none of `struct_literal_counts`'s callers, nor any check built on it, can
+see. Expanding or inspecting a macro body was rejected for the reason resolving a qualified
+associated-type projection already was earlier in this same file's history: it needs
+machinery — real macro expansion — this scanner does not have. `check_effect_types` now
+refuses `effect.rs` outright over a bare `macro_rules` identifier instead, the same
+construct `ctx-facade` already refuses in its own two pinned files for the identical reason:
+a scanner cannot expand a macro, so it refuses the construct rather than trying to see
+through it. `a_macro_rules_in_the_effect_protocol_file_is_reported` is the regression,
+confirmed RED against the unpatched rule.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
