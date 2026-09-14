@@ -175,6 +175,28 @@ fn stmt_is_cfg_test(stmt: &syn::Stmt) -> bool {
     }
 }
 
+/// Whether `stmt` is a local item [`evaluate_block`]'s own collectors never bind a name
+/// from — a type alias, a local `fn`, `struct`, `enum`, `trait`, `impl`, `use`, `mod` or
+/// `static`, every local item kind but a `const`, which [`block_const_exprs`] already
+/// reads. `rustc` allows every one of them inside a block, and `syn` reads a local `const`
+/// as the identical `syn::Stmt::Item` shape as the rest, so `evaluate_block`'s own
+/// statement count has to tell the two apart rather than treating every item as absent the
+/// way [`stmt_is_cfg_test`] does.
+///
+/// Codex's finding: `{ type Value = u8; let value: Value = 0; value }` counted the type
+/// alias against `rest` — `production_stmts` kept every item statement — while neither
+/// `block_const_exprs` nor `block_let_exprs`/`block_let_statement_count` counted it at all,
+/// since it binds no value either collector tracks. The mismatch made `evaluate_block`
+/// refuse a block that was otherwise fully resolvable, and refusing is not a conservative
+/// answer here: an unresolved pattern constant is exactly what lets a dense-table arm's own
+/// `pattern_literal` come back empty, which is the shape the whole `integrity-check` scan
+/// exists to catch rather than one it can afford to wave through. A transparent item is
+/// filtered out of `production_stmts` the same way a `#[cfg(test)]` statement already is,
+/// so the count it is compared against never counted it either.
+const fn stmt_is_transparent_item(stmt: &syn::Stmt) -> bool {
+    matches!(stmt, syn::Stmt::Item(item) if !matches!(item, syn::Item::Const(_)))
+}
+
 /// Strips a raw marker from every identifier in `stream`.
 ///
 /// `#![allow(r#missing_docs)]` renders as `allow(r#missing_docs)` through
@@ -3516,7 +3538,7 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     let production_stmts: Vec<&syn::Stmt> = block
         .stmts
         .iter()
-        .filter(|stmt| !stmt_is_cfg_test(stmt))
+        .filter(|stmt| !stmt_is_cfg_test(stmt) && !stmt_is_transparent_item(stmt))
         .collect();
     let (tail, rest) = production_stmts.split_last()?;
     // Codex's next-round finding: `locals.len()` used to double as both "how many names are

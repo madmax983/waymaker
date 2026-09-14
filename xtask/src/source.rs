@@ -21411,6 +21411,49 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_harmless_local_item_in_their_block_is_reported() {
+        // Codex's finding: `const P0: u8 = { type Value = u8; let value: Value = 0; value };`
+        // names a local item — a type alias — alongside the `let` `evaluate_block` already
+        // resolves. `production_stmts` kept the type alias (every item statement but a
+        // `#[cfg(test)]`-gated one passes `stmt_is_cfg_test`), while neither
+        // `block_const_exprs` nor `block_let_exprs`/`block_let_statement_count` count a type
+        // alias at all — it binds no value either collector tracks — so `rest.len()` came
+        // out one higher than `const_item_count + block_let_statement_count(block) +
+        // ignored_lets`, and `evaluate_block` refused a block that was otherwise fully
+        // resolvable. Defining `P0` through `P14` this way left every outer pattern of the
+        // dense table below unresolved. `stmt_is_transparent_item` now filters a local item
+        // that is not a `const` — a type alias, a local `fn`, `struct`, `enum`, `trait`,
+        // `impl`, `use`, `mod` or `static` — out of `production_stmts` the same way a
+        // `#[cfg(test)]` statement already is, so the count it is compared against never
+        // counted it either.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ type Value = u8; let value: Value = {n}; value }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_with_a_local_type_alias(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
