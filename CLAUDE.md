@@ -1141,22 +1141,22 @@ Stated so that nobody mistakes silence for coverage:
   comments, strings, char literals, `use` aliases and `#[path]` modules no longer blind
   them. Parsing is not name resolution: glob imports are not followed, macros are not
   expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. Alias
-  resolution also stops at the file it reads and at the module that declares it: a chain of
-  `use .. as ..` renames resolves within one module (issue #109), a nested module does not
-  inherit an outer one's aliases, `self::` in a chain resolves within that same module,
-  `crate::` does not — closing it would need the file root's aliases threaded into every
-  nested scope — and an alias declared in one module and reached through a `use` in another
-  *file* is invisible outright, the same limit `capacity-reserve`, `recovery-surface` and
-  `storage-contract` each record for the one file they pin. Nor does it carry a namespace: two
-  `use` items can bind one local name in different namespaces — a function and a trait can
-  both spell `Pollable` — and a syntactic scan cannot tell which one a later occurrence meant.
-  Picking the first-declared alias can silently miss a real match; exploring every alias that
-  name could mean can just as easily attribute an unrelated, legitimate construct to a
-  different one (Codex review, PR #160, rounds 3 and 4 — the second finding is what took the
-  first back out). Guessing a direction was tried and rejected in both directions, matching
-  this repository's own rule about the storage-contract suite: guessing is how a broken
-  input talks a check out of testing it. A same-spelled alias across namespaces is a residual
-  limit rather than a guess. Markdown parsing does not check
+  resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
+  within one module (issue #109), a nested module does not inherit an outer one's aliases,
+  and `self::`, `super::` and `crate::` reach the scope each names explicitly rather than by
+  inheritance — a stack of each module's own aliases from the file root down makes all three
+  well-defined regardless of nesting depth. An alias declared in one module and reached
+  through a `use` in another *file* is invisible outright, the same limit `capacity-reserve`,
+  `recovery-surface` and `storage-contract` each record for the one file they pin. Nor does
+  it carry a namespace: two `use` items can bind one local name in different namespaces — a
+  function and a trait can both spell `Pollable` — and a syntactic scan cannot tell which one
+  a later occurrence meant. Picking the first-declared alias can silently miss a real match;
+  exploring every alias that name could mean can just as easily attribute an unrelated,
+  legitimate construct to a different one (Codex review, PR #160, rounds 3 and 4 — the second
+  finding is what took the first back out). Guessing a direction was tried and rejected in
+  both directions, matching this repository's own rule about the storage-contract suite:
+  guessing is how a broken input talks a check out of testing it. A same-spelled alias across
+  namespaces is a residual limit rather than a guess. Markdown parsing does not check
   that a rendered claim is true, only that it is rendered prose rather than a code fence.
   The scanners that stayed textual are the ones whose rule is
   about *spelling* — a forbidden vocabulary item, a handwritten `unsafe` keyword — and they
