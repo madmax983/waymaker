@@ -1776,10 +1776,20 @@ fn call_shape_of(
 /// would find something and return before the relative one is ever tried, even though
 /// Rust resolves `indices::P0` written inside `outer` to `outer`'s own `indices`
 /// exclusively. So the relative lookup goes first and the plain chain is the fallback, not
-/// the other way around. A `super` is not resolved positionally, so a chain that matches
-/// neither falls back to its last two segments (`module::name`), which is what lets
-/// `crate::indices::P0` and `super::indices::P0` both still find a `mod indices` recorded
-/// relative to the file root.
+/// the other way around.
+///
+/// Codex's finding after *that*: a leading `super` was left in the chain rather than
+/// resolved, so it never matched `current_module` (which holds plain module names, `super`
+/// among none of them) and fell all the way to the last-two-segments heuristic — silently
+/// right when that heuristic's guess happened to agree, silently wrong whenever a
+/// same-named module also existed at the file root. Each leading `super` now steps one
+/// level up from `current_module` before the relative lookup runs, the same way `rustc`
+/// itself resolves it — `super::indices::P0` written inside `outer::inner` is tried against
+/// `outer::indices::P0`, not against `outer::inner`'s own scope or the file root. A chain
+/// with more `super`s than `current_module` has levels clamps to the file root, since there
+/// is nowhere higher to step to. What matches neither the relative form nor the plain chain
+/// still falls back to its last two segments (`module::name`), which is what lets
+/// `crate::indices::P0` keep finding a `mod indices` recorded relative to the file root.
 fn resolve_qualified_path(
     path: &syn::Path,
     qualified: &std::collections::HashMap<String, u128>,
@@ -1798,9 +1808,19 @@ fn resolve_qualified_path(
     if relevant.len() < 2 {
         return None;
     }
-    let joined = relevant.join("::");
-    if !current_module.is_empty() {
-        let relative = format!("{}::{joined}", current_module.join("::"));
+    let super_count = relevant
+        .iter()
+        .take_while(|segment| **segment == "super")
+        .count();
+    let rest = relevant.get(super_count..)?;
+    if rest.len() < 2 {
+        return None;
+    }
+    let joined = rest.join("::");
+    let pop = super_count.min(current_module.len());
+    let effective_module = current_module.get(..current_module.len() - pop)?;
+    if !effective_module.is_empty() {
+        let relative = format!("{}::{joined}", effective_module.join("::"));
         if let Some(value) = qualified.get(&relative) {
             return Some(*value);
         }
@@ -1808,8 +1828,8 @@ fn resolve_qualified_path(
     if let Some(value) = qualified.get(&joined) {
         return Some(*value);
     }
-    let tail_start = relevant.len().saturating_sub(2);
-    let tail = relevant.get(tail_start..)?;
+    let tail_start = rest.len().saturating_sub(2);
+    let tail = rest.get(tail_start..)?;
     qualified.get(&tail.join("::")).copied()
 }
 

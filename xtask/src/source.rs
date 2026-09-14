@@ -15383,6 +15383,40 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_with_super_resolves_against_the_parent_module() {
+        // Codex's eighteenth-round finding: a leading `super` was left in the chain rather
+        // than resolved against `current_module`, so it never matched the plain module-name
+        // stack the relative lookup compares against and fell straight to the
+        // last-two-segments heuristic — silently right only when that heuristic's guess
+        // happened to land on the same entry `super` really names. The match here sits in
+        // `outer::inner` and uses `super::indices::P0`, which Rust resolves to
+        // `outer::indices::P0` — one level up from `inner`, not the file root, and not
+        // `inner`'s own (nonexistent) `indices`. A root `mod indices` deliberately holds
+        // scattered, non-dense values so a wrong resolution (falling through to the
+        // heuristic's guess at the file root) reads as non-dense and is missed.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 200;\n    pub(crate) const P1: \
+             u8 = 201;\n    pub(crate) const P2: u8 = 202;\n    pub(crate) const P3: u8 = \
+             203;\n}\n\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = \
+             0;\n        pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = \
+             2;\n        pub(crate) const P3: u8 = 3;\n    }\n\n    mod inner {\n        \
+             const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n            \
+             match nibble & 0xF {\n                super::indices::P0 => 0,\n                \
+             super::indices::P1 => 1,\n                super::indices::P2 => 2,\n                \
+             super::indices::P3 => 3,\n                _ => 4,\n            }\n        }\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_singleton_range_patterns_is_reported() {
         // Codex's seventeenth-round finding: `pattern_literal` answered `None` for every
         // `Pat::Range`, including an inclusive range whose two ends are the same integer —
