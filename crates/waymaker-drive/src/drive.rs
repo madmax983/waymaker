@@ -440,7 +440,18 @@ impl<C: IntegrityCheck> Driver<C> {
         // own documentation for why one caller cannot hold it in both places at once.
         let mut source = Source::Scanning(Recovery::<_, C>::with_integrity(region, storage));
 
-        let recorded_version = begin(&mut source, &mut machine, workflow, page, self.reserve)?;
+        // A bank a swap installed but nothing has yet booted carries its intended version
+        // nowhere but its own immutable header — see `begin`'s own documentation of why an
+        // empty journal alone is the one case that still needs it.
+        let header_version = bank.as_ref().map(|context| context.workflow_version);
+        let recorded_version = begin(
+            &mut source,
+            &mut machine,
+            workflow,
+            page,
+            self.reserve,
+            header_version,
+        )?;
 
         let mut context = Context {
             activities: world,
@@ -759,16 +770,20 @@ where
 /// comparison, against the header instead of the journal, so that recording stays enforced
 /// rather than becoming unreachable the moment it is written.
 ///
-/// Kind and input only — never the header's own `workflow_version`. This runs on *every*
-/// boot of a bank-pointed driver, not only a bank's first, and a run already under way has
-/// its version recorded where it matters: in the journal's own `RunStarted`, which `begin`
-/// admits directly. The header's version is a fact about the swap that installed the bank,
-/// not about the run, and it never changes again — an image whose admitted range has moved
-/// on from it while still admitting the run's own recorded version would otherwise be
-/// refused over a number nothing here still depends on. For the one case this function
-/// exists for — an erased journal, nothing recorded yet — `begin` is about to write
-/// `identity.versions.current()` regardless of what the header says, which admits itself by
-/// construction and needs no check here to establish that.
+/// Kind and input only — never the header's own `workflow_version`, which is `begin`'s to
+/// admit instead, and differently depending on what it finds. This runs on *every* boot of a
+/// bank-pointed driver, not only a bank's first, and a run already under way has its version
+/// recorded where it matters: in the journal's own `RunStarted`, which `begin` admits
+/// directly, ignoring the header entirely. The header's version is a fact about the swap
+/// that installed the bank, not about the run, and it never changes again — an image whose
+/// admitted range has moved on from it while still admitting the run's own recorded version
+/// would otherwise be refused over a number nothing here still depends on. For the one case
+/// this function exists for — an erased journal, nothing recorded yet — the header's version
+/// is the *only* record of what this run was meant to be, and `begin` admits it before ever
+/// writing `identity.versions.current()` over it: Codex found that skipping this let an
+/// older, rolled-back image silently claim authorship of a run a newer image's swap had
+/// already named, the moment before that newer image's own first boot would have recorded
+/// it properly.
 fn verify_header_identity<S, C, W>(
     layout: BankLayout,
     id: BankId,
@@ -821,6 +836,7 @@ fn begin<S, C, W>(
     workflow: &W,
     page: &mut [u8],
     reserve: Reserve,
+    header_version: Option<u16>,
 ) -> Result<u16, DriveError<S::Error>>
 where
     S: StableStorage,
@@ -872,6 +888,20 @@ where
 
     // An erased journal. The run has to be recorded before anything can be scheduled
     // against it, and this is the one record the driver writes without the kernel asking.
+    //
+    // `header_version` is `Some` only for a bank-pointed driver, and only there does a
+    // still-empty journal have anything else durable to consult at all: the header a swap
+    // wrote. Codex found that skipping this let an older, rolled-back image boot such a
+    // bank on kind and input alone and silently record its own current version over one a
+    // newer image had already named — the header admits itself once a `RunStarted` exists
+    // to make that irreversible, but until then it is the one thing here that still depends
+    // on it.
+    if let Some(header_version) = header_version {
+        identity
+            .versions
+            .admits(header_version)
+            .map_err(DriveError::Kernel)?;
+    }
     let version = identity.versions.current();
     let record = RecordRef::RunStarted {
         workflow_kind: identity.kind,
@@ -2125,7 +2155,20 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         // §10's reserve, consulted before the device is touched rather than left to a
         // caller's discretion: the `Bounds` this run was priced against have to fit the
         // bank the swap installs into, and both banks of one layout are the same size.
-        Reserve::for_layout(self.reserve.bounds(), bank.layout).map_err(DriveError::Reserve)?;
+        let recomputed =
+            Reserve::for_layout(self.reserve.bounds(), bank.layout).map_err(DriveError::Reserve)?;
+        // Codex found that stopping at the line above only proves `self.reserve`'s *bounds*
+        // fit this layout in the abstract — it says nothing about whether `self.reserve`
+        // itself was ever priced against it. A caller who built this driver with a reserve
+        // computed for another layout passes that check every time, and the swap below
+        // would go on to install a run whose very first boot then meets `Reserved::over`
+        // on the empty new journal and fails with `CapacityError::WrongDevice` — after the
+        // old run is already gone. Comparing the two values here, before anything is
+        // touched, is the same refusal `Reserved::over` would reach one boot later, just
+        // early enough to matter.
+        if recomputed != self.reserve {
+            return Err(DriveError::Reserve(CapacityError::WrongDevice));
+        }
         // `Reserve::for_layout` prices the *bound* the run declared, not the bytes this
         // call was actually handed — a header wider than that bound still fits
         // `Swap::beginning`'s own, weaker gate, and installs a journal below

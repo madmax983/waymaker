@@ -8,14 +8,14 @@
 
 use waymaker_core::timer::TimerSpec;
 use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, Outcome, RunId};
+use waymaker_core::{ActivityKind, KernelError, Outcome, RecordRef, RunId};
 use waymaker_drive::{
     Boundary, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::Device;
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
-use waymaker_flash::capacity::{Bounds, Reserve};
-use waymaker_flash::frame::ProgramAlign;
+use waymaker_flash::capacity::{Bounds, CapacityError, Reserve};
+use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{JournalRegion, RecoveryError};
 use waymaker_flash::storage::{Geometry, StableStorage};
 
@@ -48,6 +48,23 @@ fn layout() -> BankLayout {
 
 fn align() -> ProgramAlign {
     layout().align()
+}
+
+/// A device twice [`geometry`]'s size, at the same granularity — so a [`Reserve`] priced
+/// against it is compatible in every way a reserve's own `bounds()` could ever reveal, and
+/// differs only in the bank size baked into the reserve itself.
+fn other_geometry() -> Geometry {
+    let Ok(geometry) = Geometry::new(16384, 8192, 8, 1) else {
+        unreachable!("16384/8192/8/1 is a legal geometry of two whole erase blocks")
+    };
+    geometry
+}
+
+fn other_layout() -> BankLayout {
+    let Ok(layout) = BankLayout::new(other_geometry()) else {
+        unreachable!("two erase blocks are two banks")
+    };
+    layout
 }
 
 fn reserve() -> Reserve {
@@ -333,6 +350,26 @@ impl Workflow for JustStartedAfterUpgrade {
         Identity {
             kind: WORKFLOW_KIND,
             versions: VersionRange::exact(WORKFLOW_VERSION + 1),
+            input: NEXT_INPUT,
+        }
+    }
+
+    fn run(&mut self, _boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
+/// A workflow over [`NEXT_INPUT`] that admits only [`WORKFLOW_VERSION`] — the version an
+/// image would carry if it had never taken the upgrade [`UpgradingContinueOnce`] represents,
+/// rolled back to over a bank that upgrade's own swap already installed and stamped with
+/// `WORKFLOW_VERSION + 1`.
+struct RolledBackToFirstVersion;
+
+impl Workflow for RolledBackToFirstVersion {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
             input: NEXT_INPUT,
         }
     }
@@ -1510,4 +1547,138 @@ fn a_stale_oversized_bank_never_inflates_the_reported_size_the_real_authority_ne
         ),
         "retrying with exactly the real authority's own requirement must boot it: {progress2:?}"
     );
+}
+
+#[test]
+fn an_empty_banks_header_version_is_admitted_before_a_rolled_back_image_claims_it() {
+    // Codex found this on round 8: `verify_header_identity` checks kind and input only, so
+    // an older image whose admitted range does not include the header's own recorded
+    // version could still boot a bank a newer image's swap installed but never itself
+    // booted — `begin`'s erased-journal branch would then silently stamp its own, older
+    // `current()` version over a run the header says was meant for something else entirely.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut UpgradingContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::Migrated { .. })),
+        "{progress:?}"
+    );
+    let (_, b_version, ..) = header_on(&mut device, BankId::B).expect("the swap installed bank B");
+    assert_eq!(b_version, WORKFLOW_VERSION + 1);
+
+    // Nothing has booted bank B yet — its journal is still empty. A rolled-back image that
+    // does not admit the version the header names must refuse rather than silently claim
+    // authorship of the run the swap already recorded.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut RolledBackToFirstVersion,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Kernel(KernelError::IncompatibleWorkflow))
+        ),
+        "an image that does not admit the header's own recorded version must refuse rather \
+         than silently claim an empty journal a newer image's swap already named: {progress:?}"
+    );
+
+    // Nothing was written: the header still names the version the swap actually stamped,
+    // and the journal is still empty.
+    let (_, b_version, ..) = header_on(&mut device, BankId::B).expect("bank B is untouched");
+    assert_eq!(b_version, WORKFLOW_VERSION + 1);
+}
+
+/// [`install`], plus a real `RunStarted` record programmed into the bank's own journal.
+///
+/// So that a boot of this bank never needs to *write* its opening record — `begin`'s
+/// existing-history branch reads it back directly and never calls `open`, which is what
+/// [`Reserve::for_layout`]'s own `Reserved::over` gate is behind. A fixture built with
+/// [`install`] alone cannot isolate a bad reserve at `swap_in` from the same bad reserve
+/// refusing this bank's *own* first write instead — the two would look identical from the
+/// boot's answer alone.
+fn install_with_run_started(
+    device: &mut Device,
+    id: BankId,
+    generation: Generation,
+    header: &BankHeader<'_>,
+) {
+    install(device, id, generation, header);
+    let region = layout().bank(id);
+    let Some(offset) = header.journal_offset() else {
+        unreachable!("this header's journal offset is representable")
+    };
+    let Ok(offset) = u32::try_from(offset) else {
+        unreachable!("a bank's journal offset fits a u32")
+    };
+    let record = RecordRef::RunStarted {
+        workflow_kind: header.workflow_kind,
+        workflow_version: header.workflow_version,
+        input: header.input,
+    };
+    let mut staging = [0_u8; 128];
+    let Ok(len) = frame::encode(&record, header.align, &mut staging) else {
+        unreachable!("a RunStarted record fits its own staging buffer")
+    };
+    let Some(record_bytes) = staging.get(..len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.base() + offset, record_bytes),
+        device.barrier(),
+    ) else {
+        unreachable!("a RunStarted record is a legal program")
+    };
+}
+
+#[test]
+fn a_reserve_priced_for_another_layout_is_refused_before_the_swap_touches_anything() {
+    // Codex found this on round 8: `Reserve::for_layout(self.reserve.bounds(), bank.layout)`
+    // only proves the *bounds* fit this layout in the abstract -- it says nothing about
+    // whether `self.reserve` itself was ever priced against it. A caller who built this
+    // driver with a reserve computed for a different, larger layout passed that check every
+    // time, and the swap would go on to install a run whose very first boot then meets
+    // `Reserved::over` on the empty new journal and fails with `CapacityError::WrongDevice`
+    // -- one boot after the old run is already gone.
+    //
+    // Bank A needs its *own* history already durable — `install_with_run_started` rather
+    // than `booted`'s bare header — so this boot's mismatched reserve is tested against
+    // `swap_in`'s own check, not against `begin`'s ordinary write of this bank's first
+    // record, which goes through exactly the same `Reserved::over` gate one call earlier.
+    let mut device = Device::new(geometry());
+    install_with_run_started(&mut device, BankId::A, Generation::FIRST, &first_header());
+
+    let Ok(mismatched) = Reserve::for_layout(BOUNDS, other_layout()) else {
+        unreachable!("these bounds fit the larger layout too")
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), mismatched).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Reserve(CapacityError::WrongDevice))
+        ),
+        "a reserve priced for another layout must be refused before the swap runs, not one \
+         boot later: {progress:?}"
+    );
+
+    // Nothing moved: bank A, with its pre-existing run, is still authoritative.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
 }
