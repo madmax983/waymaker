@@ -13,8 +13,8 @@ use waymaker_drive::demo::{
     BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_drive::{
-    Activities, Boundary, CheckedInput, Clocks, Conclusion, DriveError, Driver, DurableIntent,
-    Identity, Performed, Progress, Scratch, Suspended, Workflow,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
+    Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
@@ -277,12 +277,7 @@ impl Clocks for Greedy {
 }
 
 impl Activities for Greedy {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _input: CheckedInput<'_>,
-        out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
         Performed::Completed(out.len().saturating_add(1))
     }
 }

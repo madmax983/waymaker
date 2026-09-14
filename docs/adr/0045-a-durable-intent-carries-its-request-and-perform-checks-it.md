@@ -38,18 +38,26 @@ identity, in any caller's hands.
 
 **`Dispatchable::perform` is the one route from a proof and raw bytes to a dispatch.** It
 takes the `Activities` implementor and the input. It checks the input's length and digest
-against what step 3 committed. Only then does it call `Activities::perform`. That call's
-signature drops the free `kind` argument, because `DurableIntent::kind` is now the only
-source of one. A mismatch is `InputMismatch`, refused before the world is asked anything.
+against what step 3 committed. Only then does it call `Activities::perform`. A mismatch is
+`InputMismatch`, refused before the world is asked anything.
 
-**`Activities::perform` takes a `CheckedInput`, not a `&[u8]`.** `CheckedInput`'s field is
-private, and `Dispatchable::perform` is the only place that builds one — this crate's own
-`compile_fail` doctest shows a caller cannot construct one elsewhere. So a caller cannot
-reach `Activities::perform` with unchecked bytes by calling it directly either: there is no
-bytes-to-`CheckedInput` route outside the checked one. Codex found this exact bypass on
-review of this change's first version, which left `Activities::perform` taking `&[u8]` — a
-caller with a `DurableIntent` from `Dispatchable::intent()` could still call
-`activities.perform(intent, wrong_bytes, out)` directly. `CheckedInput` closes it.
+**`Activities::perform` takes one `CheckedDispatch`, not an identity and bytes as two
+separate arguments.** Both of `CheckedDispatch`'s fields — the `DurableIntent` and the
+bytes — are private, and `Dispatchable::perform` is the only place that builds one; this
+crate's own `compile_fail` doctest shows a caller cannot construct one elsewhere. So a
+caller cannot reach `Activities::perform` with an identity and bytes that were never checked
+against each other: there is no route to that pair except the one call that checks them
+together, and no way for an adapter to recombine a stale identity from an earlier call with
+the current call's bytes, because it would need two separate values to swap and there is
+only the one. Codex found this in two rounds of review of this change: the first version
+left `Activities::perform` taking `intent: DurableIntent` and `input: &[u8]` as two
+arguments, so a caller with a `DurableIntent` from `Dispatchable::intent()` could call
+`activities.perform(intent, wrong_bytes, out)` directly; wrapping the bytes alone in a
+`CheckedInput` closed that route but left the identity a separate argument still, so an
+adapter forwarding to another `Activities` implementor could still pair one effect's
+`DurableIntent` with another effect's `CheckedInput` and produce a value that was, field by
+field, individually valid. `CheckedDispatch` merges both into the one value
+`Dispatchable::perform` builds atomically, closing that too.
 
 **`Effect::redelivering` threads the request through, with no new read of media and no
 kernel-boundary change.** `waymaker-drive`'s own `decide` already builds an `EffectRequest`
@@ -62,33 +70,35 @@ redelivered `DurableIntent`. Issue #92 raised a heavier alternative: thread the 
 `kernel-boundary`'s pinned types. It turned out not to be needed. The kernel has already
 vouched for the request the driver already holds.
 
-**`effect-protocol` pins the two new methods.** `DurableIntent::kind` and
-`Dispatchable::perform` join `EFFECT_PROTOCOL_SURFACE` and `EFFECT_TYPE_METHODS`. Nothing
-changes about the step order, the construction sites, or the redelivery vocabulary. `perform`
-calls none of `.stage(`, `.payload_barrier(`, `.commit(`. So it is not one of §07's storage
-steps, and needs no place in `EFFECT_STEP_BODIES`.
+**`effect-protocol` pins all four new methods.** `DurableIntent::kind`,
+`Dispatchable::perform`, `CheckedDispatch::bytes` and `CheckedDispatch::durable_intent` join
+`EFFECT_PROTOCOL_SURFACE` and `EFFECT_TYPE_METHODS`. None calls `.stage(`, `.payload_barrier(`
+or `.commit(`. So none is one of §07's storage steps, and none needs a place in
+`EFFECT_STEP_BODIES`.
 
 ## Consequences
 
-A caller cannot dispatch one effect's identity under another effect's kind, and cannot
-dispatch it under another effect's input either. Both are now facts the compiler checks, for
+A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
+it under another effect's bytes, and cannot pair this identity with a different call's bytes
+by holding one back and forwarding it later. All three are now facts the compiler checks, for
 every caller there is or will be — including a caller who calls `Activities::perform`
-directly, bypassing `Dispatchable::perform`, since there is still no bytes it could pass that
-argument. This is closer to absolute than most guarantees a trait boundary between two crates
-can state: the one gap left is a caller inside `waymaker-drive` itself reaching into
-`effect.rs`'s own module to build a `CheckedInput` by hand, which is a source change to this
-crate, not a misuse of its public API.
+directly, bypassing `Dispatchable::perform`, since there is still no value it could pass that
+argument except one already checked. This is closer to absolute than most guarantees a trait
+boundary between two crates can state: the one gap left is a caller inside `waymaker-drive`
+itself reaching into `effect.rs`'s own module to build a `CheckedDispatch` by hand, which is
+a source change to this crate, not a misuse of its public API.
 
 `DurableIntent` doubles in size: an `EffectId` plus an `EffectRequest`. Both are `Copy` and
-stack-passed. So nothing here touches a heap — this engine has none. `CheckedInput` costs
-nothing: a one-field wrapper around `&[u8]` has the same layout as `&[u8]`, and the optimiser
-erases it. `Dispatchable::perform` recomputes an input digest `decide` already computed once,
-to build the request. That costs one redundant `C::frame_check` call per dispatch, on the
-shipped path. In exchange, the same check applies unconditionally to every other caller.
-Measured, not assumed: `cargo xtask size`'s gated `layers` figure moves from ADR 0036's
-12820 B to **12732 B** of the 13312 B gate — down, not up, and unchanged again by
-`CheckedInput`. The wider `DurableIntent` and the new checked call cost this optimiser less
-than the free `kind` argument they replace. No raise is asked for.
+stack-passed. So nothing here touches a heap — this engine has none. `CheckedDispatch` costs
+nothing beyond that: a two-field wrapper around a `DurableIntent` and a `&[u8]` has the same
+layout as the pair passed separately, and the optimiser erases the wrapping.
+`Dispatchable::perform` recomputes an input digest `decide` already computed once, to build
+the request. That costs one redundant `C::frame_check` call per dispatch, on the shipped
+path. In exchange, the same check applies unconditionally to every other caller. Measured,
+not assumed: `cargo xtask size`'s gated `layers` figure moves from ADR 0036's 12820 B to
+**12732 B** of the 13312 B gate — an 88 B drop, not a rise, and unmoved again by
+`CheckedDispatch`. The wider `DurableIntent` and the new checked call cost this optimiser
+less than the free `kind` argument they replace. No raise is asked for.
 
 `DriveError` gains `EffectInputMismatch`. `waymaker-drive`'s own `Context::dispatch` cannot
 reach it, for the reason above. It is named anyway: a `Result` this driver cannot construct
@@ -111,6 +121,13 @@ Issue #92's "first, weaker" option. Rejected. It closes the kind half: there is 
 argument left to disagree. But it leaves the input half exactly where it was. A caller could
 still read `dispatchable.intent()` and call `activities.perform(intent, wrong_bytes, out)`
 directly. Nothing forces the caller through a checked path.
+
+**A `CheckedInput` wrapping only the bytes, with the identity a separate argument.** This
+change's own second version, until Codex's second round of review. Rejected: it closes the
+route to unchecked bytes, but an adapter forwarding to another `Activities` implementor could
+still hold a stale `DurableIntent` from an earlier call and pair it with the current call's
+`CheckedInput`, producing a combination that is individually valid in each field and wrong as
+a pair. Bundling both into one value removes the second value there would be to swap.
 
 **A CRC comparison inside `Activities::perform` itself, left to each implementor.** Rejected.
 It would ask every firmware author to reimplement the same check, and get the same answer.

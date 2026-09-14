@@ -17,15 +17,15 @@
 //!
 //! # What makes step 4 unmistakable
 //!
-//! A [`DurableIntent`] carries the kind and the input digest, not only the sequence, so
-//! [`Activities::perform`] reads the kind from `intent` and has no second argument to read a
-//! different one from. [`Dispatchable::perform`] is the one route from a proof and raw bytes
-//! to a dispatched effect. It checks the bytes against the digest, then wraps them in a
-//! [`CheckedInput`] — a type with a private field, built nowhere else. So a caller cannot use
-//! effect A's identity to dispatch effect B's kind, and cannot reach `Activities::perform`
-//! with effect B's input either, because there is no way to build the value that argument
-//! takes except by passing this check first. See
-//! [issue #92](https://github.com/madmax983/waymaker/issues/92).
+//! A [`DurableIntent`] carries the kind and the input digest, not only the sequence.
+//! [`Dispatchable::perform`] is the one route from a proof and raw bytes to a dispatched
+//! effect. It checks the bytes against the digest, then binds the identity and the checked
+//! bytes into one [`CheckedDispatch`] — a type with private fields, built nowhere else — and
+//! hands that to [`Activities::perform`]. So a caller cannot dispatch effect A's identity
+//! under effect B's kind or bytes: there is no second argument to read a different kind from,
+//! no way to reach `Activities::perform` with bytes the check did not vouch for, and no way
+//! to pair this identity with bytes from a different, earlier call, because both live in one
+//! value built at one place. See [issue #92](https://github.com/madmax983/waymaker/issues/92).
 //!
 //! # Why this crate
 //!
@@ -278,23 +278,32 @@ impl<C: IntegrityCheck> Effect<C> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InputMismatch;
 
-/// Bytes [`Dispatchable::perform`] has checked against the recorded digest.
+/// An identity and its bytes, bound together after the check passes.
 ///
-/// The only way to build one is inside [`Dispatchable::perform`], after the check passes.
-/// Its field is private, so no caller — inside this crate or outside it — can hand
-/// [`Activities::perform`] bytes the digest never vouched for.
+/// The only way to build one is inside [`Dispatchable::perform`]. Both fields are private, so
+/// no caller can pair one effect's identity with another effect's bytes: there is no route to
+/// this value except the one call that checks them together.
 ///
 /// ```compile_fail,E0451
-/// use waymaker_drive::CheckedInput;
+/// use waymaker_drive::{CheckedDispatch, DurableIntent};
 ///
-/// let forged = CheckedInput { bytes: b"anything" };
+/// fn forge(intent: DurableIntent) -> CheckedDispatch<'static> {
+///     CheckedDispatch { intent, bytes: b"anything" }
+/// }
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct CheckedInput<'a> {
+pub struct CheckedDispatch<'a> {
+    intent: DurableIntent,
     bytes: &'a [u8],
 }
 
-impl<'a> CheckedInput<'a> {
+impl<'a> CheckedDispatch<'a> {
+    /// The identity this dispatch is under.
+    #[must_use]
+    pub const fn durable_intent(self) -> DurableIntent {
+        self.intent
+    }
+
     /// The checked bytes.
     #[must_use]
     pub const fn bytes(self) -> &'a [u8] {
@@ -321,9 +330,11 @@ impl<C: IntegrityCheck> Dispatchable<C> {
     /// Checks `input` against what step 3 committed, before `activities` ever sees it. This
     /// is the whole guarantee [`DurableIntent`] states. The kind cannot be a different kind:
     /// there is no second argument to read one from. The input cannot be different bytes
-    /// either: [`Activities::perform`] takes a [`CheckedInput`], and this is the only place
-    /// that builds one. A caller cannot skip the check by calling `Activities::perform`
-    /// directly, because it has no bytes to pass it that were not checked here first.
+    /// either: [`Activities::perform`] takes one [`CheckedDispatch`], built here from the
+    /// identity that was just checked and the bytes it was checked against, together. A
+    /// caller cannot skip the check by calling `Activities::perform` directly, and cannot
+    /// pair this identity with another effect's bytes by holding one back from an earlier
+    /// call: both live in the one value this call builds, and nowhere else.
     ///
     /// # Errors
     ///
@@ -341,7 +352,13 @@ impl<C: IntegrityCheck> Dispatchable<C> {
         {
             return Err(InputMismatch);
         }
-        Ok(activities.perform(self.intent, CheckedInput { bytes: input }, out))
+        Ok(activities.perform(
+            CheckedDispatch {
+                intent: self.intent,
+                bytes: input,
+            },
+            out,
+        ))
     }
 
     /// §07 steps 5, 6 and 7: the outcome frame, the payload barrier, and the seal.
@@ -402,7 +419,7 @@ mod tests {
 
     use super::{Effect, InputMismatch, Resolution};
     use crate::activity::{Activities, Performed};
-    use crate::effect::{CheckedInput, DurableIntent};
+    use crate::effect::{CheckedDispatch, DurableIntent};
 
     const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
 
@@ -483,19 +500,14 @@ mod tests {
     }
 
     impl Activities for Recording {
-        fn perform(
-            &mut self,
-            intent: DurableIntent,
-            input: CheckedInput<'_>,
-            out: &mut [u8],
-        ) -> Performed {
-            let input = input.bytes();
+        fn perform(&mut self, dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
+            let input = dispatch.bytes();
             let mut bytes = [0_u8; 3];
             let taken = input.len().min(bytes.len());
             if let (Some(from), Some(into)) = (input.get(..taken), bytes.get_mut(..taken)) {
                 into.copy_from_slice(from);
             }
-            self.asked = Some((intent, bytes));
+            self.asked = Some((dispatch.durable_intent(), bytes));
             let answer = b"ok";
             if let Some(dst) = out.get_mut(..answer.len()) {
                 dst.copy_from_slice(answer);

@@ -3976,15 +3976,20 @@ pub const EFFECT_PROTOCOL_PATH: &str = "waymaker-drive/src/effect.rs";
 /// from a sequence number — which is a forge in any hand but the driver's beside it. It is
 /// `pub(crate)`, and [`EFFECT_TYPE_METHODS`] is what keeps it declared.
 ///
-/// `kind`, `perform` and `bytes` are issue [#92](https://github.com/madmax983/waymaker/issues/92)'s:
-/// `DurableIntent::kind` reads the activity step 3 committed rather than a second argument
-/// naming one, and `Dispatchable::perform` is the one route from a proof and raw bytes to a
-/// dispatch — it checks the bytes against the digest step 3 committed, then wraps them in a
-/// `CheckedInput`, whose one method, `bytes`, is how an implementor reads them back.
+/// `kind`, `perform`, `bytes` and `durable_intent` are issue
+/// [#92](https://github.com/madmax983/waymaker/issues/92)'s: `DurableIntent::kind` reads the
+/// activity step 3 committed rather than a second argument naming one, and
+/// `Dispatchable::perform` is the one route from a proof and raw bytes to a dispatch — it
+/// checks the bytes against the digest step 3 committed, then binds the identity and the
+/// bytes into one `CheckedDispatch`, whose two methods, `durable_intent` and `bytes`, are how
+/// an implementor reads them back. Two methods rather than one so that an implementor cannot
+/// read one effect's identity beside another effect's bytes: both come from the one value
+/// this file builds once, and nowhere else.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
 pub const EFFECT_PROTOCOL_SURFACE: &[&str] = &[
     "bytes",
+    "durable_intent",
     "id",
     "intent",
     "into_writer",
@@ -4007,7 +4012,7 @@ pub const EFFECT_PROTOCOL_SURFACE: &[&str] = &[
 ///
 /// Each list is sorted, so the comparison can be a set comparison.
 pub const EFFECT_TYPE_METHODS: [(&str, &[&str]); 4] = [
-    ("CheckedInput", &["bytes"]),
+    ("CheckedDispatch", &["bytes", "durable_intent"]),
     ("DurableIntent", &["id", "kind"]),
     ("Dispatchable", &["intent", "perform", "resolve"]),
     (
@@ -4032,11 +4037,11 @@ pub const EFFECT_CONSTRUCTIONS: [(&str, [&str; 2]); 2] = [
 /// The construction scan counts a type's *name*, so `Self { .. }` inside the type's own
 /// `impl` is a construction it cannot see. Review of this change used exactly that, beside a
 /// `pub(crate)` constructor, to mint a `DurableIntent` with the gate green. `Effect` is not
-/// here: it is not a proof of anything, and its own constructor is a `Self`. `CheckedInput`
-/// is issue [#92](https://github.com/madmax983/waymaker/issues/92)'s: a trait impl that built
-/// one from arbitrary bytes would let a caller hand `Activities::perform` input the digest
-/// never checked.
-pub const EFFECT_NO_SELF_LITERAL: [&str; 3] = ["CheckedInput", "DurableIntent", "Dispatchable"];
+/// here: it is not a proof of anything, and its own constructor is a `Self`.
+/// `CheckedDispatch` is issue [#92](https://github.com/madmax983/waymaker/issues/92)'s: a
+/// trait impl that built one from an arbitrary identity and arbitrary bytes would let a
+/// caller hand `Activities::perform` a pair the check never vouched for.
+pub const EFFECT_NO_SELF_LITERAL: [&str; 3] = ["CheckedDispatch", "DurableIntent", "Dispatchable"];
 
 /// The type that owns each body §07's storage steps happen in, and that body's name.
 ///
@@ -15194,12 +15199,18 @@ impl DurableIntent {
     }
 }
 
-/// Bytes step 4 has checked against the recorded digest.
-pub struct CheckedInput<'a> {
+/// An identity and its bytes, bound together after the check passes.
+pub struct CheckedDispatch<'a> {
+    intent: DurableIntent,
     bytes: &'a [u8],
 }
 
-impl<'a> CheckedInput<'a> {
+impl<'a> CheckedDispatch<'a> {
+    /// The identity this dispatch is under.
+    pub const fn durable_intent(self) -> DurableIntent {
+        self.intent
+    }
+
     /// The checked bytes.
     pub const fn bytes(self) -> &'a [u8] {
         self.bytes

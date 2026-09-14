@@ -22,7 +22,7 @@ use waymaker_drive::ota::{
     WORKFLOW_VERSION, poll_ota,
 };
 use waymaker_drive::{
-    Activities, Boundary, CheckedInput, Clocks, Conclusion, DriveError, Driver, Identity,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
@@ -183,12 +183,7 @@ struct Unused {
 }
 
 impl Activities for Unused {
-    fn perform(
-        &mut self,
-        _intent: waymaker_drive::DurableIntent,
-        _input: CheckedInput<'_>,
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
         self.performed += 1;
         Performed::Pending
     }
