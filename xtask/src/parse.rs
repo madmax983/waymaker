@@ -106,6 +106,75 @@ fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
     }
 }
 
+/// The attributes on an expression, for the variants an expression *statement* can
+/// carry its own `#[cfg(test)]` on directly — `syn::Expr` is `#[non_exhaustive]` and has
+/// no one accessor every variant shares, so this covers the named shapes and falls back
+/// to none for anything else (`Verbatim` carries none at all, and a future variant this
+/// scan does not yet know about is the same standing).
+fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(e) => &e.attrs,
+        syn::Expr::Assign(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Await(e) => &e.attrs,
+        syn::Expr::Binary(e) => &e.attrs,
+        syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Break(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::Cast(e) => &e.attrs,
+        syn::Expr::Closure(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        syn::Expr::Continue(e) => &e.attrs,
+        syn::Expr::Field(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Group(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Index(e) => &e.attrs,
+        syn::Expr::Infer(e) => &e.attrs,
+        syn::Expr::Let(e) => &e.attrs,
+        syn::Expr::Lit(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Paren(e) => &e.attrs,
+        syn::Expr::Path(e) => &e.attrs,
+        syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::Reference(e) => &e.attrs,
+        syn::Expr::Repeat(e) => &e.attrs,
+        syn::Expr::Return(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Try(e) => &e.attrs,
+        syn::Expr::TryBlock(e) => &e.attrs,
+        syn::Expr::Tuple(e) => &e.attrs,
+        syn::Expr::Unary(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::Yield(e) => &e.attrs,
+        _ => &[],
+    }
+}
+
+/// Whether `stmt` carries exactly `#[cfg(test)]` on its own attributes — a `let`, a bare
+/// expression, or a statement-position macro invocation, whichever of the three it is.
+///
+/// Codex's finding, against two different scans: `rustc` strips a `#[cfg(test)]`
+/// statement from shipped code whichever of these three shapes it is, and the earlier
+/// fix for this only ever checked [`syn::Stmt::Local`] — a bare `#[cfg(test)] match
+/// nibble { .. };` expression statement, or a `#[cfg(test)] some_macro!();` statement,
+/// were each still walked into and read as production code. An item statement is not
+/// checked here at all: [`syn::Item`] is already excluded by every visitor's own
+/// `visit_item` override, which this function's callers reach through the ordinary
+/// per-statement dispatch for anything this returns `false` for.
+fn stmt_is_cfg_test(stmt: &syn::Stmt) -> bool {
+    match stmt {
+        syn::Stmt::Local(local) => has_cfg_test(&local.attrs),
+        syn::Stmt::Expr(expr, _) => has_cfg_test(expr_attrs(expr)),
+        syn::Stmt::Macro(mac) => has_cfg_test(&mac.attrs),
+        syn::Stmt::Item(_) => false,
+    }
+}
+
 /// Strips a raw marker from every identifier in `stream`.
 ///
 /// `#![allow(r#missing_docs)]` renders as `allow(r#missing_docs)` through
@@ -914,6 +983,21 @@ pub fn macro_uses(contents: &str) -> Result<Vec<String>, syn::Error> {
             syn::visit::visit_impl_item(self, node);
         }
 
+        // Codex's finding: the item and `impl`-member exclusions above say nothing
+        // about a *local* statement, so a `#[cfg(test)] assert_eq!(...);` — or any
+        // other cfg-gated local, `rustc` strips the whole statement from shipped code
+        // — inside an otherwise ordinary function was still walked into and its macro
+        // reported as a second production one. [`stmt_is_cfg_test`] is the same check
+        // [`MatchVisitor::visit_block`] makes, reused here rather than duplicated.
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            for stmt in &node.stmts {
+                if stmt_is_cfg_test(stmt) {
+                    continue;
+                }
+                self.visit_stmt(stmt);
+            }
+        }
+
         fn visit_macro(&mut self, node: &'ast syn::Macro) {
             let segments: Vec<String> = node
                 .path
@@ -1404,53 +1488,124 @@ fn collect_child_modules(
     found: &mut Vec<ChildModule>,
 ) {
     for item in items {
-        let syn::Item::Mod(module) = item else {
-            continue;
-        };
-        let name = ident_name(&module.ident);
-        let item_gated = gated || has_cfg_test(&module.attrs);
-        if let Some((_, nested)) = module.content.as_ref() {
-            // Inline: no file of its own, but its out-of-line children live under it.
-            inline_path.push(name.clone());
-            collect_child_modules(
-                nested,
+        collect_child_modules_from_item(item, parent_dir, child_dir, gated, inline_path, found);
+    }
+}
+
+/// [`collect_child_modules`]'s own per-item body, factored out so it can call itself on a
+/// function or method body's local item statements as well as on a file's or an inline
+/// module's own item list.
+///
+/// Codex's finding: module discovery started and stayed at `file.items`, so a `mod`
+/// declared inside a function body — legal Rust, and the one shape `rustc` requires a
+/// `#[path]` attribute for, since a block has no directory of its own to fall back to —
+/// was never seen at all. Its directory context is its enclosing function's, which is not
+/// a directory-owning scope of its own, so a function or method body is walked with
+/// `parent_dir`, `child_dir`, `gated` and `inline_path` all unchanged from what its
+/// surrounding item-level module already had; only `Item::Mod` and `Item::Fn` items in
+/// the body matter, and a nested one is reached by this function recursing into itself.
+fn collect_child_modules_from_item(
+    item: &syn::Item,
+    parent_dir: &str,
+    child_dir: &str,
+    gated: bool,
+    inline_path: &mut Vec<String>,
+    found: &mut Vec<ChildModule>,
+) {
+    match item {
+        syn::Item::Mod(module) => {
+            let name = ident_name(&module.ident);
+            let item_gated = gated || has_cfg_test(&module.attrs);
+            if let Some((_, nested)) = module.content.as_ref() {
+                // Inline: no file of its own, but its out-of-line children live under it.
+                inline_path.push(name.clone());
+                collect_child_modules(
+                    nested,
+                    parent_dir,
+                    &format!("{child_dir}{name}/"),
+                    item_gated,
+                    inline_path,
+                    found,
+                );
+                inline_path.pop();
+            } else {
+                // A `#[path]` attribute resolves against the *declaring file's* own
+                // directory at the top level (`parent_dir`), but Codex's finding is that
+                // this stops being true the moment the declaration sits inside an inline
+                // `mod { ... }`: `rustc` then resolves it against that inline module's own
+                // directory instead, which is `child_dir` by the time this call is
+                // reached — it was extended with each inline module's own name on the way
+                // in, one level per `inline_path.push` above. `inline_path` being
+                // non-empty is exactly "this declaration is nested inside at least one
+                // inline module" — a function body carries the same `inline_path` its
+                // surrounding item-level module had, so this reads correctly for a `mod`
+                // declared inside a function nested in an inline module too.
+                let path_base = if inline_path.is_empty() {
+                    parent_dir
+                } else {
+                    child_dir
+                };
+                let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
+                    || {
+                        vec![
+                            format!("{child_dir}{name}.rs"),
+                            format!("{child_dir}{name}/mod.rs"),
+                        ]
+                    },
+                    // `rustc` consults exactly this one path (see above): no fallback.
+                    |path| vec![normalize_path(&format!("{path_base}{path}"))],
+                );
+                found.push(ChildModule {
+                    name,
+                    inline_ancestors: inline_path.clone(),
+                    candidates,
+                    test_gated: item_gated,
+                });
+            }
+        }
+        syn::Item::Fn(function) => {
+            collect_child_modules_from_block(
+                &function.block,
                 parent_dir,
-                &format!("{child_dir}{name}/"),
-                item_gated,
+                child_dir,
+                gated,
                 inline_path,
                 found,
             );
-            inline_path.pop();
-        } else {
-            // A `#[path]` attribute resolves against the *declaring file's* own directory
-            // at the top level (`parent_dir`), but Codex's finding is that this stops
-            // being true the moment the declaration sits inside an inline `mod { ... }`:
-            // `rustc` then resolves it against that inline module's own directory
-            // instead, which is `child_dir` by the time this call is reached — it was
-            // extended with each inline module's own name on the way in, one level per
-            // `inline_path.push` above. `inline_path` being non-empty is exactly "this
-            // declaration is nested inside at least one inline module".
-            let path_base = if inline_path.is_empty() {
-                parent_dir
-            } else {
-                child_dir
-            };
-            let candidates = module.attrs.iter().find_map(path_attr_value).map_or_else(
-                || {
-                    vec![
-                        format!("{child_dir}{name}.rs"),
-                        format!("{child_dir}{name}/mod.rs"),
-                    ]
-                },
-                // `rustc` consults exactly this one path (see above): no fallback.
-                |path| vec![normalize_path(&format!("{path_base}{path}"))],
-            );
-            found.push(ChildModule {
-                name,
-                inline_ancestors: inline_path.clone(),
-                candidates,
-                test_gated: item_gated,
-            });
+        }
+        syn::Item::Impl(implementation) => {
+            for member in &implementation.items {
+                if let syn::ImplItem::Fn(method) = member {
+                    collect_child_modules_from_block(
+                        &method.block,
+                        parent_dir,
+                        child_dir,
+                        gated,
+                        inline_path,
+                        found,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`collect_child_modules_from_item`]'s block half: every local item statement in
+/// `block`, each handed to the same function that reads a file's or a module's own items —
+/// a function body is not a directory-owning scope, so nothing about the walk's context
+/// changes on the way in.
+fn collect_child_modules_from_block(
+    block: &syn::Block,
+    parent_dir: &str,
+    child_dir: &str,
+    gated: bool,
+    inline_path: &mut Vec<String>,
+    found: &mut Vec<ChildModule>,
+) {
+    for stmt in &block.stmts {
+        if let syn::Stmt::Item(item) = stmt {
+            collect_child_modules_from_item(item, parent_dir, child_dir, gated, inline_path, found);
         }
     }
 }
@@ -1510,7 +1665,7 @@ pub struct FoundArm {
     /// path resolving to a `const` this same scan found declared with a literal
     /// initializer (`literal_or_const_value`'s reach) — or `None` for anything else,
     /// `_` included.
-    pub pattern: Option<u128>,
+    pub pattern: Option<i128>,
     /// Whether the pattern is irrefutable the way a dense table's final arm needs to be —
     /// `_`, or an unguarded binding naming no known constant — since a plain binding
     /// matches everything a wildcard does and compiles to the identical lookup table.
@@ -1518,7 +1673,7 @@ pub struct FoundArm {
     /// The callee name and the resolved argument value, when the arm's whole value is a
     /// call with exactly one argument. `None` for anything else, including a call whose
     /// argument this scan cannot resolve to a value.
-    pub call: Option<(String, Option<u128>)>,
+    pub call: Option<(String, Option<i128>)>,
 }
 
 /// Every `match` expression `contents` declares, anywhere one can appear, outside
@@ -1562,7 +1717,7 @@ pub struct FoundArm {
 )]
 pub fn match_expressions(
     contents: &str,
-    external_qualified: &std::collections::HashMap<String, u128>,
+    external_qualified: &std::collections::HashMap<String, i128>,
 ) -> Result<Vec<FoundMatch>, syn::Error> {
     match_expressions_with_prefix(contents, external_qualified, &[])
 }
@@ -1594,7 +1749,7 @@ pub fn match_expressions(
 )]
 pub fn match_expressions_with_prefix(
     contents: &str,
-    external_qualified: &std::collections::HashMap<String, u128>,
+    external_qualified: &std::collections::HashMap<String, i128>,
     prefix: &[String],
 ) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
@@ -1635,7 +1790,7 @@ pub fn match_expressions_with_prefix(
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn qualified_constants(
     contents: &str,
-) -> Result<std::collections::HashMap<String, u128>, syn::Error> {
+) -> Result<std::collections::HashMap<String, i128>, syn::Error> {
     qualified_constants_with_prefix(contents, &[])
 }
 
@@ -1658,7 +1813,7 @@ pub fn qualified_constants(
 pub fn qualified_constants_with_prefix(
     contents: &str,
     prefix: &[String],
-) -> Result<std::collections::HashMap<String, u128>, syn::Error> {
+) -> Result<std::collections::HashMap<String, i128>, syn::Error> {
     let file = parse_rust(contents)?;
     let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
     let mut qualified = std::collections::HashMap::new();
@@ -1689,11 +1844,11 @@ pub fn qualified_constants_with_prefix(
 /// reverse. Resolution has to respect the same lexical scoping `rustc` gives these names:
 /// innermost declaration wins, and a name invisible from a given point (declared in a
 /// sibling module or a different function) must not be resolved from there at all.
-struct ConstScopes(Vec<std::collections::HashMap<String, u128>>);
+struct ConstScopes(Vec<std::collections::HashMap<String, i128>>);
 
 impl ConstScopes {
     /// `name`'s value at the innermost scope that declares it, searching outward.
-    fn resolve(&self, name: &str) -> Option<u128> {
+    fn resolve(&self, name: &str) -> Option<i128> {
         self.0
             .iter()
             .rev()
@@ -1713,7 +1868,7 @@ impl ConstScopes {
     /// Truncating the stack to `depth` — the length it had right after the target ancestor
     /// module's own scope was pushed — excludes every scope nested inside that ancestor,
     /// so the search can only find that ancestor's own constant or one further outward.
-    fn resolve_from(&self, name: &str, depth: usize) -> Option<u128> {
+    fn resolve_from(&self, name: &str, depth: usize) -> Option<i128> {
         self.0
             .get(..depth)?
             .iter()
@@ -1899,8 +2054,8 @@ fn flatten_use_tree(tree: &syn::UseTree, prefix: &mut Vec<String>, scope: &mut U
 fn resolve_scope_consts(
     own: &std::collections::HashMap<String, syn::Expr>,
     outer: &ConstScopes,
-) -> std::collections::HashMap<String, u128> {
-    let mut resolved: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+) -> std::collections::HashMap<String, i128> {
+    let mut resolved: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
     for _ in 0..own.len().max(1) {
         let mut progressed = false;
         for (name, expr) in own {
@@ -1937,11 +2092,11 @@ fn resolve_scope_consts(
 /// had ever looked past `syn::Lit::Int`, and a `char`'s own discriminant is no less a
 /// number than a byte's — `rustc` lowers a dense `char` match to the same indexed `.rodata`
 /// a `u8` one gets.
-fn lit_value(lit: &syn::Lit) -> Option<u128> {
+fn lit_value(lit: &syn::Lit) -> Option<i128> {
     match lit {
-        syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
-        syn::Lit::Byte(byte) => Some(u128::from(byte.value())),
-        syn::Lit::Char(char) => Some(u128::from(char.value())),
+        syn::Lit::Int(int) => int.base10_parse::<i128>().ok(),
+        syn::Lit::Byte(byte) => Some(i128::from(byte.value())),
+        syn::Lit::Char(char) => Some(i128::from(u32::from(char.value()))),
         _ => None,
     }
 }
@@ -1951,8 +2106,8 @@ fn lit_value(lit: &syn::Lit) -> Option<u128> {
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
 fn literal_or_const_value(
     expr: &syn::Expr,
-    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
-) -> Option<u128> {
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
     match expr {
         syn::Expr::Lit(literal) => lit_value(&literal.lit),
         syn::Expr::Cast(cast) => literal_or_const_value(&cast.expr, resolve),
@@ -1990,6 +2145,15 @@ fn literal_or_const_value(
                 _ => None,
             }
         }
+        // Codex's finding: a negative *range endpoint* (`-8..=6`) is a full expression,
+        // not the special negative-literal-pattern grammar a bare `-8` pattern parses
+        // through — `syn::Pat::Range`'s own `start`/`end` are `Expr`s, so `-8` there is
+        // `Expr::Unary(Neg, Expr::Lit(8))` and never reached `lit_value` at all. Checked,
+        // like every other fold here: negating `i128::MIN` has no representable positive
+        // counterpart and fails closed rather than wrapping.
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            literal_or_const_value(&unary.expr, resolve)?.checked_neg()
+        }
         _ => None,
     }
 }
@@ -2021,8 +2185,8 @@ fn literal_or_const_value(
 /// [`is_catchall_pattern`]'s question, not this one's.
 fn pattern_literal(
     pattern: &syn::Pat,
-    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
-) -> Option<u128> {
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<i128> {
     match pattern {
         syn::Pat::Lit(literal) => lit_value(&literal.lit),
         syn::Pat::Ident(named) if named.by_ref.is_none() => match &named.subpat {
@@ -2062,7 +2226,7 @@ fn pattern_literal(
 fn is_catchall_pattern(
     pattern: &syn::Pat,
     guarded: bool,
-    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
 ) -> bool {
     if guarded {
         return false;
@@ -2082,8 +2246,8 @@ fn is_catchall_pattern(
 /// an unwrapped one once a real parser is reading it.
 fn call_shape_of(
     expr: &syn::Expr,
-    resolve: &dyn Fn(&syn::Path) -> Option<u128>,
-) -> Option<(String, Option<u128>)> {
+    resolve: &dyn Fn(&syn::Path) -> Option<i128>,
+) -> Option<(String, Option<i128>)> {
     match expr {
         syn::Expr::Paren(paren) => call_shape_of(&paren.expr, resolve),
         syn::Expr::Group(group) => call_shape_of(&group.expr, resolve),
@@ -2159,9 +2323,9 @@ fn call_shape_of(
 /// lets `crate::indices::P0` keep finding a `mod indices` recorded relative to the file root.
 fn resolve_qualified_path(
     path: &syn::Path,
-    qualified: &std::collections::HashMap<String, u128>,
+    qualified: &std::collections::HashMap<String, i128>,
     current_module: &[String],
-) -> Option<u128> {
+) -> Option<i128> {
     let segments: Vec<String> = path
         .segments
         .iter()
@@ -2234,10 +2398,10 @@ fn resolve_ancestor_single_segment(
     module_path: &[String],
     module_scope_depths: &[usize],
     scopes: &ConstScopes,
-    qualified: &std::collections::HashMap<String, u128>,
+    qualified: &std::collections::HashMap<String, i128>,
     levels_up: usize,
     name: &str,
-) -> Option<u128> {
+) -> Option<i128> {
     let local_count = module_scope_depths.len();
     if levels_up < local_count {
         let depth = module_scope_depths
@@ -2282,7 +2446,7 @@ enum AnchoredLookup {
     /// at all.
     NotApplicable,
     /// Anchored; this is what the anchor's own scope resolved the name to.
-    Resolved(Option<u128>),
+    Resolved(Option<i128>),
 }
 
 fn resolve_anchored_single_segment(
@@ -2290,7 +2454,7 @@ fn resolve_anchored_single_segment(
     scopes: &ConstScopes,
     module_path: &[String],
     module_scope_depths: &[usize],
-    qualified: &std::collections::HashMap<String, u128>,
+    qualified: &std::collections::HashMap<String, i128>,
 ) -> AnchoredLookup {
     let Some((&first, rest)) = refs.split_first() else {
         return AnchoredLookup::NotApplicable;
@@ -2355,10 +2519,10 @@ fn resolve_pattern_path(
     path: &syn::Path,
     scopes: &ConstScopes,
     use_scopes: &UseScopes,
-    qualified: &std::collections::HashMap<String, u128>,
+    qualified: &std::collections::HashMap<String, i128>,
     module_path: &[String],
     module_scope_depths: &[usize],
-) -> Option<u128> {
+) -> Option<i128> {
     if let Some(ident) = path.get_ident() {
         let name = ident_name(ident);
         if let Some(value) = scopes.resolve(&name) {
@@ -2406,6 +2570,32 @@ fn resolve_pattern_path(
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
+    // Codex's finding: `use indices as idx;` binds `idx` to `indices` exactly the way
+    // `use indices::P0;` binds `P0` to `indices::P0`, above, but only the single-segment
+    // branch ever consulted `use_scopes` — a multi-segment path headed by a module alias
+    // (`idx::P0`) went straight to the anchored and qualified lookups below, which know
+    // the real module by its own name (`indices::P0` in the tree) and nothing by the
+    // alias. `crate`, `self` and `super` can never be an alias's own bound name (they are
+    // reserved words, not identifiers a `use` can rename to), so trying this first cannot
+    // shadow the anchor handling below.
+    if let Some((first, rest)) = segments.split_first() {
+        if let Some(target) = use_scopes.resolve(first) {
+            let mut full = target.to_vec();
+            full.extend(rest.iter().cloned());
+            if let Ok(synthetic) = syn::parse_str::<syn::Path>(&full.join("::")) {
+                if let Some(value) = resolve_pattern_path(
+                    &synthetic,
+                    scopes,
+                    use_scopes,
+                    qualified,
+                    module_path,
+                    module_scope_depths,
+                ) {
+                    return Some(value);
+                }
+            }
+        }
+    }
     let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
     // `crate`/`self`/`super` followed by exactly one more segment names a plain
     // constant declared directly in a specific ancestor, not a further-qualified
@@ -2458,7 +2648,7 @@ struct MatchVisitor {
     use_scopes: UseScopes,
     module_path: Vec<String>,
     module_scope_depths: Vec<usize>,
-    qualified: std::collections::HashMap<String, u128>,
+    qualified: std::collections::HashMap<String, i128>,
     found: Vec<FoundMatch>,
 }
 
@@ -2567,7 +2757,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             };
             let mut enum_path = self.module_path.clone();
             enum_path.push(ident_name(&node.ident));
-            let mut next: u128 = 0;
+            let mut next: i128 = 0;
             let mut found = Vec::new();
             for variant in &node.variants {
                 if has_cfg_test(&variant.attrs) {
@@ -2601,22 +2791,17 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         let scope = resolve_scope_consts(&block_const_exprs(node), &self.scopes);
         self.scopes.0.push(scope);
         self.use_scopes.0.push(block_use_imports(node));
-        // Codex's finding: `syn::visit::visit_block`'s default walk descends into every
-        // statement unconditionally, so a `#[cfg(test)] let expected = match ... ;` local
-        // — attributes `rustc` reads and strips the whole statement over in shipped code —
-        // was still walked into and its match reported as a second production table. Only
-        // items and `impl` members were ever checked for `#[cfg(test)]` (`visit_item` and
-        // `visit_impl_item`, above); a local statement's own attributes were never read at
-        // all. Scoped to the shape the finding names: a `Stmt::Local`'s own attribute list,
-        // which is where a `let`'s `#[cfg(test)]` lives. A bare `#[cfg(test)]` expression
-        // statement is a residual gap this does not close — `syn::Expr` has no one place
-        // every variant keeps its own attributes, so reading it uniformly needs a match
-        // over each of `syn`'s expression kinds rather than one field access.
+        // Codex's finding, in two rounds: `syn::visit::visit_block`'s default walk
+        // descends into every statement unconditionally, so a `#[cfg(test)]`-gated
+        // statement — a `let`, a bare expression such as a `match`, or a
+        // statement-position macro invocation, all of which `rustc` strips from shipped
+        // code — was still walked into and read as production code. Only items and
+        // `impl` members were ever checked for `#[cfg(test)]` (`visit_item` and
+        // `visit_impl_item`, above); [`stmt_is_cfg_test`] is what now reads a statement's
+        // own attributes whichever of the three shapes it is.
         for stmt in &node.stmts {
-            if let syn::Stmt::Local(local) = stmt {
-                if has_cfg_test(&local.attrs) {
-                    continue;
-                }
+            if stmt_is_cfg_test(stmt) {
+                continue;
             }
             self.visit_stmt(stmt);
         }

@@ -8598,7 +8598,7 @@ fn check_checksum_module_macros(
 /// pushing a violation for anything else dense enough to be a second table.
 fn check_checksum_module_dense_matches(
     scanned: &crate::size::LayerSource,
-    qualified: &std::collections::HashMap<String, u128>,
+    qualified: &std::collections::HashMap<String, i128>,
     prefix: &[String],
     allowed_table_hits: &mut [usize],
     violations: &mut Vec<Violation>,
@@ -8918,18 +8918,26 @@ const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 /// identical lookup table, and windowing from the lowest numbered value reads the second
 /// order directly and the first as an equally valid window one step higher — either
 /// reading agrees that the match is dense, which is the only thing this function's caller
-/// needs from it. Returns `None` when a numbered arm's pattern is missing, would not fit a
-/// `usize`, is repeated, or when more than one value in the window is left uncovered — a
-/// real gap rather than one arm's worth of slack for the wildcard.
-fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<usize> {
+/// needs from it. Returns `None` when a numbered arm's pattern is missing, is repeated, or
+/// when more than one value in the window is left uncovered — a real gap rather than one
+/// arm's worth of slack for the wildcard.
+///
+/// Codex's finding: every resolved pattern is an `i128` — signed, since a dense match's
+/// own patterns can themselves be negative (an `i8`'s own `-8..=6`, say) — but this used
+/// to narrow straight to `usize` before ever computing the window's base, so a negative
+/// pattern failed that conversion and the whole match read as unresolved before the base
+/// (which the negative value might even be) was ever found. Values now stay `i128`
+/// throughout; only the *offset* from the window's own base — never negative once `base`
+/// is truly the minimum — is narrowed to a `usize` to index `covered`.
+fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<i128> {
     let mut values = Vec::with_capacity(numbered.len());
     for arm in numbered {
-        values.push(usize::try_from(arm.pattern?).ok()?);
+        values.push(arm.pattern?);
     }
     let base = *values.iter().min()?;
     let mut covered = vec![false; total];
     for value in values {
-        let offset = value.checked_sub(base)?;
+        let offset = usize::try_from(value.checked_sub(base)?).ok()?;
         let slot = covered.get_mut(offset)?;
         if *slot {
             return None;
@@ -8941,7 +8949,7 @@ fn missing_value(numbered: &[crate::parse::FoundArm], total: usize) -> Option<us
     if gaps.next().is_some() {
         return None;
     }
-    base.checked_add(gap)
+    base.checked_add(i128::try_from(gap).ok()?)
 }
 
 /// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
@@ -9012,7 +9020,7 @@ fn call_shaped_uniformly(found: &crate::parse::FoundMatch) -> Option<&str> {
             Some(_) => {}
         }
         let expected = if index == last {
-            u128::try_from(wildcard_value).ok()?
+            wildcard_value
         } else {
             arm.pattern?
         };
@@ -15480,6 +15488,36 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_negative_values_is_reported() {
+        // Codex's thirty-first-round finding: every resolved pattern was a `u128`, so a
+        // negative pattern or a negative-valued constant had no representation at all —
+        // a dense `i8` match with explicit arms `-8` through `6` and a final wildcard
+        // still lowers to an offset-indexed switch table exactly like an unsigned range
+        // does, but every negative arm read as unresolved and the match as not dense.
+        // Patterns now resolve to `i128`, and `missing_value`'s own window base can
+        // itself be negative.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in -8..7 {
+            let _ = writeln!(arms, "        {value} => signed_table_helper({value}),");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn signed_table_helper(value: i32) -> u32 {{\n    value as u32\n}}\n\n\
+             const fn signed_table(value: i8) -> u32 {{\n    match value as i32 {{\n{arms}        \
+             _ => signed_table_helper(0),\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_enum_variants_is_reported() {
         // Codex's thirtieth-round finding: `Indices::P0` names a fieldless enum variant
         // exactly the way `Pat::Path` spells a module-qualified constant, and `rustc`
@@ -15538,6 +15576,30 @@ mod deferred_answer_pins {
             "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    let _expected = \
              match nibble & 0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        \
              3 => 3,\n        _ => 4,\n    };\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_expression_statement_match_is_not_reported() {
+        // Codex's thirty-first-round finding: the previous round's fix only checked a
+        // `Stmt::Local`'s own attributes, so a *bare expression statement* carrying its
+        // own `#[cfg(test)]` — `#[cfg(test)] match nibble { .. };`, with no `let` at all
+        // — was still walked and read as a second production table, even though `rustc`
+        // strips the whole statement from shipped code the same way it does a gated
+        // local. `stmt_is_cfg_test` now reads a `Stmt::Expr`'s own attributes too, via
+        // `expr_attrs`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    match nibble & \
+             0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        3 => 3,\n        \
+             _ => 4,\n    };\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
@@ -15932,6 +15994,33 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_through_a_module_alias_is_reported() {
+        // Codex's thirty-first-round finding: `use indices as idx;` binds `idx` to
+        // `indices` exactly the way `use indices::P0;` binds `P0` to `indices::P0` —
+        // but only the single-segment branch of pattern resolution ever consulted
+        // `use_scopes`. A multi-segment pattern headed by the alias (`idx::P0`) went
+        // straight to the anchored and qualified lookups, which know the real module by
+        // its own name and nothing by the alias, so every numbered arm read as
+        // unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nuse indices as idx;\n\nconst fn \
+             aliased_module_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        idx::P0 => 0,\n        idx::P1 => 1,\n        idx::P2 => 2,\n        \
+             idx::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_macro_declared_in_the_checksum_module_is_reported() {
         // Codex's twenty-seventh-round finding: the dense-match scan and the array ban
         // both read the syntax a macro invocation *is*, never what it expands to — `syn`
@@ -16012,6 +16101,25 @@ mod deferred_answer_pins {
             "\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a_check() {\n        \
              assert_eq!(1, 1);\n    }\n}\n",
         );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_local_macro_statement_is_not_reported() {
+        // Codex's thirty-first-round finding: `macro_uses`'s own item and `impl`-member
+        // exclusions say nothing about a *local* statement, so a `#[cfg(test)]
+        // assert_eq!(...)` inside an otherwise ordinary (non-test) function — a statement
+        // `rustc` strips from shipped code — was still walked and its macro reported as a
+        // second production one. `macro_uses`'s `Macros` visitor now overrides
+        // `visit_block` with the same `stmt_is_cfg_test` check `MatchVisitor` uses.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nfn ordinary_function() {\n    #[cfg(test)]\n    assert_eq!(1, 1);\n}\n");
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
             !violations
@@ -16626,6 +16734,29 @@ mod deferred_answer_pins {
             violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
             "a #[path] module inside an inline mod was not resolved against its own \
              directory: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_inside_a_function_body_is_traversed() {
+        // Codex's thirty-first-round finding: module discovery started and stayed at
+        // `file.items`, so a `mod` declared inside a *function body* — legal Rust, and
+        // the one shape `rustc` requires a `#[path]` attribute for, since a block has no
+        // directory of its own to fall back to — was never seen at all. Its own directory
+        // context is inherited from its enclosing item-level scope (the file's own
+        // directory here, since the function is not itself nested in an inline module).
+        let parent = format!(
+            "{}\nfn declares_a_module() {{\n    #[path = \"table.rs\"]\n    mod table;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/table.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a #[path] module inside a function body was not traversed: {violations:?}"
         );
     }
 
