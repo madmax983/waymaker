@@ -1766,7 +1766,21 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
         .rsplit_once('/')
         .map(|(dir, _)| format!("{dir}/"))
         .unwrap_or_default();
-    let child_dir = if parent_path == "mod.rs" || parent_path.ends_with("/mod.rs") {
+    // Codex's finding: a crate root — `lib.rs` or `main.rs` — is the *other* file name
+    // `rustc` gives this same-directory treatment, not only `mod.rs`. `collect_dependency_qualified_constants`
+    // is this function's first caller ever to hand it a crate root rather than an ordinary
+    // submodule file, and without this a dependency crate's own `pub mod transition;` in
+    // `lib.rs` produced the candidate `src/lib/transition.rs` — a directory `rustc` never
+    // creates for a crate root at all — so the declaration always resolved to
+    // `ModuleTreeError::Missing` and the whole tree walk failed closed before it read a
+    // single one of that crate's own enum declarations.
+    let is_same_directory_root = parent_path == "mod.rs"
+        || parent_path.ends_with("/mod.rs")
+        || parent_path == "lib.rs"
+        || parent_path.ends_with("/lib.rs")
+        || parent_path == "main.rs"
+        || parent_path.ends_with("/main.rs");
+    let child_dir = if is_same_directory_root {
         parent_dir.clone()
     } else {
         let stem = parent_path
@@ -2499,6 +2513,74 @@ fn item_const_types(items: &[syn::Item]) -> std::collections::HashMap<String, St
             single_segment_type_name(&constant.ty).map(|name| (ident_name(&constant.ident), name))
         })
         .collect()
+}
+
+/// Every fieldless enum variant `items` declares directly, by its own module-qualified name
+/// under `prefix` — [`item_const_exprs`]'s own enum-variant twin, flat over `items` the
+/// identical way, needed by `collect_dependency_qualified_constants` to resolve a match over
+/// a *dependency* crate's own enum without running that crate's full match-expression scan,
+/// which is what `MatchVisitor::visit_item_enum` already does for the checksum module's own
+/// tree but has no reason to be asked of a crate this scan otherwise never reads at all.
+///
+/// A variant's own discriminant is either explicit — resolved only as far as a bare integer
+/// literal or arithmetic over one, through [`literal_or_const_value`] handed a resolver that
+/// answers nothing for any named path — or implicit: one more than the previous variant's
+/// own value, `0` for the first. Scoped this narrowly on purpose: a dependency's own
+/// discriminant that itself names one of that crate's other constants is a real gap this
+/// leaves open rather than one closed by threading this scan's own cross-file `Resolve`
+/// machinery across a crate boundary it was never designed to cross, and declining is the
+/// same safe answer every other case this scan cannot confirm already gets. A variant
+/// carrying fields is skipped, since a pattern can never name one this way; the running
+/// counter still advances past it, matching how `rustc` numbers a mixed enum's own fieldless
+/// variants. An unresolvable explicit discriminant stops the enum's own count rather than
+/// guessing a wrong running value for every variant after it — `#[cfg(test)]` on the enum
+/// item or on one variant is skipped exactly as `item_const_exprs` already skips one.
+pub(crate) fn item_enum_variant_constants(
+    items: &[syn::Item],
+    prefix: &[String],
+) -> std::collections::HashMap<String, i128> {
+    let no_value = |_: &syn::Path| None;
+    let not_unsigned = |_: &syn::Path| false;
+    let no_width = |_: &syn::Path| None;
+    let resolve = Resolve {
+        value: &no_value,
+        unsigned: &not_unsigned,
+        width: &no_width,
+    };
+    let mut found = std::collections::HashMap::new();
+    for item in items {
+        let syn::Item::Enum(item_enum) = item else {
+            continue;
+        };
+        if has_cfg_test(&item_enum.attrs) {
+            continue;
+        }
+        let mut enum_path = prefix.to_vec();
+        enum_path.push(ident_name(&item_enum.ident));
+        let mut next: i128 = 0;
+        for variant in &item_enum.variants {
+            if has_cfg_test(&variant.attrs) {
+                continue;
+            }
+            let Some(value) = (match &variant.discriminant {
+                Some((_, expr)) => literal_or_const_value(expr, &resolve),
+                None => Some(next),
+            }) else {
+                break;
+            };
+            if matches!(variant.fields, syn::Fields::Unit) {
+                found.insert(
+                    format!("{}::{}", enum_path.join("::"), ident_name(&variant.ident)),
+                    value,
+                );
+            }
+            let Some(successor) = value.checked_add(1) else {
+                break;
+            };
+            next = successor;
+        }
+    }
+    found
 }
 
 /// Every plainly-typed parameter `sig` declares, by name, against its own declared type's

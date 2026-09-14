@@ -8544,6 +8544,90 @@ fn collect_tree_qualified_constants(
     (qualified, qualified_unsigned, qualified_types)
 }
 
+/// [`collect_tree_qualified_constants`]'s own cross-crate half: every module-qualified
+/// constant and enum-variant discriminant `crate_name`'s own crate root declares, across its
+/// whole reachable tree, keyed under `crate_prefix` the way a fully-qualified reference from
+/// outside that crate would spell it (`waymaker_core::transition::Divergence::A`, not
+/// `crate::transition::Divergence::A`).
+///
+/// Codex's finding: a match over `waymaker_core::transition::Divergence`'s own four unit
+/// variants — a real enum a real dependency declares, reachable from `waymaker-flash`
+/// without adding one — resolved every arm to nothing, because [`collect_tree_qualified_constants`]
+/// only ever sees the checksum module's own tree and this scan had no way to look one layer
+/// down its one legal dependency edge. `waymaker-core` is not a heuristic guess: it is the
+/// one crate `waymaker-flash`'s own row in `policy::LAYERS` names, so this closes the exact
+/// gap the finding demonstrates rather than a general "resolve any crate" feature.
+///
+/// Returns three empty maps when `crate_name`'s own crate root is not among `sources` at
+/// all — every test in this module that does not explicitly add one, and any workspace this
+/// scan runs over before that crate exists — the identical fail-soft standing
+/// `module_path_prefixes` already gives a tree it cannot walk.
+#[allow(
+    clippy::type_complexity,
+    reason = "the value map and its unsignedness and declared-type mirrors, returned \
+              together the same way `collect_tree_qualified_constants` already does"
+)]
+fn collect_dependency_qualified_constants(
+    sources: &[crate::size::LayerSource],
+    crate_name: &str,
+    crate_prefix: &str,
+) -> (
+    std::collections::HashMap<String, i128>,
+    std::collections::HashMap<String, bool>,
+    std::collections::HashMap<String, String>,
+) {
+    let empty = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    let Some(root) = sources
+        .iter()
+        .find(|source| source.crate_name == crate_name && source.path.ends_with("src/lib.rs"))
+    else {
+        return empty;
+    };
+    let Ok((production_reachable, test_only)) = module_tree(sources, root) else {
+        return empty;
+    };
+    let Ok(prefixes) = module_path_prefixes(sources, root, vec![crate_prefix.to_owned()]) else {
+        return empty;
+    };
+    let scanned_sources: Vec<&crate::size::LayerSource> = sources
+        .iter()
+        .filter(|source| {
+            let path = source.path.replace('\\', "/");
+            production_reachable.contains(&path) && !test_only.contains(&path)
+        })
+        .collect();
+    let (mut qualified, qualified_unsigned, qualified_types) =
+        collect_tree_qualified_constants(&scanned_sources, &prefixes);
+    // Codex's finding, met in full: `collect_tree_qualified_constants` folds only `const`
+    // items — the *value*-scanning half `qualified_constants_with_prefix` runs — and never
+    // an enum's own variants, which only `MatchVisitor::visit_item_enum` records, as part of
+    // the full match-expression scan this function deliberately does not run over a
+    // dependency crate's own code. `item_enum_variant_constants` is that one piece pulled
+    // out on its own, run per scanned file the same way `collect_tree_qualified_constants`
+    // already runs `qualified_constants_with_prefix` per file, and merged in afterward —
+    // local declarations (there are none here; this is the whole map) still would have won
+    // on a name collision, the identical priority `check_integrity_check_module_tree`'s own
+    // merge into the checksum module's tree gives its own local declarations over this
+    // function's answer.
+    for scanned in &scanned_sources {
+        let prefix = prefixes
+            .iter()
+            .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
+            .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
+        let Ok(file) = crate::parse::parse_rust(&scanned.contents) else {
+            continue;
+        };
+        for (key, value) in crate::parse::item_enum_variant_constants(&file.items, &prefix) {
+            qualified.entry(key).or_insert(value);
+        }
+    }
+    (qualified, qualified_unsigned, qualified_types)
+}
+
 /// The array ban and the dense-match-table scan, both walked across the checksum module's
 /// whole tree rather than the single named function [`check_integrity_check_tables`] pins —
 /// factored out to keep `check_integrity_check` under clippy's line count.
@@ -8582,9 +8666,29 @@ fn check_integrity_check_module_tree(
     // tree is a candidate, and one is only excused when it is, exactly, the one table
     // `INTEGRITY_CHECK_TABLES` names — counted, so a byte-identical copy under a second
     // function name is still a second table rather than a coincidence.
-    let prefixes = module_path_prefixes(sources, source).unwrap_or_default();
-    let (qualified, qualified_unsigned, qualified_types) =
+    let prefixes =
+        module_path_prefixes(sources, source, vec![root_module_name()]).unwrap_or_default();
+    let (mut qualified, mut qualified_unsigned, mut qualified_types) =
         collect_tree_qualified_constants(&scanned_sources, &prefixes);
+    // Codex's finding: `waymaker-flash`'s own tree has no way to see an enum variant
+    // declared in `waymaker-core` — its own must-not-own cell names it the only crate this
+    // one may depend on — so a match over such an enum's variants (`Divergence::A`, and so
+    // on, fully qualified as `waymaker_core::transition::Divergence::A`) resolved every arm
+    // to nothing and a dense table shaped that way passed unseen. Local declarations win on
+    // a name collision, matching the standing `path_is_definitely_unsigned`'s own
+    // real-declaration-over-primitive-bound rule already has: `or_insert` never overwrites
+    // an entry `collect_tree_qualified_constants` above already produced.
+    let (dependency_qualified, dependency_unsigned, dependency_types) =
+        collect_dependency_qualified_constants(sources, "waymaker-core", "waymaker_core");
+    for (key, value) in dependency_qualified {
+        qualified.entry(key).or_insert(value);
+    }
+    for (key, value) in dependency_unsigned {
+        qualified_unsigned.entry(key).or_insert(value);
+    }
+    for (key, value) in dependency_types {
+        qualified_types.entry(key).or_insert(value);
+    }
 
     let mut allowed_table_hits = vec![0_usize; INTEGRITY_CHECK_TABLES.len()];
     for scanned in scanned_sources {
@@ -9810,13 +9914,21 @@ fn root_module_name() -> String {
 /// key no absolute reference could ever name.
 ///
 /// Paths use `/` separators, the way the scan compares them.
+///
+/// `root_prefix` is what seeds `root`'s own entry — [`root_module_name`] for
+/// `waymaker-flash`'s own tree, and a dependency crate's own name
+/// ([`collect_dependency_qualified_constants`]) for the one other tree this scan ever
+/// walks: the same seeding rule, parameterised rather than hard-coded, because a
+/// dependency's own crate-root module is named after the crate rather than after a file
+/// stem one directory short of it.
 fn module_path_prefixes(
     sources: &[crate::size::LayerSource],
     root: &crate::size::LayerSource,
+    root_prefix: Vec<String>,
 ) -> Result<Vec<(String, Vec<String>)>, ModuleTreeError> {
     let mut prefixes = Vec::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
-    let mut stack = vec![(root.path.replace('\\', "/"), vec![root_module_name()])];
+    let mut stack = vec![(root.path.replace('\\', "/"), root_prefix)];
     while let Some((path, prefix)) = stack.pop() {
         if !visited.insert(path.clone()) {
             continue;
@@ -21567,6 +21679,53 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_qualified_dependency_enum_variants_is_reported() {
+        // Codex's finding: a dense match over a *dependency* crate's own enum variants —
+        // `waymaker_core::transition::Divergence`'s real `Sequence`, `Kind`, `Digest` and
+        // `BoundaryKind`, reachable without adding any dependency at all, since
+        // `waymaker-flash` already depends on `waymaker-core` — resolved every arm to
+        // nothing, because `collect_tree_qualified_constants` only ever walks the checksum
+        // module's own tree and had no way to see a variant declared one crate over. Four
+        // consecutive discriminants (0 through 3) with non-linear arm results, and no
+        // wildcard arm at all since the match already names every variant, is exactly the
+        // shape `fully_dense_arm_patterns` exists to catch when it *can* see the values —
+        // and the scan reported success over it while it could not.
+        // `collect_dependency_qualified_constants` now walks `waymaker-core`'s own reachable
+        // tree the identical way `collect_tree_qualified_constants` walks the checksum
+        // module's, keyed under the fully-qualified spelling a real external reference uses,
+        // and merges its findings into `qualified` before the density scan runs.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_a_dependency_enum() -> u32 {\n    \
+             match waymaker_core::transition::Divergence::Sequence {\n        \
+             waymaker_core::transition::Divergence::Sequence => 9,\n        \
+             waymaker_core::transition::Divergence::Kind => 3,\n        \
+             waymaker_core::transition::Divergence::Digest => 27,\n        \
+             waymaker_core::transition::Divergence::BoundaryKind => 1,\n    \
+             }\n}\n",
+        );
+        let core_lib = "pub mod transition;\n";
+        let core_transition = "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n\
+             pub enum Divergence {\n    \
+             Sequence,\n    \
+             Kind,\n    \
+             Digest,\n    \
+             BoundaryKind,\n\
+             }\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &source),
+            layer("waymaker-core/src/lib.rs", core_lib),
+            layer("waymaker-core/src/transition.rs", core_transition),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
             "{violations:?}"
         );
     }
