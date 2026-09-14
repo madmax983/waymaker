@@ -1365,6 +1365,13 @@ impl Rig {
     /// already refused meets the same refusal here. It reads, programs, and barriers
     /// nothing for that record.
     ///
+    /// This body is near-identical to `resume_as`, gated call by gated call. Left that way
+    /// rather than factored behind a shared generic or trait: the two bodies are
+    /// typestate-heavy control flow over two different writers ([`Journal`] and
+    /// [`Reserved`]), and a shared abstraction over them risks a subtle divergence for a
+    /// cosmetic gain, not a correctness one. This crate already tolerates the same trade
+    /// for `unwindow` and its siblings, for the same reason.
+    ///
     /// # Errors
     ///
     /// As [`resume`](Self::resume). [`RigError::Capacity`] if the reserve refuses the next
