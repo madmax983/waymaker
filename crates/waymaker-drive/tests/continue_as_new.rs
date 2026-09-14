@@ -6,6 +6,7 @@
 //! [`Driver::new`], pointed at a fixed region, still refuses. This file is the driver that
 //! can.
 
+use waymaker_core::timer::TimerSpec;
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, Outcome, RunId};
 use waymaker_drive::{
@@ -247,6 +248,37 @@ impl Workflow for JustStartedAfterUpgrade {
     }
 }
 
+/// A workflow over [`FIRST_INPUT`], with a version range this test picks, that waits for a
+/// persistent deadline nothing here ever reaches — so the run stays suspended, recorded but
+/// unfinished, across as many boots as a test wants to drive it through.
+struct WaitingAtVersion {
+    versions: VersionRange,
+}
+
+impl WaitingAtVersion {
+    fn new(oldest: u16, current: u16) -> Self {
+        let Some(versions) = VersionRange::new(oldest, current) else {
+            unreachable!("oldest <= current is a legal range")
+        };
+        Self { versions }
+    }
+}
+
+impl Workflow for WaitingAtVersion {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: self.versions,
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        boundary.wait(TimerSpec::AtPersistentTime { instant: u64::MAX })?;
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
 const fn scratch<'a>(page: &'a mut [u8; 512], result: &'a mut [u8; 16]) -> Scratch<'a> {
     Scratch { page, result }
 }
@@ -342,6 +374,46 @@ fn continue_as_new_stamps_the_new_bank_with_the_images_current_version_not_the_r
 }
 
 #[test]
+fn a_later_image_that_dropped_the_headers_own_version_still_resumes_the_runs_recorded_one() {
+    // Codex found this. `booted()`'s bank header names `WORKFLOW_VERSION` and never changes
+    // again — it is a fact about whatever wrote the swap, not about the run. A v2 image that
+    // still admits v1 boots this bank for the first time and records its *own* current
+    // version into `RunStarted`, per `begin`'s existing choice for an erased journal. Every
+    // boot after that has a real recorded version to read, and `verify_header_identity` must
+    // not go on checking the header's own stale one once it does — a v3 image that has since
+    // dropped v1 entirely, but still admits the v2 this run is actually recorded at, has to
+    // resume it rather than being refused over a field nothing here depends on any more.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    // v2, still admitting the header's own v1, boots this bank for the first time.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut WaitingAtVersion::new(WORKFLOW_VERSION, WORKFLOW_VERSION + 1),
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "{progress:?}"
+    );
+
+    // v3, admitting only the version the journal actually recorded and nothing below it.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut WaitingAtVersion::new(WORKFLOW_VERSION + 1, WORKFLOW_VERSION + 1),
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "a v3 image admitting only the journal's own recorded version must still resume \
+         this run rather than being refused over the header's stale v1: {progress:?}"
+    );
+}
+
+#[test]
 fn the_next_boot_of_the_same_layout_replays_the_bank_the_swap_installed() {
     let mut device = booted();
     let mut page = [0_u8; 512];
@@ -410,6 +482,43 @@ fn a_committed_effect_is_not_forfeited_by_a_live_continue_as_new() {
 
     // The swap never started: bank A is still the only sealed bank, carrying the run it
     // always did, and bank B holds nothing a swap would have installed.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+    assert_eq!(header_on(&mut device, BankId::B), None);
+}
+
+#[test]
+fn continue_as_new_refuses_when_this_replay_never_consumed_committed_history() {
+    // Codex found this. A previous boot's committed schedule record — durable, and never
+    // resolved — sits unread on this replay, because `ContinueOnce`'s own logic asks for
+    // nothing before migrating. Swapping over it would reclaim the only copy of the
+    // history that proves this image diverges from whatever recorded it: exactly the
+    // nondeterminism `nothing_follows` already refuses at a normal ending, and it has to
+    // run before the swap here rather than after, since `swap_in` is what would destroy
+    // the evidence.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    // A previous boot leaves a durable, unresolved schedule record behind.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ScheduleThenContinue,
+        scratch(&mut page, &mut result),
+    );
+    assert_eq!(progress, Err(DriveError::EffectOutstanding));
+
+    // This replay's own logic never asks for it before trying to migrate.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+    assert_eq!(progress, Err(DriveError::HistoryContinues));
+
+    // Refused before anything moved: bank A is untouched and bank B still empty.
     let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
     assert_eq!(a_run, RUN);
     assert_eq!(header_on(&mut device, BankId::B), None);

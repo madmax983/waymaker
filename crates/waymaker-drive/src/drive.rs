@@ -575,13 +575,24 @@ where
 
 /// Refuses a boot whose workflow does not match what bank `id`'s own header declares.
 ///
-/// [`begin`] makes this comparison against the *journal*'s `RunStarted` record, but an
+/// [`begin`] makes the same comparison against the *journal*'s `RunStarted` record, but an
 /// erased journal has none — it writes one from `workflow.identity()` alone, with nothing
 /// else to check it against. A bank a swap just installed is exactly that: its header
 /// durably records the workflow and input `continue_as_new` was asked for, and until a
 /// first boot writes the opening record, `begin` cannot enforce it. This is the same
-/// comparison `begin` makes, against the header instead of the journal, so that recording
-/// stays enforced rather than becoming unreachable the moment it is written.
+/// comparison, against the header instead of the journal, so that recording stays enforced
+/// rather than becoming unreachable the moment it is written.
+///
+/// Kind and input only — never the header's own `workflow_version`. This runs on *every*
+/// boot of a bank-pointed driver, not only a bank's first, and a run already under way has
+/// its version recorded where it matters: in the journal's own `RunStarted`, which `begin`
+/// admits directly. The header's version is a fact about the swap that installed the bank,
+/// not about the run, and it never changes again — an image whose admitted range has moved
+/// on from it while still admitting the run's own recorded version would otherwise be
+/// refused over a number nothing here still depends on. For the one case this function
+/// exists for — an erased journal, nothing recorded yet — `begin` is about to write
+/// `identity.versions.current()` regardless of what the header says, which admits itself by
+/// construction and needs no check here to establish that.
 fn verify_header_identity<S, C, W>(
     layout: BankLayout,
     id: BankId,
@@ -612,10 +623,7 @@ where
     if workflow_kind != identity.kind || input != identity.input {
         return Err(DriveError::NotThisWorkflow);
     }
-    identity
-        .versions
-        .admits(header.workflow_version)
-        .map_err(DriveError::Kernel)
+    Ok(())
 }
 
 /// Design document §06 steps 1 and 2: the run's own record, from history or newly written.
@@ -1037,9 +1045,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                     remaining,
                 });
             }
-            // The run that asked is retired either way, so there is nothing left of it to
-            // check `nothing_follows` against — that question is the *new* bank's, on its
-            // own first boot.
+            // `swap_in` already asked `nothing_follows` before it touched the device —
+            // asking again here would be asking it of a bank this call just reclaimed.
             Some(Stop::Migrated(run)) => return Ok(Progress::Migrated { run }),
             Some(Stop::Finished {
                 conclusion,
@@ -1946,6 +1953,14 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                 bound,
             });
         }
+        // §08's own rule for a run that says it is over, applied to the other way a run
+        // ends: a replay still short of the end of history has not earned the right to
+        // decide anything, migrating included — and unlike `Stop::Finished`'s check, this
+        // one has to run *before* the swap rather than after it, because `swap_in` is about
+        // to reclaim the only copy of whatever comes next. An earlier image that continued
+        // past this point and recorded more would be silently overwritten rather than
+        // reported, which is the nondeterminism `nothing_follows` exists to catch.
+        nothing_follows(&mut self.source, self.page)?;
         let next_run = bank.run.successor().ok_or(DriveError::RunIdExhausted)?;
         let Some(storage) = take_storage(&mut self.source) else {
             return Err(DriveError::NoAppendPoint);
