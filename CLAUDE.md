@@ -3412,6 +3412,40 @@ this shape. `collect_trait_implementors_in_item_body`'s `Item::Impl` arm needed 
 into `impl_member_scope_roots`/`trait_member_scope_roots` to stay under this file's own
 line-count lint once the header roots joined it.
 
+Round 26 found four more. The first: `extern "C" { fn hidden(_: [(); { impl Clone for
+Recovery { .. }; 0 }]); }` is legal Rust, and `Item::ForeignMod` reached this scan's
+fallback arm entirely — a foreign function's own signature and a foreign static's own
+declared type, either of which can bury an impl the same way an ordinary signature or
+declared type already could, were never walked at all. Both
+`collect_trait_implementors_in_item_body` and the module-tree walk's
+`nested_item_bodies_for_child_modules` gained a `ForeignMod` arm, the latter split into
+its own `foreign_mod_bodies` to stay under this file's line-count lint; verifying it
+against the real crate needed a standalone `rustc` file rather than a `waymaker-flash`
+build, because an `extern` block requires an `unsafe extern` block since edition 2024
+and this crate's `#![forbid(unsafe_code)]` refuses one regardless of where it is
+written, so the shape cannot appear anywhere in this crate's own tree even though the
+scanner has to handle it as general Rust syntax. The second: `trait Outer { type A<T>
+where T: Marker<{ impl Clone for Recovery { .. }; 0 }>; }` is a GAT-shaped associated
+type *declaration* in a trait, as opposed to an impl's associated type, which round 23
+already covers — `TraitItem::Type` fell through both scanners' wildcard arms, so its own
+generics (whose `where` clause bounds can bury a block), its own trait bounds, and its
+default type were never visited. The third: `trait Outer: Marker<{ impl Clone for
+Recovery { .. }; 0 }> {}` — a trait's own supertrait bound list was never walked by
+either scanner, only its generics and selected members, so a supertrait bound's own
+const generic argument could bury an impl invisibly; a new
+`direct_blocks_in_bounds`/`bound_items` pair mirrors the existing generics-walking
+helpers for a `Punctuated<TypeParamBound, Token![+]>`, shared by the trait's own
+supertraits and by the second finding's associated-type bounds. The fourth was a false
+positive rather than a false negative: `enum_variant_bodies` gated every field of a
+variant by the *variant's* own `#[cfg(test)]` alone, unlike `struct_field_bodies` and
+`union_field_bodies`, which each also gate a field by its own attribute — so a field
+carrying its own `#[cfg(test)]` inside an otherwise-ungated variant was read as
+reachable in production, and a legitimate test-only reimplementation buried in such a
+field's type was wrongly reported as a production `Clone` impl. Each field is now its
+own `(bool, Vec<&syn::Item>)` entry gated by `variant_gated || has_cfg_test(field)`,
+matching the two sibling helpers; the discriminant, having no per-part gate of its own
+to combine with, keeps its single entry at the variant's own gate.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

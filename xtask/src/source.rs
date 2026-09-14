@@ -12177,6 +12177,215 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_impl_inside_a_foreign_functions_own_signature_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 26: `extern "C" { fn
+        // hidden(_: [(); { impl Clone for super::Recovery { .. }; 0 }]); }` is legal
+        // Rust, and `Item::ForeignMod` reached this scan's fallback arm entirely — a
+        // foreign function's own signature was never walked at all, so an `impl`
+        // buried in one of its parameter types went unmatched.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "extern \"C\" {\n",
+                "    fn hidden(_: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }]);\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_foreign_statics_own_declared_type_is_rejected() {
+        // The other half of round 26's foreign-item finding: a foreign `static`'s own
+        // declared type can bury a block exactly the way a foreign function's
+        // signature can, and it reached the same unwalked fallback arm.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "extern \"C\" {\n",
+                "    static HIDDEN: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }];\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_traits_own_associated_type_declaration_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 26: `trait Outer {
+        // type A<T> where T: Marker<{ impl Clone for super::Recovery { .. }; 0 }>; }`
+        // is a GAT-shaped associated type *declaration* in a trait, as opposed to an
+        // impl's associated type, which round 23 already covers. `TraitItem::Type`
+        // fell through this scan's wildcard arm, so its own generics (whose `where`
+        // clause bounds can bury a block), its own trait bounds, and its default type
+        // were never visited.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Marker<const N: usize> {}\n",
+                "trait Outer {\n",
+                "    type A<T> where T: Marker<{\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }>;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_traits_own_supertrait_bound_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 26: `trait Outer:
+        // Marker<{ impl Clone for super::Recovery { .. }; 0 }> {}` — a trait's own
+        // supertrait bound list was never walked in this scan's `Item::Trait` arm,
+        // only its generics and selected members, so a supertrait bound's own const
+        // generic argument could bury an impl invisibly.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Marker<const N: usize> {}\n",
+                "trait Outer: Marker<{\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}> {\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_enum_field_is_not_read_as_reachable_in_production() {
+        // Found by Codex review of this change (PR #143), round 26: an individual
+        // enum field's own `#[cfg(test)]` was not propagated by
+        // `enum_variant_bodies` — only the variant-level gate was used for every
+        // field's own type, unlike `struct_field_bodies`/`union_field_bodies`, which
+        // each already gate a field by its own attribute on top of the enclosing
+        // item's. A `mod` hidden inside a test-only field's own type — here, one that
+        // itself implements `Clone` for `Recovery` — used to be read as reachable in
+        // production (because the ungated *variant* was the only gate consulted),
+        // wrongly flagging a construct that only ever compiles under `#[cfg(test)]`.
+        let contents = tests_support::clean_recovery_surface().replace(
+            "#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n",
+            concat!(
+                "mod clone_impl;\n",
+                "#[derive(Debug, PartialEq, Eq)]\n",
+                "pub struct Recovery;\n",
+            ),
+        );
+        let mut sources = vec![crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+            contents,
+        }];
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "enum E {\n",
+                "    V(\n",
+                "        #[cfg(test)]\n",
+                "        [(); {\n",
+                "            mod nested_only_under_test;\n",
+                "            0\n",
+                "        }],\n",
+                "    ),\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl/nested_only_under_test.rs"
+                .to_owned(),
+            contents: concat!(
+                "impl Clone for super::super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

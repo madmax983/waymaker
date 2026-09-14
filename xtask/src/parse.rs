@@ -778,7 +778,8 @@ fn collect_trait_implementors<'a>(
             | syn::Item::Enum(_)
             | syn::Item::Type(_)
             | syn::Item::Struct(_)
-            | syn::Item::Union(_) => {
+            | syn::Item::Union(_)
+            | syn::Item::ForeignMod(_) => {
                 collect_trait_implementors_in_item_body(item, aliases, trait_name, implementors);
             }
             _ => {}
@@ -837,6 +838,11 @@ fn collect_trait_implementors_in_item_body<'a>(
         }
         syn::Item::Trait(trait_item) => {
             roots.extend(direct_blocks_in_generics(&trait_item.generics));
+            // Round 26: a trait's own supertrait bounds (`trait Outer: Marker<{ .. }>
+            // {}`) can bury a block through a const generic argument exactly the way
+            // its generics' own bounds already could, and this arm never read
+            // `trait_item.supertraits` at all.
+            roots.extend(direct_blocks_in_bounds(&trait_item.supertraits));
             roots.extend(trait_member_scope_roots(trait_item));
         }
         syn::Item::Const(constant) => {
@@ -885,6 +891,24 @@ fn collect_trait_implementors_in_item_body<'a>(
                 .filter(|f| !has_cfg_test(&f.attrs))
             {
                 roots.extend(direct_blocks_in_type(&field.ty));
+            }
+        }
+        // Round 26: `extern "C" { fn hidden(_: [(); { impl Clone for super::Recovery
+        // { .. }; 0 }]); }` is legal Rust, and a foreign function's own signature or a
+        // foreign static's own declared type can bury a block exactly the way an
+        // ordinary one's already could — this scan never read `Item::ForeignMod` at
+        // all, so its members reached the fallback arm below.
+        syn::Item::ForeignMod(foreign_mod) => {
+            for foreign_item in &foreign_mod.items {
+                match foreign_item {
+                    syn::ForeignItem::Fn(function) if !has_cfg_test(&function.attrs) => {
+                        roots.extend(direct_blocks_in_signature(&function.sig));
+                    }
+                    syn::ForeignItem::Static(statik) if !has_cfg_test(&statik.attrs) => {
+                        roots.extend(direct_blocks_in_type(&statik.ty));
+                    }
+                    _ => {}
+                }
             }
         }
         _ => {}
@@ -942,6 +966,19 @@ fn trait_member_scope_roots(trait_item: &syn::ItemTrait) -> Vec<&syn::Block> {
                 roots.extend(direct_blocks_in_type(&constant.ty));
                 if let Some((_, expr)) = constant.default.as_ref() {
                     roots.extend(direct_blocks_in_expr(expr));
+                }
+            }
+            // Round 26: a trait's own associated type *declaration* — as opposed to
+            // an impl's associated type, which round 23 already covers — can be a
+            // GAT with its own generics (whose `where` clause bounds can bury a
+            // block), its own trait bounds, and a default type, and this arm read
+            // none of the three: `trait Outer { type A<T> where T: Marker<{ .. }>; }`
+            // reached neither this function nor the module-tree walk's twin.
+            syn::TraitItem::Type(assoc_type) if !has_cfg_test(&assoc_type.attrs) => {
+                roots.extend(direct_blocks_in_generics(&assoc_type.generics));
+                roots.extend(direct_blocks_in_bounds(&assoc_type.bounds));
+                if let Some((_, ty)) = assoc_type.default.as_ref() {
+                    roots.extend(direct_blocks_in_type(ty));
                 }
             }
             _ => {}
@@ -2438,6 +2475,35 @@ fn direct_blocks_in_generics(generics: &syn::Generics) -> Vec<&syn::Block> {
     visitor.blocks
 }
 
+/// [`direct_blocks_in_expr`], starting from a bound list — a trait's own supertraits
+/// (`trait Outer: Marker<{ .. }> {}`) and an associated type's own trait bounds
+/// (`type A: Marker<{ .. }>;`) are each a `Punctuated<TypeParamBound, Token![+]>`
+/// rather than a type or a set of generics, and a bound's own trait path can carry a
+/// const generic argument the same way any other path can. Round 26 of Codex review on
+/// this change (PR #143) found neither read at all: a trait's generics and its members
+/// were walked, never its supertrait list.
+fn direct_blocks_in_bounds(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+) -> Vec<&syn::Block> {
+    let mut visitor = DirectChildBlockVisitor { blocks: Vec::new() };
+    for bound in bounds {
+        visitor.visit_type_param_bound(bound);
+    }
+    visitor.blocks
+}
+
+/// [`direct_blocks_in_bounds`]'s [`block_items`]-flavoured twin, for the module-tree
+/// walk's own use — mirrors how [`type_items`] pairs with [`direct_blocks_in_type`].
+fn bound_items(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+) -> Vec<&syn::Item> {
+    let mut visitor = BlockItemVisitor { items: Vec::new() };
+    for bound in bounds {
+        visitor.visit_type_param_bound(bound);
+    }
+    visitor.items
+}
+
 /// Every [`direct_blocks_in_type`] finds in a function or method signature's own
 /// parameter types, return type, and generics, mirroring [`fn_signature_type_items`]
 /// for [`collect_trait_implementors_in_item_body`]'s own use.
@@ -2606,15 +2672,24 @@ fn union_field_bodies(
 }
 
 /// [`struct_field_bodies`], for an enum's own variants — each variant's discriminant
-/// expression and its fields' types combined into the one nested-item set that
-/// variant's own `#[cfg(test)]` gating covers.
+/// expression is gated by the variant's own `#[cfg(test)]` alone, and each of its
+/// fields is gated by its own `#[cfg(test)]` on top of the variant's, one entry apiece.
 ///
 /// Round 20 of Codex review on this change (PR #143) found that a variant's *fields*,
 /// not only its discriminant, can carry a buried block the same way a struct's own
 /// field types can (`enum E { V([(); { impl Clone for super::Recovery { .. }; 0 }]) }`)
 /// — a `mod` hidden inside one was never reached by this walk, and neither was an
 /// `impl` hidden inside one by the trait-implementor scan's own enum handling, which
-/// round 20 also closed the same way.
+/// round 20 also closed the same way. Round 26 found that fix had combined every
+/// field's items into one entry gated by the *variant* alone, unlike
+/// [`struct_field_bodies`] and [`union_field_bodies`], which each gate a field by its
+/// own attribute in addition to the enclosing item's — so a field carrying its own
+/// `#[cfg(test)]` inside a variant that carries none was misclassified as reachable in
+/// production, and one inside a variant that itself carries `#[cfg(test)]` could never
+/// be told apart from a field with no gate of its own. Each field is now its own
+/// `(bool, Vec<&syn::Item>)` entry, gated by `variant_gated || has_cfg_test(field)`,
+/// matching the two sibling helpers exactly; the discriminant has no analogous
+/// per-part gate to combine with, so it keeps its own single entry at `variant_gated`.
 fn enum_variant_bodies(
     enum_item: &syn::ItemEnum,
     enum_gated: bool,
@@ -2622,20 +2697,19 @@ fn enum_variant_bodies(
     enum_item
         .variants
         .iter()
-        .map(|variant| {
+        .flat_map(|variant| {
             let variant_gated = enum_gated || has_cfg_test(&variant.attrs);
-            let discriminant_items = variant
+            let discriminant_entry = variant
                 .discriminant
                 .as_ref()
-                .map_or_else(Vec::new, |(_, expr)| expr_items(expr));
-            let field_items = variant
-                .fields
-                .iter()
-                .flat_map(|field| type_items(&field.ty));
-            (
-                variant_gated,
-                discriminant_items.into_iter().chain(field_items).collect(),
-            )
+                .map(|(_, expr)| (variant_gated, expr_items(expr)));
+            let field_entries = variant.fields.iter().map(move |field| {
+                (
+                    variant_gated || has_cfg_test(&field.attrs),
+                    type_items(&field.ty),
+                )
+            });
+            discriminant_entry.into_iter().chain(field_entries)
         })
         .collect()
 }
@@ -2677,6 +2751,24 @@ fn trait_member_bodies(
                     trait_gated || has_cfg_test(&constant.attrs),
                     type_items(&constant.ty)
                         .into_iter()
+                        .chain(default_items)
+                        .collect(),
+                ))
+            }
+            // Round 26: the module-tree walk's twin of
+            // [`trait_member_scope_roots`]'s own `TraitItem::Type` arm — a trait's own
+            // associated type declaration can be a GAT with generics, bounds and a
+            // default type, none of which this walk read before.
+            syn::TraitItem::Type(assoc_type) => {
+                let default_items = assoc_type
+                    .default
+                    .as_ref()
+                    .map_or_else(Vec::new, |(_, ty)| type_items(ty));
+                Some((
+                    trait_gated || has_cfg_test(&assoc_type.attrs),
+                    generics_items(&assoc_type.generics)
+                        .into_iter()
+                        .chain(bound_items(&assoc_type.bounds))
                         .chain(default_items)
                         .collect(),
                 ))
@@ -2789,7 +2881,11 @@ fn nested_item_bodies_for_child_modules(
         }
         syn::Item::Trait(trait_item) => {
             let trait_gated = gated || has_cfg_test(&trait_item.attrs);
-            std::iter::once((trait_gated, generics_items(&trait_item.generics)))
+            let header_items: Vec<&syn::Item> = generics_items(&trait_item.generics)
+                .into_iter()
+                .chain(bound_items(&trait_item.supertraits))
+                .collect();
+            std::iter::once((trait_gated, header_items))
                 .chain(trait_member_bodies(trait_item, trait_gated))
                 .collect()
         }
@@ -2841,8 +2937,39 @@ fn nested_item_bodies_for_child_modules(
                 .chain(union_field_bodies(union_item, union_gated))
                 .collect()
         }
+        // Round 26: the module-tree walk's twin of the trait-implementor scan's own
+        // `Item::ForeignMod` arm — a `mod` hidden inside a foreign function's
+        // signature or a foreign static's declared type was never even reached as a
+        // file, the same standing every other shape in this function already records.
+        syn::Item::ForeignMod(foreign_mod) => foreign_mod_bodies(foreign_mod, gated),
         _ => Vec::new(),
     }
+}
+
+/// [`nested_item_bodies_for_child_modules`]'s `Item::ForeignMod` arm — split out to
+/// keep that function under this file's own line-count lint once round 26's arm
+/// joined it, the same way [`impl_member_scope_roots`] was split from
+/// [`collect_trait_implementors_in_item_body`].
+fn foreign_mod_bodies(
+    foreign_mod: &syn::ItemForeignMod,
+    gated: bool,
+) -> Vec<(bool, Vec<&syn::Item>)> {
+    let mod_gated = gated || has_cfg_test(&foreign_mod.attrs);
+    foreign_mod
+        .items
+        .iter()
+        .filter_map(|foreign_item| match foreign_item {
+            syn::ForeignItem::Fn(function) => Some((
+                mod_gated || has_cfg_test(&function.attrs),
+                fn_signature_type_items(&function.sig),
+            )),
+            syn::ForeignItem::Static(statik) => Some((
+                mod_gated || has_cfg_test(&statik.attrs),
+                type_items(&statik.ty),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The string value of a `#[path = "..."]` attribute, if present.
