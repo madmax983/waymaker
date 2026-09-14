@@ -780,9 +780,8 @@ impl Rig {
         // boot does, so a rig that skipped it would be running a protocol no firmware runs.
         let region = {
             let mut engine = self.engine(part).map_err(widen)?;
-            if self.authoritative_banks(&mut engine, page).map_err(widen)? != 1 {
-                return Err(RigError::Bank);
-            }
+            self.require_own_authority(&mut engine, page)
+                .map_err(widen)?;
             self.journal_region(&mut engine, page).map_err(widen)?
         };
         let mut journal = {
@@ -919,9 +918,8 @@ impl Rig {
 
         let region = {
             let mut engine = self.engine(part).map_err(widen)?;
-            if self.authoritative_banks(&mut engine, page).map_err(widen)? != 1 {
-                return Err(RigError::Bank);
-            }
+            self.require_own_authority(&mut engine, page)
+                .map_err(widen)?;
             self.journal_region(&mut engine, page).map_err(widen)?
         };
         let mut journal = {
@@ -1015,9 +1013,8 @@ impl Rig {
 
         let region = {
             let mut engine = self.engine(part).map_err(widen)?;
-            if self.authoritative_banks(&mut engine, page).map_err(widen)? != 1 {
-                return Err(RigError::Bank);
-            }
+            self.require_own_authority(&mut engine, page)
+                .map_err(widen)?;
             self.journal_region(&mut engine, page).map_err(widen)?
         };
         let mut reserved = {
@@ -1127,7 +1124,7 @@ impl Rig {
             }));
         }
 
-        self.perform(iteration, effect, dispatcher)?;
+        Self::perform(self.workload(iteration), effect, dispatcher)?;
         Ok(None)
     }
 
@@ -1190,14 +1187,21 @@ impl Rig {
     }
 
     /// §07 step 4: the physical effect, with the input its schedule record described.
+    ///
+    /// Takes `workload` rather than an iteration to reconstruct one from: `resume_as` may be
+    /// auditing history against a `declared` workload that disagrees with
+    /// `self.workload(iteration)` — issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// row 10 — and review found this call reconstructing its own instead, so a caller whose
+    /// declaration matched the recovered prefix but claimed more effects than the rig can
+    /// answer for durably appended that schedule and then failed to dispatch it, for a
+    /// reason `declared` could have refused before either happened.
     fn perform<D: Dispatcher, E>(
-        &self,
-        iteration: u32,
+        workload: Workload,
         effect: u16,
         dispatcher: &mut D,
     ) -> Result<(), RigError<E, D::Error>> {
         let mut input = [0_u8; Workload::MAX_PAYLOAD_BYTES];
-        let Some(bytes) = self.workload(iteration).effect_input(effect, &mut input) else {
+        let Some(bytes) = workload.effect_input(effect, &mut input) else {
             return Err(RigError::Workload);
         };
         dispatcher
@@ -1351,7 +1355,7 @@ impl Rig {
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                Self::perform(workload, effect, dispatcher)?;
                 Some(effect)
             }
             None => None,
@@ -1377,7 +1381,7 @@ impl Rig {
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                Self::perform(workload, effect, dispatcher)?;
             }
             if matches!(role, Role::Completion(_)) {
                 part.credit_effect();
@@ -1462,7 +1466,7 @@ impl Rig {
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                Self::perform(workload, effect, dispatcher)?;
                 Some(effect)
             }
             None => None,
@@ -1488,7 +1492,7 @@ impl Rig {
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                Self::perform(workload, effect, dispatcher)?;
             }
             if matches!(role, Role::Completion(_)) {
                 part.credit_effect();
@@ -1583,16 +1587,29 @@ impl Rig {
         outcome.map_err(|error| RigError::Witness(unwindow_witness(error)))
     }
 
-    /// How many banks are authoritative.
+    /// Refuses unless [`Rig::BANK`] is the one bank authoritative right now.
     ///
-    /// §14's `single-authority`, read off media exactly as a boot would read it: each bank's
-    /// header and seal, through [`bank::sealed_generation`], then [`bank::select`].
-    fn authoritative_banks<S: StableStorage>(
+    /// For a caller about to read or append to [`Rig::BANK`]'s own journal —
+    /// [`iterate`](Self::iterate), [`iterate_until_rollover`](Self::iterate_until_rollover)
+    /// and [`iterate_reserved`](Self::iterate_reserved) all do, next. Checking only that some
+    /// *one* bank was authoritative was a defect review found once issue
+    /// [#96](https://github.com/madmax983/waymaker/issues/96) gave a device a way to reach
+    /// two authoritative banks in its lifetime rather than one for ever: a device a swap had
+    /// already moved past would pass that count and this call would go on to read or append
+    /// into the retired bank, growing or duplicating a journal nothing boots from. Naming the
+    /// bank rather than counting closes it the same way [`own_bank_journal`] closed the
+    /// matching gap in `judge`.
+    fn require_own_authority<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
         page: &mut [u8],
-    ) -> Result<usize, RigError<S::Error>> {
-        Ok(authority_count(self.authority(engine, page)?))
+    ) -> Result<(), RigError<S::Error>> {
+        match self.authority(engine, page)? {
+            bank::Authority::Bank { id: Self::BANK, .. } => Ok(()),
+            bank::Authority::Unsealed
+            | bank::Authority::Bank { .. }
+            | bank::Authority::Ambiguous { .. } => Err(RigError::Bank),
+        }
     }
 
     /// Which bank is authoritative.

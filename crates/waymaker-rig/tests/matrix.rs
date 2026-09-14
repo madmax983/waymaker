@@ -2227,3 +2227,175 @@ fn verify_does_not_report_a_reclaimed_bank_as_having_lost_its_acknowledged_recor
         "the reclaimed bank's superseded history was reported lost: {verdict:?}"
     );
 }
+
+/// `iterate_until_rollover` and `iterate_reserved` refuse rather than append into a bank a
+/// swap has already moved authority away from.
+///
+/// Before this, both checked only that *some one* bank was authoritative, so calling either
+/// again on a device a swap had already moved past would read and append into the retired
+/// bank instead of refusing it.
+#[test]
+fn iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+        let mut dispatcher = Log::default();
+        let Ok(()) = rig.iterate_until_rollover(
+            0,
+            &mut metered,
+            &mut dispatcher,
+            &mut page,
+            ROLLOVER_EFFECTS_BEFORE,
+        ) else {
+            unreachable!("the fault-free prefix writes cleanly")
+        };
+    }
+
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next = rollover_next_header(&rig);
+    let region = bank_a_region(&rig, &mut device, &mut page);
+    let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(&mut page) {
+        if step.is_err() {
+            unreachable!("bank A's journal is whole up to its last completed effect")
+        }
+    }
+    let Ok(swap) = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    ) else {
+        unreachable!("a swap can be planned from the rolled-over prefix")
+    };
+    let Ok(prepared) = swap.prepare(&mut engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(_installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+
+    // Bank B is now the sole authority. Calling either write path again must refuse rather
+    // than blindly reading and appending into bank A, which a boot will never choose again.
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_until_rollover(
+        0,
+        &mut metered,
+        &mut dispatcher,
+        &mut page,
+        ROLLOVER_EFFECTS_BEFORE,
+    );
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 16,
+            terminal_bytes: 16,
+        },
+        rig.layout(),
+    ) else {
+        unreachable!("the shared fixture's own bounds price a valid reserve")
+    };
+    let outcome = rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+}
+
+/// Round 5, review finding B: `perform` used to rebuild its own workload from the iteration
+/// number instead of using the one `resume_as` was auditing against, so `resume_declaring`
+/// could durably append a schedule record its own narrower workload could not answer for.
+///
+/// This finds a crash point that leaves both of the rig's two effects durably completed and
+/// `RunCompleted` not yet begun, then resumes it declaring a workload with one more effect
+/// than the rig has. The declared workload's extra effect matches the recovered prefix, so
+/// the resume writes its schedule record and dispatches it — from the *declared* workload's
+/// wider effect range. Reverting the fix reproduces the review finding directly: the extra
+/// effect's schedule record lands durably and the dispatch that follows it fails, because
+/// `self.workload(iteration)`'s narrower range refuses an effect index the declared workload
+/// would have served.
+#[test]
+fn resume_declaring_dispatches_the_extra_effect_from_the_declared_workload() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let declared = Workload::new(SEED, 0, EFFECTS + 1);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Both of the rig's own effects durably completed, and `RunCompleted` not yet
+        // begun: the sharpest case, because the recovered prefix agrees with the declared
+        // workload exactly and the only disagreement is what comes after it.
+        if !matches!(
+            (evidence.attempted, evidence.activity, evidence.recovered_it),
+            (Role::Completion(1), Activity::Returned, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(
+            matches!(
+                outcome,
+                Ok(Resumed::Completed {
+                    recovered: 5,
+                    redelivered: None
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            dispatcher.entered,
+            [2],
+            "the extra effect was not dispatched from the declared workload"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(
+        checked > 0,
+        "no crash point left both effects durably completed with RunCompleted not yet begun"
+    );
+}
