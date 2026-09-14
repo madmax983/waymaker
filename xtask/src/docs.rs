@@ -686,12 +686,12 @@ pub const STORAGE_SHAPES: &[StorageShape] = &[
     StorageShape {
         id: "read-single-unit",
         sentence: "A read of exactly one read unit.",
-        issued_by: "`recovery::Recovery::stage`'s header read, on a geometry where the header fits one read unit; and its erased-tail walk, when the caller's page holds exactly one read unit",
+        issued_by: "`recovery::Recovery::stage`'s header read and its erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — come to exactly one read unit",
     },
     StorageShape {
         id: "read-multi-unit",
         sentence: "A read of more than one read unit in one call.",
-        issued_by: "`recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; its header read, on a geometry where the header spans more than one; and its erased-tail walk, when the caller's page holds more than one read unit",
+        issued_by: "`recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; and its header read and erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — span more than one read unit",
     },
 ];
 
