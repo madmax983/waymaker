@@ -1496,6 +1496,7 @@ pub fn match_expressions_with_prefix(
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
         module_path: prefix.to_vec(),
+        module_scope_depths: Vec::new(),
         qualified: external_qualified.clone(),
         found: Vec::new(),
     };
@@ -1562,6 +1563,7 @@ pub fn qualified_constants_with_prefix(
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
         module_path: prefix.to_vec(),
+        module_scope_depths: Vec::new(),
         qualified,
         found: Vec::new(),
     };
@@ -1585,6 +1587,27 @@ impl ConstScopes {
     /// `name`'s value at the innermost scope that declares it, searching outward.
     fn resolve(&self, name: &str) -> Option<u128> {
         self.0
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    /// `name`'s value at the innermost scope within the first `depth` entries of the
+    /// stack, searching outward from there — [`resolve`](Self::resolve) truncated to a
+    /// specific ancestor rather than the whole live stack.
+    ///
+    /// Codex's finding: `super::P0` was resolved with a plain [`resolve`](Self::resolve),
+    /// which searches the *entire* current stack — including scopes nested more deeply
+    /// than the ancestor `super` actually names. A child module that shadows its parent's
+    /// `P0` with a non-dense value of its own made a match in that child reading
+    /// `super::P0` find the child's own shadowing value instead of the parent's, because
+    /// the child's scope is innermost and a plain search never learns to skip past it.
+    /// Truncating the stack to `depth` — the length it had right after the target ancestor
+    /// module's own scope was pushed — excludes every scope nested inside that ancestor,
+    /// so the search can only find that ancestor's own constant or one further outward.
+    fn resolve_from(&self, name: &str, depth: usize) -> Option<u128> {
+        self.0
+            .get(..depth)?
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
@@ -1685,6 +1708,18 @@ fn resolve_scope_consts(
     resolved
 }
 
+/// A literal's own integer value: an integer of any base or suffix, or a byte literal
+/// (`b'\0'`), which is exactly as numeric a singleton as `0` is and compiles to the
+/// identical lookup-table entry — Codex's finding, since neither [`literal_or_const_value`]
+/// nor [`pattern_literal`] had ever looked past `syn::Lit::Int`.
+fn lit_value(lit: &syn::Lit) -> Option<u128> {
+    match lit {
+        syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
+        syn::Lit::Byte(byte) => Some(u128::from(byte.value())),
+        _ => None,
+    }
+}
+
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
@@ -1693,10 +1728,7 @@ fn literal_or_const_value(
     resolve: &dyn Fn(&syn::Path) -> Option<u128>,
 ) -> Option<u128> {
     match expr {
-        syn::Expr::Lit(literal) => match &literal.lit {
-            syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
-            _ => None,
-        },
+        syn::Expr::Lit(literal) => lit_value(&literal.lit),
         syn::Expr::Cast(cast) => literal_or_const_value(&cast.expr, resolve),
         syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
         syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
@@ -1730,10 +1762,7 @@ fn pattern_literal(
     resolve: &dyn Fn(&syn::Path) -> Option<u128>,
 ) -> Option<u128> {
     match pattern {
-        syn::Pat::Lit(literal) => match &literal.lit {
-            syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
-            _ => None,
-        },
+        syn::Pat::Lit(literal) => lit_value(&literal.lit),
         syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
             resolve(&syn::Path::from(named.ident.clone()))
         }
@@ -1891,6 +1920,89 @@ fn resolve_qualified_path(
     qualified.get(&tail.join("::")).copied()
 }
 
+/// The scope-stack depth naming "as of `levels_up` ancestor modules above the current
+/// one" — `0` for the current module itself (`self::NAME`), `1` for its parent
+/// (`super::NAME`), and so on — read from `module_scope_depths`, [`MatchVisitor`]'s record
+/// of the stack depth right after each entered module's own scope was pushed. `levels_up`
+/// at or past the number of modules actually entered clamps to `1`, the file root's own
+/// scope, the same clamp [`resolve_qualified_path`] applies for an excess `super`.
+fn ancestor_scope_depth(module_scope_depths: &[usize], levels_up: usize) -> usize {
+    let count = module_scope_depths.len();
+    if levels_up >= count {
+        return 1;
+    }
+    module_scope_depths
+        .get(count - 1 - levels_up)
+        .copied()
+        .unwrap_or(1)
+}
+
+/// `refs`' own value when it is `crate`, `self`, or one or more `super`s, followed by
+/// exactly one more segment — the value that segment names, resolved against the scope
+/// stack truncated to the depth the anchor names, rather than [`ConstScopes::resolve`]'s
+/// unrestricted outward search. `None` when `refs` is not one of these three shapes at
+/// all, so the caller falls through to its own unrelated handling for anything else — a
+/// module-qualified chain (`super::indices::P0`) among them, which stays
+/// [`resolve_qualified_path`]'s.
+///
+/// Codex's finding: `super::P0`, resolved by a plain [`ConstScopes::resolve`], searches the
+/// *entire* live stack, including a scope nested more deeply than the ancestor `super`
+/// actually names — a child module shadowing its parent's `P0` with a non-dense value made
+/// a match inside that child reading `super::P0` find the child's own value instead of the
+/// parent's, since the child's own scope is innermost and an unrestricted search never
+/// learns to stop before it. `crate::P0` and `self::P0` have the identical shape of gap,
+/// each solved the same way: `crate` anchors at the file root (depth `1`), `self` at the
+/// current module's own depth (`levels_up: 0`), and each leading `super` steps one level
+/// further out.
+/// [`resolve_anchored_single_segment`]'s answer: either the shape does not apply and the
+/// caller's own unrelated handling decides, or it does, with whatever value (`None`
+/// included) the anchor's own scope resolved the remaining name to.
+enum AnchoredLookup {
+    /// Not `crate`/`self`/`super`-anchored with exactly one segment left, or not anchored
+    /// at all.
+    NotApplicable,
+    /// Anchored; this is what the anchor's own scope resolved the name to.
+    Resolved(Option<u128>),
+}
+
+fn resolve_anchored_single_segment(
+    refs: &[&str],
+    scopes: &ConstScopes,
+    module_scope_depths: &[usize],
+) -> AnchoredLookup {
+    let Some((&first, rest)) = refs.split_first() else {
+        return AnchoredLookup::NotApplicable;
+    };
+    if first == "crate" {
+        let (true, Some(&name)) = (rest.len() == 1, rest.first()) else {
+            return AnchoredLookup::NotApplicable;
+        };
+        return AnchoredLookup::Resolved(scopes.resolve_from(name, 1));
+    }
+    if first == "self" {
+        let (true, Some(&name)) = (rest.len() == 1, rest.first()) else {
+            return AnchoredLookup::NotApplicable;
+        };
+        let depth = ancestor_scope_depth(module_scope_depths, 0);
+        return AnchoredLookup::Resolved(scopes.resolve_from(name, depth));
+    }
+    if first == "super" {
+        let super_count = refs
+            .iter()
+            .take_while(|segment| **segment == "super")
+            .count();
+        let Some(after_super) = refs.get(super_count..) else {
+            return AnchoredLookup::NotApplicable;
+        };
+        let (true, Some(&name)) = (after_super.len() == 1, after_super.first()) else {
+            return AnchoredLookup::NotApplicable;
+        };
+        let depth = ancestor_scope_depth(module_scope_depths, super_count);
+        return AnchoredLookup::Resolved(scopes.resolve_from(name, depth));
+    }
+    AnchoredLookup::NotApplicable
+}
+
 /// Walks a parsed file collecting every [`FoundMatch`], skipping anything declared under
 /// `#[cfg(test)]` — an item, an `impl` member, or an inline module's contents — the
 /// structural equivalent of `without_test_modules` blanking the same text.
@@ -1904,10 +2016,15 @@ fn resolve_qualified_path(
 /// every module's own constants, recorded once under that module's file-root-relative path
 /// (`module_path` is the stack of module names currently entered) as the walk resolves each
 /// module's scope, so a later `module::P0` reference — from anywhere the walk has since
-/// moved on to — still finds it.
+/// moved on to — still finds it. `module_scope_depths` is `scopes`'s own depth recorded
+/// once per entry of `module_path`, right after that module's scope was pushed — what lets
+/// `super::P0`, `self::P0` and `crate::P0` truncate the live stack to the ancestor they
+/// each name instead of searching all of it (Codex's finding: an unrestricted search can
+/// return a *shadowing* constant declared at a level the anchor explicitly steps past).
 struct MatchVisitor {
     scopes: ConstScopes,
     module_path: Vec<String>,
+    module_scope_depths: Vec<usize>,
     qualified: std::collections::HashMap<String, u128>,
     found: Vec<FoundMatch>,
 }
@@ -1939,7 +2056,9 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 .insert(format!("{}::{name}", self.module_path.join("::")), *value);
         }
         self.scopes.0.push(scope);
+        self.module_scope_depths.push(self.scopes.0.len());
         syn::visit::visit_item_mod(self, node);
+        self.module_scope_depths.pop();
         self.scopes.0.pop();
         self.module_path.pop();
     }
@@ -1949,22 +2068,27 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         // one, and nothing here had ever read an `impl` block's own `const` items. Scoped
         // to the shape the finding names and no wider: an inherent `impl` (no `trait_`,
         // since a trait impl's own consts can come from the trait's default and this scan
-        // has no notion of one) over a plain, single-segment, non-generic `Self` type —
-        // `impl Indices<T> { .. }` or `impl some::Path { .. }` name no known type this way
-        // and are left unrecorded rather than guessed at.
+        // has no notion of one) over a plain, single-segment `Self` type — `impl some::Path
+        // { .. }` names no known type this way and is left unrecorded rather than guessed
+        // at.
+        //
+        // Codex's next-round finding: `impl<T> Indices<T> { .. }` was excluded by requiring
+        // the one segment to carry no generic arguments at all, even though a caller
+        // referencing `Indices::<u8>::P0` names the base type the same way — the arguments
+        // are on the *caller's* path and are already ignored by every reader of a
+        // `syn::Path` here (`ident_name` reads a segment's identifier, never its
+        // arguments), so a `Self` type's own generics are no reason to skip its constants.
         if node.trait_.is_none() {
             if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
                 if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
                     if let Some(segment) = type_path.path.segments.first() {
-                        if matches!(segment.arguments, syn::PathArguments::None) {
-                            let scope =
-                                resolve_scope_consts(&impl_const_exprs(&node.items), &self.scopes);
-                            let mut path = self.module_path.clone();
-                            path.push(ident_name(&segment.ident));
-                            for (name, value) in &scope {
-                                self.qualified
-                                    .insert(format!("{}::{name}", path.join("::")), *value);
-                            }
+                        let scope =
+                            resolve_scope_consts(&impl_const_exprs(&node.items), &self.scopes);
+                        let mut path = self.module_path.clone();
+                        path.push(ident_name(&segment.ident));
+                        for (name, value) in &scope {
+                            self.qualified
+                                .insert(format!("{}::{name}", path.join("::")), *value);
                         }
                     }
                 }
@@ -1984,43 +2108,41 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         let scopes = &self.scopes;
         let qualified = &self.qualified;
         let module_path = &self.module_path;
+        let module_scope_depths = &self.module_scope_depths;
         let resolve = move |path: &syn::Path| {
             if let Some(ident) = path.get_ident() {
                 return scopes.resolve(&ident_name(ident));
             }
-            // A leading `crate` or `self` names no module of its own, so a path that is
-            // only that plus one more segment (`crate::P0`) is still a bare, ambiently
-            // resolved name once it is stripped — the qualified map only holds an actual
-            // module's own constants.
             let segments: Vec<String> = path
                 .segments
                 .iter()
                 .map(|segment| ident_name(&segment.ident))
                 .collect();
-            let relevant: Vec<&str> = segments
+            let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+            // `crate`/`self`/`super` followed by exactly one more segment names a plain
+            // constant declared directly in a specific ancestor, not a further-qualified
+            // `module::name` chain — `resolve_qualified_path`'s map has no entry for a
+            // constant that was never itself nested in a named module of its own. Tried
+            // before anything else strips these words, because the anchor decides *which*
+            // scope the remaining name is looked up against.
+            if let AnchoredLookup::Resolved(value) =
+                resolve_anchored_single_segment(&refs, scopes, module_scope_depths)
+            {
+                return value;
+            }
+            // A leading `crate` or `self` names no module of its own, so a path that is
+            // only that plus one more segment (`crate::P0`) is still a bare, ambiently
+            // resolved name once it is stripped — the qualified map only holds an actual
+            // module's own constants. (The anchored form above already caught this shape;
+            // reaching here means `refs` had more than one segment left after `crate`/
+            // `self`, so this is `crate::module::P0` rather than `crate::P0`.)
+            let relevant: Vec<&str> = refs
                 .iter()
-                .map(String::as_str)
+                .copied()
                 .skip_while(|segment| *segment == "crate" || *segment == "self")
                 .collect();
             if relevant.len() == 1 {
                 return relevant.first().and_then(|name| scopes.resolve(name));
-            }
-            // Codex's finding: one or more leading `super`s followed by exactly one more
-            // segment (`super::P0`) names a plain constant declared directly in an
-            // ancestor module, not a further-qualified `module::name` chain —
-            // `resolve_qualified_path`'s map has no entry for a constant that was never
-            // itself nested in a named module of its own, and `qualified_constants_with_prefix`
-            // has nothing else to have recorded it under. The live scope stack already
-            // holds every ancestor's own constants regardless of how many `super`s it took
-            // to name one, so the remaining single name is resolved the same way a bare
-            // identifier is.
-            let after_super: Vec<&str> = relevant
-                .iter()
-                .copied()
-                .skip_while(|segment| *segment == "super")
-                .collect();
-            if after_super.len() == 1 {
-                return after_super.first().and_then(|name| scopes.resolve(name));
             }
             resolve_qualified_path(path, qualified, module_path)
         };

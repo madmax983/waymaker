@@ -15424,6 +15424,86 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_qualified_against_a_generic_associated_constant_is_reported() {
+        // Codex's twenty-second-round finding: `impl<T> Indices<T> { const P0 = 0; .. }`
+        // was excluded entirely because the fix for the last round required the `Self`
+        // type's one segment to carry no generic arguments at all — even though a caller
+        // referencing `Indices::<u8>::P0` names the base type `Indices` exactly the way a
+        // non-generic one would, since `ident_name` reads a segment's identifier and never
+        // its arguments on either side. The generics requirement is gone; only the shape
+        // (inherent, single-segment `Self`) still gates it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Indices<T>(T);\n\nimpl<T> Indices<T> {\n    pub(crate) const P0: u8 \
+             = 0;\n    pub(crate) const P1: u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    \
+             pub(crate) const P3: u8 = 3;\n}\n\nconst fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        Indices::<u8>::P0 => 0,\n        Indices::<u8>::P1 => 1,\n        \
+             Indices::<u8>::P2 => 2,\n        Indices::<u8>::P3 => 3,\n        _ => 4,\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_byte_literal_patterns_is_reported() {
+        // Codex's twenty-second-round finding: `b'\0'`, `b'\x01'`, .. are numeric
+        // singletons with the same semantics `0`, `1`, .. have and LLVM lowers a dense
+        // table spelled either way to the same indexed rodata. `lit_value` — shared by
+        // `literal_or_const_value` and `pattern_literal` — now reads `syn::Lit::Byte`
+        // alongside `syn::Lit::Int`, so this is dense rather than five unresolved patterns.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn byte_literal_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        b'\\0' => crc32_nibble(0),\n        b'\\x01' => crc32_nibble(1),\n        \
+             b'\\x02' => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_reading_super_does_not_find_a_shadowing_child_value() {
+        // Codex's twenty-second-round finding: `super::P0` was resolved with a plain,
+        // unrestricted `ConstScopes::resolve`, which searches the *entire* live scope
+        // stack rather than only the ancestor `super` actually names. A child module that
+        // shadows its parent's `P0` with a non-dense value of its own — declared in the
+        // very module the match sits in — used to have `super::P0` find the child's own
+        // shadowing value first, since the child's scope is innermost. `P0` is dense
+        // (0..3) in the parent and deliberately non-dense (200..203) in the child, so the
+        // match is reported only if `super::P0` resolves against the parent, truncating
+        // the search before it ever reaches the child's own scope.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+             3;\n\nmod child {\n    const P0: u8 = 200;\n    const P1: u8 = 201;\n    \
+             const P2: u8 = 202;\n    const P3: u8 = 203;\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            super::P0 => 0,\n            super::P1 => 1,\n            \
+             super::P2 => 2,\n            super::P3 => 3,\n            _ => 4,\n        }\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_qualified_with_super_across_out_of_line_files_resolves_against_the_tree() {
         // Codex's nineteenth-round finding: `module_path_prefixes` computes each scanned
         // file's own position in the tree for constant *collection*, but
