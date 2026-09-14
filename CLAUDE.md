@@ -3569,37 +3569,14 @@ check exists for authors, not adversaries. Tracked as issue
 [#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
 one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
 
-Issue #169 closes PR #160 round 9's own finding: `resolve_segments` could not follow a plain
-relative path — `traits::Pollable`, no `crate`/`super`/`self` prefix — into a sibling `mod`
-block declared in the same file, because the scope stack held only precomputed alias lists
-for the lexical ancestors the visitor was walking, not an index of named modules reachable
-from an arbitrary point in the tree. The stack now holds each scope's own item list instead
-of its precomputed aliases, and `resolve_segments` derives `own_aliases` from it as before
-plus a new `own_modules`: when no alias matches, it steps into a same-named sibling `mod`
-block and keeps resolving there, chained through as many levels as the path names. `self::`
-still resolves inside an entered module; `super::` does not, once resolution is off the
-lexical ancestor stack. That is the same residual-limit shape as `crate::` and a top-level
-`super::` above rather than a guess. An out-of-line `mod name;` and a `#[cfg(test)]`-gated
-module are both left unresolved for the same reason those are already residual limits
-elsewhere. The five call sites sharing this stack (`resolved_path_uses`,
-`future_trait_implementors`, `struct_literal_counts`, `name_uses`, and the
-`fn_blocks`/`inherent_impls` pair beneath it) moved to the new representation together, since
-they all resolve through one function; the existing `alias_scope_tests` suite covers every
-one of them.
-
-Codex review of this pull request found two real gaps in the fix, both closed here rather
-than carried forward. The first is the loop's own bound: it had moved from counting every
-alias reachable across the ancestor stack to counting *items*, which undercounts a chain
-packed into one grouped `use`, `use m::{a as b, b as c, ...};` — a single item can declare as
-many hops as it likes. The bound is now the file's total item count *plus* its total alias
-count, the same recursive walk `use_aliases` already does, so a grouped chain nine hops long
-from four items resolves in full rather than stopping three hops short. The second is sharper:
-a one-segment path — `impl Future for X`, no further segments — was still checked against
-`own_modules`, and a same-named sibling `mod Future { .. }` anywhere in scope made resolution
-step into it and throw the name away, leaving `segments` empty and the genuine `impl` invisible
-to `future_trait_implementors`. A path with nothing left to resolve past its head never names a
-module to step into, so descent is now only attempted when a segment remains behind it.
-`alias_scope_tests` gained a case for each, plus a same-named-module-in-a-different-branch
-scope-leakage test, a crafted-alias-cycle termination test, and a direct test of the descent
-through `resolved_path_uses` and `name_uses` rather than through `future_trait_implementors`
-alone. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+Issue #153 asks a specific question: does a host-side instruction profile justify a CRC
+lookup table? For `crc32` the answer is no. ADR 0010 requires evidence from real flash,
+measured against a stated latency limit. A host profile is not that evidence. Its table
+stays declined. For `crc16` the question does not apply. `0x1021`'s three set bits each
+land a 4-bit nibble in its own span, with no overlap. So a nibble's four bitwise rounds
+equal one multiply. No table is needed. `crc16` now folds two nibble-rounds per byte this
+way; `crc32`'s reflected polynomial has overlapping spans and keeps its eight-round
+bitwise loop. Same algorithms, same outputs, checked
+exhaustively in `crates/waymaker-flash/src/crc.rs`. See
+[ADR 0046](docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md),
+which supersedes one sentence of ADR 0010's decision text and nothing else in it.

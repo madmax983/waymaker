@@ -75,6 +75,25 @@ pub const REQUIRED_BUFFER_UNITS: u32 = 2;
 /// one helper. Checked against the byte-at-a-time definition at every length and
 /// single-byte-mutation position around a word boundary in this module's tests, so a
 /// remainder handled short does not pass silently.
+///
+/// # Do not change the loop to `split_first_chunk`
+///
+/// This change looks like an improvement. It is not. Do not make it again.
+///
+/// `split_first_chunk::<WORD>()` removes the `TryFrom` check. It removes the
+/// `chunks_exact` iterator too. It appears to need fewer operations per word.
+///
+/// A test shows the opposite result. On the `conformance` workload
+/// (`cargo xtask profile`), the `split_first_chunk` form increases
+/// engine-attributed instructions by 9.3% (41113 Ir to 44931 Ir). The
+/// `journal`, `driver` and `facade` workloads do not change. They do not call
+/// this function.
+///
+/// Here is the reason. This loop already compiles into a loop with three
+/// instructions for each word. Compiler output shows this, not source code.
+/// Use `objdump` on `target/profiling/xtask` to check the compiler output.
+/// The `split_first_chunk` form compiles into a slower loop for this exact
+/// case. See issue #152 for the full measurement.
 fn slice_is_erased(bytes: &[u8]) -> bool {
     const WORD: usize = size_of::<usize>();
     let mut words = bytes.chunks_exact(WORD);
