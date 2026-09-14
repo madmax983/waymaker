@@ -2432,6 +2432,25 @@ fn apply_integer_cast(value: i128, ty: &syn::Type) -> Option<i128> {
     }
 }
 
+/// `expr`'s own integer literal, if it is one carrying an explicit suffix (`255u8`, never
+/// a bare `255`) — seen through any nesting of parentheses or brace groups, the same two
+/// wrappers every other literal-reading function here sees through.
+///
+/// The suffix is what [`literal_or_const_value`]'s own bitwise-NOT case needs and a bare
+/// literal or an already-resolved constant cannot supply: the *width* `!` is meant to flip
+/// every bit of, which this scan has no way to learn except from the source spelling.
+fn as_suffixed_int_literal(expr: &syn::Expr) -> Option<&syn::LitInt> {
+    match expr {
+        syn::Expr::Paren(paren) => as_suffixed_int_literal(&paren.expr),
+        syn::Expr::Group(group) => as_suffixed_int_literal(&group.expr),
+        syn::Expr::Lit(literal) => match &literal.lit {
+            syn::Lit::Int(int) if !int.suffix().is_empty() => Some(int),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a path that `resolve` answers for — the
 /// constant-pattern half of both [`FoundArm::pattern`] and a call argument's own value.
@@ -2491,6 +2510,25 @@ fn literal_or_const_value(
         // counterpart and fails closed rather than wrapping.
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
             literal_or_const_value(&unary.expr, resolve)?.checked_neg()
+        }
+        // Codex's forty-third-round finding: `!255u8` — bitwise NOT of a literal — is
+        // `Expr::Unary(Not, ..)`, which fell to the wildcard `_ => None` case below, so a
+        // table whose numbered arms were spelled `!255u8` through `!241u8` read as
+        // unresolved on every arm. Rust's `!` flips every bit *within the operand's own
+        // width* — `!255u8` is `0`, not the all-ones `i128` a naive `!raw_value` would
+        // give — so this scan needs that width, and the only place it can get one without
+        // guessing is a literal that carries its own suffix: [`as_suffixed_int_literal`]
+        // requires exactly that, seen through any nesting of parentheses or brace groups,
+        // and an operand with no visible suffix (a bare constant reference, or arithmetic)
+        // stays unresolved rather than assumed. `!value` at full `i128` width, then
+        // [`apply_integer_cast`]'s own truncating mask down to the suffix's width, is the
+        // same answer a width-aware NOT would give directly: masking to the low `N` bits
+        // after a full-width NOT is bit-for-bit identical to NOT-ing those `N` bits alone.
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => {
+            let int = as_suffixed_int_literal(&unary.expr)?;
+            let ty = syn::parse_str::<syn::Type>(int.suffix()).ok()?;
+            let raw = lit_value(&syn::Lit::Int(int.clone()))?;
+            apply_integer_cast(!raw, &ty)
         }
         // Codex's finding: `const P0: u8 = { const N: u8 = 0; N };` is `Expr::Block` — a
         // block used as an expression, most often to give an initializer a scope of its
@@ -2606,12 +2644,25 @@ fn literal_or_const_value(
 /// [`MatchVisitor::visit_item_impl`] indexes a trait impl's constants under the *impl's*
 /// own lexical module, never the trait's. Neither candidate above names that module (this
 /// function only ever sees the *pattern's* own path, never where the impl actually sits),
-/// so both failed and the arm stayed unresolved. The fallback below searches every key
-/// `qualified` holds for the one ending in exactly `type_name::member` — the suffix every
+/// so both failed and the arm stayed unresolved. A fallback searches every key `qualified`
+/// holds for the one ending in exactly `type_name::member` — the suffix every
 /// [`MatchVisitor::visit_item_impl`] insertion carries regardless of which module recorded
 /// it — and answers only when that search is unambiguous, the same standing every other
 /// unsupported shape in this scan already has: a second impl of the same type existing
 /// somewhere else in the tree leaves this unresolved rather than guessing between them.
+///
+/// Codex's next-round finding after *that*: "unambiguous" broke the moment two different
+/// traits are each implemented for the same type in two different modules — `traits::Dense`
+/// and `traits::Noise`, say, both implemented for `u8` — because both impls' constants end
+/// in the identical `u8::P0` suffix, and the bare-type search above cannot tell them apart
+/// even though the pattern's own trait path (`<u8 as traits::Dense>::P0`) names the intended
+/// impl exactly. [`MatchVisitor::visit_item_impl`] now indexes a trait impl's constants a
+/// second way too, with the trait's own bare name ahead of the type
+/// (`impl_module::Dense::u8::P0`), and the search below tries that shape — keyed on the
+/// pattern's own trait segment, `path.segments[segment_count - 2]`, which is always the
+/// trait's bare name whether the pattern referenced it bare or through a longer qualified
+/// path — before falling back to the type-only suffix, which stays for an impl this second
+/// key cannot reach (an inherent impl, where there is no trait to disambiguate with).
 fn resolve_qself_associated_const(
     qself: &syn::QSelf,
     path: &syn::Path,
@@ -2640,6 +2691,19 @@ fn resolve_qself_associated_const(
     let synthetic = syn::parse_str::<syn::Path>(&format!("{type_name}::{member}")).ok()?;
     if let Some(value) = resolve(&synthetic) {
         return Some(value);
+    }
+    if let Some(trait_segment) = segment_count
+        .checked_sub(2)
+        .and_then(|index| path.segments.get(index))
+    {
+        let trait_bare_name = ident_name(&trait_segment.ident);
+        let trait_suffix = format!("::{trait_bare_name}::{type_name}::{member}");
+        let mut trait_candidates = qualified.keys().filter(|key| key.ends_with(&trait_suffix));
+        if let Some(unique) = trait_candidates.next() {
+            if trait_candidates.next().is_none() {
+                return qualified.get(unique).copied();
+            }
+        }
     }
     let suffix = format!("::{type_name}::{member}");
     let mut candidates = qualified.keys().filter(|key| key.ends_with(&suffix));
@@ -2775,13 +2839,6 @@ fn pattern_literal(
             else {
                 return Vec::new();
             };
-            let inclusive_end = match range.limits {
-                syn::RangeLimits::Closed(_) => Some(end),
-                syn::RangeLimits::HalfOpen(_) => end.checked_sub(1),
-            };
-            let Some(inclusive_end) = inclusive_end else {
-                return Vec::new();
-            };
             // Bounded before it is generated: a span too wide to fit a `usize`, or one
             // whose width cannot even be computed, is not a dense table any real
             // integer pattern could name, and is refused rather than attempted.
@@ -2796,17 +2853,53 @@ fn pattern_literal(
             // ever justify — ADR 0010 measures the widest one ever considered, a 256-entry
             // byte-indexed CRC table, at 1024 B against an 8 KiB code-flash budget — and
             // narrow enough that even the worst case allocates kilobytes, not gigabytes.
-            let count = inclusive_end
-                .checked_sub(start)
-                .and_then(|span| usize::try_from(span).ok())
-                .and_then(|span| span.checked_add(1));
-            let Some(count) = count else {
+            //
+            // Codex's forty-third-round finding: a range whose `start` and `end` straddle
+            // the point [`lit_value`]'s own two's-complement reinterpretation of a `u128`
+            // literal at or above `2^127` wraps through — `2^127-2..=2^127`, say — has
+            // `start` sitting near `i128::MAX` and `end` near `i128::MIN` after that
+            // reinterpretation, so `end.checked_sub(start)` (by way of `inclusive_end`)
+            // always overflowed and this whole arm answered `None`, even though the range
+            // is still exactly as dense a window as any other. The span is now the
+            // *forward* distance from `start` to `end`, computed as `end.wrapping_sub
+            // (start)`'s own bit pattern read as `u128` — [`window_layout`]'s own
+            // reasoning, that this bit pattern is the circular distance mod `2^128`
+            // regardless of which half of `i128` either endpoint sits in — plus one for a
+            // closed range, and the values are generated the same way: `wrapping_add(1)`
+            // from `start`, which is the identical successor a plain increment gives for
+            // every range that does not straddle the boundary and the correct one for a
+            // range that does.
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "wrapping_sub's own bit pattern, reinterpreted as the unsigned \
+                          forward distance from start to end, not a value conversion"
+            )]
+            let mut count = end.wrapping_sub(start) as u128;
+            if matches!(range.limits, syn::RangeLimits::Closed(_)) {
+                let Some(bumped) = count.checked_add(1) else {
+                    return Vec::new();
+                };
+                count = bumped;
+            }
+            let Ok(max_values) = u128::try_from(MAX_RANGE_PATTERN_VALUES) else {
                 return Vec::new();
             };
-            if start > inclusive_end || count > MAX_RANGE_PATTERN_VALUES {
+            if count == 0 || count > max_values {
                 return Vec::new();
             }
-            (start..=inclusive_end).collect()
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "count was just bounded above by MAX_RANGE_PATTERN_VALUES, itself \
+                          a usize, so it fits"
+            )]
+            let count = count as usize;
+            let mut values = Vec::with_capacity(count);
+            let mut current = start;
+            for _ in 0..count {
+                values.push(current);
+                current = current.wrapping_add(1);
+            }
+            values
         }
         // Codex's finding: a reference pattern (`&0`) is exactly as singleton a value as
         // its own referent, over a scrutinee that is itself a reference — a shape a dense
@@ -3702,17 +3795,20 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         if let syn::Type::Path(type_path) = node.self_ty.as_ref() {
             if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
                 if let Some(segment) = type_path.path.segments.first() {
-                    let mut scope = node
+                    let trait_name = node
                         .trait_
                         .as_ref()
                         .and_then(|(_, trait_path, _)| trait_path.segments.last())
-                        .and_then(|segment| {
+                        .map(|segment| ident_name(&segment.ident));
+                    let mut scope = trait_name
+                        .as_ref()
+                        .and_then(|trait_name| {
                             lookup_trait_defaults(
                                 &self.trait_defaults,
                                 &self.module_path,
                                 &self.function_path,
                                 &self.block_path,
-                                &ident_name(&segment.ident),
+                                trait_name,
                             )
                         })
                         .cloned()
@@ -3730,9 +3826,31 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     ));
                     let name = ident_name(&segment.ident);
                     path.push(name.clone());
+                    // Codex's forty-third-round finding: two sibling modules each
+                    // implementing a *different* trait for the same type (`u8`, say) both
+                    // indexed their constants under the identical suffix `u8::P0`, so
+                    // `resolve_qself_associated_const`'s suffix search — which exists
+                    // precisely because the impl's own module can differ from the trait's —
+                    // found two candidates for `<u8 as traits::Dense>::P0` and answered
+                    // neither, even though the pattern's own trait path names the impl
+                    // unambiguously. A second key, carrying the trait's own bare name ahead
+                    // of the type, is inserted alongside the existing one whenever this is a
+                    // trait impl, so a suffix search keyed on *both* the trait and the type
+                    // finds exactly one candidate again.
+                    let mut trait_qualified_path = path.clone();
+                    if let Some(trait_name) = &trait_name {
+                        let insertion_point = trait_qualified_path.len() - 1;
+                        trait_qualified_path.insert(insertion_point, trait_name.clone());
+                    }
                     for (const_name, value) in &scope {
                         self.qualified
                             .insert(format!("{}::{const_name}", path.join("::")), *value);
+                        if trait_name.is_some() {
+                            self.qualified.insert(
+                                format!("{}::{const_name}", trait_qualified_path.join("::")),
+                                *value,
+                            );
+                        }
                     }
                     self_type_name = Some(name);
                 }

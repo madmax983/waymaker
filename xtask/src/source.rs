@@ -17434,6 +17434,101 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_a_range_spanning_the_u128_sign_boundary_is_reported() {
+        // Codex's forty-third-round finding: preserving individual `u128` literals above
+        // `2^127` was not enough — a *range* pattern whose own `start` and `end` straddle
+        // the boundary (`2^127-1..=2^127+1`) has `start` reinterpreted as a large positive
+        // `i128` and `end` reinterpreted as a small negative one, so the old
+        // `checked_sub`-based span computation overflowed and the whole range answered no
+        // values at all, which emptied the arm's pattern and skipped the match outright.
+        // The range is now expanded with the identical wrapping (mod 2^128) reasoning
+        // `window_layout` already uses for the values it lays out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn range_boundary_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn range_boundary_table(nibble: u128) -> u32 \
+             {\n    match nibble {\n        \
+             170141183460469231731687303715884105726 => \
+             range_boundary_helper(0),\n        \
+             170141183460469231731687303715884105727..=\
+             170141183460469231731687303715884105729 => \
+             range_boundary_helper(1),\n        \
+             170141183460469231731687303715884105730 => \
+             range_boundary_helper(2),\n        _ => range_boundary_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_one_of_two_traits_implemented_for_one_type_is_reported() {
+        // Codex's forty-third-round finding: the sibling-module suffix search the prior
+        // round added searches for a key ending in `type_name::member` alone, which is
+        // ambiguous the moment *two* different traits are each implemented for the same
+        // type in two different modules — `traits::Dense` and `traits::Noise`, both for
+        // `u8`, each declaring `P0` through `P3` — because both impls' constants end in
+        // the identical `u8::P0` suffix, even though the pattern's own trait path
+        // (`<u8 as traits::Dense>::P0`) names the intended impl exactly.
+        // `visit_item_impl` now also indexes a trait impl's constants with the trait's own
+        // bare name ahead of the type, and the search tries that shape first.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits {\n    pub trait Dense {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n\n    \
+             pub trait Noise {\n        const P0: u8;\n        const P1: u8;\n        \
+             const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod dense_impl {\n    impl super::traits::Dense for u8 {\n        \
+             const P0: u8 = 0;\n        const P1: u8 = 1;\n        const P2: u8 = \
+             2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             mod noise_impl {\n    impl super::traits::Noise for u8 {\n        \
+             const P0: u8 = 99;\n        const P1: u8 = 100;\n        const P2: u8 = \
+             101;\n        const P3: u8 = 102;\n    }\n}\n\n\
+             const fn trait_identity_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        <u8 as traits::Dense>::P0 => 0,\n        \
+             <u8 as traits::Dense>::P1 => 1,\n        <u8 as traits::Dense>::P2 => \
+             2,\n        <u8 as traits::Dense>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_bitwise_not_initializers_is_reported() {
+        // Codex's forty-third-round finding: `const P0: u8 = !255u8;` through `P3` is
+        // `Expr::Unary(Not, ..)`, which fell to the wildcard `_ => None` case and left
+        // every numbered constant unresolved. `!` flips every bit within the operand's
+        // own width, which this scan can only know from a literal's own suffix — computed
+        // as a full-width `i128` NOT truncated down to that width, the same masking
+        // `apply_integer_cast` already does for a cast.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn bitwise_not_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = !255u8;\n    const P1: u8 = !254u8;\n    \
+             const P2: u8 = !253u8;\n    const P3: u8 = !252u8;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
