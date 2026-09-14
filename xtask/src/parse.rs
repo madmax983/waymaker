@@ -952,17 +952,17 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // decision recorded inside `<div>...</div>` is still visible to a reader, unlike a
     // comment, and dropping it would fail a build over content that renders fine.
     let mut in_html_comment = false;
-    // The non-rendering elements (`<script>`, `<style>` or `<template>`) currently
-    // open, innermost last — a stack rather than one tag, named rather than a bare flag
-    // (Codex, pull request #138, round 30) so a matching close is required: a
+    // The non-rendering elements (`<script>`, `<style>`, `<title>` or `<template>`)
+    // currently open, innermost last — a stack rather than one tag, named rather than a
+    // bare flag (Codex, pull request #138, round 30) so a matching close is required: a
     // `<script>` body containing the literal text `</style>` (a JavaScript string, say)
-    // does not end HTML parsing of the script, and closing on any of the three would
+    // does not end HTML parsing of the script, and closing on any of them would
     // resume visibility while a browser is still in script-data state. A real stack
-    // since round 33: unlike `<script>`/`<style>`, `<template>` content is parsed as
-    // ordinary HTML, so a nested `<template>` genuinely opens a second context that
-    // needs its own close first, and a `<script>` or `<style>` can itself nest inside a
-    // `<template>` and needs its own level tracked rather than scanned as more
-    // `<template>` content.
+    // since round 33: unlike `<script>`/`<style>`/`<title>`, `<template>` content is
+    // parsed as ordinary HTML, so a nested `<template>` genuinely opens a second context
+    // that needs its own close first, and a `<script>`, `<style>` or `<title>` can
+    // itself nest inside a `<template>` and needs its own level tracked rather than
+    // scanned as more `<template>` content.
     let mut open_non_rendering_tag: Vec<String> = Vec::new();
     // A tag whose own closing `>` had not yet appeared when its line ran out
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
@@ -1103,7 +1103,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             // The close must name the *same* tag that opened (Codex, round 30): a
             // `<script>` body can contain the literal text `</style>` — a JavaScript
             // string, say — without ending HTML parsing of the script, so closing on
-            // any of the three would resume visibility too early.
+            // any of them would resume visibility too early.
             Event::Html(html) => {
                 let spans = visible_html_ranges(
                     &html,
@@ -1156,16 +1156,50 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
 ///
 /// `<template>` content is parsed as ordinary HTML, so
 /// `<template><template>inner</template>more</template>` really does open a second
-/// template context, and `more` stays inert until the *outer* close is found. `<script>`
-/// and `<style>` are raw-text elements: a browser is in raw-text parsing mode once
-/// either opens, so a further `<script` inside one is literal text — a JavaScript
-/// string, say (round 30) — and never opens a second level. Every other tag nests too,
-/// which matters now that the non-rendering stack can hold an *arbitrary* tag name
-/// suppressed by its own `hidden` attribute rather than only the three fixed ones: a
-/// `<div hidden>` still parses its children as ordinary HTML, exactly like
-/// `<template>`, and only `<script>`/`<style>`'s raw-text parsing is the exception.
+/// template context, and `more` stays inert until the *outer* close is found. `<script>`,
+/// `<style>` and `<title>` are raw-text/RCDATA elements: a browser is in raw-text (or
+/// RCDATA) parsing mode once one opens, so a further `<script`/`<title` inside one is
+/// literal text — a JavaScript string, or a literal document title containing the
+/// characters `<title>`, say (round 30) — and never opens a second level. Every other
+/// tag nests too, which matters now that the non-rendering stack can hold an *arbitrary*
+/// tag name suppressed by its own `hidden` attribute rather than only the fixed ones: a
+/// `<div hidden>` still parses its children as ordinary HTML, exactly like `<template>`,
+/// and only `<script>`/`<style>`/`<title>`'s raw-text parsing is the exception.
 fn non_rendering_element_nests(tag: &str) -> bool {
-    !matches!(tag, "script" | "style")
+    !matches!(tag, "script" | "style" | "title")
+}
+
+/// Whether a second `tag`, opened while one is already the innermost open non-rendering
+/// element, implicitly closes the first rather than nesting inside it — HTML5's optional
+/// end tag rules (Codex, pull request #138, round 48, "Honor implicit closes for
+/// optional-end-tag elements").
+///
+/// `<li>`'s own end tag may be omitted immediately before another `<li>`, so
+/// `<ul><li hidden>hidden<li>All 6 recovery invariants</li></ul>` is not two nested `li`
+/// elements sharing one `</li>` — the second `<li>` silently ends the first, the same way
+/// a browser's own parser would. Treating it as a further open (as every non-raw-text
+/// same-name opener used to be) left the hidden stack open past the visible item's own
+/// single close tag, hiding the item itself and everything the document says after it.
+/// `<template>` and an arbitrary `hidden`-suppressed element are deliberately not on this
+/// list: both genuinely nest, and a repeated `<template>` (or a `<div hidden>` nested
+/// inside another) really does open a second level a browser keeps separately open.
+fn implicitly_closes_same_name(tag: &str) -> bool {
+    matches!(
+        tag,
+        "li" | "dt"
+            | "dd"
+            | "p"
+            | "option"
+            | "optgroup"
+            | "rt"
+            | "rp"
+            | "tr"
+            | "td"
+            | "th"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+    )
 }
 
 /// The byte range of the first well-formed opening tag for `tag` at or after `from` in
@@ -1217,14 +1251,15 @@ fn find_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)
     }
 }
 
-/// The byte range of the next raw-text end tag for `tag` (`"script"` or `"style"`) at or
-/// after `from` in `line` — matched the way an HTML5 parser matches one inside raw-text
-/// content: a literal, case-insensitive `</tag` sequence, wherever it falls, with no
-/// regard for anything around it that merely *looks* tag-shaped (Codex, pull request
-/// #138, round 40, finding 3).
+/// The byte range of the next raw-text end tag for `tag` (`"script"`, `"style"` or
+/// `"title"`) at or after `from` in `line` — matched the way an HTML5 parser matches one
+/// inside raw-text (or RCDATA) content: a literal, case-insensitive `</tag` sequence,
+/// wherever it falls, with no regard for anything around it that merely *looks*
+/// tag-shaped (Codex, pull request #138, round 40, finding 3; extended to `<title>`,
+/// round 48, finding 2).
 ///
-/// Once a `<script>` or `<style>` opens, a browser is not parsing tags or quotes at
-/// all — every byte up to the literal closing sequence is opaque script or style text —
+/// Once a `<script>`, `<style>` or `<title>` opens, a browser is not parsing tags or
+/// quotes at all — every byte up to the literal closing sequence is opaque text —
 /// so `<span title="x</script>y">`, appearing inside one, is not a `<span>` tag whose
 /// attribute happens to quote a closer; it is plain text containing the real close.
 /// [`find_closing_tag`]'s quote-aware tokenization, built for `<template>`'s genuinely
@@ -1280,15 +1315,16 @@ enum RawTextClose {
     Pending(Option<u8>),
 }
 
-/// The earliest opening tag, at or after `from` in `line`, among the three non-rendering
+/// The earliest opening tag, at or after `from` in `line`, among the fixed non-rendering
 /// elements, with the tag name it matched.
 ///
-/// These are the three HTML elements whose body a browser never renders as visible text
-/// (Codex, pull request #138, rounds 27, 28 and 29 — `<template>`'s content is inert DOM
-/// meant for cloning by script, not display); every other tag this module keeps verbatim
-/// because a reader does see it.
+/// These are the HTML elements whose body a browser never renders as visible text (Codex,
+/// pull request #138, rounds 27, 28 and 29 — `<template>`'s content is inert DOM meant
+/// for cloning by script, not display; `<title>` added round 48, finding 2 — a document's
+/// title is metadata for the browser chrome, never page prose); every other tag this
+/// module keeps verbatim because a reader does see it.
 fn find_any_opening_tag(line: &str, from: usize) -> Option<(usize, usize, &'static str)> {
-    ["script", "style", "template"]
+    ["script", "style", "title", "template"]
         .into_iter()
         .filter_map(|tag| find_opening_tag(line, from, tag).map(|(start, end)| (start, end, tag)))
         .min_by_key(|&(start, _, _)| start)
@@ -1411,7 +1447,7 @@ fn has_hidden_attribute(span: &str) -> bool {
 /// nested *inside* the hidden element that happens to share its exact name is not
 /// itself detected as a further open the way a `<template>` reopen is — the
 /// non-rendering stack still closes on that inner tag's own close, one narrower limit
-/// than the three fixed elements get, since only `<template>`'s reopen tracking is
+/// than the fixed elements get, since only `<template>`'s reopen tracking is
 /// built to recognize a specific name rather than any of a short list.
 fn find_any_hidden_opening_tag(line: &str, from: usize) -> Option<(usize, usize, String)> {
     let mut cursor = from;
@@ -1431,8 +1467,8 @@ fn find_any_hidden_opening_tag(line: &str, from: usize) -> Option<(usize, usize,
     }
 }
 
-/// Whether `line` *itself is* a closing tag for `tag` (`"script"`, `"style"` or
-/// `"template"`), case-insensitively.
+/// Whether `line` *itself is* a closing tag for `tag` (`"script"`, `"style"`, `"title"`
+/// or `"template"`), case-insensitively.
 ///
 /// Required to start at byte `0` — the whole of `line`, not merely contained somewhere
 /// in it (Codex, pull request #138, round 38, finding 1, the closing-side twin of
@@ -1448,7 +1484,7 @@ fn closes_non_rendering_element(line: &str, tag: &str) -> bool {
 
 /// Whether `line` *itself is* a well-formed opening tag for `tag`, case-insensitively —
 /// [`closes_non_rendering_element`]'s opening twin, for a name that is not one of the
-/// three fixed non-rendering ones (Codex, pull request #138, round 45, "Preserve
+/// fixed non-rendering ones (Codex, pull request #138, round 45, "Preserve
 /// inline nesting for hidden elements"): the
 /// block-level nesting search already reopens an arbitrary `hidden`-suppressed element
 /// by its own name (`find_opening_tag(line, cursor, top)`, round 43, finding 1), but
@@ -1461,8 +1497,8 @@ fn opens_tag_named(line: &str, tag: &str) -> bool {
     find_opening_tag(line, 0, tag).is_some_and(|(start, _)| start == 0)
 }
 
-/// The tag name (`"script"`, `"style"` or `"template"`) of an opening non-rendering tag,
-/// if `line` *itself is* one, case-insensitively.
+/// The tag name (`"script"`, `"style"`, `"title"` or `"template"`) of an opening
+/// non-rendering tag, if `line` *itself is* one, case-insensitively.
 ///
 /// Required to start at byte `0` — the whole of `line`, not merely contained somewhere
 /// in it (Codex, pull request #138, round 38, finding 1): both callers below pass one
@@ -1516,18 +1552,28 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<String>) -> bool {
     // Cloned rather than borrowed, for the reason `advance_past_non_rendering` now
     // does the same (Codex, pull request #138, round 42, finding 3): `stack` holds
     // owned names since it can carry an arbitrary `hidden`-suppressed one, not only
-    // the three fixed `&'static str`s, so a borrow of its top would still be live
+    // the fixed `&'static str`s, so a borrow of its top would still be live
     // across the `push`/`pop` calls below.
     match stack.last().cloned() {
         Some(top) if non_rendering_element_nests(&top) => {
             if let Some(tag) = opens_non_rendering_element(html) {
                 stack.push(tag.to_owned());
             } else if opens_tag_named(html, &top) {
-                // Codex, pull request #138, round 45 ("Preserve inline
-                // nesting for hidden elements"): a same-named ordinary child of
-                // the `hidden`-suppressed `top` reopens it, the same way the
-                // block-level scan's `top_reopen` already does.
-                stack.push(top);
+                if implicitly_closes_same_name(&top) {
+                    // Codex, pull request #138, round 48, "Honor implicit
+                    // closes for optional-end-tag elements": `top` does not
+                    // nest on a same-name reopen — its own end tag may be
+                    // omitted immediately before a sibling of the same
+                    // name — so this construct ends `top` rather than
+                    // opening a second one.
+                    stack.pop();
+                } else {
+                    // Codex, pull request #138, round 45 ("Preserve inline
+                    // nesting for hidden elements"): a same-named ordinary child of
+                    // the `hidden`-suppressed `top` reopens it, the same way the
+                    // block-level scan's `top_reopen` already does.
+                    stack.push(top);
+                }
             } else if closes_non_rendering_element(html, &top) {
                 stack.pop();
             }
@@ -1540,7 +1586,7 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<String>) -> bool {
             true
         }
         // An arbitrary element carrying its own `hidden` attribute is checked after
-        // the three fixed names, not instead of them (Codex, pull request #138, round
+        // the fixed names, not instead of them (Codex, pull request #138, round
         // 43, finding 2): `find_any_hidden_opening_tag`'s own doc comment already
         // covers a tag that is both (`<template hidden>`), and the fixed check is
         // cheaper to try first. `<span hidden>` reaching `Event::InlineHtml` —
@@ -1664,7 +1710,7 @@ fn is_html_block_tag(span: &str) -> bool {
 enum HidingMarker {
     /// The byte offset of a `<!--`.
     Comment(usize),
-    /// The byte range and name of one of the three fixed non-rendering elements'
+    /// The byte range and name of one of the fixed non-rendering elements'
     /// opening tag.
     Tag(usize, usize, &'static str),
     /// The byte range and name of an arbitrary element's opening tag, suppressed by
@@ -1830,7 +1876,7 @@ enum NonRenderingAdvance {
     /// *different* one, for a `<script>` or `<style>` nested inside a `<template>`
     /// (Codex, round 33, finding 2). Owned rather than `&'static str` since round 42
     /// widened the stack to hold an arbitrary `hidden`-suppressed name too, though
-    /// this candidate itself is still only ever one of the three fixed names — see
+    /// this candidate itself is still only ever one of the fixed names — see
     /// [`find_any_hidden_opening_tag`]'s own doc comment for the one thing that
     /// leaves unfound.
     Open(usize, String),
@@ -1868,14 +1914,22 @@ enum NonRenderingAdvance {
 /// `<template>`'s genuinely parsed content would skip straight over it.
 ///
 /// The "further open" half also checks for a reopen of `top` *by name*, not only
-/// among the three fixed non-rendering elements (Codex, pull request #138, round 43,
+/// among the fixed non-rendering elements (Codex, pull request #138, round 43,
 /// finding 1): `<div hidden><div>x</div>decision-id headline</div>` has an ordinary,
 /// unsuppressed `<div>` nested inside the `hidden`-tracked outer one, and reading only
-/// `find_any_opening_tag` — blind to any name outside the fixed three — never saw it,
+/// `find_any_opening_tag` — blind to any name outside the fixed ones — never saw it,
 /// so the *inner* `</div>` was read as the outer element's own close, exposing
 /// everything after it (still really inside the hidden container) as visible prose.
 /// `<template>`'s own reopen was always covered this way already, since it is one of
-/// the three; this closes the same gap for an arbitrary `hidden`-suppressed name.
+/// the fixed ones; this closes the same gap for an arbitrary `hidden`-suppressed name.
+///
+/// A reopen of `top` that [`implicitly_closes_same_name`] (Codex, pull request #138,
+/// round 48, "Honor implicit closes for optional-end-tag elements") is not an `Open` at
+/// all: `<li>`'s own end tag may be omitted immediately before another `<li>`, so a
+/// second `<li>` silently ends the first rather than nesting inside it, and the marker
+/// this returns for it is a `Close` at the reopening tag's own *start* — not its end, the
+/// way an explicit `</li>` resumes past itself — so the reopening tag's own markup is
+/// left for the caller's normal, unhidden processing, the same as any other ordinary tag.
 fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<NonRenderingAdvance> {
     if !non_rendering_element_nests(top) {
         return find_raw_text_closing_tag(line, cursor, top).map(|(_, close)| match close {
@@ -1885,18 +1939,18 @@ fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<Non
     }
     let close = find_closing_tag(line, cursor, top)
         .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
-    let fixed_open =
-        find_any_opening_tag(line, cursor).map(|(start, end, tag)| (start, end, tag.to_owned()));
-    let top_reopen =
-        find_opening_tag(line, cursor, top).map(|(start, end)| (start, end, top.to_owned()));
-    let open = [fixed_open, top_reopen]
-        .into_iter()
-        .flatten()
-        .min_by_key(|&(start, _, _)| start)
-        .map(|(start, end, tag)| (start, NonRenderingAdvance::Open(end, tag)));
+    let fixed_open = find_any_opening_tag(line, cursor)
+        .map(|(start, end, tag)| (start, NonRenderingAdvance::Open(end, tag.to_owned())));
+    let top_reopen = find_opening_tag(line, cursor, top).map(|(start, end)| {
+        if implicitly_closes_same_name(top) {
+            (start, NonRenderingAdvance::Close(start))
+        } else {
+            (start, NonRenderingAdvance::Open(end, top.to_owned()))
+        }
+    });
     let comment =
         find_comment_opener(line, cursor).map(|start| (start, NonRenderingAdvance::Comment(start)));
-    [close, open, comment]
+    [close, fixed_open, top_reopen, comment]
         .into_iter()
         .flatten()
         .min_by_key(|&(start, _)| start)
@@ -2017,7 +2071,7 @@ struct PendingTag {
     /// The tag's own raw text seen so far, across every line read while it stayed
     /// unresolved (Codex, pull request #138, round 43, finding 3): whether it opens
     /// an arbitrary `hidden`-suppressed element cannot be decided from its name
-    /// alone the way opening one of the three fixed elements can, since the
+    /// alone the way opening one of the fixed elements can, since the
     /// attribute itself may sit on a line after the one the tag started on —
     /// `<div\n hidden>decision-id headline</div>` — and [`has_hidden_attribute`]
     /// needs the tag's complete markup to answer that.
@@ -2038,7 +2092,7 @@ struct PendingRawTextClose {
 
 /// The visible byte ranges of one `Event::Html` line — real block-level HTML
 /// passthrough, one source line per event — with HTML comments and the content of
-/// non-rendering elements (`<script>`, `<style>`, `<template>`) excluded. Carries
+/// non-rendering elements (`<script>`, `<style>`, `<title>`, `<template>`) excluded. Carries
 /// `in_html_comment`, the open non-rendering element and a tag still awaiting its own
 /// close across calls the way each already has to be: a multi-line comment, a
 /// `<script>` that outlives its own `HtmlBlock` (rounds 20 and 29), or a tag whose
@@ -2064,7 +2118,7 @@ struct PendingRawTextClose {
 /// `<script>` or `<style>` can nest inside a `<template>`, and its raw-text body has to
 /// be tracked as its own level — closed only by its own matching close — rather than
 /// scanned for a `</template>`-looking substring that is really just JavaScript or CSS
-/// text. Holds owned names since round 42, finding 3, not only the three fixed
+/// text. Holds owned names since round 42, finding 3, not only the fixed
 /// `&'static str`s, so an arbitrary element suppressed by its own `hidden` attribute
 /// can be tracked the same way.
 ///
@@ -2095,6 +2149,13 @@ struct PendingRawTextClose {
 /// *nesting* element (`<template>`, or an arbitrary `hidden`-suppressed one) by its own
 /// name is still a reopen, and a matching close is still a close, neither of which the
 /// two checks below (written for the top-level, empty-stack case) know how to do.
+///
+/// A reopen that [`implicitly_closes_same_name`] (Codex, pull request #138, round 48,
+/// "Honor implicit closes for optional-end-tag elements") pops the open one before
+/// anything else decides the reopening tag's own fate — a cross-line `<li\n
+/// class="x">` reopening a hidden `<li>` is a *sibling*, not a second `li` nested inside
+/// the hidden one, so it is then judged purely on its own `hidden` attribute below, the
+/// same as any other tag.
 fn resolve_pending_tag(
     line: &str,
     open_non_rendering: &mut Vec<String>,
@@ -2123,21 +2184,27 @@ fn resolve_pending_tag(
         if matches_open_top {
             open_non_rendering.pop();
         }
-    } else if matches!(name.as_str(), "script" | "style" | "template") || matches_open_top {
-        open_non_rendering.push(name);
-    } else if !is_void_element(&name) {
-        // The full tag text, not just this line's own portion (Codex, round 43,
-        // finding 3): `hidden` may sit on any line the tag spans, not only the last
-        // one.
-        let full_text = text + &line[..end];
-        // Self-closing foreign content checked here too, not only in
-        // `find_any_hidden_opening_tag`'s own same-line search (Codex, round 46,
-        // "Skip multiline self-closing foreign hidden tags"): `<svg\n hidden />`
-        // takes this cross-line path, and pushing it regardless left the tracked
-        // state waiting for a `</svg>` a document never writes, hiding everything
-        // after it to end of document.
-        if !is_self_closing_tag(&full_text, &name) && has_hidden_attribute(&full_text) {
+    } else {
+        if matches_open_top && implicitly_closes_same_name(&name) {
+            open_non_rendering.pop();
+        }
+        let reopens_top = matches_open_top && !implicitly_closes_same_name(&name);
+        if matches!(name.as_str(), "script" | "style" | "title" | "template") || reopens_top {
             open_non_rendering.push(name);
+        } else if !is_void_element(&name) {
+            // The full tag text, not just this line's own portion (Codex, round 43,
+            // finding 3): `hidden` may sit on any line the tag spans, not only the
+            // last one.
+            let full_text = text + &line[..end];
+            // Self-closing foreign content checked here too, not only in
+            // `find_any_hidden_opening_tag`'s own same-line search (Codex, round 46,
+            // "Skip multiline self-closing foreign hidden tags"): `<svg\n hidden />`
+            // takes this cross-line path, and pushing it regardless left the
+            // tracked state waiting for a `</svg>` a document never writes, hiding
+            // everything after it to end of document.
+            if !is_self_closing_tag(&full_text, &name) && has_hidden_attribute(&full_text) {
+                open_non_rendering.push(name);
+            }
         }
     }
     Ok(end)
@@ -2528,7 +2595,7 @@ fn decode_one_character_reference(entity: &str) -> Option<char> {
 /// reader (and a renderer) sees, not an example, so only HTML that is actually a
 /// comment is hidden.
 ///
-/// A non-rendering (`<script>`, `<style>`, `<template>`) or `hidden`-suppressed
+/// A non-rendering (`<script>`, `<style>`, `<title>`, `<template>`) or `hidden`-suppressed
 /// element's body is a fourth thing hidden (Codex, pull request #138, round 45,
 /// "Suppress non-rendering blocks in `visible_source`"): a Markdown link written
 /// inside `<script>[one](0001-one.md)</script>`, or a wire-format path named inside a
@@ -2875,18 +2942,18 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // is reused for the state transition alone: called with `hidden: true`, it never
     // writes anywhere; called for the state transition alone.
     let mut in_html_comment = false;
-    // The non-rendering elements (`<script>`, `<style>` or `<template>`) currently open
-    // at block level, innermost last, if any (Codex, pull request #138, round 30):
-    // `<div>\n<script>\n\n- Status: accepted\n\n</script>\n</div>` outlives its own
-    // `HtmlBlock` across the blank line the same way an unterminated comment does —
-    // `pulldown-cmark` ends the block there and resumes the decoy item as an ordinary,
-    // structurally separate one, even though a browser is still in script-data state
-    // until the real `</script>` two lines later. Folded into `hidden` below so
-    // `Start(Tag::Item)` never begins collecting such an item at all, the same
-    // disqualification a fence or blockquote already gets. A real stack since round 33:
-    // a nested `<template>` genuinely opens a second context, unlike
-    // `<script>`/`<style>`'s raw-text parsing, and either of those can itself nest
-    // inside a `<template>` and needs its own level tracked.
+    // The non-rendering elements (`<script>`, `<style>`, `<title>` or `<template>`)
+    // currently open at block level, innermost last, if any (Codex, pull request #138,
+    // round 30): `<div>\n<script>\n\n- Status: accepted\n\n</script>\n</div>` outlives
+    // its own `HtmlBlock` across the blank line the same way an unterminated comment
+    // does — `pulldown-cmark` ends the block there and resumes the decoy item as an
+    // ordinary, structurally separate one, even though a browser is still in
+    // script-data state until the real `</script>` two lines later. Folded into
+    // `hidden` below so `Start(Tag::Item)` never begins collecting such an item at
+    // all, the same disqualification a fence or blockquote already gets. A real stack
+    // since round 33: a nested `<template>` genuinely opens a second context, unlike
+    // `<script>`/`<style>`/`<title>`'s raw-text parsing, and either of those can itself
+    // nest inside a `<template>` and needs its own level tracked.
     let mut open_non_rendering_tag: Vec<String> = Vec::new();
     // A tag whose own closing `>` had not yet appeared when its line ran out
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
@@ -3004,7 +3071,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // comment that outlived its own block, is excluded because it is handled
             // separately above and cannot occur while a paragraph is still open.
             //
-            // A non-rendering element — `<script>`, `<style>`, `<template>` —
+            // A non-rendering element — `<script>`, `<style>`, `<title>`, `<template>` —
             // disqualifies the item too (Codex, round 30): `- Status:
             // <script>accepted</script>` has a real, visible `Status: ` prefix ahead
             // of the tag, so merely *excluding* the hidden value (rather than
@@ -3186,14 +3253,15 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // it by real HTML rules until an actual `-->` appears. `visible_html_ranges` is
     // called for the state transition alone; nothing between cells is ever read.
     let mut in_html_comment = false;
-    // The non-rendering elements (`<script>`, `<style>` or `<template>`) currently open
-    // inside a cell, innermost last, if any (Codex, pull request #138, round 30): this
-    // parser is independent of `markdown_prose`'s own non-rendering handling (rounds
-    // 27-29), and a required value placed inside one of these three elements is
-    // invisible to a reader the same way a comment is, but was still copied into the
-    // cell verbatim. A real stack since round 33: a nested `<template>` genuinely opens
-    // a second context, unlike `<script>`/`<style>`'s raw-text parsing, and either of
-    // those can itself nest inside a `<template>` and needs its own level tracked.
+    // The non-rendering elements (`<script>`, `<style>`, `<title>` or `<template>`)
+    // currently open inside a cell, innermost last, if any (Codex, pull request #138,
+    // round 30): this parser is independent of `markdown_prose`'s own non-rendering
+    // handling (rounds 27-29), and a required value placed inside one of these
+    // elements is invisible to a reader the same way a comment is, but was still
+    // copied into the cell verbatim. A real stack since round 33: a nested `<template>`
+    // genuinely opens a second context, unlike `<script>`/`<style>`/`<title>`'s
+    // raw-text parsing, and either of those can itself nest inside a `<template>` and
+    // needs its own level tracked.
     let mut open_non_rendering_tag: Vec<String> = Vec::new();
     // A tag whose own closing `>` had not yet appeared when its line ran out
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
@@ -3305,7 +3373,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // excluded (Codex, round 16), for `visible_source`'s reason: `| <!--
             // \`id\` --> |` is a hidden decoy, not a real cell, and keeping its text
             // would let it stand in for the real one. A non-rendering element —
-            // `<script>`, `<style>`, `<template>` — is excluded the same way (Codex,
+            // `<script>`, `<style>`, `<title>`, `<template>` — is excluded the same way (Codex,
             // round 30), and its own open/close tags update `open_non_rendering_tag`
             // instead of joining the cell's text: a required value placed inside one is
             // invisible to a reader. `<br>` is a real line break, this collector's own

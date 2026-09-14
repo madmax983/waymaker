@@ -6704,6 +6704,40 @@ mod tests {
     }
 
     #[test]
+    fn a_link_inside_a_title_tag_does_not_vouch_for_it_but_a_real_one_after_it_still_does() {
+        // Codex, pull request #138, round 48, "Suppress title element contents
+        // from visible prose": a document's `<title>` is RCDATA metadata for the
+        // browser chrome, never rendered as page prose, but `<title>` was missing
+        // from the fixed non-rendering list `find_any_opening_tag` and
+        // `visible_html_ranges` share — `visible_html_ranges` stripped only the
+        // tags themselves and emitted the body, so a Markdown link written inside
+        // one, like `<title>[0002-two.md](0002-two.md)</title>`, satisfied
+        // `linked_markdown_files` even though a reader never sees it as a link.
+        let index = "<title>\n[0002-two.md](0002-two.md)\n</title>\n\n\
+                      - [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "the real link after the title tag was not seen: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link written only inside a title tag counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_quoted_comment_spelling_inside_a_real_tag_does_not_hide_the_real_links_after_it() {
         // Codex, pull request #138, round 40, finding 2: the per-block comment
         // search inside an `HtmlBlock` did a raw substring search for `<!--`, blind
@@ -8655,6 +8689,31 @@ mod tests {
         let (claude_md, adrs, obligations) = spec_inputs();
         let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
         let wrapped = format!("<hidden>{count}</hidden>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_li_implicitly_closes_a_hidden_first_li_and_stays_visible() {
+        // Codex, pull request #138, round 48, "Honor implicit closes for
+        // optional-end-tag elements": an `li` element's own end tag may be omitted
+        // immediately before another `li`, so `<ul><li hidden>hidden<li>All 6
+        // recovery invariants</li></ul>` is one hidden `li` followed by one
+        // ordinary, visible `li` sharing the document's single `</li>` — not two
+        // nested `li`s, neither of which that one close tag could ever fully close.
+        // Treating the second `<li>` as a further open (as every non-raw-text
+        // same-name opener used to be) left the second, visible item suppressed
+        // and the hidden stack open past its own close, hiding the count and
+        // everything the document says after it.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<ul><li hidden>hidden<li>{count}</li></ul>");
         let linked = claude_md.replacen(&count, &wrapped, 1);
         let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
         assert!(
