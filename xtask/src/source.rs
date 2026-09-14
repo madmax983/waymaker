@@ -4174,10 +4174,18 @@ pub const INTEGRITY_CHECK_TABLES: &[ChecksumTable] = &[ChecksumTable {
 pub struct ChecksumRoute {
     /// The top-level checksum function, by name.
     pub function: &'static str,
-    /// The function its body must call.
-    pub calls: &'static str,
+    /// The exact update statement the routed call must appear as — not merely present
+    /// somewhere in the body. Codex found that a bare call count is satisfied by
+    /// `let _ = helper(0);` twice, discarded, beside a return value computed some other
+    /// way, so this pins the whole assignment: which variable is updated, with which
+    /// shift, and that the routed call is the other side of the xor.
+    pub statement: &'static str,
     /// How many times — two, for both rows: a byte is two nibbles.
     pub occurrences: usize,
+    /// The function's own last statement, exactly as source spells it — tying the
+    /// variable `statement` updates to what the function actually returns, so a body that
+    /// updates it correctly and then returns something else is still caught.
+    pub returns: &'static str,
 }
 
 /// Both top-level checksums' routes into the helper ADR 0044 gave each. See
@@ -4186,13 +4194,15 @@ pub struct ChecksumRoute {
 pub const INTEGRITY_CHECK_ROUTING: &[ChecksumRoute] = &[
     ChecksumRoute {
         function: "crc16",
-        calls: "crc16_nibble",
+        statement: "crc = (crc << 4) ^ crc16_nibble(",
         occurrences: 2,
+        returns: "crc",
     },
     ChecksumRoute {
         function: "crc32",
-        calls: "crc32_nibble_table",
+        statement: "crc = (crc >> 4) ^ crc32_nibble_table(",
         occurrences: 2,
+        returns: "crc ^ 0xFFFF_FFFF",
     },
 ];
 
@@ -8434,23 +8444,59 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
             ));
             continue;
         };
-        let found = count_calls(body, route.calls);
+        let found = count_prefixes(body, route.statement);
         if found != route.occurrences {
             violations.push(Violation::new(
                 RULE,
                 ADAPTER,
                 format!(
-                    "`{}` in {INTEGRITY_CHECK_PATH} calls `{}(` {found} time(s), not the {} \
-                     ADR 0044 pins — a checksum that stopped routing into the helper its \
-                     polynomial lives in could compute anything and still pass every other \
-                     check here",
-                    route.function, route.calls, route.occurrences
+                    "`{}` in {INTEGRITY_CHECK_PATH} does not contain `{}` exactly {} \
+                     time(s) — found {found}. A checksum that stopped routing into the \
+                     helper its polynomial lives in could compute anything and still pass \
+                     every other check here",
+                    route.function, route.statement, route.occurrences
+                ),
+            ));
+        }
+        if !body_ends_with(body, route.returns) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{}` in {INTEGRITY_CHECK_PATH} does not end with `{}` — the pinned \
+                     update statement can update the right variable the right number of \
+                     times and still not be what the function returns",
+                    route.function, route.returns
                 ),
             ));
         }
     }
 
     violations
+}
+
+/// Whether `body`'s last non-whitespace content is exactly `expected_tail`, at an
+/// identifier boundary.
+///
+/// Whitespace-normalised for the reason [`table_body_matches_pinned_shape`] is: line breaks
+/// and indentation do not matter, only the trailing content does. The boundary check is
+/// what stops `crc` matching as the tail of some unrelated `own_crc` a rewritten function
+/// might return instead.
+#[must_use]
+fn body_ends_with(body: &str, expected_tail: &str) -> bool {
+    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+
+    let normalized = normalize(body);
+    let expected = normalize(expected_tail);
+    let Some(prefix_len) = normalized.len().checked_sub(expected.len()) else {
+        return false;
+    };
+    normalized.ends_with(&expected)
+        && normalized
+            .get(..prefix_len)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !continues(character))
 }
 
 /// Whether `body` is exactly the dense match [`ChecksumTable`] pins: `match {selector} { 0
@@ -8478,8 +8524,12 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
     }
     expected.push_str(" }");
 
+    // Equality rather than `contains`: Codex found that a substring check lets the pinned
+    // match survive as a discarded sub-expression — `let _ = match ...;` — beside a second,
+    // different match that actually produces the return value. The real function's body is
+    // this match and nothing else, so nothing is lost by requiring the whole of it.
     let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalize(body).contains(&normalize(&expected))
+    normalize(body) == normalize(&expected)
 }
 
 /// The checksum module, every file its module tree reaches, and every source under a
@@ -8709,22 +8759,22 @@ fn count_tokens(code: &str, token: &str) -> usize {
         .count()
 }
 
-/// How many times `code` calls `function(`, at a left-hand identifier boundary.
+/// How many times `prefix` appears in `code` at a left-hand identifier boundary.
 ///
 /// Not [`count_tokens`]: that helper's boundary check treats the character *after* the
 /// token as a continuation whenever it is alphanumeric, which is right for a bare
-/// identifier and wrong for a token that already ends in its own delimiter — every call
-/// this counts is followed by an argument, and a digit is alphanumeric, so
-/// `count_tokens(code, "crc32_nibble(")` reads a real call to `crc32_nibble(0)` as `(`
-/// continuing into `0` and refuses to count it at all. The call's own trailing `(` already
-/// delimits the right side, so only the left needs checking — `crc32_nibble(` cannot be
-/// mistaken for the tail of `the_crc32_nibble(` because that fails on the left instead.
+/// identifier and wrong for a prefix that already ends in its own delimiter — a call like
+/// `helper(0)` is followed by a digit, and a digit is alphanumeric, so
+/// `count_tokens(code, "helper(")` reads the `(` as continuing into the `0` and refuses to
+/// count a real call at all. Any prefix ending in a non-identifier character — `(`, an
+/// operator, a brace — is already self-delimiting on the right, so only the left side
+/// needs checking. Used both for a bare call (`{function}(`) and for
+/// [`ChecksumRoute::statement`], a whole update statement.
 #[must_use]
-fn count_calls(code: &str, function: &str) -> usize {
+fn count_prefixes(code: &str, prefix: &str) -> usize {
     let continues = |character: char| character.is_alphanumeric() || character == '_';
-    let needle = format!("{function}(");
 
-    code.match_indices(&needle)
+    code.match_indices(prefix)
         .filter(|(index, _)| {
             code.get(..*index)
                 .and_then(|before| before.chars().next_back())
@@ -14352,15 +14402,16 @@ mod deferred_answer_pins {
         // with the right polynomial, but nothing tied the top-level function to it. A
         // `crc32` rewritten to call something else, leaving `crc32_nibble_table` sitting
         // unused beside it, has to be reported even though `crc32_nibble_table` itself is
-        // untouched and still matches its own pin.
-        let source =
-            tests_support::clean_checksum_module().replace("crc32_nibble_table(0)", "0xFFFF_FFFF");
+        // untouched and still matches its own pin. `some_other_function` rather than a
+        // literal, so this is only ever the routing pin's finding and not also a changed
+        // literal count.
+        let source = tests_support::clean_checksum_module()
+            .replace("crc32_nibble_table(0)", "some_other_function(0)");
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
-            violations
-                .iter()
-                .any(|violation| violation.detail.contains("ADR 0044 pins")
-                    && violation.detail.contains("crc32")),
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("does not contain `crc = (crc >> 4) ^ crc32_nibble_table(`")),
             "{violations:?}"
         );
     }
@@ -14375,6 +14426,51 @@ mod deferred_answer_pins {
         let source = tests_support::clean_checksum_module()
             .replace("0 => crc32_nibble(0),", "0 => crc32_nibble(1),")
             .replace("1 => crc32_nibble(1),", "1 => crc32_nibble(0),");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("exact `match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discarded_routing_call_is_reported_even_though_the_tail_is_unchanged() {
+        // Codex's sharper version of the routing finding, on the revision that first
+        // added `INTEGRITY_CHECK_ROUTING` as a bare call count: `let _ =
+        // crc32_nibble_table(0);`, discarded, twice, satisfies "calls
+        // crc32_nibble_table(" twice while never actually updating `crc` with it — the
+        // function can still end with the pinned `crc ^ 0xFFFF_FFFF` tail syntactically.
+        // Pinning the whole assignment statement rather than a bare call is what catches
+        // it: a discarded call does not contain `crc = (crc >> 4) ^
+        // crc32_nibble_table(` at all.
+        let source = tests_support::clean_checksum_module().replace(
+            "crc = (crc >> 4) ^ crc32_nibble_table(0)",
+            "let _ = crc32_nibble_table(0)",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("does not contain `crc = (crc >> 4) ^ crc32_nibble_table(`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_match_discarded_into_a_dead_binding_is_reported() {
+        // Codex's sharper version of the arm-mapping finding, on the revision that first
+        // tightened counting to a substring `contains`: the exact pinned match survives
+        // as `let _ = match ...;` beside a second, different tail expression that is what
+        // the function actually returns. Equality rather than `contains` is what catches
+        // it, since the body then holds more than just the pinned match.
+        let source = tests_support::clean_checksum_module()
+            .replacen("match nibble & 0xF {", "let _ = match nibble & 0xF {", 1)
+            .replace(
+                "_ => crc32_nibble(15), }\n}\n",
+                "_ => crc32_nibble(15), }; 0\n}\n",
+            );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
             violations
@@ -15169,7 +15265,7 @@ pub mod tests_support {
         TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES,
         TRANSITION_SURFACE, VERSION_GATE_SURFACE, VERSION_MARKER_FIELDS, VERSION_PREDICATE,
         VERSION_RANGE, VERSION_RANGE_METHODS, VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES,
-        WIRING_SURFACE, WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
+        WIRING_SURFACE, WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS, count_tokens,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -15723,26 +15819,42 @@ mod tests {
         // call appends after it.
         let mut bodies: BTreeMap<&str, String> = BTreeMap::new();
         for parameter in INTEGRITY_CHECK_PARAMETERS {
+            // A routed function's pinned `returns` tail can already contain one of this
+            // parameter's occurrences — `crc32`'s final xor genuinely is its own initial
+            // value's literal — so that many fewer standalone segments are added here, or
+            // the fixture would overshoot the exact count `INTEGRITY_CHECK_PARAMETERS`
+            // itself pins once the routing loop below appends the tail.
+            let already_in_tail: usize = INTEGRITY_CHECK_ROUTING
+                .iter()
+                .filter(|route| route.function == parameter.function)
+                .map(|route| count_tokens(route.returns, parameter.literal))
+                .sum();
             let body = bodies.entry(parameter.function).or_default();
-            for _ in 0..parameter.occurrences {
+            for _ in 0..parameter.occurrences.saturating_sub(already_in_tail) {
                 if !body.is_empty() {
                     body.push(';');
                 }
                 let _ = write!(body, " {} ", parameter.literal);
             }
         }
-        // Each routed function's body also calls its helper the pinned number of times,
-        // so this fixture satisfies `INTEGRITY_CHECK_ROUTING` as well as the literal pins
-        // above — added to the same bodies map so a routed function that also carries a
-        // literal (`crc16`, `crc32`) gets both.
+        // Each routed function's body also contains its pinned update statement the
+        // pinned number of times, ending with its pinned return expression, so this
+        // fixture satisfies `INTEGRITY_CHECK_ROUTING` as well as the literal pins above —
+        // added to the same bodies map so a routed function that also carries a literal
+        // (`crc16`, `crc32`) gets both. The return expression goes last and with no
+        // trailing content after it, which is what `body_ends_with` checks for.
         for route in INTEGRITY_CHECK_ROUTING {
             let body = bodies.entry(route.function).or_default();
             for _ in 0..route.occurrences {
                 if !body.is_empty() {
                     body.push(';');
                 }
-                let _ = write!(body, " {}(0) ", route.calls);
+                let _ = write!(body, " {}0) ", route.statement);
             }
+            if !body.is_empty() {
+                body.push(';');
+            }
+            let _ = write!(body, " {} ", route.returns);
         }
 
         let mut source = String::from("//! Two checksums.\n");
