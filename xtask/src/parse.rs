@@ -340,22 +340,46 @@ fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
     }
 }
 
-/// `ty`, or a type it wraps in parens or a macro's hygiene grouping, names a qualified
-/// associated-type projection — `<T as Trait>::Assoc`, or `<T>::Assoc` with no `as`.
-fn type_is_qself_projection(ty: &syn::Type) -> bool {
+/// `ty`, or a type it wraps in parens or a macro's hygiene grouping, names an associated-type
+/// projection this scanner cannot resolve: `<T as Trait>::Assoc`, `<T>::Assoc` with no `as`,
+/// or a bare `T::Assoc` where `T` is one of `type_params` — the alias's own declared generic
+/// type parameters.
+///
+/// The third shape is issue #171's finding 2. `T::Dispatch` has no `qself`: no `<`, no `as`,
+/// nothing but an ordinary multi-segment path, so [`type_alias_target`] resolves it to
+/// `["T", "Dispatch"]` and a lookup chases `T` as if it were a real local alias — which it is
+/// not, so the chain dead-ends at `Dispatch` and never reaches whatever `T::Dispatch` really
+/// names. Restricting the match to the alias's *own* parameters is what tells this apart from
+/// a module-qualified path to some other, already-defined type (`type Foo =
+/// some_module::Bar;`): only a name the alias itself introduced as generic can be bound to
+/// anything a caller chooses, the same unresolvable shape as `<T as Trait>::Assoc`. A
+/// UFCS-style projection through a *concrete* type (`type Foo = Via::Dispatch;`, where `Via`
+/// is some other type implementing an associated-type-bearing trait) is not caught here —
+/// telling that apart from an ordinary qualified path needs real name resolution, which is
+/// out of scope for a syntactic scanner and left as a residual limit.
+fn type_is_qself_projection(ty: &syn::Type, type_params: &[String]) -> bool {
     match ty {
-        syn::Type::Path(type_path) => type_path.qself.is_some(),
-        syn::Type::Paren(inner) => type_is_qself_projection(&inner.elem),
-        syn::Type::Group(inner) => type_is_qself_projection(&inner.elem),
+        syn::Type::Path(type_path) => {
+            type_path.qself.is_some()
+                || type_path.path.segments.len() > 1
+                    && type_path.path.segments.first().is_some_and(|first| {
+                        type_params
+                            .iter()
+                            .any(|param| ident_is(&first.ident, param.as_str()))
+                    })
+        }
+        syn::Type::Paren(inner) => type_is_qself_projection(&inner.elem, type_params),
+        syn::Type::Group(inner) => type_is_qself_projection(&inner.elem, type_params),
         _ => false,
     }
 }
 
-/// Every `type` alias `contents` declares — at file scope, in an inline module, or inside a
-/// function body — whose right-hand side is a qualified associated-type projection, outside
-/// `#[cfg(test)]`.
+/// Every `type` alias `contents` declares whose right-hand side is an associated-type
+/// projection [`syn`] cannot resolve, outside `#[cfg(test)]`.
 ///
-/// `<T as Trait>::Assoc` can name any struct the trait's `impl` chooses — `CheckedDispatch`
+/// At file scope, in an inline module, or inside a function body. See
+/// `type_is_qself_projection` for the three shapes a projection can take. Such a
+/// projection can name any struct the trait's `impl` chooses — `CheckedDispatch`
 /// included — and following it needs type inference `syn` does not have. A plain type alias
 /// already resolves a plain path and one wrapped in parens; a projection is the one shape it
 /// cannot safely treat as "not an alias" the way it treats a
@@ -388,7 +412,12 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
         }
 
         fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-            if type_is_qself_projection(&node.ty) {
+            let type_params: Vec<String> = node
+                .generics
+                .type_params()
+                .map(|param| ident_name(&param.ident))
+                .collect();
+            if type_is_qself_projection(&node.ty, &type_params) {
                 self.found.push(ident_name(&node.ident));
             }
             syn::visit::visit_item_type(self, node);
@@ -753,12 +782,15 @@ fn collect_future_implementors(
 /// anywhere — so every method call on a guarded field is refused outright, since telling a
 /// mutating method from a read-only one needs type inference `syn` does not have. A method
 /// called on the whole *value* (`x.field()`, an accessor) is unaffected: its receiver is a
-/// plain path, not a field access. A `ref mut` binding in a struct pattern is the fourth:
+/// plain path, not a field access. A named binding in a struct pattern is the fourth:
 /// `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the pattern
 /// itself, with no assignment, no `&mut` expression and no method call anywhere for the
-/// first three routes to see. A field bound `mut slot` with no `ref` is not this: it moves
-/// or copies the value into a fresh local, which is a read, and rebuilding `x` from that
-/// local afterward is a struct literal the construction pins already cover.
+/// first three routes to see — and so, under match ergonomics, does a bare `field` or a
+/// by-value `field: mut slot` once `x` is itself a `&mut` reference, with no `ref`, `mut` or
+/// `&mut` written anywhere in the pattern to tell that apart from a harmless move or copy
+/// (issue #171's finding 1). `syn` sees the pattern, never `x`'s type, so it cannot rule
+/// the reference case out — every named binding on a guarded field is refused, not only an
+/// explicit `ref mut`. Only a wildcard (`_`) binds no name and is left alone.
 ///
 /// A name is matched on the field member alone, not on the receiver's type — `syn` sees
 /// syntax, not types, so `x.bytes = value` is refused for any `x` once `"bytes"` is in
@@ -771,25 +803,35 @@ fn collect_future_implementors(
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>, syn::Error> {
-    /// Whether `pat`, or any sub-pattern it contains, binds by `ref mut`.
+    /// Whether `pat`, or any sub-pattern it contains, binds a name at all.
+    ///
+    /// Issue #171's finding 1: `syn` sees a pattern's syntax, never the type of the value it
+    /// matches, and Rust's match ergonomics (RFC 2005) let that type decide what a *bare*
+    /// binding means. `let Foo { field, .. } = dispatch;` moves or copies `field` when
+    /// `dispatch` is owned — a read, safe to ignore — but aliases it as `&mut field`'s type
+    /// when `dispatch: &mut Foo`, with no `ref`, `mut` or `&mut` written anywhere to tell the
+    /// two apart. An explicit `ref mut` is only the loudest of several spellings that reach a
+    /// mutable alias; a bare name and a plain `mut` reach it too, under a `&mut` scrutinee,
+    /// and nothing here can rule that scrutinee out. So every named binding on a guarded
+    /// field is reported, not only an explicit `ref mut` — the sound answer without type
+    /// inference, in the same spirit as this family's other over-broad refusals.
     ///
     /// Walked with a nested [`syn::visit::Visit`] rather than matched by hand over every
-    /// [`syn::Pat`] variant, so a `ref mut` nested inside a struct, tuple, tuple-struct,
-    /// slice or paren pattern is found the same way regardless of how deep it sits — the
-    /// traversal is `syn`'s own, only the question asked at each identifier is new.
-    fn pattern_binds_ref_mut(pat: &syn::Pat) -> bool {
-        struct RefMutBinding(bool);
+    /// [`syn::Pat`] variant, so a binding nested inside a struct, tuple, tuple-struct, slice
+    /// or paren pattern is found the same way regardless of how deep it sits — the traversal
+    /// is `syn`'s own, only the question asked at each identifier is new. A wildcard (`_`)
+    /// binds no name and is not reported: nothing reaches it to alias or read back.
+    fn pattern_binds_a_name(pat: &syn::Pat) -> bool {
+        struct NamedBinding(bool);
 
-        impl<'ast> syn::visit::Visit<'ast> for RefMutBinding {
+        impl<'ast> syn::visit::Visit<'ast> for NamedBinding {
             fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
-                if node.by_ref.is_some() && node.mutability.is_some() {
-                    self.0 = true;
-                }
+                self.0 = true;
                 syn::visit::visit_pat_ident(self, node);
             }
         }
 
-        let mut visitor = RefMutBinding(false);
+        let mut visitor = NamedBinding(false);
         visitor.visit_pat(pat);
         visitor.0
     }
@@ -864,16 +906,15 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
         fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
             // `let Foo { field: ref mut slot, .. } = x;` borrows `field` mutably through the
             // pattern itself — no `Expr::Assign`, no `Expr::Reference`, and no method call
-            // anywhere, so none of the three routes above sees it. A field bound `mut slot`
-            // with no `ref` just moves or copies the value into a fresh local, which is a
-            // read: rebinding that local cannot write back to `x.field`, and rebuilding `x`
-            // from `slot` afterward is a struct literal the construction pins already cover.
-            // So the shape that matters is `ref mut` specifically, and it can be arbitrarily
-            // nested (`field: Inner { deeper: ref mut slot, .. }`), which is why this walks
+            // anywhere, so none of the three routes above sees it. A bare `field` or a
+            // by-value `field: mut slot` reaches the same alias under match ergonomics when
+            // the scrutinee is `&mut`, a fact this scanner cannot see (issue #171's finding
+            // 1) — so every named binding is reported, not only an explicit `ref mut`. It can
+            // be arbitrarily nested (`field: Inner { deeper, .. }`), which is why this walks
             // the whole sub-pattern rather than checking only its outermost shape.
             if let syn::Member::Named(ident) = &node.member {
                 let name = ident_name(ident);
-                if self.names.contains(&name.as_str()) && pattern_binds_ref_mut(&node.pat) {
+                if self.names.contains(&name.as_str()) && pattern_binds_a_name(&node.pat) {
                     self.found.push(name);
                 }
             }
@@ -2477,9 +2518,13 @@ mod raw_identifier_tests {
     }
 
     #[test]
-    fn a_by_value_struct_pattern_binding_is_not_reported() {
-        // `field: mut slot` (no `ref`) moves or copies the value into a fresh local: rebinding
-        // that local cannot write back to the original place.
+    fn a_mut_by_value_struct_pattern_binding_is_reported() {
+        // Issue #171's finding 1: `field: mut slot` looks like it moves or copies the value
+        // into a fresh local, and does — *if* the scrutinee is owned. `syn` sees only the
+        // pattern, never the scrutinee's type, so it cannot tell that case apart from the one
+        // below, where the identical pattern aliases the field instead. The sound answer
+        // without type inference is to report every named binding on a guarded field, not
+        // only the ones a by-value scrutinee would make safe.
         let found = mutated_field_names(
             "fn read(dispatch: Foo) {\n\
              \x20   let Foo { bytes: mut slot, .. } = dispatch;\n\
@@ -2487,7 +2532,26 @@ mod raw_identifier_tests {
             &["bytes"],
         )
         .expect("the fixture parses");
-        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_bare_binding_under_match_ergonomics_is_reported() {
+        // Issue #171's finding 1: no `ref`, `mut` or `&mut` is written anywhere here, and
+        // `syn`'s parse of the bare identifier pattern `bytes` is identical whether `dispatch`
+        // is owned or `&mut`. RFC 2005's match ergonomics mean the *default binding mode* — a
+        // fact about `dispatch`'s type, not about this pattern's syntax — decides whether
+        // `bytes` is a fresh copy or `&mut &'a [u8]` aliasing the original field. A `&mut`
+        // scrutinee is exactly the case `Dispatchable::perform` and `CheckedDispatch::bytes`
+        // both take `self`/`&self` through, so it is not a hypothetical.
+        let found = mutated_field_names(
+            "fn read(dispatch: &mut Foo) {\n\
+             \x20   let Foo { bytes, .. } = dispatch;\n\
+             \x20   *bytes = other;\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
     }
 
     #[test]
@@ -2528,6 +2592,52 @@ mod raw_identifier_tests {
             "#[cfg(test)]\nmod tests {\n    type Unchecked = <Via as Alias>::Dispatch;\n}",
         )
         .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_type_alias_projecting_through_its_own_parameter_is_reported() {
+        // Issue #171's finding 2: `T::Dispatch` has no `qself` — no `<`, no `as` — so it
+        // parses as an ordinary path, `["T", "Dispatch"]`. Chased as one, it resolves to
+        // `Dispatch`, never `CheckedDispatch`, so a construction spelled through `Unchecked`
+        // was invisible to the pin. But `T` is a generic parameter of `Unchecked` itself, so
+        // whatever it names at each call site is exactly as unresolvable as
+        // `<T as Trait>::Assoc` — the same danger, spelled without the disambiguating syntax.
+        let found = qself_type_alias_names(
+            "#[allow(type_alias_bounds)]\ntype Unchecked<T: Alias> = T::Dispatch;",
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["Unchecked"], "{found:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_generic_projection_is_reported() {
+        let found = qself_type_alias_names(
+            "#[allow(type_alias_bounds, unused_parens)]\n\
+             type Unchecked<T: Alias> = (T::Dispatch);",
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["Unchecked"], "{found:?}");
+    }
+
+    #[test]
+    fn a_bare_generic_parameter_with_no_projection_is_not_reported() {
+        // `T` alone is a plain path `type_alias_target` already resolves; nothing is
+        // projected through it.
+        let found = qself_type_alias_names("type Same<T> = T;").expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_qualified_path_through_a_concrete_type_is_not_reported() {
+        // `Via` here is an ordinary, already-defined type — not one of `Unchecked`'s own
+        // generic parameters — so this is a module-qualified path (`type Foo =
+        // some_module::Bar;`'s shape), not a projection through a trait bound. Telling a
+        // UFCS-style projection through a *concrete* type apart from that needs real name
+        // resolution, which this scanner does not have; the issue that adds this check scopes
+        // it to the alias's own declared parameters rather than guessing further.
+        let found =
+            qself_type_alias_names("type Unchecked = Via::Dispatch;").expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
     }
 
