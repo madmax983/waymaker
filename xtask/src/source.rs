@@ -15070,6 +15070,37 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_scoped_constant_table_survives_an_unrelated_function_reusing_its_names() {
+        // Codex's thirteenth-round finding: the constant resolver kept one file-wide map
+        // keyed only by name, so a later function's own `const P0 = 99;` silently
+        // overwrote an earlier function's unrelated `const P0 = 0;` — `rustc` resolves
+        // each function's own `P0`, `P1`, .. against its own declarations, but a flat map
+        // has the second function's values win everywhere, and the first function's
+        // genuinely dense table then resolves to non-dense values and is missed entirely.
+        // Constants are now collected per lexical scope (a `syn::Block` — a function body
+        // among them — or a module) and resolution searches that scope's own stack
+        // outward, so one function's declarations never leak into another's.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_via_scoped_constants(nibble: u8) -> u32 {\n    const P0: u8 = \
+             0;\n    const P1: u8 = 1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n    \
+             match nibble & 0xF {\n        P0 => crc32_nibble(0),\n        \
+             P1 => crc32_nibble(1),\n        P2 => crc32_nibble(2),\n        \
+             P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n\nfn \
+             unrelated_shadowing_function() -> u8 {\n    const P0: u8 = 99;\n    const P1: \
+             u8 = 100;\n    const P2: u8 = 101;\n    const P3: u8 = 102;\n    P0 + P1 + P2 + \
+             P3\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_a_binding_catchall_is_reported() {
         // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
         // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to

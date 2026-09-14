@@ -1425,9 +1425,9 @@ pub struct FoundArm {
 /// `if`/`else`, and a comma inside a turbofish — eight shapes `rustc`'s own grammar
 /// disambiguates for free and no text scan built one rule at a time ever closes for good).
 /// `syn` parses the real grammar, so every one of those shapes is handled without a rule of
-/// its own, and two more besides: a constant pattern is resolved the same way a constant
-/// argument is, against every `const` this file declares with a literal initializer,
-/// rather than read as "not a literal" and let through unclassified.
+/// its own, and one more besides: a constant pattern is resolved the same way a constant
+/// argument is, against every `const` visible at the match's own position, rather than read
+/// as "not a literal" and let through unclassified.
 ///
 /// # Errors
 ///
@@ -1435,38 +1435,94 @@ pub struct FoundArm {
 /// on this, the same as every other structural query in this module.
 pub fn match_expressions(contents: &str) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
-    let mut constants = std::collections::HashMap::new();
-    collect_literal_constants(&file, &mut constants);
+    let base = resolve_scope_consts(&item_const_exprs(&file.items), &ConstScopes(Vec::new()));
     let mut visitor = MatchVisitor {
-        constants: &constants,
+        scopes: ConstScopes(vec![base]),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
     Ok(visitor.found)
 }
 
-/// Every `const NAME: TYPE = EXPR;` this file declares, outside `#[cfg(test)]`, resolved to
-/// an integer where `EXPR` allows it — directly, or through a chain of references to other
-/// constants this same pass collected. Declaration order does not matter: Rust's own name
-/// resolution does not require one, so a fixed-point pass (bounded, since a real dependency
-/// chain among a handful of constants is shallow) is what a single top-to-bottom scan would
-/// get wrong for a constant that names a later one.
-fn collect_literal_constants(
-    file: &syn::File,
-    resolved: &mut std::collections::HashMap<String, u128>,
-) {
-    let mut collector = ConstExprCollector {
-        exprs: std::collections::HashMap::new(),
-    };
-    collector.visit_file(file);
-    let pending = collector.exprs;
-    for _ in 0..pending.len().max(1) {
+/// A stack of constant scopes, outermost first, each mapping a `const` name declared
+/// directly in that scope to its resolved integer value.
+///
+/// Codex's finding: a single file-wide map lets a second module's or function's own local
+/// `const P0 = 0;` be silently overwritten by an unrelated `const P0 = 99;` declared
+/// elsewhere in the same file, so the first table's patterns resolve to the *wrong* file's
+/// values — either hiding a real dense table behind values that no longer look dense, or the
+/// reverse. Resolution has to respect the same lexical scoping `rustc` gives these names:
+/// innermost declaration wins, and a name invisible from a given point (declared in a
+/// sibling module or a different function) must not be resolved from there at all.
+struct ConstScopes(Vec<std::collections::HashMap<String, u128>>);
+
+impl ConstScopes {
+    /// `name`'s value at the innermost scope that declares it, searching outward.
+    fn resolve(&self, name: &str) -> Option<u128> {
+        self.0
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+}
+
+/// The unevaluated initializer of every `const` declared *directly* in `items` — not
+/// recursing into a nested `mod` or `fn`, each of which is its own scope and resolved
+/// separately when [`MatchVisitor`] descends into it.
+fn item_const_exprs(items: &[syn::Item]) -> std::collections::HashMap<String, syn::Expr> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let syn::Item::Const(constant) = item else {
+                return None;
+            };
+            (!has_cfg_test(&constant.attrs))
+                .then(|| (ident_name(&constant.ident), (*constant.expr).clone()))
+        })
+        .collect()
+}
+
+/// The unevaluated initializer of every `const` declared *directly* as a local item
+/// statement in `block` — a function body's own `const P0: u8 = 0;`, which Codex found the
+/// first version of this scan missed entirely by only ever walking `syn::Item::Mod`.
+fn block_const_exprs(block: &syn::Block) -> std::collections::HashMap<String, syn::Expr> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Item(syn::Item::Const(constant)) = stmt else {
+                return None;
+            };
+            (!has_cfg_test(&constant.attrs))
+                .then(|| (ident_name(&constant.ident), (*constant.expr).clone()))
+        })
+        .collect()
+}
+
+/// `own`'s constants, each resolved to an integer where its initializer allows — directly,
+/// through a chain of references to other constants `own` itself declares, or through one
+/// already visible in `outer`. Declaration order within `own` does not matter: Rust's own
+/// name resolution does not require one, so a fixed-point pass (bounded, since a real
+/// dependency chain among a handful of constants in one scope is shallow) is what a single
+/// top-to-bottom scan would get wrong for a constant that names a later one.
+fn resolve_scope_consts(
+    own: &std::collections::HashMap<String, syn::Expr>,
+    outer: &ConstScopes,
+) -> std::collections::HashMap<String, u128> {
+    let mut resolved: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+    for _ in 0..own.len().max(1) {
         let mut progressed = false;
-        for (name, expr) in &pending {
+        for (name, expr) in own {
             if resolved.contains_key(name) {
                 continue;
             }
-            if let Some(value) = literal_or_const_value(expr, resolved) {
+            let resolve = |candidate: &str| {
+                resolved
+                    .get(candidate)
+                    .copied()
+                    .or_else(|| outer.resolve(candidate))
+            };
+            if let Some(value) = literal_or_const_value(expr, &resolve) {
                 resolved.insert(name.clone(), value);
                 progressed = true;
             }
@@ -1475,67 +1531,29 @@ fn collect_literal_constants(
             break;
         }
     }
-}
-
-/// The unevaluated initializer of every `const` a file declares, outside `#[cfg(test)]` —
-/// at module scope, in an inline module, inside an `impl` (an associated constant), or
-/// declared *locally inside a function body*, which Codex found the first version of this
-/// visitor missed: a manual walk over `syn::Item::Mod`'s own nested items never looks inside
-/// `syn::Item::Fn`'s block, and a second dense table can declare its singleton patterns as
-/// `const P0: u8 = 0;` statements at the top of its own function rather than at module
-/// scope. A `syn::visit::Visit` default traversal already descends into a function's block,
-/// a block's statements, and a local item statement among them, so overriding only
-/// `visit_item` and `visit_impl_item` — to record a `Const` and to skip `#[cfg(test)]` — is
-/// enough; the recursion the manual version had to write by hand is now the visitor's own.
-struct ConstExprCollector {
-    exprs: std::collections::HashMap<String, syn::Expr>,
-}
-
-impl<'ast> syn::visit::Visit<'ast> for ConstExprCollector {
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        if has_cfg_test(item_attrs(item)) {
-            return;
-        }
-        if let syn::Item::Const(constant) = item {
-            self.exprs
-                .insert(ident_name(&constant.ident), (*constant.expr).clone());
-        }
-        syn::visit::visit_item(self, item);
-    }
-
-    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-        if has_cfg_test(impl_item_attrs(item)) {
-            return;
-        }
-        if let syn::ImplItem::Const(constant) = item {
-            self.exprs
-                .insert(ident_name(&constant.ident), constant.expr.clone());
-        }
-        syn::visit::visit_impl_item(self, item);
-    }
+    resolved
 }
 
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
 /// cast, a set of parentheses or a brace group; or a bare path naming one identifier that
-/// `known` already resolves to a value — the constant-pattern half of both
-/// [`FoundArm::pattern`] and a call argument's own value.
+/// `resolve` answers for — the constant-pattern half of both [`FoundArm::pattern`] and a
+/// call argument's own value.
 fn literal_or_const_value(
     expr: &syn::Expr,
-    known: &std::collections::HashMap<String, u128>,
+    resolve: &dyn Fn(&str) -> Option<u128>,
 ) -> Option<u128> {
     match expr {
         syn::Expr::Lit(literal) => match &literal.lit {
             syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
             _ => None,
         },
-        syn::Expr::Cast(cast) => literal_or_const_value(&cast.expr, known),
-        syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, known),
-        syn::Expr::Group(group) => literal_or_const_value(&group.expr, known),
+        syn::Expr::Cast(cast) => literal_or_const_value(&cast.expr, resolve),
+        syn::Expr::Paren(paren) => literal_or_const_value(&paren.expr, resolve),
+        syn::Expr::Group(group) => literal_or_const_value(&group.expr, resolve),
         syn::Expr::Path(path) => path
             .path
             .get_ident()
-            .and_then(|ident| known.get(&ident_name(ident)))
-            .copied(),
+            .and_then(|ident| resolve(&ident_name(ident))),
         _ => None,
     }
 }
@@ -1543,26 +1561,22 @@ fn literal_or_const_value(
 /// `pattern`'s own integer value, the pattern half of [`literal_or_const_value`]: a bare
 /// literal, or a plain identifier — a pattern this simple parses as a binding rather than a
 /// path, since `syn` cannot tell one from a constant of the same name without resolving it —
-/// that `known` already resolves. `None` for a wildcard, a range, a tuple, or anything else
-/// a dense table's patterns are not, and for a binding that names no known constant — that
-/// is [`is_catchall_pattern`]'s question, not this one's.
-fn pattern_literal(
-    pattern: &syn::Pat,
-    known: &std::collections::HashMap<String, u128>,
-) -> Option<u128> {
+/// that `resolve` answers for. `None` for a wildcard, a range, a tuple, or anything else a
+/// dense table's patterns are not, and for a binding that names no known constant — that is
+/// [`is_catchall_pattern`]'s question, not this one's.
+fn pattern_literal(pattern: &syn::Pat, resolve: &dyn Fn(&str) -> Option<u128>) -> Option<u128> {
     match pattern {
         syn::Pat::Lit(literal) => match &literal.lit {
             syn::Lit::Int(int) => int.base10_parse::<u128>().ok(),
             _ => None,
         },
         syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
-            known.get(&ident_name(&named.ident)).copied()
+            resolve(&ident_name(&named.ident))
         }
         syn::Pat::Path(path) => path
             .path
             .get_ident()
-            .and_then(|ident| known.get(&ident_name(ident)))
-            .copied(),
+            .and_then(|ident| resolve(&ident_name(ident))),
         _ => None,
     }
 }
@@ -1581,7 +1595,7 @@ fn pattern_literal(
 fn is_catchall_pattern(
     pattern: &syn::Pat,
     guarded: bool,
-    known: &std::collections::HashMap<String, u128>,
+    resolve: &dyn Fn(&str) -> Option<u128>,
 ) -> bool {
     if guarded {
         return false;
@@ -1589,7 +1603,7 @@ fn is_catchall_pattern(
     match pattern {
         syn::Pat::Wild(_) => true,
         syn::Pat::Ident(named) if named.by_ref.is_none() && named.subpat.is_none() => {
-            !known.contains_key(&ident_name(&named.ident))
+            resolve(&ident_name(&named.ident)).is_none()
         }
         _ => false,
     }
@@ -1601,14 +1615,14 @@ fn is_catchall_pattern(
 /// an unwrapped one once a real parser is reading it.
 fn call_shape_of(
     expr: &syn::Expr,
-    known: &std::collections::HashMap<String, u128>,
+    resolve: &dyn Fn(&str) -> Option<u128>,
 ) -> Option<(String, Option<u128>)> {
     match expr {
-        syn::Expr::Paren(paren) => call_shape_of(&paren.expr, known),
-        syn::Expr::Group(group) => call_shape_of(&group.expr, known),
+        syn::Expr::Paren(paren) => call_shape_of(&paren.expr, resolve),
+        syn::Expr::Group(group) => call_shape_of(&group.expr, resolve),
         syn::Expr::Block(block) if block.block.stmts.len() == 1 => {
             match block.block.stmts.first()? {
-                syn::Stmt::Expr(inner, None) => call_shape_of(inner, known),
+                syn::Stmt::Expr(inner, None) => call_shape_of(inner, resolve),
                 _ => None,
             }
         }
@@ -1621,7 +1635,10 @@ fn call_shape_of(
                 return None;
             }
             let argument = call.args.first()?;
-            Some((ident_name(callee), literal_or_const_value(argument, known)))
+            Some((
+                ident_name(callee),
+                literal_or_const_value(argument, resolve),
+            ))
         }
         _ => None,
     }
@@ -1630,12 +1647,18 @@ fn call_shape_of(
 /// Walks a parsed file collecting every [`FoundMatch`], skipping anything declared under
 /// `#[cfg(test)]` — an item, an `impl` member, or an inline module's contents — the
 /// structural equivalent of `without_test_modules` blanking the same text.
-struct MatchVisitor<'a> {
-    constants: &'a std::collections::HashMap<String, u128>,
+///
+/// `scopes` grows and shrinks as the walk enters and leaves a module or a block (a
+/// function's body among them): each carries only the constants declared directly in it, so
+/// resolving a name at any point searches the live stack from the innermost scope outward —
+/// the same shadowing a real name lookup gives these declarations, and what stops one
+/// module's or function's own constants from being read through another's of the same name.
+struct MatchVisitor {
+    scopes: ConstScopes,
     found: Vec<FoundMatch>,
 }
 
-impl<'ast> syn::visit::Visit<'ast> for MatchVisitor<'_> {
+impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
     fn visit_item(&mut self, item: &'ast syn::Item) {
         if has_cfg_test(item_attrs(item)) {
             return;
@@ -1650,15 +1673,35 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor<'_> {
         syn::visit::visit_impl_item(self, item);
     }
 
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let Some((_, items)) = &node.content else {
+            syn::visit::visit_item_mod(self, node);
+            return;
+        };
+        let scope = resolve_scope_consts(&item_const_exprs(items), &self.scopes);
+        self.scopes.0.push(scope);
+        syn::visit::visit_item_mod(self, node);
+        self.scopes.0.pop();
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        let scope = resolve_scope_consts(&block_const_exprs(node), &self.scopes);
+        self.scopes.0.push(scope);
+        syn::visit::visit_block(self, node);
+        self.scopes.0.pop();
+    }
+
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        let scopes = &self.scopes;
+        let resolve = move |name: &str| scopes.resolve(name);
         let selector = node.expr.to_token_stream().to_string();
         let arms = node
             .arms
             .iter()
             .map(|arm| FoundArm {
-                pattern: pattern_literal(&arm.pat, self.constants),
-                is_wild: is_catchall_pattern(&arm.pat, arm.guard.is_some(), self.constants),
-                call: call_shape_of(&arm.body, self.constants),
+                pattern: pattern_literal(&arm.pat, &resolve),
+                is_wild: is_catchall_pattern(&arm.pat, arm.guard.is_some(), &resolve),
+                call: call_shape_of(&arm.body, &resolve),
             })
             .collect();
         self.found.push(FoundMatch { selector, arms });
