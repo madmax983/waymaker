@@ -28,16 +28,16 @@
 //! ```
 //! # use waymaker_flash::append::Sealable;
 //! # use waymaker_flash::storage::StableStorage;
-//! fn commit_after_the_barrier<S: StableStorage>(sealable: Sealable<'_, '_>, storage: &mut S) {
-//!     let _ = sealable.commit(storage);
+//! fn commit_after_the_barrier<S: StableStorage>(sealable: Sealable<'_, '_, '_, S>) {
+//!     let _ = sealable.commit();
 //! }
 //! ```
 //!
 //! ```compile_fail,E0599
 //! # use waymaker_flash::append::Staged;
 //! # use waymaker_flash::storage::StableStorage;
-//! fn commit_without_the_barrier<S: StableStorage>(staged: Staged<'_, '_>, storage: &mut S) {
-//!     let _ = staged.commit(storage);
+//! fn commit_without_the_barrier<S: StableStorage>(staged: Staged<'_, '_, '_, S>) {
+//!     let _ = staged.commit();
 //! }
 //! ```
 //!
@@ -45,6 +45,30 @@
 //! failing for some unrelated reason — a `compile_fail` doctest with no compiling twin is a
 //! test that passes when the type it names is deleted — and the second names `E0599`, so it
 //! fails for "no method named `commit`" specifically rather than for a typo.
+//!
+//! # Why the two later steps take no `storage` argument
+//!
+//! Issue [#84](https://github.com/madmax983/waymaker/issues/84): a `storage: &mut S`
+//! argument accepted anew at every step cannot tell two devices of one model apart, because
+//! [`StableStorage::geometry`] answers the same for both. [`Journal::stage`] borrows
+//! `storage` for as long as the record it started is unresolved, and [`Staged`] and
+//! [`Sealable`] carry that borrow instead of asking for a fresh one — so a caller that tried
+//! to finish the record on a second device would not meet a runtime refusal, it would meet a
+//! type error:
+//!
+//! ```compile_fail,E0061
+//! # use waymaker_flash::append::Staged;
+//! # use waymaker_flash::storage::StableStorage;
+//! fn a_second_device_has_no_call_to_make<S: StableStorage>(
+//!     staged: Staged<'_, '_, '_, S>,
+//!     mut other: S,
+//! ) {
+//!     let _ = staged.payload_barrier(&mut other);
+//! }
+//! ```
+//!
+//! [`AppendError::WrongDevice`] still exists, and still fires — once, at
+//! [`Journal::stage`], the one call that takes a `storage` argument at all.
 //!
 //! # Where a writer may start
 //!
@@ -244,18 +268,19 @@ pub enum AppendError<E> {
     /// [`frame::encode`] documents: a record that fails [`frame::encoded_len`] can never be
     /// written, and one that passes it and fails here needs a bigger page.
     Encode(DecodeError),
-    /// The storage handed to a step is not the device the region was validated against.
+    /// `storage` is not the device the region was validated against.
     ///
     /// The same refusal [`RecoveryError::WrongDevice`](crate::recovery::RecoveryError::WrongDevice)
     /// makes, in the direction that programs rather than reads — which is the worse
     /// direction: an append at an offset proved legal on another device is a write outside
     /// the journal.
     ///
-    /// Compared at **every** step and not only at the first. Review of this change found the
-    /// half that a single check leaves open: a payload barrier taken on some other device
-    /// orders nothing on this one, so the frame would be sealed without ever having been made
-    /// durable, and a commit taken on another device programs a seal at an offset that device
-    /// never validated.
+    /// Reachable only from [`Journal::stage`], the one call in this protocol that takes a
+    /// `storage` argument at all. [`Staged::payload_barrier`] and [`Sealable::commit`] carry
+    /// the same borrow onward instead of asking for a fresh one, so a barrier or a commit
+    /// taken on a second device is not a refusal this type has to make — it is a call a
+    /// caller cannot write. See the module documentation, and issue
+    /// [#84](https://github.com/madmax983/waymaker/issues/84).
     WrongDevice,
     /// The record does not fit in what is left of the region.
     ///
@@ -351,7 +376,7 @@ impl<C: IntegrityCheck> Journal<C> {
                   scan that could be asked twice would hand out two writers at one offset, \
                   and clippy cannot see a linear discipline"
     )]
-    pub fn after(recovery: Recovery<C>) -> Option<Self> {
+    pub fn after<S>(recovery: Recovery<'_, S, C>) -> Option<Self> {
         let offset = recovery.append_offset()?;
         Some(Self {
             region: recovery.region(),
@@ -360,6 +385,29 @@ impl<C: IntegrityCheck> Journal<C> {
             written: WriteAmplification::NONE,
             check: PhantomData,
         })
+    }
+
+    /// [`after`](Self::after), and the device `recovery` held.
+    ///
+    /// For a caller whose only handle to the device lives inside `recovery` — a driver whose
+    /// own state holds nothing else, say — and who needs it back whether or not the scan
+    /// left somewhere safe to write. [`after`](Self::after) alone would leave that caller
+    /// with no way to reach the device again on [`None`].
+    #[must_use]
+    pub fn after_taking_storage<S>(recovery: Recovery<'_, S, C>) -> (&mut S, Option<Self>) {
+        let offset = recovery.append_offset();
+        let region = recovery.region();
+        let storage = recovery.into_storage();
+        (
+            storage,
+            offset.map(|offset| Self {
+                region,
+                offset,
+                appendable: true,
+                written: WriteAmplification::NONE,
+                check: PhantomData,
+            }),
+        )
     }
 
     /// Where the next record goes, relative to the region's base.
@@ -422,16 +470,18 @@ impl<C: IntegrityCheck> Journal<C> {
     /// validated against; [`AppendError::Encode`] when the record cannot be encoded or
     /// `page` cannot hold it; [`AppendError::NoRoom`] when the region cannot; and
     /// [`AppendError::Storage`] when the program fails.
-    pub fn stage<'journal, 'page, S: StableStorage>(
+    pub fn stage<'journal, 'page, 'storage, S: StableStorage>(
         &'journal mut self,
-        storage: &mut S,
+        storage: &'storage mut S,
         record: &RecordRef<'_>,
         page: &'page mut [u8],
-    ) -> Result<Staged<'journal, 'page, C>, AppendError<S::Error>> {
+    ) -> Result<Staged<'journal, 'page, 'storage, S, C>, AppendError<S::Error>> {
         // Before anything: the device this region's arithmetic was proved against. Every
         // bound below — that the offset is programmable, that the record stays inside the
         // region — was established at construction, and proving them about one device and
-        // programming another is the failure that cannot be seen from the outside.
+        // programming another is the failure that cannot be seen from the outside. This is
+        // the one check in the whole protocol, because `storage` is the one argument: see
+        // "why the two later steps take no `storage` argument" above.
         if storage.geometry() != self.region.geometry() {
             return Err(AppendError::WrongDevice);
         }
@@ -498,6 +548,7 @@ impl<C: IntegrityCheck> Journal<C> {
                 barriers: 0,
             },
             journal: self,
+            storage,
             seal,
             seal_at: at.saturating_add(body_bytes),
             stride: record_bytes,
@@ -550,8 +601,11 @@ fn payload_of(record: &RecordRef<'_>) -> u32 {
 #[must_use = "a staged frame is not committed until its payload barrier and commit barrier \
               have returned"]
 #[derive(Debug)]
-pub struct Staged<'journal, 'page, C: IntegrityCheck = Catalogued> {
+pub struct Staged<'journal, 'page, 'storage, S: StableStorage, C: IntegrityCheck = Catalogued> {
     journal: &'journal mut Journal<C>,
+    /// The device [`Journal::stage`] validated, carried rather than re-taken. See "why the
+    /// two later steps take no `storage` argument" in the module documentation.
+    storage: &'storage mut S,
     /// The record's commit seal, still in the caller's page.
     seal: &'page [u8],
     /// Where that seal goes, as a device offset.
@@ -562,7 +616,9 @@ pub struct Staged<'journal, 'page, C: IntegrityCheck = Catalogued> {
     record: WriteAmplification,
 }
 
-impl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {
+impl<'journal, 'page, 'storage, S: StableStorage, C: IntegrityCheck>
+    Staged<'journal, 'page, 'storage, S, C>
+{
     /// §07 step 2: waits for the frame body to become durable.
     ///
     /// # Postconditions
@@ -578,22 +634,15 @@ impl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {
     ///
     /// # Errors
     ///
-    /// [`AppendError::WrongDevice`] when `storage` is not the device the region was
-    /// validated against, and [`AppendError::Storage`] if the barrier fails.
-    pub fn payload_barrier<S: StableStorage>(
+    /// [`AppendError::Storage`] if the barrier fails.
+    pub fn payload_barrier(
         self,
-        storage: &mut S,
-    ) -> Result<Sealable<'journal, 'page, C>, AppendError<S::Error>> {
-        // Every step compares the device, not only the first. A barrier on some *other*
-        // device orders nothing on this one, and the frame body would then be sealed without
-        // ever having been made durable — which is the one thing §07 step 2 exists to stop.
-        if storage.geometry() != self.journal.region.geometry() {
-            return Err(AppendError::WrongDevice);
-        }
+    ) -> Result<Sealable<'journal, 'page, 'storage, S, C>, AppendError<S::Error>> {
         self.journal.written = self.journal.written.barriering();
-        storage.barrier().map_err(AppendError::Storage)?;
+        self.storage.barrier().map_err(AppendError::Storage)?;
         Ok(Sealable {
             journal: self.journal,
+            storage: self.storage,
             seal: self.seal,
             seal_at: self.seal_at,
             stride: self.stride,
@@ -609,15 +658,16 @@ impl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {
 /// place a seal is programmed.
 #[must_use = "a sealable frame is not committed until `commit` has returned"]
 #[derive(Debug)]
-pub struct Sealable<'journal, 'page, C: IntegrityCheck = Catalogued> {
+pub struct Sealable<'journal, 'page, 'storage, S: StableStorage, C: IntegrityCheck = Catalogued> {
     journal: &'journal mut Journal<C>,
+    storage: &'storage mut S,
     seal: &'page [u8],
     seal_at: u32,
     stride: u32,
     record: WriteAmplification,
 }
 
-impl<C: IntegrityCheck> Sealable<'_, '_, C> {
+impl<S: StableStorage, C: IntegrityCheck> Sealable<'_, '_, '_, S, C> {
     /// §07 step 3: programs the commit seal and waits for it to become durable.
     ///
     /// # Postconditions
@@ -636,25 +686,15 @@ impl<C: IntegrityCheck> Sealable<'_, '_, C> {
     ///
     /// # Errors
     ///
-    /// [`AppendError::WrongDevice`] when `storage` is not the device the region was
-    /// validated against, and [`AppendError::Storage`] if the program or the barrier fails.
-    pub fn commit<S: StableStorage>(
-        self,
-        storage: &mut S,
-    ) -> Result<WriteAmplification, AppendError<S::Error>> {
-        // The worst of the three to get wrong: `seal_at` is an offset proved legal against
-        // the region's geometry, and programming it on another device is a write outside any
-        // journal that device has.
-        if storage.geometry() != self.journal.region.geometry() {
-            return Err(AppendError::WrongDevice);
-        }
+    /// [`AppendError::Storage`] if the program or the barrier fails.
+    pub fn commit(self) -> Result<WriteAmplification, AppendError<S::Error>> {
         let seal_bytes = u32::try_from(self.seal.len()).unwrap_or(u32::MAX);
         self.journal.written = self.journal.written.programming(seal_bytes);
-        storage
+        self.storage
             .program(self.seal_at, self.seal)
             .map_err(AppendError::Storage)?;
         self.journal.written = self.journal.written.barriering();
-        storage.barrier().map_err(AppendError::Storage)?;
+        self.storage.barrier().map_err(AppendError::Storage)?;
 
         // And only now is it history. Everything above this line is recoverable as "nothing
         // happened"; below it, the record is in the committed prefix — and the new offset is

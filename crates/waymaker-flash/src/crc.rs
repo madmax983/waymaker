@@ -44,7 +44,7 @@
 //!
 //! ADR 0010 kept both bitwise "until a profile of a real workload says otherwise", naming
 //! the nibble table as the most likely answer if one ever did.
-//! [ADR 0044](https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
+//! [ADR 0045](https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
 //! is that profile, and it splits in two rather than landing where ADR 0010 expected.
 //! [`crc16_nibble`] needs no table at all: for this specific polynomial, four rounds over a
 //! single nibble reduce to one multiply, with no rodata and no lookup — `crc16` stays
@@ -162,7 +162,7 @@ pub(crate) const fn crc32(bytes: &[u8]) -> u32 {
 #[inline(always)]
 #[allow(
     clippy::inline_always,
-    reason = "LLVM only builds crc32_nibble_table's table when this body is visible at each arm first; a soft #[inline] measured as a real call per nibble instead, see ADR 0044"
+    reason = "LLVM only builds crc32_nibble_table's table when this body is visible at each arm first; a soft #[inline] measured as a real call per nibble instead, see ADR 0045"
 )]
 const fn crc32_nibble(nibble: u8) -> u32 {
     // `crc16_nibble`'s reason: named once, in the function that now owns it.
@@ -187,23 +187,23 @@ const fn crc32_nibble(nibble: u8) -> u32 {
 /// `crc32_nibble` and nothing else, over the full masked range of a nibble with no gap and
 /// no repeat. LLVM's own switch-to-lookup-table pass is what turns that shape into a single
 /// indexed load from a table it builds in `.rodata` on every target this crate has been
-/// disassembled for so far — [ADR 0044] is where that disassembly and the reproduction
+/// disassembled for so far — [ADR 0045] is where that disassembly and the reproduction
 /// steps for it live, the same way ADR 0010's cycle counts are a dated, by-hand measurement
 /// rather than a thing CI re-derives on every run, and for the same reason: there is no
 /// gate here that could tell "a compiler stopped applying this optimisation" apart from "a
 /// compiler applied a different one that costs the same", so this stays a documented,
 /// reproducible claim rather than a green check that would read as more than it is.
-/// [ADR 0044] is the decision that this specific, sixteen-entry, `crc32`-only table is worth
+/// [ADR 0045] is the decision that this specific, sixteen-entry, `crc32`-only table is worth
 /// 64 B of `.rodata`; the `integrity-check` gate's `INTEGRITY_CHECK_TABLES` pins its
 /// *shape* — this function's name, `crc32_nibble`'s name, and the count sixteen — so a
 /// seventeenth arm, a seventh helper, or a second table elsewhere in this file is still
 /// exactly the surprise ADR 0010 wanted a decision attached to.
 ///
-/// [ADR 0044]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md
+/// [ADR 0045]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md
 #[inline(always)]
 #[allow(
     clippy::inline_always,
-    reason = "a soft #[inline] left this match uninlined into crc32's loop, measured as a real call per nibble rather than a table load, see ADR 0044"
+    reason = "a soft #[inline] left this match uninlined into crc32's loop, measured as a real call per nibble rather than a table load, see ADR 0045"
 )]
 const fn crc32_nibble_table(nibble: u8) -> u32 {
     match nibble & 0xF {

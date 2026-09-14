@@ -50,10 +50,10 @@ fn reserve() -> Reserve {
 
 /// Every record the journal holds, decoded.
 fn history(device: &mut Device) -> Vec<RecordKindAndBytes> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -377,10 +377,10 @@ fn a_record_kind_from_the_future_stops_the_driver_rather_than_being_skipped() {
     // frame that was merely damaged, which is a different refusal reached the same way —
     // and the version of this test in `waymaker-flash` was exactly that for two rungs.
     {
-        let mut recovery = Recovery::new(region());
+        let mut recovery = Recovery::new(region(), &mut device);
         let mut seen = 0_usize;
         let mut refusal = None;
-        while let Some(step) = recovery.next(&mut device, &mut page) {
+        while let Some(step) = recovery.next(&mut page) {
             match step {
                 Ok(_) => seen += 1,
                 Err(error) => {

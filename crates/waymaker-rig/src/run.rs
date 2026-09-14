@@ -745,8 +745,8 @@ impl Rig {
         };
         let mut journal = {
             let mut engine = self.engine(part).map_err(widen)?;
-            let mut recovery = Recovery::new(region);
-            while let Some(step) = recovery.next(&mut engine, page) {
+            let mut recovery = Recovery::new(region, &mut engine);
+            while let Some(step) = recovery.next(page) {
                 if let Err(error) = step {
                     return Err(RigError::Recovery(unwindow_recovery(error)));
                 }
@@ -895,10 +895,10 @@ impl Rig {
                 .stage(&mut engine, record, page)
                 .map_err(|error| RigError::Append(unwindow_append(error)))?;
             let sealable = staged
-                .payload_barrier(&mut engine)
+                .payload_barrier()
                 .map_err(|error| RigError::Append(unwindow_append(error)))?;
             sealable
-                .commit(&mut engine)
+                .commit()
                 .map_err(|error| RigError::Append(unwindow_append(error)))?;
         }
         part.set_amplification(journal.amplification());
@@ -952,8 +952,8 @@ impl Rig {
         let mut audit = Audit::new(workload, known);
         let mut expected = [0_u8; Workload::MAX_PAYLOAD_BYTES];
         let mut engine = self.engine(part)?;
-        let mut recovery = Recovery::new(region);
-        while let Some(step) = recovery.next(&mut engine, page) {
+        let mut recovery = Recovery::new(region, &mut engine);
+        while let Some(step) = recovery.next(page) {
             match step {
                 Ok(record) => audit
                     .saw(&record, &mut expected)
@@ -1294,9 +1294,9 @@ impl Rig {
         };
 
         let mut audit = Audit::new(workload, progress);
-        let mut recovery = Recovery::new(region);
+        let mut recovery = Recovery::new(region, &mut engine);
         let mut expected = [0_u8; Workload::MAX_PAYLOAD_BYTES];
-        while let Some(step) = recovery.next(&mut engine, page) {
+        while let Some(step) = recovery.next(page) {
             match step {
                 Ok(record) => {
                     if let Err(breach) = audit.saw(&record, &mut expected) {

@@ -230,13 +230,13 @@ fn append(device: &mut Nor, region: JournalRegion, records: &[RecordRef<'_>]) ->
 }
 
 /// Every record a recovery yields, and how it ended.
-fn drain<C>(device: &mut Nor, recovery: &mut Recovery<C>) -> (Vec<Vec<u8>>, Option<Ending>)
+fn drain<C>(recovery: &mut Recovery<'_, Nor, C>) -> (Vec<Vec<u8>>, Option<Ending>)
 where
     C: waymaker_flash::integrity::IntegrityCheck,
 {
     let mut page = [0_u8; PAGE];
     let mut seen = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         match step {
             Ok(record) => seen.push(describe(&record)),
             Err(_) => break,
@@ -310,8 +310,8 @@ fn recovery_stops_at_a_torn_frame_and_never_reaches_the_valid_one_after_it() {
     .expect("a page holds this frame");
     device.put(after, &staging[..written]);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
 
     assert_eq!(
         seen.len(),
@@ -361,8 +361,8 @@ fn a_hole_in_a_journal_is_not_the_end_of_it() {
     .expect("a page holds this frame");
     device.put(end + 64, &staging[..written]);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
 
     assert_eq!(seen.len(), 1);
     assert_eq!(ending, Some(Ending::Damaged { at: end }));
@@ -389,8 +389,8 @@ fn a_short_tail_that_is_not_erased_is_a_torn_header() {
     );
     device.put(24, &[0x57, 0x4D, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00]);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
 
     assert_eq!(seen.len(), 1);
     assert_eq!(ending, Some(Ending::Damaged { at: 24 }));
@@ -444,11 +444,11 @@ fn an_unknown_record_kind_stops_recovery() {
     reseal(&mut bytes, journal.align());
     device.put(end, &bytes);
 
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut device);
     let mut seen = Vec::new();
     let mut refusal = None;
     let mut page = [0_u8; PAGE];
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         match step {
             Ok(record) => seen.push(record.kind()),
             Err(error) => {
@@ -489,10 +489,10 @@ fn a_frame_the_page_cannot_hold_stops_recovery_without_calling_it_damage() {
     );
     assert!(end > 200);
 
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut device);
     let mut page = [0_u8; 64];
     let step = recovery
-        .next(&mut device, &mut page)
+        .next(&mut page)
         .expect("a journal with a frame in it has a step");
     // The whole record, seal included: a reader that staged only the frame would have
     // nowhere to check the seal from.
@@ -507,11 +507,7 @@ fn a_frame_the_page_cannot_hold_stops_recovery_without_calling_it_damage() {
     );
     assert_eq!(recovery.ending(), Some(Ending::Incomplete { at: 0 }));
     assert_eq!(recovery.append_offset(), None);
-    assert_eq!(
-        recovery.next(&mut device, &mut page),
-        None,
-        "and it is fused"
-    );
+    assert_eq!(recovery.next(&mut page), None, "and it is fused");
 }
 
 #[test]
@@ -529,10 +525,10 @@ fn a_device_that_cannot_be_read_ends_a_recovery_without_a_prefix_or_an_offset() 
     );
     device.fail_read_at = Some(0);
 
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut device);
     let mut page = [0_u8; PAGE];
     assert_eq!(
-        recovery.next(&mut device, &mut page),
+        recovery.next(&mut page),
         Some(Err(RecoveryError::Storage(GeometryError::OutOfBounds)))
     );
     assert_eq!(recovery.ending(), Some(Ending::Incomplete { at: 0 }));
@@ -562,10 +558,10 @@ fn a_recovery_refuses_a_device_its_region_was_not_validated_against() {
     );
 
     let mut other = Nor::new(coarse);
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut other);
     let mut page = [0_u8; PAGE];
     assert_eq!(
-        recovery.next(&mut other, &mut page),
+        recovery.next(&mut page),
         Some(Err(RecoveryError::WrongDevice))
     );
     assert_eq!(recovery.ending(), Some(Ending::Incomplete { at: 0 }));
@@ -575,8 +571,8 @@ fn a_recovery_refuses_a_device_its_region_was_not_validated_against() {
     // And the device the region *was* built against still works, so this is a refusal rather
     // than a rule nobody can satisfy.
     let mut own = Nor::new(fine);
-    let mut sound = Recovery::new(journal);
-    let (seen, ending) = drain(&mut own, &mut sound);
+    let mut sound = Recovery::new(journal, &mut own);
+    let (seen, ending) = drain(&mut sound);
     assert!(seen.is_empty());
     assert_eq!(ending, Some(Ending::Clean { append_at: 0 }));
 }
@@ -599,8 +595,8 @@ fn an_append_offset_is_only_ever_erased_media() {
             .collect();
         let end = append(&mut device, journal, &records);
 
-        let mut recovery = Recovery::new(journal);
-        let (seen, ending) = drain(&mut device, &mut recovery);
+        let mut recovery = Recovery::new(journal, &mut device);
+        let (seen, ending) = drain(&mut recovery);
         assert_eq!(seen.len(), count);
         assert_eq!(ending, Some(Ending::Clean { append_at: end }));
 
@@ -629,8 +625,8 @@ fn a_journal_that_stopped_at_damage_has_no_append_offset() {
     let journal = region(geometry, 0, 128, 8);
     device.put(0, &[0x57, 0x4D, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00]);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
     assert!(seen.is_empty());
     assert_eq!(ending, Some(Ending::Damaged { at: 0 }));
     assert_eq!(recovery.append_offset(), None);
@@ -654,8 +650,8 @@ fn a_full_journal_appends_at_its_end_and_a_caller_finds_no_room() {
     );
     assert_eq!(end, 48, "two empty records, each sixteen bytes and a seal");
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
     assert_eq!(seen.len(), 2);
     assert_eq!(ending, Some(Ending::Clean { append_at: 48 }));
     assert_eq!(recovery.append_offset(), Some(48));
@@ -669,8 +665,8 @@ fn an_erased_journal_recovers_nothing_and_appends_at_its_first_byte() {
     let mut device = Nor::new(geometry);
     let journal = region(geometry, 0, 256, 8);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
     assert!(seen.is_empty());
     assert_eq!(ending, Some(Ending::Clean { append_at: 0 }));
     assert_eq!(recovery.append_offset(), Some(0));
@@ -734,8 +730,8 @@ fn a_recovery_reads_what_a_scan_reads() {
             expected.push(describe(&record));
         }
 
-        let mut recovery = Recovery::new(journal);
-        let (seen, ending) = drain(&mut device, &mut recovery);
+        let mut recovery = Recovery::new(journal, &mut device);
+        let (seen, ending) = drain(&mut recovery);
 
         assert_eq!(seen, expected, "case {case}: the two readers disagree");
         assert_eq!(
@@ -785,16 +781,16 @@ fn a_recovery_with_the_wrong_check_stops_at_the_first_frame() {
     );
 
     // The shipped check reads it.
-    let mut shipped = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut shipped);
+    let mut shipped = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut shipped);
     assert_eq!(seen.len(), 2);
     assert!(matches!(ending, Some(Ending::Clean { .. })));
 
     // Another one does not, and stops at the very first frame rather than walking it wrong.
-    let mut other = Recovery::<Other>::with_integrity(journal);
+    let mut other = Recovery::<Nor, Other>::with_integrity(journal, &mut device);
     let mut page = [0_u8; PAGE];
     assert_eq!(
-        other.next(&mut device, &mut page),
+        other.next(&mut page),
         Some(Err(RecoveryError::Decode(DecodeError::IntegrityFailed)))
     );
     assert_eq!(other.ending(), Some(Ending::Damaged { at: 0 }));
@@ -821,8 +817,8 @@ fn a_read_that_fails_mid_scan_ends_a_recovery_after_a_short_prefix() {
     // Reads 0 and 1 are the first record's header and frame; read 2 is the second's header.
     device.fail_read_at = Some(2);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
     assert_eq!(seen.len(), 1);
     assert_eq!(ending, Some(Ending::Incomplete { at: 32 }));
     assert_ne!(ending, Some(Ending::Damaged { at: 32 }));
@@ -851,14 +847,14 @@ fn a_frame_exactly_the_size_of_the_page_is_read_rather_than_refused() {
         &[RecordRef::RunCompleted { result: &payload }],
     );
 
-    let mut exact = Recovery::new(journal);
+    let mut exact = Recovery::new(journal, &mut device);
     let mut page = [0_u8; 80];
-    assert!(matches!(exact.next(&mut device, &mut page), Some(Ok(_))));
+    assert!(matches!(exact.next(&mut page), Some(Ok(_))));
 
-    let mut short = Recovery::new(journal);
+    let mut short = Recovery::new(journal, &mut device);
     let mut one_less = [0_u8; 79];
     assert_eq!(
-        short.next(&mut device, &mut one_less),
+        short.next(&mut one_less),
         Some(Err(RecoveryError::PageTooSmall { needed: 80 }))
     );
 }
@@ -881,12 +877,9 @@ fn a_page_that_is_not_whole_read_units_is_used_down_to_the_unit() {
         }],
     );
 
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut device);
     let mut ragged = [0_u8; 34];
-    assert!(matches!(
-        recovery.next(&mut device, &mut ragged),
-        Some(Ok(_))
-    ));
+    assert!(matches!(recovery.next(&mut ragged), Some(Ok(_))));
     for (offset, len) in &device.spans {
         assert_eq!(
             len % 4,
@@ -912,8 +905,8 @@ fn a_recovery_at_a_wider_read_unit_still_stops_where_a_scan_does() {
     );
     device.put(end, &[0x57, 0x4D, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00]);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
     assert_eq!(seen.len(), 1);
     assert_eq!(ending, Some(Ending::Damaged { at: end }));
 }
@@ -955,8 +948,8 @@ fn the_cost_of_a_record_does_not_depend_on_how_many_came_before_it() {
         assert_eq!(end, count * FRAME);
         device.forget();
 
-        let mut recovery = Recovery::new(journal);
-        let (seen, ending) = drain(&mut device, &mut recovery);
+        let mut recovery = Recovery::new(journal, &mut device);
+        let (seen, ending) = drain(&mut recovery);
         assert_eq!(seen.len(), usize::try_from(count).expect("host"));
         assert_eq!(ending, Some(Ending::Clean { append_at: end }));
         cost.push((count, device.reads, device.bytes_read));
@@ -999,22 +992,25 @@ fn recovery_is_a_position_rather_than_a_buffer() {
     let [schedule, complete] = effect(3, b"in", b"out");
     append(&mut device, journal, &[schedule, complete]);
 
-    let mut recovery = Recovery::new(journal);
+    let mut recovery = Recovery::new(journal, &mut device);
     let mut page = [0_u8; PAGE];
     let mut seen = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let record = step.expect("this journal is sound");
         seen.push(describe(&record));
         page.fill(0xA5);
     }
     assert_eq!(seen.len(), 2);
     // The size itself is a `const` assertion in the crate, which is where a `<=` would be a
-    // place to hide a page. What a test adds is the *shape*: a recovery is its region, an
-    // offset and a verdict, and nothing else — so a field that appeared would move this
-    // equality rather than merely fit under a ceiling.
+    // place to hide a page. What a test adds is the *shape*: a recovery is its borrowed
+    // device, its region, an offset and a verdict, and nothing else — so a field that
+    // appeared would move this equality rather than merely fit under a ceiling.
     assert_eq!(
-        std::mem::size_of::<Recovery>(),
-        std::mem::size_of::<JournalRegion>() + std::mem::size_of::<u32>() + 8
+        std::mem::size_of::<Recovery<'_, Nor>>(),
+        std::mem::size_of::<&mut Nor>()
+            + std::mem::size_of::<JournalRegion>()
+            + std::mem::size_of::<u32>()
+            + 8
     );
 }
 
@@ -1039,8 +1035,8 @@ fn a_recovery_never_reads_outside_the_region_it_was_given() {
     );
     device.forget();
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, _) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, _) = drain(&mut recovery);
     assert_eq!(seen.len(), 2);
     assert!(!device.spans.is_empty());
     for (offset, len) in &device.spans {
@@ -1080,8 +1076,8 @@ fn every_offset_a_recovery_reports_is_relative_to_its_region() {
     let torn_at = end - journal.base();
     device.put(end, &[0x57, 0x4D, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00]);
 
-    let mut recovery = Recovery::new(journal);
-    let (seen, ending) = drain(&mut device, &mut recovery);
+    let mut recovery = Recovery::new(journal, &mut device);
+    let (seen, ending) = drain(&mut recovery);
     assert_eq!(seen.len(), 2);
     assert!(
         torn_at > 0 && torn_at < journal.base(),

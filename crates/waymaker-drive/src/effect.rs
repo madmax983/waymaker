@@ -195,9 +195,9 @@ impl<C: IntegrityCheck> Effect<C> {
         self.writer
             .stage(storage, &record, page)
             .map_err(refusal)?
-            .payload_barrier(storage)
+            .payload_barrier()
             .map_err(DriveError::Append)?
-            .commit(storage)
+            .commit()
             .map_err(DriveError::Append)?;
         Ok(Scheduled {
             dispatch: Dispatchable {
@@ -269,9 +269,9 @@ impl<C: IntegrityCheck> Dispatchable<C> {
         self.writer
             .stage(storage, &record, page)
             .map_err(refusal)?
-            .payload_barrier(storage)
+            .payload_barrier()
             .map_err(DriveError::Append)?
-            .commit(storage)
+            .commit()
             .map_err(DriveError::Append)?;
         Ok(Resolved {
             next: Effect {
@@ -337,9 +337,9 @@ mod tests {
         let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
             unreachable!("these bounds fit this layout")
         };
-        let mut recovery = Recovery::new(region());
+        let mut recovery = Recovery::new(region(), storage);
         let mut page = [0_u8; 128];
-        while recovery.next(storage, &mut page).is_some() {}
+        while recovery.next(&mut page).is_some() {}
         let Some(journal) = Journal::after(recovery) else {
             unreachable!("an erased journal has an append point")
         };

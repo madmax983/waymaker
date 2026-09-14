@@ -1,4 +1,4 @@
-# ADR 0044: a nibble table is a superseding ADR, and CRC-16 needed none
+# ADR 0045: a nibble table is a superseding ADR, and CRC-16 needed none
 
 - Status: accepted
 - Date: 2026-09-13

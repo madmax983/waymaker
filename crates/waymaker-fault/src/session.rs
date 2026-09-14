@@ -137,6 +137,36 @@ impl Session {
         self.marks.push((None, self.ops.len()));
     }
 
+    /// How many operations this session has recorded so far.
+    ///
+    /// A caller reads this at two points where it can still reach `&mut Self` — before and
+    /// after a writer's middle steps, which for a typestate like
+    /// `waymaker_flash::append::Sealable` hold the device by borrow and take no `&mut Self`
+    /// of their own. [`mark_operations`](Self::mark_operations) is what turns the two counts
+    /// into a record declared after the fact, rather than opened and closed live.
+    #[must_use]
+    pub fn operations(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Declares that operations `range` belong to `id`, after they have already happened.
+    ///
+    /// [`begin_record`](Self::begin_record) and [`end_record`](Self::end_record) bracket a
+    /// record live, which needs `&mut Self` for the whole span. A typestate that carries the
+    /// device across several calls, such as `waymaker_flash::append::Sealable`, holds that
+    /// borrow itself instead, leaving no `&mut Self` for the caller to bracket with. This is
+    /// the same declaration made afterwards, from a range whose ends the caller counted with
+    /// [`operations`](Self::operations) before and after the span.
+    ///
+    /// # Preconditions
+    ///
+    /// Same as [`begin_record`](Self::begin_record): `id` is distinct within one run, and
+    /// `range` does not overlap a span already declared.
+    pub fn mark_operations(&mut self, id: RecordId, range: core::ops::Range<usize>) {
+        self.marks.push((Some(id), range.start));
+        self.marks.push((None, range.end));
+    }
+
     /// The bytes as they stand, which is what a reader after a reset would see.
     #[must_use]
     pub fn image(&self) -> &[u8] {

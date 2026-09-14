@@ -1798,12 +1798,22 @@ pub const RECOVERY_SURFACE_PATH: &str = "waymaker-flash/src/recovery.rs";
 /// anything. `fmt` is on the list because a trait `impl`'s methods are callable without
 /// `pub`, and `message` because a device with no console still has to report something.
 ///
+/// `into_storage` is on this list for issue
+/// [#84](https://github.com/madmax983/waymaker/issues/84): once a [`Recovery`] borrows its
+/// device for its own life instead of taking it fresh at every call, a caller moving on to
+/// [`Journal::after`] needs the device back as well as the finished scan. It hands out only
+/// the reference `new`/`with_integrity` were given, so it is `after`'s escape hatch and not
+/// a second `append_offset`.
+///
 /// What it does **not** catch: this compares *names*. An `offset` widened to `u64`, or an
 /// `append_offset` that started answering for a damaged journal, are both invisible to it —
 /// `crates/waymaker-flash/tests/recovery.rs` and `waymaker-fault`'s crash sweep are what
 /// hold the behaviour.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
+///
+/// [`Recovery`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/recovery.rs
+/// [`Journal::after`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
 pub const RECOVERY_SURFACE: &[&str] = &[
     "align",
     "append_offset",
@@ -1811,6 +1821,7 @@ pub const RECOVERY_SURFACE: &[&str] = &[
     "bytes",
     "ending",
     "fmt",
+    "into_storage",
     "message",
     "new",
     "next",
@@ -2040,14 +2051,22 @@ pub const APPEND_SURFACE_PATH: &str = "waymaker-flash/src/append.rs";
 /// `pub(crate)`: a same-crate caller is served without widening the surface this rule exists
 /// to make expensive, and without obliging the size probe to link a call it has no use for.
 ///
+/// `after_taking_storage` is on this list for issue
+/// [#84](https://github.com/madmax983/waymaker/issues/84)'s reason: a caller moving from a
+/// finished [`Recovery`] to a [`Journal`] needs the device back as well as the writer, once
+/// [`Recovery`] itself stopped handing it out for free at every call. It is `after` with one
+/// more return value, not a second way to skip the scan `after` already requires.
+///
 /// What it does **not** catch: this compares *names*. It is the surface half of the rule;
 /// [`check_commit_discipline`] also checks the shape the names sit in.
 ///
 /// Sorted, so that the comparison can be a set comparison and the list can be read.
 ///
 /// [`Journal`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/append.rs
+/// [`Recovery`]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-flash/src/recovery.rs
 pub const APPEND_SURFACE: &[&str] = &[
     "after",
+    "after_taking_storage",
     "amplification",
     "barriers",
     "commit",
@@ -4080,10 +4099,10 @@ pub struct ChecksumParameter {
 /// final xor. A pin that cannot fail is worse than no pin, because the report says it
 /// checked.
 ///
-/// ADR 0044 moved each polynomial out of `crc16`/`crc32` themselves and into a per-nibble
+/// ADR 0045 moved each polynomial out of `crc16`/`crc32` themselves and into a per-nibble
 /// helper — `crc16_nibble` and `crc32_nibble` — so the two rows naming a polynomial are
 /// retargeted there rather than at the checksum functions. The initial-value and final-xor
-/// rows stay on `crc16`/`crc32`, because ADR 0044 did not touch where those live.
+/// rows stay on `crc16`/`crc32`, because ADR 0045 did not touch where those live.
 pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
     ChecksumParameter {
         function: "crc16_nibble",
@@ -4114,7 +4133,7 @@ pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
 /// A dense `match` [`INTEGRITY_CHECK_PATH`] is permitted to compile into a lookup table,
 /// and the shape [`INTEGRITY_CHECK_TABLES`] pins it to.
 ///
-/// [ADR 0044](https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
+/// [ADR 0045](https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
 /// supersedes ADR 0010's table-free conclusion for exactly one table — `crc32`'s.
 /// `crc16`'s own nibble reduction needed none, so [`INTEGRITY_CHECK_TABLES`] holds one
 /// entry rather than two. Structural rather than textual, the way `EFFECT_STEP_BODIES` and
@@ -4127,7 +4146,7 @@ pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
 ///
 /// No `[u32; 16]` ever appears in `crc.rs` for this table: LLVM's switch-to-lookup-table
 /// pass is what turns this exact shape into one, verified by disassembly at the time ADR
-/// 0044 was written rather than assumed, so the array ban below cannot see it at all and
+/// 0045 was written rather than assumed, so the array ban below cannot see it at all and
 /// this pin is what stands in for that ban on the one table this file is allowed to have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChecksumTable {
@@ -4147,7 +4166,7 @@ pub struct ChecksumTable {
     pub arms: u8,
 }
 
-/// The one table ADR 0044 permits, in a checksum module ADR 0010 otherwise still bans one from.
+/// The one table ADR 0045 permits, in a checksum module ADR 0010 otherwise still bans one from.
 ///
 /// See [`ChecksumTable`] for what each field pins and why a `match` needs a structural pin
 /// where an array gets a textual one.
@@ -4158,10 +4177,10 @@ pub const INTEGRITY_CHECK_TABLES: &[ChecksumTable] = &[ChecksumTable {
     arms: 16,
 }];
 
-/// The exact body ADR 0044 pins each top-level checksum to — the one shape it may have
+/// The exact body ADR 0045 pins each top-level checksum to — the one shape it may have
 /// rather than a set of things it must contain.
 ///
-/// ADR 0044 moved each polynomial out of `crc16`/`crc32` and into a per-nibble helper, so
+/// ADR 0045 moved each polynomial out of `crc16`/`crc32` and into a per-nibble helper, so
 /// [`INTEGRITY_CHECK_PARAMETERS`] pinning the helper's own body only proves the helper
 /// still computes with the right polynomial — nothing ties the top-level function to it.
 /// Three rounds of review on the pull request that introduced these two pins found the same
@@ -4198,7 +4217,7 @@ pub struct ChecksumRoute {
     pub returns: &'static str,
 }
 
-/// Both top-level checksums' routes into the helper ADR 0044 gave each. See
+/// Both top-level checksums' routes into the helper ADR 0045 gave each. See
 /// [`ChecksumRoute`] for what each field pins and why this exists beside
 /// [`INTEGRITY_CHECK_TABLES`] rather than folded into it.
 pub const INTEGRITY_CHECK_ROUTING: &[ChecksumRoute] = &[
@@ -8421,7 +8440,7 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
         }
     }
 
-    // ADR 0044's one exception to the array ban below: a dense `match` LLVM compiles into
+    // ADR 0045's one exception to the array ban below: a dense `match` LLVM compiles into
     // a table, pinned by shape because no array ever appears for the ban to see. Checked
     // against the same `code` the parameter loop above used, so a table introduced only
     // under `#[cfg(test)]` is not what this is pinned against.
@@ -8578,7 +8597,7 @@ fn check_integrity_check_module_tree(
                     "{} declares `{name}` as an array, which is a lookup table; ADR 0010 \
                      measured what one costs — 64 B of rodata for a nibble table, 1024 B \
                      for a byte table, against an 8 KiB incremental code-flash budget — and \
-                     ADR 0044 already spent one nibble table's worth of that as a `match` \
+                     ADR 0045 already spent one nibble table's worth of that as a `match` \
                      `INTEGRITY_CHECK_TABLES` pins by shape rather than as an array; a \
                      second one, spelled as an array, is still a superseding ADR, not an \
                      optimisation",
@@ -8836,7 +8855,7 @@ fn check_checksum_module_dense_matches(
                 format!(
                     "{} declares a {arm_count}-arm dense match over `{selector}`, which LLVM \
                      compiles into a lookup table the same way `INTEGRITY_CHECK_TABLES` pins \
-                     `crc32_nibble_table` — and it is not that one table, so ADR 0044's \
+                     `crc32_nibble_table` — and it is not that one table, so ADR 0045's \
                      superseding decision does not cover it; a second table is still a \
                      decision, not an optimisation, whether its arms call a helper or carry \
                      a literal value each",
@@ -8867,7 +8886,7 @@ fn check_integrity_check_tables(source: &crate::size::LayerSource, code: &str) -
                 RULE,
                 ADAPTER,
                 format!(
-                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so ADR 0044's pinned \
+                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so ADR 0045's pinned \
                      table has nothing to check its shape against"
                 ),
             ));
@@ -8879,7 +8898,7 @@ fn check_integrity_check_tables(source: &crate::size::LayerSource, code: &str) -
                 ADAPTER,
                 format!(
                     "`{}` in {INTEGRITY_CHECK_PATH} is not the exact `match {} {{ 0 => {}(0), \
-                     1 => {}(1), ..., _ => {}({}) }}` ADR 0044 pins, in that order — Codex found \
+                     1 => {}(1), ..., _ => {}({}) }}` ADR 0045 pins, in that order — Codex found \
                      that counting calls alone lets two arms swap patterns, or the match be \
                      replaced by something else calling the same functions, and still pass",
                     table.function,
@@ -8894,11 +8913,11 @@ fn check_integrity_check_tables(source: &crate::size::LayerSource, code: &str) -
 
         // Codex's fifth-round finding: `braced_body` starts reading at the `fn` header and
         // never looks at what precedes it, so downgrading or removing either function's
-        // `#[inline(always)]` passed every check above — even though ADR 0044's whole
+        // `#[inline(always)]` passed every check above — even though ADR 0045's whole
         // argument for this table's shape is that LLVM only builds the lookup table when
         // `crc32_nibble` is force-inlined into each of `crc32_nibble_table`'s arms first; a
         // soft `#[inline]` measured as a real function call per nibble instead, 5-21%
-        // slower on the workloads ADR 0044 profiled.
+        // slower on the workloads ADR 0045 profiled.
         for header_name in [table.function, table.helper] {
             let header = format!("fn {header_name}");
             if let Some(violation) = checksum_declared_once(source, header_name, "inline-attribute")
@@ -8912,7 +8931,7 @@ fn check_integrity_check_tables(source: &crate::size::LayerSource, code: &str) -
                     ADAPTER,
                     format!(
                         "`{header_name}` in {INTEGRITY_CHECK_PATH} is not declared \
-                         `#[inline(always)]` immediately before its `fn` — ADR 0044's table \
+                         `#[inline(always)]` immediately before its `fn` — ADR 0045's table \
                          is only a lookup table because both `{}` and `{}` are force-inlined \
                          into each arm before LLVM's switch-to-lookup-table pass runs",
                         table.helper, table.function
@@ -8941,7 +8960,7 @@ fn check_integrity_check_tables(source: &crate::size::LayerSource, code: &str) -
 /// a plain `.contains` cannot tell that from the real thing. The occurrence now has to sit
 /// at bracket depth zero *within the window* — balanced against everything since the
 /// previous item's closing brace — which a macro call's own unclosed `(` rules out, while a
-/// real attribute stacked above another attribute (ADR 0044's own `#[allow(clippy::
+/// real attribute stacked above another attribute (ADR 0045's own `#[allow(clippy::
 /// inline_always, reason = "...")]`, spanning several lines) stays at depth zero the whole
 /// way through, since every bracket it opens is closed before the next line.
 #[must_use]
@@ -8998,7 +9017,7 @@ fn check_integrity_check_routing(source: &crate::size::LayerSource, code: &str) 
                 RULE,
                 ADAPTER,
                 format!(
-                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so ADR 0044's routing \
+                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so ADR 0045's routing \
                      pin has nothing to check"
                 ),
             ));
@@ -9009,7 +9028,7 @@ fn check_integrity_check_routing(source: &crate::size::LayerSource, code: &str) 
                 RULE,
                 ADAPTER,
                 format!(
-                    "`{}` in {INTEGRITY_CHECK_PATH} is not exactly the body ADR 0044 pins. \
+                    "`{}` in {INTEGRITY_CHECK_PATH} is not exactly the body ADR 0045 pins. \
                      Codex found that checking the pinned nibble updates by presence, count \
                      and order still let them sit inside dead control flow — both fitting \
                      inside `if false {{ .. }}`, in order, exactly once each — while a \
@@ -9345,7 +9364,7 @@ fn compact_span(values: &[i128], unsigned_domain: bool) -> Option<usize> {
     usize::try_from(slots).ok()
 }
 
-/// Whether `found`'s patterns are dense in the shape ADR 0044 permits a `match` to compile
+/// Whether `found`'s patterns are dense in the shape ADR 0045 permits a `match` to compile
 /// into a lookup table: every value of some window of consecutive integers, as wide as
 /// the number of values the numbered arms cover plus one for the wildcard, named exactly
 /// once — whatever base the window sits at, whatever suffix each pattern was spelled
@@ -9354,7 +9373,7 @@ fn compact_span(values: &[i128], unsigned_domain: bool) -> Option<usize> {
 /// [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
 ///
 /// `found` comes from `crate::parse::match_expressions`, which parses the real grammar —
-/// [ADR 0044]'s own history on pull request #154 is why that matters: a hand-rolled
+/// [ADR 0045]'s own history on pull request #154 is why that matters: a hand-rolled
 /// brace-and-comma scan over the same question accumulated eight distinct bypasses in as
 /// many review rounds (a comma-less block arm, a block scrutinee, a postfixed block value,
 /// a cast, an `else`, a scrutinee with its own nested `match`, one with its own `if`/`else`,
@@ -9366,7 +9385,7 @@ fn compact_span(values: &[i128], unsigned_domain: bool) -> Option<usize> {
 /// because a lookup table is exactly as much of one whichever shape backs it, and it is the
 /// pattern half this checks; [`call_shaped_uniformly`] is the value half.
 ///
-/// [ADR 0044]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md
+/// [ADR 0045]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md
 #[must_use]
 fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
     let total = found.arms.len();
@@ -15163,13 +15182,15 @@ mod deferred_answer_pins {
         // the path: `self::Sealable { .. }` builds the same value the bare name does.
         for spelling in ["Sealable {", "self::Sealable {"] {
             let contents = real_append_module().replace(
-                "impl<C: IntegrityCheck> Sealable<'_, '_, C> {",
+                "impl<S: StableStorage, C: IntegrityCheck> Sealable<'_, '_, '_, S, C> {",
                 &format!(
-                    "impl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {{\n\
-                     fn assume(self) -> Sealable<'journal, 'page, C> {{ {spelling} \
-                     journal: self.journal, seal: self.seal, seal_at: self.seal_at, \
-                     stride: self.stride, record: self.record }} }} }}\n\
-                     impl<C: IntegrityCheck> Sealable<'_, '_, C> {{"
+                    "impl<'journal, 'page, 'storage, S: StableStorage, C: IntegrityCheck> \
+                     Staged<'journal, 'page, 'storage, S, C> {{\n\
+                     fn assume(self) -> Sealable<'journal, 'page, 'storage, S, C> {{ \
+                     {spelling} journal: self.journal, storage: self.storage, \
+                     seal: self.seal, seal_at: self.seal_at, stride: self.stride, \
+                     record: self.record }} }} }}\n\
+                     impl<S: StableStorage, C: IntegrityCheck> Sealable<'_, '_, '_, S, C> {{"
                 ),
             );
             let violations = check_commit_discipline(&[layer(APPEND_SURFACE_PATH, &contents)]);
@@ -15187,7 +15208,8 @@ mod deferred_answer_pins {
         // The rule reads *every* inherent block for the type, not the first: a second
         // `impl Staged` further down the file was invisible until review said so.
         let contents = format!(
-            "{}\nimpl<'journal, 'page, C: IntegrityCheck> Staged<'journal, 'page, C> {{\n\
+            "{}\nimpl<'journal, 'page, 'storage, S: StableStorage, C: IntegrityCheck> \
+             Staged<'journal, 'page, 'storage, S, C> {{\n\
              fn sneak(&self) {{}}\n}}\n",
             real_append_module()
         );
@@ -16679,7 +16701,7 @@ mod deferred_answer_pins {
         // Codex's own round-27 reproduction, reproduced exactly: a `macro_rules!
         // extra_table` carrying the same five-arm mapping the existing regression tests
         // use, invoked as `extra_table!(nibble)` — which rustc compiles into an indexed
-        // lookup table the same way ADR 0044's own pinned `crc32_nibble_table` is, and
+        // lookup table the same way ADR 0045's own pinned `crc32_nibble_table` is, and
         // which neither `has_dense_arm_patterns` nor the array ban could ever see, because
         // both the definition's body and the invocation's arguments are opaque token
         // streams to `syn`. Both halves are reported (the definition once, as
@@ -19321,7 +19343,7 @@ mod deferred_answer_pins {
     fn a_downgraded_inline_always_is_reported() {
         // Codex's fifth-round finding: `braced_body` starts reading at a function's `fn`
         // header and never looks at what precedes it, so removing `#[inline(always)]`
-        // from `crc32_nibble_table` passed every check above even though ADR 0044's whole
+        // from `crc32_nibble_table` passed every check above even though ADR 0045's whole
         // shape argument depends on it — a soft `#[inline]` here measured as a real
         // function call per nibble rather than the table LLVM otherwise builds.
         let source = tests_support::clean_checksum_module().replace(
@@ -19345,7 +19367,7 @@ mod deferred_answer_pins {
         // macro invocation's own arguments. `ignore!(#[inline(always)]);` contains the
         // exact attribute text immediately before `crc32_nibble_table`'s real declaration
         // while attaching the attribute to nothing — the compiler receives no
-        // force-inlining directive at all, so ADR 0044's measured 5-21% regression can
+        // force-inlining directive at all, so ADR 0045's measured 5-21% regression can
         // return even though the old `.contains` scan read this as satisfied. The
         // occurrence now has to sit at bracket depth zero within the window, which an
         // unclosed macro-call paren rules out.
@@ -21680,7 +21702,7 @@ mod tests {
         }
 
         // `declares_inline_always` reads backward from a function's own `fn` header, so
-        // every function ADR 0044 pins that way — a table's own function and the helper
+        // every function ADR 0045 pins that way — a table's own function and the helper
         // every one of its arms calls — needs the attribute here too, or the clean fixture
         // would fail the pin it is meant to satisfy.
         let needs_inline_always = |name: &str| {

@@ -261,10 +261,10 @@ fn boot(
 
 /// Every record the journal holds, as a kind and its bytes.
 fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };
@@ -566,10 +566,10 @@ fn scheduled(image: &[u8]) -> Vec<u32> {
     let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
         unreachable!("the image is device-sized")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };

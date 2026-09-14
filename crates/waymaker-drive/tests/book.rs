@@ -178,10 +178,10 @@ fn boot<W: Workflow>(
 
 /// Every record the journal holds, by kind, in the order recovery reads them.
 fn recorded_kinds(device: &mut Device) -> Vec<RecordKind> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut kinds = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these samples write are legal")
         };

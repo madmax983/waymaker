@@ -167,13 +167,13 @@ fn recover_with(
     page_bytes: usize,
 ) -> (Vec<RecordId>, Option<Ending>, Option<u32>) {
     let mut device = restored_on(geometry, image);
-    let mut recovery = Recovery::new(region_of(geometry));
+    let mut recovery = Recovery::new(region_of(geometry), &mut device);
     let mut page = [0_u8; PAGE];
     let Some(page) = page.get_mut(..page_bytes) else {
         unreachable!("no test in this file asks for more than a page")
     };
     let mut found = Vec::new();
-    while let Some(step) = recovery.next(&mut device, page) {
+    while let Some(step) = recovery.next(page) {
         let Ok(record) = step else { break };
         if let Some(id) = id_of(&record) {
             found.push(id);
@@ -387,9 +387,9 @@ fn an_append_offset_taken_from_the_stopping_point_lands_on_programmed_media() {
     let mut caught = None;
     for run in drive() {
         let mut device = restored(run.image());
-        let mut recovery = Recovery::new(region());
+        let mut recovery = Recovery::new(region(), &mut device);
         let mut page = [0_u8; PAGE];
-        while let Some(step) = recovery.next(&mut device, &mut page) {
+        while let Some(step) = recovery.next(&mut page) {
             if step.is_err() {
                 break;
             }

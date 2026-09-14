@@ -113,10 +113,10 @@ fn boot<W: Workflow, A: Activities + Clocks>(
 
 /// Every record the journal holds, by shape and sequence.
 fn history(device: &mut Device) -> Vec<Shape> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut records = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };
@@ -313,10 +313,10 @@ fn a_schedule_record_carries_the_length_and_digest_of_the_bytes_the_workflow_pas
         unreachable!("the reference run completes")
     };
 
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut digests = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };

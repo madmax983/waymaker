@@ -32,21 +32,44 @@
 //! ```
 //! # use waymaker_flash::swap::Sealable;
 //! # use waymaker_flash::storage::StableStorage;
-//! fn commit_after_the_barrier<S: StableStorage>(sealable: Sealable<'_>, storage: &mut S) {
-//!     let _ = sealable.commit(storage);
+//! fn commit_after_the_barrier<S: StableStorage>(sealable: Sealable<'_, '_, S>) {
+//!     let _ = sealable.commit();
 //! }
 //! ```
 //!
 //! ```compile_fail,E0599
 //! # use waymaker_flash::swap::Staged;
 //! # use waymaker_flash::storage::StableStorage;
-//! fn commit_without_the_barrier<S: StableStorage>(staged: Staged<'_>, storage: &mut S) {
-//!     let _ = staged.commit(storage);
+//! fn commit_without_the_barrier<S: StableStorage>(staged: Staged<'_, '_, S>) {
+//!     let _ = staged.commit();
 //! }
 //! ```
 //!
 //! The two differ in one word, and the compiling twin is what stops the second from passing
 //! because [`Staged`] was deleted rather than because it has no `commit`.
+//!
+//! # Why the later steps take no `storage` argument
+//!
+//! Issue [#84](https://github.com/madmax983/waymaker/issues/84): a `storage: &mut S`
+//! argument accepted anew at every step is a [`Geometry`](crate::storage::Geometry)
+//! comparison, and two devices of one model share a geometry — so it cannot tell a caller
+//! who prepares on one chip and commits on another that anything is wrong.
+//! [`Swap::prepare`] borrows `storage` for the whole swap, and every state after it carries
+//! that borrow onward instead of asking for a fresh one:
+//!
+//! ```compile_fail,E0061
+//! # use waymaker_flash::swap::Staged;
+//! # use waymaker_flash::storage::StableStorage;
+//! fn a_second_device_has_no_call_to_make<S: StableStorage>(
+//!     staged: Staged<'_, '_, S>,
+//!     mut other: S,
+//! ) {
+//!     let _ = staged.payload_barrier(&mut other);
+//! }
+//! ```
+//!
+//! [`SwapStepError::WrongDevice`] still exists, and still fires — once, at
+//! [`Swap::prepare`], the one call in the protocol that takes a `storage` argument at all.
 //!
 //! # The erase, and the barrier after it
 //!
@@ -146,7 +169,7 @@ use crate::storage::StableStorage;
 /// function: the linear discipline is in the `self` of [`Swap::beginning`], and a second
 /// entry point would be a second thing `swap-discipline` has to pin.
 #[derive(Debug)]
-pub enum Retired<C: IntegrityCheck = Catalogued> {
+pub enum Retired<'storage, S, C: IntegrityCheck = Catalogued> {
     /// The writer the run was appending with.
     Journal(Journal<C>),
     /// The capacity-gated writer the run was appending through.
@@ -172,10 +195,17 @@ pub enum Retired<C: IntegrityCheck = Catalogued> {
     /// reader. The wording above is what this variant is *for* rather than what it requires,
     /// and the probe and the crash sweep both hand it an unscanned one, because a scan reads
     /// and step 1 is about what can write.
-    Recovery(Recovery<C>),
+    ///
+    /// Carries the device the recovery was reading, since issue
+    /// [#84](https://github.com/madmax983/waymaker/issues/84): [`Recovery`] now borrows it
+    /// for its own life rather than taking it fresh at every call. That borrow ends here,
+    /// the one place this variant is looked at: `into_region` takes only the region out and
+    /// drops the rest, so the device is free again the moment step 1 finishes — before
+    /// [`Swap::prepare`] asks for it back.
+    Recovery(Recovery<'storage, S, C>),
 }
 
-impl<C: IntegrityCheck> Retired<C> {
+impl<S, C: IntegrityCheck> Retired<'_, S, C> {
     /// The journal region this reader or writer was over, taking the value with it.
     ///
     /// Consuming rather than borrowing, because that is §10 step 1: the reader or writer the
@@ -339,32 +369,14 @@ pub enum SwapStepError<E> {
     /// [`DecodeError::LengthOutOfBounds`] in both cases. The header's *fit in the bank* was
     /// settled at [`Swap::beginning`]; what is left here is the caller's buffer.
     Encode(DecodeError),
-    /// The storage handed to a step is not the device the swap was planned against.
+    /// `storage` is not the device the swap was planned against.
     ///
-    /// Compared at **every** step and not only at the first, which is the lesson issue #24's
-    /// review left: a barrier taken on some other device orders nothing on this one, so the
-    /// new bank would be sealed without its payload ever having been made durable, and an
-    /// erase aimed at an offset another device does not have is a write outside every bank
-    /// it does.
-    ///
-    /// # What "device" means here, exactly
-    ///
-    /// A [`Geometry`](crate::storage::Geometry), and therefore not an *instance*. Two parts
-    /// of the same model have the same geometry, so a caller holding two of them can
-    /// [`prepare`](Swap::prepare) on one and [`commit`](Sealable::commit) on the other and
-    /// this refusal will not fire — sealing a bank whose erase happened on the other chip, or
-    /// erasing an unrelated device's active bank. Codex found that on the second review
-    /// round.
-    ///
-    /// It is stated rather than closed because it is not this module's contract to change:
-    /// [`AppendError::WrongDevice`](crate::append::AppendError::WrongDevice),
-    /// [`RecoveryError::WrongDevice`](crate::recovery::RecoveryError::WrongDevice) and
-    /// [`CapacityError::WrongDevice`](crate::capacity::CapacityError::WrongDevice) are the
-    /// same comparison, and a swap that bound an instance while the writer beside it did not
-    /// would be the one module in this crate whose `WrongDevice` meant something different.
-    /// Binding storage identity across all four — by holding the `&mut S` through a
-    /// protocol rather than accepting one per step — is issue
-    /// [#84](https://github.com/madmax983/waymaker/issues/84).
+    /// Reachable only from [`Swap::prepare`], the one call in this protocol that takes a
+    /// `storage` argument at all. [`Prepared::stage`], [`Staged::payload_barrier`],
+    /// [`Sealable::commit`] and [`Installed::reclaim`] carry the same borrow onward instead
+    /// of asking for a fresh one, so a later step taken on a second device is not a refusal
+    /// this type has to make — it is a call a caller cannot write. See the module
+    /// documentation, and issue [#84](https://github.com/madmax983/waymaker/issues/84).
     WrongDevice,
 }
 
@@ -396,13 +408,13 @@ struct Plan {
 impl Plan {
     /// Refuses `storage` unless it is the device this plan's offsets were proved against.
     ///
-    /// Every step calls it, not only the first. A barrier taken on some other device orders
-    /// nothing on this one, and an erase or a program aimed at an offset another device does
-    /// not have is a write outside every bank it does.
+    /// Called once, from [`Swap::prepare`] — the one step that receives `storage` fresh. Every
+    /// later step carries the same borrow onward instead of asking for a new one, so a barrier
+    /// or a program taken on a second device is not this check's to catch; see issue
+    /// [#84](https://github.com/madmax983/waymaker/issues/84).
     ///
-    /// By reference, and answering `()`: a plan is eighty-odd bytes and there are five
-    /// steps, so a check that handed the plan back would copy it five times for a comparison
-    /// that reads one field.
+    /// By reference, and answering `()`: a plan is eighty-odd bytes, so a check that handed
+    /// the plan back would copy it for a comparison that reads one field.
     fn on<S: StableStorage>(&self, storage: &S) -> Result<(), SwapStepError<S::Error>> {
         if storage.geometry() == self.region.geometry() {
             Ok(())
@@ -468,11 +480,11 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
     /// [`RunReused`](SwapError::RunReused),
     /// [`NotTheActiveBank`](SwapError::NotTheActiveBank),
     /// [`WrongDevice`](SwapError::WrongDevice) and [`Region`](SwapError::Region).
-    pub fn beginning(
+    pub fn beginning<'storage, S>(
         layout: BankLayout,
         booted: Authority,
         run: RunId,
-        retired: Retired<C>,
+        retired: Retired<'storage, S, C>,
         next: BankHeader<'next>,
     ) -> Result<Self, SwapError> {
         let Authority::Bank { id, generation } = booted else {
@@ -559,10 +571,10 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
     ///
     /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
     /// against, and [`SwapStepError::Storage`] when the erase or the barrier fails.
-    pub fn prepare<S: StableStorage>(
+    pub fn prepare<'storage, S: StableStorage>(
         self,
-        storage: &mut S,
-    ) -> Result<Prepared<'next, C>, SwapStepError<S::Error>> {
+        storage: &'storage mut S,
+    ) -> Result<Prepared<'next, 'storage, S, C>, SwapStepError<S::Error>> {
         self.plan.on(storage)?;
         storage
             .erase(self.plan.installing.base(), self.plan.installing.bytes())
@@ -571,6 +583,7 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
         Ok(Prepared {
             plan: self.plan,
             next: self.next,
+            storage,
             check: PhantomData,
         })
     }
@@ -583,13 +596,16 @@ impl<'next, C: IntegrityCheck> Swap<'next, C> {
 /// documented.
 #[must_use = "an erased bank with no header in it is not a run"]
 #[derive(Debug)]
-pub struct Prepared<'next, C: IntegrityCheck = Catalogued> {
+pub struct Prepared<'next, 'storage, S, C: IntegrityCheck = Catalogued> {
     plan: Plan,
     next: BankHeader<'next>,
+    /// The device [`Swap::prepare`] validated, carried rather than re-taken. See "why the
+    /// later steps take no `storage` argument" in the module documentation.
+    storage: &'storage mut S,
     check: PhantomData<C>,
 }
 
-impl<C: IntegrityCheck> Prepared<'_, C> {
+impl<'storage, S: StableStorage, C: IntegrityCheck> Prepared<'_, 'storage, S, C> {
     /// §10 step 3: writes the new bank header — the new run id, workflow version and input.
     ///
     /// The header is encoded into `page` and programmed from it; the seal that will make the
@@ -615,16 +631,12 @@ impl<C: IntegrityCheck> Prepared<'_, C> {
     ///
     /// # Errors
     ///
-    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, [`SwapStepError::Encode`] when `page` cannot hold the header or the seal, and
+    /// [`SwapStepError::Encode`] when `page` cannot hold the header or the seal, and
     /// [`SwapStepError::Storage`] when the program fails.
-    pub fn stage<'page, S: StableStorage>(
+    pub fn stage<'page>(
         self,
-        storage: &mut S,
         page: &'page mut [u8],
-    ) -> Result<Staged<'page, C>, SwapStepError<S::Error>> {
-        self.plan.on(storage)?;
-
+    ) -> Result<Staged<'page, 'storage, S, C>, SwapStepError<S::Error>> {
         let written =
             bank::encode_header_with::<C>(&self.next, page).map_err(SwapStepError::Encode)?;
         let Some(frame) = page.get(..written) else {
@@ -636,7 +648,7 @@ impl<C: IntegrityCheck> Prepared<'_, C> {
         // module documentation.
         let seal =
             bank::seal_for_with::<C>(frame, self.plan.generation).map_err(SwapStepError::Encode)?;
-        storage
+        self.storage
             .program(self.plan.installing.base(), frame)
             .map_err(SwapStepError::Storage)?;
 
@@ -651,6 +663,7 @@ impl<C: IntegrityCheck> Prepared<'_, C> {
         };
         Ok(Staged {
             plan: self.plan,
+            storage: self.storage,
             seal: bytes,
             check: PhantomData,
         })
@@ -670,14 +683,15 @@ impl<C: IntegrityCheck> Prepared<'_, C> {
 #[must_use = "a staged bank is not authoritative until its payload barrier and commit have \
               returned"]
 #[derive(Debug)]
-pub struct Staged<'page, C: IntegrityCheck = Catalogued> {
+pub struct Staged<'page, 'storage, S, C: IntegrityCheck = Catalogued> {
     plan: Plan,
+    storage: &'storage mut S,
     /// The generation seal, still in the caller's page.
     seal: &'page [u8],
     check: PhantomData<C>,
 }
 
-impl<'page, C: IntegrityCheck> Staged<'page, C> {
+impl<'page, 'storage, S: StableStorage, C: IntegrityCheck> Staged<'page, 'storage, S, C> {
     /// §10 step 4: waits for the new bank's payload to become durable.
     ///
     /// # Postconditions
@@ -692,16 +706,14 @@ impl<'page, C: IntegrityCheck> Staged<'page, C> {
     ///
     /// # Errors
     ///
-    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, and [`SwapStepError::Storage`] if the barrier fails.
-    pub fn payload_barrier<S: StableStorage>(
+    /// [`SwapStepError::Storage`] if the barrier fails.
+    pub fn payload_barrier(
         self,
-        storage: &mut S,
-    ) -> Result<Sealable<'page, C>, SwapStepError<S::Error>> {
-        self.plan.on(storage)?;
-        storage.barrier().map_err(SwapStepError::Storage)?;
+    ) -> Result<Sealable<'page, 'storage, S, C>, SwapStepError<S::Error>> {
+        self.storage.barrier().map_err(SwapStepError::Storage)?;
         Ok(Sealable {
             plan: self.plan,
+            storage: self.storage,
             seal: self.seal,
             check: PhantomData,
         })
@@ -715,13 +727,14 @@ impl<'page, C: IntegrityCheck> Staged<'page, C> {
 /// place a generation seal is programmed.
 #[must_use = "a sealable bank is not authoritative until `commit` has returned"]
 #[derive(Debug)]
-pub struct Sealable<'page, C: IntegrityCheck = Catalogued> {
+pub struct Sealable<'page, 'storage, S, C: IntegrityCheck = Catalogued> {
     plan: Plan,
+    storage: &'storage mut S,
     seal: &'page [u8],
     check: PhantomData<C>,
 }
 
-impl<C: IntegrityCheck> Sealable<'_, C> {
+impl<'storage, S: StableStorage, C: IntegrityCheck> Sealable<'_, 'storage, S, C> {
     /// §10 steps 5 and 6: programs the generation seal and waits for it to become durable.
     ///
     /// # Postconditions
@@ -739,19 +752,15 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
     ///
     /// # Errors
     ///
-    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, and [`SwapStepError::Storage`] if the program or the barrier fails.
-    pub fn commit<S: StableStorage>(
-        self,
-        storage: &mut S,
-    ) -> Result<Installed<C>, SwapStepError<S::Error>> {
-        self.plan.on(storage)?;
-        storage
+    /// [`SwapStepError::Storage`] if the program or the barrier fails.
+    pub fn commit(self) -> Result<Installed<'storage, S, C>, SwapStepError<S::Error>> {
+        self.storage
             .program(self.plan.installing.seal_offset(), self.seal)
             .map_err(SwapStepError::Storage)?;
-        storage.barrier().map_err(SwapStepError::Storage)?;
+        self.storage.barrier().map_err(SwapStepError::Storage)?;
         Ok(Installed {
             plan: self.plan,
+            storage: self.storage,
             check: PhantomData,
         })
     }
@@ -775,15 +784,16 @@ impl<C: IntegrityCheck> Sealable<'_, C> {
 /// retired bank twice, which is a second erase cycle on a part that has a countable number
 /// of them. `Journal` is not `Copy` for the same shape of reason, one layer down.
 #[must_use = "a completed swap reports the journal the new run writes into"]
-#[derive(Debug, PartialEq, Eq)]
-pub struct Installed<C: IntegrityCheck = Catalogued> {
+#[derive(Debug)]
+pub struct Installed<'storage, S, C: IntegrityCheck = Catalogued> {
     plan: Plan,
+    storage: &'storage mut S,
     /// The check this bank was sealed with. Zero-sized: [`IntegrityCheck`]'s methods take no
     /// `self`.
     check: PhantomData<C>,
 }
 
-impl<C: IntegrityCheck> Installed<C> {
+impl<S, C: IntegrityCheck> Installed<'_, S, C> {
     /// What [`bank::select`] would now say, and what the next swap begins from.
     ///
     /// Not read back from media: it is what this swap installed, and a device that
@@ -796,30 +806,6 @@ impl<C: IntegrityCheck> Installed<C> {
             id: self.plan.installed,
             generation: self.plan.generation,
         }
-    }
-
-    /// A [`Recovery`] of the journal the new run writes into, keyed to the check `C` this
-    /// bank was sealed with.
-    ///
-    /// Validated at [`Swap::beginning`], before the erase, so this costs the caller no
-    /// second chance to get §10's chain wrong. Every byte of the journal is erased media:
-    /// step 2 erased the whole bank and step 3 programmed only the header in front of it, so
-    /// this recovery ends [`Clean`](crate::recovery::Ending::Clean) at zero.
-    ///
-    /// A [`Journal`] is deliberately *not* handed back. [`Journal::after`] taking a finished
-    /// [`Recovery`] and nothing else is what makes issue #23's anti-bricking rule structural,
-    /// and a second constructor for the writer — even one this module could prove correct —
-    /// is a second way to reach an append offset that no scan vouched for.
-    ///
-    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to hand
-    /// back the bare [`JournalRegion`] instead. A caller could pass it to [`Recovery::new`]
-    /// by mistake. `Recovery::new` defaults to [`Catalogued`], the wrong check for a bank
-    /// sealed with another one — recovery then stops at the first frame with
-    /// [`IntegrityFailed`](DecodeError::IntegrityFailed). This method returns the journal
-    /// already keyed to the right check, so that mistake has no route left.
-    #[must_use]
-    pub const fn recovery(&self) -> Recovery<C> {
-        Recovery::with_integrity(self.plan.region)
     }
 
     /// An effect id allocator for the run this swap installed.
@@ -841,7 +827,39 @@ impl<C: IntegrityCheck> Installed<C> {
     pub const fn allocator(&self) -> EffectIdAllocator {
         EffectIdAllocator::for_run(self.plan.run)
     }
+}
 
+impl<'storage, S: StableStorage, C: IntegrityCheck> Installed<'storage, S, C> {
+    /// A [`Recovery`] of the journal the new run writes into, keyed to the check `C` this
+    /// bank was sealed with.
+    ///
+    /// Validated at [`Swap::beginning`], before the erase, so this costs the caller no
+    /// second chance to get §10's chain wrong. Every byte of the journal is erased media:
+    /// step 2 erased the whole bank and step 3 programmed only the header in front of it, so
+    /// this recovery ends [`Clean`](crate::recovery::Ending::Clean) at zero.
+    ///
+    /// A [`Journal`] is deliberately *not* handed back. [`Journal::after`] taking a finished
+    /// [`Recovery`] and nothing else is what makes issue #23's anti-bricking rule structural,
+    /// and a second constructor for the writer — even one this module could prove correct —
+    /// is a second way to reach an append offset that no scan vouched for.
+    ///
+    /// Issue [#85](https://github.com/madmax983/waymaker/issues/85): this type used to hand
+    /// back the bare [`JournalRegion`] instead. A caller could pass it to [`Recovery::new`]
+    /// by mistake. `Recovery::new` defaults to [`Catalogued`], the wrong check for a bank
+    /// sealed with another one — recovery then stops at the first frame with
+    /// [`IntegrityFailed`](DecodeError::IntegrityFailed). This method returns the journal
+    /// already keyed to the right check, so that mistake has no route left.
+    ///
+    /// Consumes `self` rather than borrowing it, for issue [#84](https://github.com/madmax983/waymaker/issues/84)'s
+    /// reason: this device is bound to `self` by the same borrow the whole swap carried, and
+    /// the [`Recovery`] this returns needs it exclusively for its own scan.
+    #[must_use]
+    pub const fn recovery(self) -> Recovery<'storage, S, C> {
+        Recovery::with_integrity(self.plan.region, self.storage)
+    }
+}
+
+impl<S: StableStorage, C: IntegrityCheck> Installed<'_, S, C> {
     /// §10 step 7: erases the bank the swap replaced.
     ///
     /// Lazy, and crash-safe by construction rather than by care. The new bank already
@@ -851,6 +869,9 @@ impl<C: IntegrityCheck> Installed<C> {
     /// retiring was decided at [`Swap::beginning`] from the authority the device booted, and
     /// there is no parameter here to get it wrong with.
     ///
+    /// This is the same device [`Swap::prepare`] validated, carried through every step since
+    /// — see "why the later steps take no `storage` argument" in the module documentation.
+    ///
     /// # Postconditions
     ///
     /// On success the retiring bank is erased media and the device has exactly one
@@ -859,18 +880,15 @@ impl<C: IntegrityCheck> Installed<C> {
     ///
     /// # Errors
     ///
-    /// [`SwapStepError::WrongDevice`] when `storage` is not the device the swap was planned
-    /// against, and [`SwapStepError::Storage`] when the erase or the barrier fails. Neither is
-    /// fatal to the run that was installed — a bank that is still there is a bank the next
-    /// swap erases again.
-    pub fn reclaim<S: StableStorage>(self, storage: &mut S) -> Result<(), SwapStepError<S::Error>> {
-        self.plan.on(storage)?;
-        storage
+    /// [`SwapStepError::Storage`] when the erase or the barrier fails. Not fatal to the run
+    /// that was installed — a bank that is still there is a bank the next swap erases again.
+    pub fn reclaim(self) -> Result<(), SwapStepError<S::Error>> {
+        self.storage
             .erase(self.plan.retiring.base(), self.plan.retiring.bytes())
             .map_err(SwapStepError::Storage)?;
         // Spelled with the `?` its sibling in `prepare` uses rather than as a tail
         // expression, so that one pinned spelling means the same thing in both bodies.
-        storage.barrier().map_err(SwapStepError::Storage)?;
+        self.storage.barrier().map_err(SwapStepError::Storage)?;
         Ok(())
     }
 }
