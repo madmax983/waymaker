@@ -4079,9 +4079,14 @@ pub struct ChecksumParameter {
 /// initial value could not be lost — and then let CRC-32's initial value vouch for its own
 /// final xor. A pin that cannot fail is worse than no pin, because the report says it
 /// checked.
+///
+/// ADR 0044 moved each polynomial out of `crc16`/`crc32` themselves and into a per-nibble
+/// helper — `crc16_nibble` and `crc32_nibble` — so the two rows naming a polynomial are
+/// retargeted there rather than at the checksum functions. The initial-value and final-xor
+/// rows stay on `crc16`/`crc32`, because ADR 0044 did not touch where those live.
 pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
     ChecksumParameter {
-        function: "crc16",
+        function: "crc16_nibble",
         role: "CRC-16/CCITT-FALSE polynomial",
         literal: "0x1021",
         occurrences: 1,
@@ -4093,7 +4098,7 @@ pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
         occurrences: 1,
     },
     ChecksumParameter {
-        function: "crc32",
+        function: "crc32_nibble",
         role: "CRC-32/ISO-HDLC reflected polynomial",
         literal: "0xEDB8_8320",
         occurrences: 1,
@@ -4105,6 +4110,44 @@ pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
         occurrences: 2,
     },
 ];
+
+/// A dense `match` [`INTEGRITY_CHECK_PATH`] is permitted to compile into a lookup table,
+/// and the shape [`INTEGRITY_CHECK_TABLES`] pins it to.
+///
+/// [ADR 0044](https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
+/// supersedes ADR 0010's table-free conclusion for exactly one table — `crc32`'s.
+/// `crc16`'s own nibble reduction needed none, so [`INTEGRITY_CHECK_TABLES`] holds one
+/// entry rather than two. Structural rather than textual, the way `EFFECT_STEP_BODIES` and
+/// `WIRING_SELECTION_BODIES` each pin a body's *shape* rather than its bytes: `function`
+/// names the `const fn` whose body is the table, `helper` the `const fn` every arm must
+/// call, and `arms` how many literal, distinct, zero-based arms it must have — `helper(0)`
+/// through `helper(arms - 1)`, each exactly once, and `helper(` exactly `arms` times in
+/// total so a seventeenth arm calling something out of range cannot hide behind the other
+/// sixteen being correct.
+///
+/// No `[u32; 16]` ever appears in `crc.rs` for this table: LLVM's switch-to-lookup-table
+/// pass is what turns this exact shape into one, verified by disassembly at the time ADR
+/// 0044 was written rather than assumed, so the array ban below cannot see it at all and
+/// this pin is what stands in for that ban on the one table this file is allowed to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumTable {
+    /// The `const fn` whose whole body is a dense `match` compiled into a table.
+    pub function: &'static str,
+    /// The `const fn` every arm must call, with the arm's own literal as its argument.
+    pub helper: &'static str,
+    /// How many arms: `0` through `arms - 1`, no gap, no repeat, nothing past the range.
+    pub arms: u8,
+}
+
+/// The one table ADR 0044 permits, in a checksum module ADR 0010 otherwise still bans one from.
+///
+/// See [`ChecksumTable`] for what each field pins and why a `match` needs a structural pin
+/// where an array gets a textual one.
+pub const INTEGRITY_CHECK_TABLES: &[ChecksumTable] = &[ChecksumTable {
+    function: "crc32_nibble_table",
+    helper: "crc32_nibble",
+    arms: 16,
+}];
 
 /// The file that binds the shipped integrity check to an algorithm.
 ///
@@ -8241,6 +8284,12 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
         }
     }
 
+    // ADR 0044's one exception to the array ban below: a dense `match` LLVM compiles into
+    // a table, pinned by shape because no array ever appears for the ban to see. Checked
+    // against the same `code` the parameter loop above used, so a table introduced only
+    // under `#[cfg(test)]` is not what this is pinned against.
+    violations.extend(check_integrity_check_tables(&code));
+
     // The checksum module and anything it is split into. Codex asked for this on PR #58:
     // a table in `crc/table.rs` that `crc.rs` imports is the same 1 KiB of rodata, and a
     // rule that read one file would have called it absent.
@@ -8269,14 +8318,75 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
                 format!(
                     "{} declares `{name}` as an array, which is a lookup table; ADR 0010 \
                      measured what one costs — 64 B of rodata for a nibble table, 1024 B \
-                     for a byte table, against an 8 KiB incremental code-flash budget — so \
-                     adding one is a superseding ADR, not an optimisation",
+                     for a byte table, against an 8 KiB incremental code-flash budget — and \
+                     ADR 0044 already spent one nibble table's worth of that as a `match` \
+                     `INTEGRITY_CHECK_TABLES` pins by shape rather than as an array; a \
+                     second one, spelled as an array, is still a superseding ADR, not an \
+                     optimisation",
                     scanned.path.replace('\\', "/")
                 ),
             ));
         }
     }
 
+    violations
+}
+
+/// [`INTEGRITY_CHECK_TABLES`]'s half of `check_integrity_check`, factored out to keep that
+/// function under clippy's line count: for each pinned table, verifies its `function` body
+/// exists and calls `helper(0)` through `helper(arms - 1)` each exactly once, with no call
+/// to `helper(` outside that range.
+fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
+    for table in INTEGRITY_CHECK_TABLES {
+        let header = format!("fn {}", table.function);
+        let Some(body) = braced_body(code, &header) else {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so ADR 0044's pinned \
+                     table has nothing to check its shape against"
+                ),
+            ));
+            continue;
+        };
+        for arm in 0..table.arms {
+            let call = format!("{}({arm})", table.helper);
+            if count_tokens(body, &call) != 1 {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "`{}` in {INTEGRITY_CHECK_PATH} does not call `{call}` exactly \
+                         once — ADR 0044 pins {} arms, `{}(0)` through `{}({})`, each \
+                         exactly once",
+                        table.function,
+                        table.arms,
+                        table.helper,
+                        table.helper,
+                        table.arms - 1
+                    ),
+                ));
+            }
+        }
+        let total = count_calls(body, table.helper);
+        if total != usize::from(table.arms) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{}` in {INTEGRITY_CHECK_PATH} calls `{}(` {total} time(s), not the \
+                     {} ADR 0044 pinned — a call outside the pinned arms cannot hide behind \
+                     the other {} being correct",
+                    table.function, table.helper, table.arms, table.arms
+                ),
+            ));
+        }
+    }
     violations
 }
 
@@ -8503,6 +8613,30 @@ fn count_tokens(code: &str, token: &str) -> usize {
                 .and_then(|after| after.chars().next())
                 .is_none_or(|character| !continues(character));
             before_is_boundary && after_is_boundary
+        })
+        .count()
+}
+
+/// How many times `code` calls `function(`, at a left-hand identifier boundary.
+///
+/// Not [`count_tokens`]: that helper's boundary check treats the character *after* the
+/// token as a continuation whenever it is alphanumeric, which is right for a bare
+/// identifier and wrong for a token that already ends in its own delimiter — every call
+/// this counts is followed by an argument, and a digit is alphanumeric, so
+/// `count_tokens(code, "crc32_nibble(")` reads a real call to `crc32_nibble(0)` as `(`
+/// continuing into `0` and refuses to count it at all. The call's own trailing `(` already
+/// delimits the right side, so only the left needs checking — `crc32_nibble(` cannot be
+/// mistaken for the tail of `the_crc32_nibble(` because that fails on the left instead.
+#[must_use]
+fn count_calls(code: &str, function: &str) -> usize {
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+    let needle = format!("{function}(");
+
+    code.match_indices(&needle)
+        .filter(|(index, _)| {
+            code.get(..*index)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|character| !continues(character))
         })
         .count()
 }
@@ -14897,14 +15031,14 @@ pub mod tests_support {
         CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE, CTX_FUTURES, CTX_JOURNAL_SURFACE,
         CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE, DIGEST_FUNCTION, DISPATCH_SURFACE,
         EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP, INTEGRITY_CHECK_PARAMETERS,
-        INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
-        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
-        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
-        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
-        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, VERSION_GATE_SURFACE,
-        VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE, VERSION_RANGE_METHODS,
-        VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE, WIRING_TYPE_FIELDS,
-        WIRING_TYPE_METHODS,
+        INTEGRITY_CHECK_TABLES, INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE,
+        REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE,
+        SWAP_BARRIER_CALL, SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS,
+        SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TIMER_BRACED_STRUCTS,
+        TIMER_RECORD_FIELDS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
+        VERSION_GATE_SURFACE, VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE,
+        VERSION_RANGE_METHODS, VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE,
+        WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -15471,6 +15605,19 @@ mod tests {
                 source,
                 "pub(crate) const fn {function}(bytes: &[u8]) -> u32 {{{body} }}"
             );
+        }
+        // One matching table per `INTEGRITY_CHECK_TABLES` entry, rendered the same way the
+        // parameter bodies above are: from the pin, so a table added to the pin arrives in
+        // this fixture too and the fixture cannot pass a shape the real module would fail.
+        for table in INTEGRITY_CHECK_TABLES {
+            let _ = writeln!(source, "const fn {}(nibble: u8) -> u32 {{", table.function);
+            let _ = writeln!(source, "    match nibble {{");
+            for arm in 0..table.arms {
+                let _ = writeln!(source, "        {arm} => {}({arm}),", table.helper);
+            }
+            let _ = writeln!(source, "        _ => 0,");
+            let _ = writeln!(source, "    }}");
+            let _ = writeln!(source, "}}");
         }
         source
     }
