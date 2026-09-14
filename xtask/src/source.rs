@@ -8697,14 +8697,45 @@ fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
 /// that happens to have integer patterns for an unrelated reason.
 const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
 
+/// The content of the brace-balanced block opening at `text[open..]` — `open` must be the
+/// byte offset of the `{` itself — and the offset in `text` immediately after its matching
+/// `}`.
+#[must_use]
+fn balanced_brace_block(text: &str, open: usize) -> Option<(&str, usize)> {
+    let after_open = text.get(open + 1..)?;
+    let mut depth = 1_u32;
+    for (offset, character) in after_open.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((after_open.get(..offset)?, open + 1 + offset + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Every `match <selector> { <arms> }` in `code`, both parts verbatim and in the order they
 /// appear.
 ///
 /// Text-scanned rather than parsed with `syn`, the same way [`braced_body`] finds a named
 /// item's body: `match` is matched at a token boundary and the arm block is the first
-/// brace-balanced `{ ... }` that follows, which is exact for the simple scrutinees this
-/// module's functions use (`nibble & 0xF`, no braces of their own) and is what
-/// [`dense_table_shape`] is checked against rather than assumed sound on anything wilder.
+/// brace-balanced `{ ... }` that follows — which is exact for the simple scrutinees this
+/// module's functions use (`nibble & 0xF`, no braces of their own), and is what
+/// [`has_dense_arm_patterns`] and [`call_shaped_uniformly`] are checked against rather than
+/// assumed sound on anything wilder.
+///
+/// Codex found the one case that assumption misses: a scrutinee that is *itself* a block
+/// expression — `match { let key = nibble & 0xF; key } { 0 => .., .. }` is legal Rust, and
+/// the first `{` found belongs to the scrutinee rather than the arms. A block found there
+/// contains no `=>` at all, which a real arm list always does, so that is the signal used to
+/// tell the two apart: a candidate block with no `=>` in it is taken as the scrutinee and
+/// skipped, and the *next* brace-balanced block immediately after it (whitespace aside) is
+/// tried as the arms instead.
 #[must_use]
 fn match_expressions(code: &str) -> Vec<(&str, &str)> {
     const KEYWORD: &str = "match";
@@ -8729,32 +8760,33 @@ fn match_expressions(code: &str) -> Vec<(&str, &str)> {
         if !(before_boundary && after_boundary) {
             continue;
         }
-        let Some(open_relative) = after_keyword.find('{') else {
-            continue;
-        };
-        let (Some(selector), Some(after_open)) = (
-            after_keyword.get(..open_relative),
-            after_keyword.get(open_relative + 1..),
-        ) else {
+        let Some(mut open_relative) = after_keyword.find('{') else {
             continue;
         };
 
-        let mut depth = 1_u32;
-        let mut end = None;
-        for (offset, character) in after_open.char_indices() {
-            match character {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(offset);
-                        break;
-                    }
-                }
-                _ => {}
+        let (arms, selector_end) = loop {
+            let Some((block, after_block)) = balanced_brace_block(after_keyword, open_relative)
+            else {
+                break (None, open_relative);
+            };
+            if block.contains("=>") {
+                break (Some(block), open_relative);
             }
-        }
-        let Some(arms) = end.and_then(|end| after_open.get(..end)) else {
+            // Not an arm list — most likely the scrutinee is itself a block expression.
+            // The real arms are the next brace-balanced block, if one follows immediately.
+            let Some(rest) = after_keyword.get(after_block..) else {
+                break (None, open_relative);
+            };
+            let skip_ws = rest.len() - rest.trim_start().len();
+            if !rest.trim_start().starts_with('{') {
+                break (None, open_relative);
+            }
+            open_relative = after_block + skip_ws;
+        };
+        let Some(arms) = arms else {
+            continue;
+        };
+        let Some(selector) = after_keyword.get(..selector_end) else {
             continue;
         };
         found.push((selector.trim(), arms));
@@ -8792,7 +8824,39 @@ fn split_top_level(text: &str, separator: char) -> Vec<&str> {
     parts
 }
 
-/// `arms`, with a synthetic `,` inserted immediately after every top-level `}`.
+/// A character immediately after a top-level `}` that means the brace closed a block used
+/// as an *operand* — a postfix call, index, field, method or `?`, or the left side of a
+/// binary operator — rather than the whole of an arm's value.
+///
+/// [`with_synthetic_arm_separators`] must not split here: `0 => { VALUE }.wrapping_mul(3),`
+/// is one arm expression, and cutting it in two after the block leaves neither half
+/// parseable as `pattern => expression`, which [`parse_dense_arms`] would refuse the whole
+/// match over — turning a fix for one bypass into a way to fail closed at recognising a
+/// table that really is dense, rather than one it should be a decision about.
+#[must_use]
+const fn continues_an_expression(character: char) -> bool {
+    matches!(
+        character,
+        '.' | '?'
+            | '('
+            | '['
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '%'
+            | '&'
+            | '|'
+            | '^'
+            | '<'
+            | '>'
+            | '='
+            | ':'
+    )
+}
+
+/// `arms`, with a synthetic `,` inserted immediately after every top-level `}` that is not
+/// followed by something continuing the same expression.
 ///
 /// Rust lets a block-valued match arm — `0 => { VALUE }` — omit its trailing comma, because
 /// the block already delimits it; a whole match spelled that way, arm after arm, has no
@@ -8803,12 +8867,16 @@ fn split_top_level(text: &str, separator: char) -> Vec<&str> {
 /// block is self-delimiting, so treating its own closing brace as an arm boundary — in
 /// addition to a real comma, never instead of one — is sound rather than a guess: a comma
 /// that *is* there just produces one empty segment, which [`parse_dense_arms`] already
-/// discards.
+/// discards. [`continues_an_expression`] is the one case that is not sound: a block used as
+/// an operand rather than as the whole arm value, where inserting a separator would cut a
+/// legal expression in two instead of recovering the boundary a comma-less arm never wrote.
 #[must_use]
 fn with_synthetic_arm_separators(arms: &str) -> String {
+    let chars: Vec<char> = arms.chars().collect();
     let mut result = String::with_capacity(arms.len() + 8);
     let mut depth = 0_i32;
-    for character in arms.chars() {
+    let mut index = 0_usize;
+    while let Some(&character) = chars.get(index) {
         match character {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' => depth -= 1,
@@ -8816,13 +8884,24 @@ fn with_synthetic_arm_separators(arms: &str) -> String {
                 depth -= 1;
                 result.push(character);
                 if depth == 0 {
-                    result.push(',');
+                    let mut lookahead = index + 1;
+                    while chars.get(lookahead).is_some_and(|c| c.is_whitespace()) {
+                        lookahead += 1;
+                    }
+                    if !chars
+                        .get(lookahead)
+                        .is_some_and(|c| continues_an_expression(*c))
+                    {
+                        result.push(',');
+                    }
                 }
+                index += 1;
                 continue;
             }
             _ => {}
         }
         result.push(character);
+        index += 1;
     }
     result
 }
@@ -14974,6 +15053,56 @@ mod deferred_answer_pins {
              0 => { 0x0000_0000 }\n        1 => { 0x7707_3096 }\n        \
              2 => { 0xEE0E_612C }\n        3 => { 0x9909_57BA }\n        \
              _ => { 0x0000_0000 }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_behind_a_block_scrutinee_is_reported() {
+        // Codex's seventh-round finding: a match's scrutinee can itself be a block
+        // expression — `match { let key = nibble & 0xF; key } { 0 => .., .. }` is legal
+        // Rust — and the first `{` found then belongs to the scrutinee rather than the
+        // arms. A block with no `=>` in it at all is taken as the scrutinee and skipped,
+        // and the next brace-balanced block that follows is tried as the arms instead.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn scrutinee_table(nibble: u8) -> u32 {\n    match { let key = nibble & 0xF; key } \
+             {\n        0 => crc32_nibble(0),\n        1 => crc32_nibble(1),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_postfixed_block_values_is_reported() {
+        // Codex's seventh-round finding, the sharper half: the synthetic-separator fix for
+        // comma-less block arms used to insert a separator after *every* top-level `}`,
+        // which would cut `{ VALUE }.wrapping_add(0)` in two and make the whole match
+        // unparseable — failing closed on recognising a table that really is dense, rather
+        // than reporting it as a decision. A block followed by a postfix operator is left
+        // alone now, so this match is still recognised as dense and — since its values are
+        // not the one permitted call shape — reported as an unauthorised table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn postfix_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => { 0x0000_0000_u32 }.wrapping_add(0),\n        \
+             1 => { 0x0000_0000_u32 }.wrapping_add(1),\n        \
+             2 => { 0x0000_0000_u32 }.wrapping_add(2),\n        \
+             3 => { 0x0000_0000_u32 }.wrapping_add(3),\n        \
+             _ => { 0x0000_0000_u32 }.wrapping_add(4),\n    }\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
