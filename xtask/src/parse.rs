@@ -1097,6 +1097,17 @@ pub struct NamedFn {
     pub attrs: Vec<syn::Attribute>,
     /// The body rendered as text, with `::` normalized (see `block_text`).
     pub body: String,
+    /// The 1-indexed source line the `fn` keyword itself sits on — not the identifier's
+    /// line, which a comment between `fn` and the name (legal Rust) can separate from it
+    /// (issue #97, Codex review round 7): a caller checking whether an *item* sits inside
+    /// a line range means the whole item, starting at its own keyword.
+    ///
+    /// Read off the parsed item's own span rather than found again by a second,
+    /// independent text search: two searches for "the same" declaration can each answer
+    /// about a different one when a name is declared more than once, which is exactly
+    /// the ambiguity a caller matching attributes to a position must not have (issue
+    /// #97, Codex review round 5).
+    pub line: usize,
 }
 
 /// Every `fn name` in `contents`, outside `#[cfg(test)]`, in source order.
@@ -1123,7 +1134,7 @@ pub fn fns_named(contents: &str, name: &str) -> Vec<NamedFn> {
 /// [`fns_named`] is the production view. [`declares_test`] passes `true`: a `#[cfg(test)]`
 /// on the enclosing module must not disqualify a test declaration, exactly as the old
 /// scan read only the attribute block above the `fn`.
-fn fns_matching(contents: &str, name: &str, include_test_gated: bool) -> Vec<NamedFn> {
+pub(crate) fn fns_matching(contents: &str, name: &str, include_test_gated: bool) -> Vec<NamedFn> {
     let Ok(file) = parse_rust(contents) else {
         return Vec::new();
     };
@@ -1148,6 +1159,7 @@ fn collect_fns_named(
                 found.push(NamedFn {
                     attrs: function.attrs.clone(),
                     body: block_text(&function.block),
+                    line: function.sig.fn_token.span.start().line,
                 });
             }
             syn::Item::Impl(implementation) => {
@@ -1162,6 +1174,7 @@ fn collect_fns_named(
                             found.push(NamedFn {
                                 attrs: method.attrs.clone(),
                                 body: block_text(&method.block),
+                                line: method.sig.fn_token.span.start().line,
                             });
                         }
                     }

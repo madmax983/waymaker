@@ -898,7 +898,7 @@ this table is how you find out what a red build is telling you.
 | `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
 | `storage-conformance` | Design document §12's storage contract and the four places it lives stop agreeing: a clause in `docs::STORAGE_CONTRACT_CLAUSES` is missing from this file, from [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md), or from `crates/waymaker-conformance/src/clause.rs`; its row here does not carry the sentence or what discharges it; the count is wrong; the crate discharges a clause differently than the table does; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Two tables agreeing on the names of six things and disagreeing about what any of them costs is the failure worth catching, so ids and discharges are compared in both directions. What it cannot see is inside the crate: that a clause the table calls in-process is reached by a case is `crates/waymaker-conformance/tests/clauses.rs`. |
 | `hardware-attestation` | Rung 0.2's board runs and the places they are recorded stop agreeing: a target in `docs::HARDWARE_TARGETS` has no backticked table row in this file, its row does not carry the headline or the status the table renders, the count is wrong, a target marked `Passed` has no accepted ADR carrying `docs::HARDWARE_ATTESTATION_MARKER` for it or has more than one, a target marked `Not run` is nevertheless claimed by an ADR, or an ADR attests a target the table never declared. What it cannot check is that a `Passed` row is *true* — the evidence is a log from a bench — only that the claim is a line in an accepted decision record rather than a status somebody flipped. |
-| `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]` or `#[cfg(` is not a test. What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
+| `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]`, `#[cfg(` or `#[cfg_attr(` is not a test — a conditional attribute is refused outright, because a row test is either a test or it is not (issue #97). What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
 | `adr-structure` | An ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries an unrecognised status. |
 | `adr-index` | An ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist. |
@@ -906,7 +906,7 @@ this table is how you find out what a red build is telling you.
 | `deferred-questions` | A question in `docs::DEFERRED_QUESTIONS` is missing from this file, its row does not carry the headline and the status the table renders, the count is wrong, a settled one's ADR is absent, unaccepted or does not carry its `Settles deferred question:` marker, two ADRs claim one question, an open one is already claimed by an ADR, or an ADR claims a question the table never declared. |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge — or draws an edge the layering does not permit, or labels two blocks with one id. |
 | `missing-docs` | A crate root stops warning, denying or forbidding `missing_docs`, or turns it back off — `allow`, `expect`, the `warnings` group, a `cfg_attr` wrapper, or an attribute split over several lines are all the same regression. |
-| `book` | Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s book stops being the book it asks for. The *shape*: a row of `book::BOOK_CHAPTERS` has no file under `docs/book/src` or no link of its own title in `SUMMARY.md`, or a **file** appears under that directory that the table does not declare — every file rather than every `.md` file, because review of this change added a chapter named `rogue.MD`, linked it, and watched a case-sensitive collector leave it covered by nothing. The *samples*: a fence whose language `book::QUOTABLE_FENCE_LANGUAGES` does not name — the *unlabelled* one included — carries anything but `{{#include}}` directives; a line carries a directive and something else; a directive that is not `{{#include}}` appears at all; a line is indented four spaces; an include names a file `book::BOOK_SAMPLE_FILES` does not, an anchor that file does not declare, an anchor with no `#[test]` of its name, or a line *range*; an anchor is declared and no chapter shows it; or an anchor does not **contain** the `#[test] fn` of its own name and is not named in `book::BOOK_FIXTURE_ANCHORS` — a fixture anchor being one that shows a type a test uses, which must still declare an item rather than commentary. A `#[test]` under `#[ignore]` or `#[cfg(` is not a test, which is `failure-matrix`'s standard met here. Five of those are things review demonstrated rather than predicted, each watched passing on a mutation before it was closed: a bare ` ``` ` fence carrying Rust, past a version that asked whether the info string said "rust"; `{{#include a}} let x = 1; {{#include b}}`, which satisfies `starts_with` and `ends_with` and renders the source between them; `{{#playground}}`, which renders an arbitrary source file as a Rust block with no fence at all; `#[ignore]` written *above* the anchor marker, where a reader of the book never sees it and the test never runs; and an anchor shrunk to two comment lines advertising an API that does not exist, which a name-only tie accepted. The *contents*: the wire-format chapter must `{{#include}}` [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) and state no table of its own; the failure chapter must carry every row of `docs::FAILURE_ROWS`; the non-goals chapter every row of `book::NON_GOALS`; and `CLAUDE.md` and `README.md` must both link `docs/book/src/SUMMARY.md` — the path rather than the directory, because `docs/book (deleted; see the archive)` satisfied the looser check. What it cannot see is prose, and it cannot say the *rendered* book is whole: `cargo xtask book` is what does that, because mdBook exits zero for an include it cannot resolve and renders an anchor it cannot find as nothing at all. |
+| `book` | Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s book stops being the book it asks for. The *shape*: a row of `book::BOOK_CHAPTERS` has no file under `docs/book/src` or no link of its own title in `SUMMARY.md`, or a **file** appears under that directory that the table does not declare — every file rather than every `.md` file, because review of this change added a chapter named `rogue.MD`, linked it, and watched a case-sensitive collector leave it covered by nothing. The *samples*: a fence whose language `book::QUOTABLE_FENCE_LANGUAGES` does not name — the *unlabelled* one included — carries anything but `{{#include}}` directives; a line carries a directive and something else; a directive that is not `{{#include}}` appears at all; a line is indented four spaces; an include names a file `book::BOOK_SAMPLE_FILES` does not, an anchor that file does not declare, an anchor with no `#[test]` of its name, or a line *range*; an anchor is declared and no chapter shows it; or an anchor does not **contain** the `#[test] fn` of its own name and is not named in `book::BOOK_FIXTURE_ANCHORS` — a fixture anchor being one that shows a type a test uses, which must still declare an item rather than commentary. A `#[test]` under `#[ignore]`, `#[cfg(` or `#[cfg_attr(` is not a test, which is `failure-matrix`'s standard met here. Five of those are things review demonstrated rather than predicted, each watched passing on a mutation before it was closed: a bare ` ``` ` fence carrying Rust, past a version that asked whether the info string said "rust"; `{{#include a}} let x = 1; {{#include b}}`, which satisfies `starts_with` and `ends_with` and renders the source between them; `{{#playground}}`, which renders an arbitrary source file as a Rust block with no fence at all; `#[ignore]` written *above* the anchor marker, where a reader of the book never sees it and the test never runs; and an anchor shrunk to two comment lines advertising an API that does not exist, which a name-only tie accepted. The *contents*: the wire-format chapter must `{{#include}}` [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) and state no table of its own; the failure chapter must carry every row of `docs::FAILURE_ROWS`; the non-goals chapter every row of `book::NON_GOALS`; and `CLAUDE.md` and `README.md` must both link `docs/book/src/SUMMARY.md` — the path rather than the directory, because `docs/book (deleted; see the archive)` satisfied the looser check. What it cannot see is prose, and it cannot say the *rendered* book is whole: `cargo xtask book` is what does that, because mdBook exits zero for an include it cannot resolve and renders an anchor it cannot find as nothing at all. |
 | `hardware-matrix` | The matrix stops covering every part, or starts claiming something. A board in `docs::HARDWARE_TARGETS` or a modelled part in `wear::PARTS` has no row in `book::HARDWARE_MATRIX`; a row names a board or a part neither table declares; the matrix chapter's table is not, cell for cell and row for row, `book::MATRIX_TABLE_HEADER` followed by every derived row in order; the chapter says `Passed` while no row renders it; or a modelled part's figure could not be measured, which is a failure rather than a blank column. Whole rows compared by equality rather than each cell searched for somewhere in the page, because review of this change fabricated a table of two boards that do not exist — both `Passed`, with invented geometry and invented wear — hid the honest rows in HTML comments, and watched a substring version print `ok`; it separately took a wear figure from `63.37` to `163.37`, which no `contains` can see, and duplicated a declared id with `Passed` in it. Every cell but the clock column is derived: the geometry from `wear::PARTS`, the power-cut standing from `HARDWARE_TARGETS` for a board and from `book::SWEPT_PROGRAM_BYTES` for a model — every crash sweep in this workspace lays the part out at a four-byte program unit, so the other two modelled rows say so rather than borrowing a sweep that never ran — and the written bytes per effect from the measurement this run took. So the book cannot say `Passed` where the record says `Not run`, and moving that record needs an accepted ADR, which is `hardware-attestation`'s. What it cannot see is whether a `Passed` row is *true*; that is a log from a bench, and [what the boards still owe](#what-the-boards-still-owe) is where its absence is recorded. |
 
 ## What is not checked
@@ -3251,3 +3251,100 @@ about `Sealable` or `Staged` grew to make any of this easier: `commit-discipline
 `swap-discipline` both still hold "the one type that may program a seal should do nothing
 else," and a `storage_mut` accessor tried against both was rejected by the gate for exactly
 that reason.
+
+Issue #97 closes a gap Codex found in the `failure-matrix` rule itself: a row test under
+`#[cfg_attr(.., ignore)]` is a test the compiler can skip, and the old scan refused only a
+direct `#[ignore]` or `#[cfg(..)]`, so such a test still vouched for its row. The scanner's
+own rewrite for issue #51 had already closed this — `crate::parse::declares_test` reads a
+test function's own attributes through `syn` and refuses `#[cfg_attr(..)]` the same way —
+but no regression test drove that specific attribute through `failure-matrix`'s own check,
+and `book`'s matching scanner, `#[cfg_attr(..)]`-aware since issue #42, had the same untested
+gap. `an_ignored_or_compiled_out_test_does_not_vouch_for_its_row` now does.
+
+`book`'s own scanner turned out to need more than a test. It was a hand-written line scan —
+collect the lines above a `fn name(` that look like attributes, reset on anything that does
+not, refuse if `#[ignore]`, `#[cfg(..)]` or `#[cfg_attr(..)]` is one of them by *prefix* —
+and across four Codex review rounds on this PR it lost every one of those four ways: a
+spelling with extra whitespace or a raw-identifier marker never matched the prefix; two
+attributes sharing one line hid the second behind the first a patched version checked; an
+attribute spanning several lines lost its own continuation to the "reset on anything that
+does not look like an attribute" rule; and once that was patched with a bracket count, a
+delimiter character inside a string literal — `doc = ")]"` — closed the count early and let
+the same multi-line trick back in. Four patches to one heuristic is four attempts to
+reimplement enough of Rust's grammar to answer "is this really `#[cfg_attr(..)]`" by hand,
+which is the mistake: `crate::parse::declares_test` never had any of these four bugs, because
+a real parser has no such thing as a line or a bracket count.
+
+`book`'s `declares_test` now asks `syn` the same way: [`crate::parse::fns_matching`] — the
+same structural lookup the `failure-matrix` scanner already uses, made `pub(crate)` for this
+— finds the function by name and hands back its real attributes, and every attribute is
+checked regardless of order, line breaks, whitespace, a raw-identifier marker, or what a
+string literal inside it happens to contain.
+
+Codex found a fifth bug in the line index the caller still needs, to check the test sits
+inside its anchor: it was found by a second, independent plain-text search, kept apart from
+the attribute check on the theory that position is a *shape* question and skippability is a
+*does this run* question. Two independent searches for "the same" declaration can each answer
+about a different one when a name is declared twice — a real, running
+`#[test] pub fn a_first_sample()` declared earlier in the file (found first by `syn`, since it
+does not care about visibility) paired its own passing attributes with the position of a
+*later*, non-test `fn a_first_sample()` the text search found instead (since `pub` does not
+match a search for a bare `"fn a_first_sample("` prefix) — and that later declaration is the
+one actually sitting inside the anchor. The anchor passed while showing untested content.
+`crate::parse::NamedFn` now carries `line`, the 1-indexed source line of the exact function
+whose attributes were just checked, read off that function's own `syn` span rather than
+re-found by a second search; `proc-macro2`'s `span-locations` feature is what makes a span
+carry a real line outside an actual proc-macro.
+
+Codex found a sixth bug, the mirror image of the fifth, on the very next round: fixing "the
+first declaration found can be the wrong one" by taking `fns_matching`'s first match still
+takes *a* first match — of every declaration of `name` in the file, not of the ones that are
+actually candidates for *this* anchor. A plain helper `fn a_first_sample()` declared earlier
+in the file, not a test at all, made `declares_test` stop there and report "declares no
+test" for an anchor whose own content was a real, running `#[test]` — the old line scanner
+had tolerated exactly this by continuing past a same-named non-test, and the structural
+rewrite lost it. `declares_test` now takes the anchor's own line range as a third argument
+and prefers, among every candidate `fns_matching` finds, the one whose line falls inside it;
+only when none do is the first candidate taken, which is what keeps the "declared, but
+outside the anchor" report for a file with exactly one declaration. This one change closes
+both the fifth bug and the sixth by the same construction — preferring the in-anchor
+candidate answers "is the anchor's own declaration a real test" directly, rather than "does
+some declaration of this name run," which is a different question in each direction once a
+name can be declared more than once.
+
+Round 7 found two more, both in the sixth's own fix. The first is the sixth's mistake one
+level in: preferring the first *in-anchor* candidate is still "the first match," now scoped
+to a smaller pool rather than answered. Two same-named declarations can both sit inside one
+anchor — an ordinary helper in one nested module, a real `#[test]` in another — and the
+first one is not necessarily the qualifying one. `declares_test` now tries every in-anchor
+candidate in turn (widening to every declaration in the file only when none sit in the
+anchor at all) and takes the first that actually qualifies, via a `verdict` helper the
+per-candidate check was pulled into.
+
+The second is sharper: [`crate::parse::NamedFn::line`] read the function's *identifier*
+span, and a line comment between the `fn` keyword and the name — legal Rust, since a comment
+is whitespace to the lexer — can put the keyword outside an anchor whose line range still
+contains the identifier. mdBook would then render the fragment starting after `fn`, which is
+not the tested function the check claims to have found. `line` now reads
+`Signature::fn_token`'s own span instead, the start of the item rather than the start of its
+name.
+
+The parametrized test grew eleven cases across the first four rounds, one or more per bug
+found, and every earlier one still passes unmodified against each fix in turn. Rounds five
+through seven were not spellings any single attribute check could see — each was a mismatch
+between which declaration answered and which one the anchor actually meant — so
+`a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name`,
+`a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor`,
+`a_qualifying_test_is_found_even_behind_a_non_test_inside_the_same_anchor` and
+`an_anchor_marker_between_fn_and_the_name_does_not_count_as_containing_the_test` each stand
+beside that parametrized test rather than inside it.
+
+Round eight found an eighth: `NamedFn::line` is still only where the item *starts*, and
+nothing checks where it *ends*, so an anchor whose own end marker sits between the `fn`
+keyword and the identifier "contains" a function that is, on the rendered page, the single
+word `fn`. Left open rather than fixed here — by round eight the construction needed to
+show it is an anchor's own end marker planted inside a function signature, which is the
+kind of input this design has never claimed to survive: this function's whole positional
+check exists for authors, not adversaries. Tracked as issue
+[#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
+one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
