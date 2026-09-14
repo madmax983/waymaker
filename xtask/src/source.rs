@@ -20805,6 +20805,37 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_guarded_by_an_inline_const_blocks_unsigned_shift_is_reported() {
+        // Codex's next-round finding: `(const { u128::MAX }) >> 127` names an inline
+        // const block as the shift's own left operand — `is_definitely_unsigned` had no
+        // case for `Expr::Const` at all, even though `literal_or_const_value` already
+        // evaluates the identical shape as a *value* by recursing into `evaluate_block`.
+        // Without it, `evaluate_shift_op` refuses to reinterpret `u128::MAX`'s own negative
+        // `i128` bit pattern as unsigned, so `(const { u128::MAX }) >> 127 == 0` stays
+        // unresolved — not provably false, so the guarded arm is neither dropped as dead
+        // code nor read as the real wildcard, and the trailing `_` that would otherwise
+        // complete a dense table is never reached. `is_definitely_unsigned` now recurses
+        // into a const block's own bare tail expression the same way.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dead_guard_inline_const_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn dead_guard_inline_const_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => dead_guard_inline_const_helper(0),\n        \
+             1 => dead_guard_inline_const_helper(1),\n        \
+             2 => dead_guard_inline_const_helper(2),\n        \
+             _ if ((const { u128::MAX }) >> 127) == 0 => 999,\n        \
+             _ => dead_guard_inline_const_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

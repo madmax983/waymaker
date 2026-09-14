@@ -3617,6 +3617,20 @@ fn is_definitely_unsigned(expr: &syn::Expr, resolve: &Resolve<'_>) -> bool {
         syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => {
             is_definitely_unsigned(&unary.expr, resolve)
         }
+        // Codex's next-round finding: `(const { u128::MAX }) >> 127` names an inline
+        // const block — `Expr::Const` — whose own tail expression is exactly as unsigned
+        // as `literal_or_const_value`'s identical `Expr::Const` case already evaluates it
+        // as a *value*, but nothing here had ever asked the block anything at all. Scoped
+        // to the one shape this scan resolves a block's own unsignedness for without
+        // guessing: a block holding nothing but a bare tail expression, no local `let` or
+        // `const` beside it — recursed into with the same `resolve`, since such a block
+        // introduces no scope of its own for a further name to shadow. A block with any
+        // other statement in it declines, the same standing every other shape this
+        // function cannot answer for already has.
+        syn::Expr::Const(expr_const) => match expr_const.block.stmts.as_slice() {
+            [syn::Stmt::Expr(tail, None)] => is_definitely_unsigned(tail, resolve),
+            _ => false,
+        },
         _ => false,
     }
 }
