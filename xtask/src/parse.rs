@@ -1200,6 +1200,43 @@ fn find_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)
     }
 }
 
+/// The byte range of the next raw-text end tag for `tag` (`"script"` or `"style"`) at or
+/// after `from` in `line` — matched the way an HTML5 parser matches one inside raw-text
+/// content: a literal, case-insensitive `</tag` sequence, wherever it falls, with no
+/// regard for anything around it that merely *looks* tag-shaped (Codex, pull request
+/// #138, round 40, finding 3).
+///
+/// Once a `<script>` or `<style>` opens, a browser is not parsing tags or quotes at
+/// all — every byte up to the literal closing sequence is opaque script or style text —
+/// so `<span title="x</script>y">`, appearing inside one, is not a `<span>` tag whose
+/// attribute happens to quote a closer; it is plain text containing the real close.
+/// [`find_closing_tag`]'s quote-aware tokenization, built for `<template>`'s genuinely
+/// parsed content, misreads that quoted-looking span as an ordinary tag and skips
+/// straight over the closer "trapped" inside it, leaving the non-rendering stack open
+/// for the rest of the document; this function is what the raw-text branch of
+/// [`next_non_rendering_marker`] uses instead.
+fn find_raw_text_closing_tag(line: &str, from: usize, tag: &str) -> Option<(usize, usize)> {
+    let lower = line.to_ascii_lowercase();
+    let needle = format!("</{tag}");
+    let bytes = line.as_bytes();
+    let mut cursor = from;
+    loop {
+        let start = cursor + lower.get(cursor..)?.find(needle.as_str())?;
+        let after_name = start + needle.len();
+        let terminates = bytes
+            .get(after_name)
+            .is_none_or(|&byte| byte.is_ascii_whitespace() || byte == b'/' || byte == b'>');
+        if terminates {
+            let end = line
+                .get(after_name..)
+                .and_then(|rest| rest.find('>'))
+                .map_or(line.len(), |offset| after_name + offset + 1);
+            return Some((start, end));
+        }
+        cursor = start + 1;
+    }
+}
+
 /// The earliest opening tag, at or after `from` in `line`, among the three non-rendering
 /// elements, with the tag name it matched.
 ///
@@ -1375,12 +1412,22 @@ fn markup_tag_name(span: &str) -> &str {
 }
 
 /// Whether `span` — an opening or closing tag's own markup — names one of
-/// [`HTML_BLOCK_TAG_NAMES`], case-insensitively.
+/// [`HTML_BLOCK_TAG_NAMES`], or `<pre>`, case-insensitively.
+///
+/// `<pre>` is `CommonMark` §4.6 type 1, not type 6 — it is ended by its own matching
+/// close tag rather than by a blank line, which is why [`HTML_BLOCK_TAG_NAMES`] itself
+/// stays exactly the type-6 list its own doc comment claims — but a browser still
+/// always starts it on a line of its own (Codex, pull request #138, round 40, finding
+/// 4): `<pre>head</pre><pre>line</pre>` renders as two separate blocks, `head` and
+/// `line`, not one running word, exactly like the type-6 tags already handled here, and
+/// stripping its markup with no separator fused the two into a literal `headline` a
+/// `.contains` scan could match.
 fn is_html_block_tag(span: &str) -> bool {
     let name = markup_tag_name(span);
-    HTML_BLOCK_TAG_NAMES
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    name.eq_ignore_ascii_case("pre")
+        || HTML_BLOCK_TAG_NAMES
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
 /// One place in a line that stops content from being visible: a comment opener, a
@@ -1428,6 +1475,29 @@ fn find_any_tag(line: &str, from: usize) -> Option<(usize, usize)> {
             index += 1;
         }
         return None;
+    }
+}
+
+/// The byte offset of the next real comment opener (`<!--`) at or after `from` in
+/// `line` — one that begins a genuine construct of its own, never one trapped inside an
+/// ordinary tag's quoted attribute value (Codex, pull request #138, round 40, finding
+/// 1). `<span title="<!--">hidden</span>` is one complete, well-formed tag whose
+/// attribute value happens to spell a comment opener — a browser parses it as ordinary
+/// attribute text, never as the start of a comment — and a raw substring search for
+/// `<!--` anywhere in the line reads it as a real one regardless, latching a tracked
+/// "still inside a comment" flag for the rest of the document once no closing `-->` is
+/// ever found for it. Tokenizes past every ordinary tag's own span via [`find_any_tag`],
+/// the same way [`find_opening_tag`]/[`find_closing_tag`] already do, so only a `<!--`
+/// that truly starts outside any tag's markup is ever returned.
+fn find_comment_opener(line: &str, from: usize) -> Option<usize> {
+    let mut cursor = from;
+    loop {
+        let start = cursor + line.get(cursor..)?.find('<')?;
+        if line[start..].starts_with("<!--") {
+            return Some(start);
+        }
+        let (_, end) = find_any_tag(line, start)?;
+        cursor = end;
     }
 }
 
@@ -1481,23 +1551,31 @@ enum NonRenderingAdvance {
 /// tracked as its own level rather than scanned for `</template>`-looking text), or
 /// `top`'s own close — a close tag written *inside* a comment inside the template is not
 /// a real close (round 32, finding 1): `<template><!-- </template> -->hidden</template>`
-/// keeps `hidden` inert until the real, final close. For a raw-text element (`<script>`,
-/// `<style>`), only its own close: a browser never parses anything else inside one,
-/// comment or nested element included.
+/// keeps `hidden` inert until the real, final close. The comment opener is found through
+/// [`find_comment_opener`], not a raw substring search (Codex, round 40, finding 1): an
+/// ordinary child of the template whose own quoted attribute merely spells `<!--` —
+/// `<span title="<!--">hidden</span>` — is real, visible text a browser renders as
+/// attribute content, not a comment, and a raw search over the whole remaining line
+/// would find it regardless of the tag it sits inside, latching `in_html_comment` for
+/// the rest of the document once no real close ever follows.
+///
+/// For a raw-text element (`<script>`, `<style>`), only its own close, found through
+/// [`find_raw_text_closing_tag`] rather than [`find_closing_tag`] (Codex, round 40,
+/// finding 3): a browser is not parsing tags at all inside one, so a quoted-looking
+/// closer trapped inside what merely *looks* like a nested tag — `<span title="x
+/// </script>y">` — really is the close, and the quote-aware tokenizer built for
+/// `<template>`'s genuinely parsed content would skip straight over it.
 fn next_non_rendering_marker(line: &str, cursor: usize, top: &str) -> Option<NonRenderingAdvance> {
+    if !non_rendering_element_nests(top) {
+        return find_raw_text_closing_tag(line, cursor, top)
+            .map(|(_, end)| NonRenderingAdvance::Close(end));
+    }
     let close = find_closing_tag(line, cursor, top)
         .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
-    if !non_rendering_element_nests(top) {
-        return close.map(|(_, marker)| marker);
-    }
     let open = find_any_opening_tag(line, cursor)
         .map(|(start, end, tag)| (start, NonRenderingAdvance::Open(end, tag)));
-    let comment = line[cursor..].find("<!--").map(|offset| {
-        (
-            cursor + offset,
-            NonRenderingAdvance::Comment(cursor + offset),
-        )
-    });
+    let comment =
+        find_comment_opener(line, cursor).map(|start| (start, NonRenderingAdvance::Comment(start)));
     [close, open, comment]
         .into_iter()
         .flatten()
@@ -1874,9 +1952,17 @@ pub fn visible_source(contents: &str) -> String {
                     // behaviour `without_html_comments` already had for this case. HTML
                     // comments do not nest, so the first `-->` found always closes the
                     // `<!--` before it.
+                    //
+                    // Found through `find_comment_opener`, not a raw substring search
+                    // (Codex, pull request #138, round 40, finding 2): a real, complete
+                    // tag inside the block whose own quoted attribute merely spells
+                    // `<!--` — `<div title="<!--">note</div>` — is text a browser
+                    // renders as an attribute value, not a comment, and a raw search
+                    // would hide everything from there to end of document over a
+                    // decoy that was never a real opener. Bounded to `range.end` the
+                    // same way the old search was, by slicing the search text there.
                     let mut cursor = start;
-                    while let Some(open) = contents[cursor..range.end].find("<!--") {
-                        let open = cursor + open;
+                    while let Some(open) = find_comment_opener(&contents[..range.end], cursor) {
                         let end = contents[open..]
                             .find("-->")
                             .map_or(contents.len(), |close| open + close + "-->".len());

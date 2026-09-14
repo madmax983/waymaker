@@ -6654,6 +6654,32 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_comment_spelling_inside_a_real_tag_does_not_hide_the_real_links_after_it() {
+        // Codex, pull request #138, round 40, finding 2: the per-block comment
+        // search inside an `HtmlBlock` did a raw substring search for `<!--`, blind
+        // to whether that text sat inside an ordinary tag's own quoted attribute
+        // value. `<div title="<!--">note</div>` is one complete, well-formed tag
+        // whose attribute value happens to spell a comment opener — a browser
+        // renders it as attribute text, not a comment — but the raw search matched
+        // it anyway, found no closing `-->` anywhere in the rest of the document,
+        // and hid everything from there to end of file, including the real link
+        // that follows. `find_comment_opener` now tokenizes past the tag's own span
+        // the same way the rest of this module already does, so a spelling trapped
+        // inside one can never stand in for a real comment opener.
+        let index = "<div title=\"<!--\">note</div>\n\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a quoted comment spelling inside a real tag hid the real link after it: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn an_unterminated_comment_nested_in_html_hides_everything_after_it() {
         // Codex, pull request #138, round 14: CommonMark never renders an HTML comment
         // with no closing `-->`, and treats everything after it the same way — the old
@@ -7232,6 +7258,85 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_quoted_comment_spelling_inside_a_template_child_still_counts() {
+        // Codex, pull request #138, round 40, finding 1: while scanning inside an open
+        // `<template>` for the next comment opener, non-rendering open, or close,
+        // the comment half did a raw substring search for `<!--`, blind to whether
+        // that text sat inside an ordinary child tag's own quoted attribute value.
+        // `<span title="<!--">hidden filler</span>` is one complete, well-formed tag
+        // whose attribute value happens to spell a comment opener — a browser
+        // renders it as attribute text, not a comment — but the raw search matched
+        // it anyway, found no closing `-->` anywhere after it (there is none: the
+        // quote closes with a plain `"` and `>`), and latched `in_html_comment` for
+        // the rest of the document. The template's own real close two lines later
+        // never gets a chance to pop the tracked stack, because the block-level loop
+        // checks `in_html_comment` before it ever looks at the open element — so the
+        // decision, recorded as an ordinary paragraph well *after* the template
+        // genuinely ends, reads as still hidden along with everything else. Verified
+        // via a throwaway `pulldown-cmark` probe that this source is one `HtmlBlock`
+        // of three `Event::Html` lines. The comment search now tokenizes past every
+        // ordinary tag's own span (`find_comment_opener`), so a spelling trapped
+        // inside one can never stand in for a real comment opener, and the template's
+        // own close is found and pops the stack as it should.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<span title=\"<!--\">hidden filler</span>\n</template>\n\n{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision after a quoted comment spelling inside a template child was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_raw_text_end_tag_trapped_in_a_quoted_attribute_still_counts() {
+        // Codex, pull request #138, round 40, finding 3: `find_closing_tag`'s
+        // quote-aware tokenization, built for `<template>`'s genuinely parsed
+        // content, was also used to search for a `<script>`/`<style>` element's own
+        // close — but a browser is not parsing tags or quotes at all once one of
+        // those raw-text elements opens, so `<span title="x</script>y">`, appearing
+        // inside an open `<script>`, is not a `<span>` tag whose attribute happens to
+        // quote a closer; it is plain script text containing the real close. The old
+        // tokenized search read the whole `<span ...>` as one well-formed tag and
+        // skipped straight over the closer "trapped" inside it, leaving the tracked
+        // state open and hiding the decision's own id and headline, which sit right
+        // after the decoy on the same line. `find_raw_text_closing_tag` now matches
+        // the literal, case-insensitive `</script` sequence the way an HTML5 parser's
+        // raw-text mode does, regardless of anything around it that merely looks
+        // tag-shaped.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script>\n<span title=\"x</script>y\">{} {}</span>\n</script>\n",
+                    second.id, second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == second.id),
+            "a decision after a raw-text end tag trapped in a quoted attribute was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_tag_spelling_inside_another_tags_quoted_attribute_still_counts() {
         // Codex, pull request #138, round 38, finding 1: `opens_non_rendering_element`
         // searched a whole self-contained `Event::InlineHtml` construct for a tag
@@ -7296,6 +7401,40 @@ mod tests {
         assert!(
             violations.iter().any(|v| v.subject == seventh.id),
             "a decision id split by adjacent block-level tags still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_split_by_adjacent_pre_blocks_does_not_count() {
+        // Codex, pull request #138, round 40, finding 4: `<pre>` is `CommonMark` §4.6
+        // type 1, not type 6, so `HTML_BLOCK_TAG_NAMES`'s type-6-only list did not
+        // classify it as block-level. A browser still always starts `<pre>` on a
+        // line of its own, so `<pre>head</pre><pre>line</pre>` renders as two
+        // separate blocks, `head` and `line`, exactly like the type-6 tags this
+        // module already handles — but stripping its markup with no separator fused
+        // the two into the literal contiguous run `headline`, matching a `.contains`
+        // scan no reader would. Verified via a throwaway `pulldown-cmark` probe that
+        // this source is one `Event::Html` line, the same shape as the round-39
+        // `<div>` scenario. `is_html_block_tag` now recognizes `<pre>` alongside the
+        // type-6 list without adding it to that list itself.
+        let mut inputs = clean_inputs(RULES);
+        let eighth = SETTLED_DECISIONS[7];
+        let (first_half, second_half) = eighth.id.split_at(eighth.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", eighth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<pre>{first_half}</pre><pre>{second_half} {}</pre>\n",
+                    eighth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == eighth.id),
+            "a decision id split by adjacent <pre> blocks still counted: {violations:?}"
         );
     }
 
