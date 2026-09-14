@@ -4032,6 +4032,21 @@ pub const EFFECT_CONSTRUCTIONS: [(&str, [&str; 2]); 2] = [
     ("Dispatchable", ["schedule", "redelivering"]),
 ];
 
+/// The one body that may build a `CheckedDispatch`, and the type that owns it.
+///
+/// One body rather than `EFFECT_CONSTRUCTIONS`' two, because `CheckedDispatch` has one
+/// legitimate origin: the moment `Dispatchable::perform` has just checked an input against
+/// the identity it was scheduled under. A second construction site — a `pub(crate)` helper
+/// elsewhere in this file, say — would be a second, uninspected route to the one value
+/// `Activities::perform` trusts to pair an identity with its own bytes, which is issue
+/// [#92](https://github.com/madmax983/waymaker/issues/92)'s second round: Codex found that
+/// `EFFECT_NO_SELF_LITERAL` alone refuses a trait impl and a `Self` literal inside
+/// `CheckedDispatch`'s own `impl`, but says nothing about a sibling function building one
+/// with ordinary field names. Read out of `Dispatchable`'s own `impl` blocks rather than out
+/// of the file, for [`EFFECT_STEP_BODIES`]' reason: a free `fn perform` above the real one is
+/// the body a first-match scan reads.
+pub const CHECKED_DISPATCH_CONSTRUCTION: (&str, &str) = ("Dispatchable", "perform");
+
 /// The proof types whose own `impl` blocks may not build a `Self`.
 ///
 /// The construction scan counts a type's *name*, so `Self { .. }` inside the type's own
@@ -7607,6 +7622,7 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     let code = without_test_modules(&code_only(&source.contents));
     violations.extend(check_effect_types(&code, &source.contents));
     violations.extend(check_effect_constructions(&source.contents));
+    violations.extend(check_checked_dispatch_construction(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
@@ -7831,6 +7847,56 @@ fn check_effect_constructions(contents: &str) -> Vec<Violation> {
                 ),
             ));
         }
+    }
+    violations
+}
+
+/// [`CheckedDispatch`]'s one construction site, over one file's text.
+///
+/// `EFFECT_CONSTRUCTIONS`'s twin for a type with one legitimate origin rather than two:
+/// `CheckedDispatch` binds an identity to bytes `Dispatchable::perform` has just checked, and
+/// a second construction site anywhere in this file would be a second, uninspected route to
+/// that pairing.
+fn check_checked_dispatch_construction(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+    const VALUE: &str = "CheckedDispatch";
+
+    let mut violations = Vec::new();
+    let (ty, body) = CHECKED_DISPATCH_CONSTRUCTION;
+    let Some(counts) = struct_literal_counts_or_violation(
+        contents,
+        VALUE,
+        crate::parse::FnScope::InherentFns { ty, name: body },
+        RULE,
+        DRIVER,
+        EFFECT_PROTOCOL_PATH,
+        &mut violations,
+    ) else {
+        return violations;
+    };
+    if counts.inside == 0 {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{VALUE}` is not built inside `{ty}::{body}`: it is the one value that binds \
+                 an identity to bytes checked against it, and it has to come from the one \
+                 place that checked them"
+            ),
+        ));
+    }
+    if counts.total != counts.inside {
+        violations.push(Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "`{VALUE}` is built {} time(s), {} of them inside `{ty}::{body}`: a second \
+                 construction site is a second, uninspected route to a pairing \
+                 `Activities::perform` trusts",
+                counts.total, counts.inside
+            ),
+        ));
     }
     violations
 }
@@ -12043,6 +12109,38 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_built_outside_perform_is_reported() {
+        // Issue #92's second round: `CheckedDispatch` has one legitimate origin, and a
+        // sibling `pub(crate)` forge — invisible to the surface pin, which counts `pub ` and
+        // not `pub(` — is exactly the hole `EFFECT_NO_SELF_LITERAL` alone leaves open.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn forge(intent: DurableIntent) -> CheckedDispatch<'static> {\n\
+               \x20   CheckedDispatch { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_never_built_inside_perform_is_reported() {
+        let source = tests_support::clean_effect_module().replace(
+            "pub fn perform(&self) -> CheckedDispatch<'_> {\n        CheckedDispatch {\n            intent: self.intent,\n            bytes: &[],\n        }\n    }",
+            "pub fn perform(&self) -> u8 {\n        0\n    }",
+        );
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("it has to come from the one place")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_submodule_in_the_pinned_file_is_reported() {
         // `inherent_impl_bodies` reads `impl` at column zero, so an indented one in a nested
         // module escapes every method pin above.
@@ -15273,8 +15371,11 @@ impl<C: IntegrityCheck> Dispatchable<C> {
     }
 
     /// Step 4, checked against what step 3 recorded.
-    pub fn perform(&self) -> u8 {
-        0
+    pub fn perform(&self) -> CheckedDispatch<'_> {
+        CheckedDispatch {
+            intent: self.intent,
+            bytes: &[],
+        }
     }
 
     /// Steps 5, 6 and 7.

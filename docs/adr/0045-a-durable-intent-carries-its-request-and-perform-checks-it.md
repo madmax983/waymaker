@@ -76,6 +76,15 @@ vouched for the request the driver already holds.
 or `.commit(`. So none is one of §07's storage steps, and none needs a place in
 `EFFECT_STEP_BODIES`.
 
+**`effect-protocol` also pins `CheckedDispatch`'s one construction site.**
+`CHECKED_DISPATCH_CONSTRUCTION` names `Dispatchable::perform` as the only body that may build
+one, the way `EFFECT_CONSTRUCTIONS` already does for `DurableIntent` and `Dispatchable` — one
+body rather than two, because `CheckedDispatch` has one legitimate origin rather than a
+schedule and a redelivery. `EFFECT_NO_SELF_LITERAL` alone refuses a `Self` literal inside
+`CheckedDispatch`'s own `impl` and a trait built for it; it says nothing about a sibling
+`pub(crate)` function elsewhere in the file naming the type directly. Codex found that hole
+on a third round of review of this change.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
@@ -84,9 +93,11 @@ by holding one back and forwarding it later. All three are now facts the compile
 every caller there is or will be — including a caller who calls `Activities::perform`
 directly, bypassing `Dispatchable::perform`, since there is still no value it could pass that
 argument except one already checked. This is closer to absolute than most guarantees a trait
-boundary between two crates can state: the one gap left is a caller inside `waymaker-drive`
-itself reaching into `effect.rs`'s own module to build a `CheckedDispatch` by hand, which is
-a source change to this crate, not a misuse of its public API.
+boundary between two crates can state. What is left is a caller inside `waymaker-drive`
+itself reaching into `effect.rs`'s own module to build a `CheckedDispatch` by hand — a source
+change to this crate, not a misuse of its public API — and `CHECKED_DISPATCH_CONSTRUCTION`
+closes even that: `effect-protocol` fails a build in which any body but
+`Dispatchable::perform` does it.
 
 `DurableIntent` doubles in size: an `EffectId` plus an `EffectRequest`. Both are `Copy` and
 stack-passed. So nothing here touches a heap — this engine has none. `CheckedDispatch` costs
