@@ -21371,6 +21371,46 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_constants_bound_by_their_own_selected_arm_is_reported() {
+        // Codex's finding: `const P0: u8 = match 0u8 { x @ 0 => x, _ => 100 };` returns a
+        // value bound by its own selected arm's pattern. `match_arm_matches_constant`
+        // confirms `x @ 0` matches `0u8`, but the body `x` was then evaluated through only
+        // the *outer* resolver, where the arm-local binding `x` does not exist — a bare
+        // path lookup that fails and takes the whole match down with it, `None`, exactly
+        // as if the arm's own pattern had never matched. Defining `P0` through `P14` this
+        // way left every outer pattern of the dense table below unresolved.
+        // `evaluate_match` and `evaluate_tuple_match` each now build a resolver, scoped to
+        // the selected arm, that answers for whatever name the arm's own pattern binds —
+        // an at-binding (`x @ ..`) or a bare irrefutable binding alike — before evaluating
+        // that arm's guard and body, so `x` resolves to the value the pattern just matched.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = match {n}u8 {{ x @ {n} => x, _ => 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_self_bound_arm_constants(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

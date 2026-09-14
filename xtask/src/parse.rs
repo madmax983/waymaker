@@ -4612,14 +4612,38 @@ fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<
             if !match_arm_matches_constant(&arm.pat, scrutinee, resolve)? {
                 continue;
             }
+            // Codex's finding: an arm that binds its own scrutinee (`x @ 0 => x`) has to be
+            // evaluated — guard and body alike — through a resolver that answers for that
+            // binding, not only through the outer one `resolve` already is. `unsigned` and
+            // `width` are wrapped in fresh pass-through closures rather than copied straight
+            // from `resolve` — the identical shape every other local `Resolve` built in this
+            // module already uses (`block_resolve_width` and its neighbours, above) — because
+            // a field copied unchanged carries its own already-fixed lifetime into the new
+            // struct literal and forces every other field to match it exactly, where a fresh
+            // closure lets inference pick the one lifetime this whole local value actually
+            // needs: this block's own.
+            let bound = pattern_binding(&arm.pat, resolve);
+            let bound_value = |path: &syn::Path| -> Option<i128> {
+                if bound.is_some_and(|name| path.get_ident().is_some_and(|ident| ident == name)) {
+                    return Some(scrutinee);
+                }
+                (resolve.value)(path)
+            };
+            let bound_unsigned = |path: &syn::Path| (resolve.unsigned)(path);
+            let bound_width = |path: &syn::Path| (resolve.width)(path);
+            let arm_resolve = Resolve {
+                value: &bound_value,
+                unsigned: &bound_unsigned,
+                width: &bound_width,
+            };
             if let Some((_, guard_expr)) = arm.guard.as_ref() {
-                match literal_or_const_value(guard_expr, resolve) {
+                match literal_or_const_value(guard_expr, &arm_resolve) {
                     Some(0) => continue,
                     Some(_) => {}
                     None => return None,
                 }
             }
-            return literal_or_const_value(&arm.body, resolve);
+            return literal_or_const_value(&arm.body, &arm_resolve);
         }
         return None;
     }
@@ -4658,16 +4682,65 @@ fn evaluate_tuple_match(
         if !tuple_pattern_matches_constant(&arm.pat, &values, resolve)? {
             continue;
         }
+        // [`evaluate_match`]'s own fix, carried here: an arm that binds one of the
+        // scrutinee's own elements (`(x, _) => x`) has to be evaluated through a resolver
+        // that answers for it too.
+        let bindings = tuple_pattern_bindings(&arm.pat, &values, resolve);
+        let bound_value = |path: &syn::Path| -> Option<i128> {
+            if let Some(ident) = path.get_ident() {
+                if let Some((_, value)) = bindings.iter().find(|(name, _)| ident == *name) {
+                    return Some(*value);
+                }
+            }
+            (resolve.value)(path)
+        };
+        // `unsigned`/`width` wrapped fresh, for the identical reason `evaluate_match`'s own
+        // arm resolver wraps them rather than copying `resolve.unsigned`/`resolve.width`
+        // unchanged.
+        let bound_unsigned = |path: &syn::Path| (resolve.unsigned)(path);
+        let bound_width = |path: &syn::Path| (resolve.width)(path);
+        let arm_resolve = Resolve {
+            value: &bound_value,
+            unsigned: &bound_unsigned,
+            width: &bound_width,
+        };
         if let Some((_, guard_expr)) = arm.guard.as_ref() {
-            match literal_or_const_value(guard_expr, resolve) {
+            match literal_or_const_value(guard_expr, &arm_resolve) {
                 Some(0) => continue,
                 Some(_) => {}
                 None => return None,
             }
         }
-        return literal_or_const_value(&arm.body, resolve);
+        return literal_or_const_value(&arm.body, &arm_resolve);
     }
     None
+}
+
+/// The name-to-value bindings `pattern` introduces when it matches `values`, component-wise
+/// — [`pattern_binding`]'s own tuple-arity twin, for the identical reason
+/// [`tuple_pattern_matches_constant`] is [`match_arm_matches_constant`]'s: a tuple pattern
+/// (`(x, _) => x`) can bind one of the scrutinee's own elements rather than the whole thing,
+/// and [`evaluate_tuple_match`] needs every such binding to evaluate an arm's guard and body
+/// correctly. Element positions that bind nothing are simply absent from the result, rather
+/// than the whole call answering `None` — unlike the match functions beside it, a tuple that
+/// binds nothing at all is not a failure to resolve, it is a pattern with no bindings in it.
+fn tuple_pattern_bindings<'a>(
+    pattern: &'a syn::Pat,
+    values: &[i128],
+    resolve: &Resolve<'_>,
+) -> Vec<(&'a syn::Ident, i128)> {
+    match pattern {
+        syn::Pat::Paren(paren) => tuple_pattern_bindings(&paren.pat, values, resolve),
+        syn::Pat::Tuple(tuple_pat) if tuple_pat.elems.len() == values.len() => tuple_pat
+            .elems
+            .iter()
+            .zip(values)
+            .filter_map(|(sub_pattern, value)| {
+                pattern_binding(sub_pattern, resolve).map(|name| (name, *value))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Whether `pattern` matches the constant tuple `values`, component-wise — the tuple-arity
@@ -4693,6 +4766,46 @@ fn tuple_pattern_matches_constant(
             }
             Some(true)
         }
+        _ => None,
+    }
+}
+
+/// The identifier `pattern` binds when it matches a value, for the same narrow set of
+/// shapes [`match_arm_matches_constant`] recognises — `None` when the pattern introduces
+/// no binding at all (a wildcard, a literal, a range) or when the shape is not one this
+/// scan supports.
+///
+/// Codex's finding: `match 0u8 { x @ 0 => x, _ => 100 }` — a constant initializer that
+/// returns the value its own selected arm bound — confirmed the arm matched through
+/// [`match_arm_matches_constant`] and then evaluated `x` with only the *outer* resolver,
+/// where the arm-local binding does not exist, so `x` stayed unresolved and the whole
+/// match fell to `None`. [`evaluate_match`] and [`evaluate_tuple_match`] are what call
+/// this to find out which name, if any, an arm's own pattern bound, so they can hand the
+/// arm's guard and body a resolver that answers for it too. An at-binding (`x @ subpat`)
+/// always binds `x`, regardless of what `subpat` itself matches; a bare identifier binds
+/// only when it does not already resolve as a known constant — the identical distinction
+/// [`match_arm_matches_constant`]'s own bare-`Pat::Ident` arm draws between a value match
+/// and an irrefutable catch-all — since a constant's own name is not a fresh binding. An
+/// or-pattern's alternatives are required by `rustc` to bind the same names, so the first
+/// alternative that names one speaks for all of them.
+fn pattern_binding<'a>(pattern: &'a syn::Pat, resolve: &Resolve<'_>) -> Option<&'a syn::Ident> {
+    match pattern {
+        syn::Pat::Ident(named) if named.by_ref.is_none() => {
+            if named.subpat.is_some() {
+                return Some(&named.ident);
+            }
+            (resolve.value)(&syn::Path::from(named.ident.clone()))
+                .is_none()
+                .then_some(&named.ident)
+        }
+        syn::Pat::Paren(paren) => pattern_binding(&paren.pat, resolve),
+        syn::Pat::Tuple(tuple) if tuple.elems.len() == 1 => {
+            pattern_binding(tuple.elems.first()?, resolve)
+        }
+        syn::Pat::Or(or_pattern) => or_pattern
+            .cases
+            .iter()
+            .find_map(|case| pattern_binding(case, resolve)),
         _ => None,
     }
 }
