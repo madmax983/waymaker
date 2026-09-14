@@ -8299,6 +8299,52 @@ fn check_boundary_type(pin: &MemberPin<'_>, code: &str, pinned: &BoundaryType) -
     violations
 }
 
+/// Whether `source` declares `function` exactly once, counted structurally rather than by
+/// the textual `declaration_count` every other pin in this module reads — `None` when it
+/// does, so a caller can `continue` straight past the violation this pushes.
+///
+/// Codex's finding: a textual `fn {function}` search does not see that `fn r#{function}`
+/// names the same item. A private nested module can keep an exact, plain-spelled decoy
+/// under the pinned name while the real, module-scope function is renamed to its raw form —
+/// `fn r#crc32` — and changed; a textual count sees exactly one `fn crc32` (the decoy) and
+/// waves the routing, table and parameter pins through to check it, while the unqualified
+/// `crc32` the shipped `Catalogued` binding calls still resolves the altered raw-identifier
+/// function. `crate::parse::fn_declaration_count` already un-raws identifiers for this
+/// reason (issue #62); this is that check wired to the checksum module's own pins, reading
+/// the raw `source.contents` rather than the comment-and-test-module-stripped text every
+/// other check here works from, since `syn` needs to parse real Rust to see through the
+/// nested module a textual scan cannot look inside honestly in the first place.
+#[must_use]
+fn checksum_declared_once(
+    source: &crate::size::LayerSource,
+    function: &str,
+    pin: &str,
+) -> Option<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+    match crate::parse::fn_declaration_count(&source.contents, function) {
+        Ok(1) => None,
+        Ok(declarations) => Some(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_CHECK_PATH} declares `fn {function}` {declarations} times, not \
+                 once — counted structurally, so `fn r#{function}` counts as the same \
+                 declaration; the {pin} pin reads the first one a textual scan finds, so \
+                 more than one leaves it checking a function nobody ships",
+            ),
+        )),
+        Err(error) => Some(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_CHECK_PATH} could not be parsed ({error}); an unreadable source \
+                 fails closed rather than approving what it cannot see"
+            ),
+        )),
+    }
+}
+
 /// Rule: the integrity check is the catalogued, table-free one ADR 0010 settled on.
 ///
 /// Two things. The algorithm parameters have to still be there, because a polynomial is the
@@ -8334,23 +8380,8 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
 
     for parameter in INTEGRITY_CHECK_PARAMETERS {
         let header = format!("fn {}", parameter.function);
-        // Before the body: `braced_body` reads the *first* declaration, so a decoy
-        // declared earlier in the file — or in a private nested module, importing the
-        // real helper from `super` — leaves this pin checking a function nobody ships
-        // while the shipped one computes something else entirely. `check_boundary_type`
-        // guards the same shape; this is the same guard for the checksum module's own
-        // parameters.
-        let declarations = declaration_count(&code, &header);
-        if declarations != 1 {
-            violations.push(Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, not \
-                     once; the parameter pin reads the first declaration, so a decoy — in \
-                     a nested module, say — leaves it checking a function nobody ships",
-                ),
-            ));
+        if let Some(violation) = checksum_declared_once(source, parameter.function, "parameter") {
+            violations.push(violation);
             continue;
         }
         let Some(body) = braced_body(&code, &header) else {
@@ -8384,7 +8415,7 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
     // a table, pinned by shape because no array ever appears for the ban to see. Checked
     // against the same `code` the parameter loop above used, so a table introduced only
     // under `#[cfg(test)]` is not what this is pinned against.
-    violations.extend(check_integrity_check_tables(&code));
+    violations.extend(check_integrity_check_tables(source, &code));
 
     violations.extend(check_integrity_check_module_tree(sources, source));
     violations
@@ -8508,28 +8539,15 @@ fn check_integrity_check_module_tree(
 /// function under clippy's line count: for each pinned table, verifies its `function` body
 /// exists and calls `helper(0)` through `helper(arms - 1)` each exactly once, with no call
 /// to `helper(` outside that range.
-fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
+fn check_integrity_check_tables(source: &crate::size::LayerSource, code: &str) -> Vec<Violation> {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
     let mut violations = Vec::new();
     for table in INTEGRITY_CHECK_TABLES {
         let header = format!("fn {}", table.function);
-        // Same guard as the parameter loop above, and for the same reason: a decoy
-        // declared anywhere else in the file — a private nested module reusing the real
-        // helper is Codex's example — would otherwise leave `braced_body`'s first match
-        // pinning a table that is not the one the shipped `Catalogued` binding calls.
-        let declarations = declaration_count(code, &header);
-        if declarations != 1 {
-            violations.push(Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, not \
-                     once; the table pin reads the first declaration, so a decoy — in a \
-                     nested module, say — leaves it checking a function nobody ships",
-                ),
-            ));
+        if let Some(violation) = checksum_declared_once(source, table.function, "table") {
+            violations.push(violation);
             continue;
         }
         let Some(body) = braced_body(code, &header) else {
@@ -8571,21 +8589,9 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
         // slower on the workloads ADR 0044 profiled.
         for header_name in [table.function, table.helper] {
             let header = format!("fn {header_name}");
-            // `declares_inline_always` also reads the first declaration it finds; a
-            // decoy `{header_name}` elsewhere in the tree — nested-module or otherwise —
-            // would let it vouch for an attribute on a function nobody ships.
-            let declarations = declaration_count(code, &header);
-            if declarations != 1 {
-                violations.push(Violation::new(
-                    RULE,
-                    ADAPTER,
-                    format!(
-                        "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, \
-                         not once; the inline-attribute pin reads the first declaration, \
-                         so a decoy — in a nested module, say — leaves it checking a \
-                         function nobody ships",
-                    ),
-                ));
+            if let Some(violation) = checksum_declared_once(source, header_name, "inline-attribute")
+            {
+                violations.push(violation);
                 continue;
             }
             if !declares_inline_always(code, &header) {
@@ -8604,7 +8610,7 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
         }
     }
 
-    violations.extend(check_integrity_check_routing(code));
+    violations.extend(check_integrity_check_routing(source, code));
     violations
 }
 
@@ -8616,6 +8622,16 @@ fn check_integrity_check_tables(code: &str) -> Vec<Violation> {
 /// precedes it, so nothing else here would notice one downgraded to a soft `#[inline]` or
 /// removed outright. The search window is bounded by the previous item's own closing brace,
 /// so an `#[inline(always)]` on some earlier, unrelated function does not vouch for this one.
+///
+/// Codex's finding: bounding the window by the previous `}` still let anything *inside* the
+/// window vouch for the attribute, including a macro invocation's own arguments — `ignore!(
+/// #[inline(always)]);` contains the exact attribute text while attaching it to nothing, and
+/// a plain `.contains` cannot tell that from the real thing. The occurrence now has to sit
+/// at bracket depth zero *within the window* — balanced against everything since the
+/// previous item's closing brace — which a macro call's own unclosed `(` rules out, while a
+/// real attribute stacked above another attribute (ADR 0044's own `#[allow(clippy::
+/// inline_always, reason = "...")]`, spanning several lines) stays at depth zero the whole
+/// way through, since every bracket it opens is closed before the next line.
 #[must_use]
 fn declares_inline_always(code: &str, header: &str) -> bool {
     const ATTRIBUTE: &str = "#[inline(always)]";
@@ -8637,40 +8653,32 @@ fn declares_inline_always(code: &str, header: &str) -> bool {
 
     let preceding = code.get(..index).unwrap_or_default();
     let scope_start = preceding.rfind('}').map_or(0, |at| at + 1);
-    preceding
-        .get(scope_start..)
-        .is_some_and(|window| window.contains(ATTRIBUTE))
+    let Some(window) = preceding.get(scope_start..) else {
+        return false;
+    };
+    window.match_indices(ATTRIBUTE).any(|(offset, _)| {
+        let Some(before) = window.get(..offset) else {
+            return false;
+        };
+        let opened = before.matches(['{', '(', '[']).count();
+        let closed = before.matches(['}', ')', ']']).count();
+        opened == closed
+    })
 }
 
 /// [`INTEGRITY_CHECK_ROUTING`]'s half of `check_integrity_check_tables`, factored out to
 /// keep that function under clippy's line count: for each routed checksum, verifies its
 /// `function` body is exactly the one [`expected_route_body`] builds from the pin — not a
 /// body that merely contains the right pieces somewhere.
-fn check_integrity_check_routing(code: &str) -> Vec<Violation> {
+fn check_integrity_check_routing(source: &crate::size::LayerSource, code: &str) -> Vec<Violation> {
     const RULE: &str = "integrity-check";
     const ADAPTER: &str = "waymaker-flash";
 
     let mut violations = Vec::new();
     for route in INTEGRITY_CHECK_ROUTING {
         let header = format!("fn {}", route.function);
-        // Codex's finding: a private nested module placed before the real checksum,
-        // giving it an exact copy of `crc32` with the helper imported from `super`, lets
-        // `braced_body`'s first-match search pin that decoy while the shipped
-        // `Catalogued` binding still resolves the module-scope `crc32` — every other
-        // check here stays green while the shipped function computes something else
-        // entirely. Counting declarations closes it the same way `check_boundary_type`
-        // already does for a pinned type.
-        let declarations = declaration_count(code, &header);
-        if declarations != 1 {
-            violations.push(Violation::new(
-                RULE,
-                ADAPTER,
-                format!(
-                    "{INTEGRITY_CHECK_PATH} declares `{header}` {declarations} times, not \
-                     once; the routing pin reads the first declaration, so a decoy — in a \
-                     nested module, say — leaves it checking a function nobody ships",
-                ),
-            ));
+        if let Some(violation) = checksum_declared_once(source, route.function, "routing") {
+            violations.push(violation);
             continue;
         }
         let Some(body) = braced_body(code, &header) else {
@@ -8928,6 +8936,27 @@ const fn continues_an_expression(character: char) -> bool {
     )
 }
 
+/// Whether `chars[start..]` begins with the keyword `as` at a word boundary — the cast
+/// operator, invisible to [`continues_an_expression`]'s single-character check because it
+/// is spelled with letters rather than a symbol.
+///
+/// Codex's finding: `0 => { 0x7707_3096 } as u32,` is a legal arm value — a cast applied to
+/// a block operand — and without this, [`with_synthetic_arm_separators`] cuts it into a
+/// block segment and a standalone `as u32` segment, neither of which [`parse_dense_arms`]
+/// can read as `pattern => expression`, so the whole match is refused as unparseable and the
+/// module-wide scan never sees it at all — the same failure mode `continues_an_expression`
+/// itself exists to avoid for `.`, `?` and the rest.
+#[must_use]
+fn continues_with_a_cast(chars: &[char], start: usize) -> bool {
+    let is_letter = |offset: usize| chars.get(start + offset);
+    if is_letter(0) != Some(&'a') || is_letter(1) != Some(&'s') {
+        return false;
+    }
+    !chars
+        .get(start + 2)
+        .is_some_and(|character| character.is_alphanumeric() || *character == '_')
+}
+
 /// `arms`, with a synthetic `,` inserted immediately after every top-level `}` that is not
 /// followed by something continuing the same expression.
 ///
@@ -8961,10 +8990,11 @@ fn with_synthetic_arm_separators(arms: &str) -> String {
                     while chars.get(lookahead).is_some_and(|c| c.is_whitespace()) {
                         lookahead += 1;
                     }
-                    if !chars
+                    let continues = chars
                         .get(lookahead)
                         .is_some_and(|c| continues_an_expression(*c))
-                    {
+                        || continues_with_a_cast(&chars, lookahead);
+                    if !continues {
                         result.push(',');
                     }
                 }
@@ -15224,6 +15254,33 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_with_cast_block_values_is_reported() {
+        // Codex's ninth-round finding: `continues_an_expression` checks one character at a
+        // time and so cannot see the keyword cast operator `as`, spelled with letters
+        // rather than a symbol. `0 => { 0x7707_3096 } as u32,` is a legal arm value — a
+        // cast applied to a block operand — and without recognising `as`, the
+        // synthetic-separator pass cuts it into a block segment and a standalone `as u32`
+        // segment, neither of which is `pattern => expression`; `parse_dense_arms` refused
+        // the whole match, and the module-wide scan never saw a table that really is
+        // dense. It is recognised now, and — since its values are casts rather than the
+        // one permitted call shape — reported as an unauthorised table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn cast_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => { 0x0000_0000 } as u32,\n        1 => { 0x7707_3096 } as u32,\n        \
+             2 => { 0xEE0E_612C } as u32,\n        3 => { 0x9909_57BA } as u32,\n        \
+             _ => { 0x0000_0000 } as u32,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_with_literal_valued_arms_is_reported() {
         // Codex's fourth-round finding: the shape scan required every arm's value to be a
         // call, so a table spelled as `0 => 0x0000_0000, 1 => 0x7707_3096, ..` — the most
@@ -15335,12 +15392,54 @@ mod deferred_answer_pins {
         // function that actually ships computes something else entirely. Counting
         // declarations before `braced_body` is asked which one to read closes it, the
         // same way `check_boundary_type` already guards a pinned type against a decoy.
-        let mut source = String::from(
-            "mod decoy {\n    use super::crc32_nibble;\n    pub(crate) const fn crc32(bytes: \
-             &[u8]) -> u32 {\n        let mut crc: u32 = 0xFFFF_FFFF;\n        let _ = \
-             crc32_nibble(0);\n        crc ^ 0xFFFF_FFFF\n    }\n}\n\n",
+        const DECOY: &str = "mod decoy {\n    use super::crc32_nibble;\n    pub(crate) const \
+             fn crc32(bytes: &[u8]) -> u32 {\n        let mut crc: u32 = 0xFFFF_FFFF;\n        \
+             let _ = crc32_nibble(0);\n        crc ^ 0xFFFF_FFFF\n    }\n}\n\n";
+        // The fixture's own leading line is an inner doc comment (`//! Two checksums.`),
+        // which Rust requires to precede every other item in its enclosing scope — so the
+        // decoy is spliced in right after that line rather than prepended ahead of it,
+        // keeping "declared before the real checksum" (what `braced_body`'s first-match
+        // search would read) without producing a file `syn` itself refuses to parse.
+        let clean = tests_support::clean_checksum_module();
+        let split_at = clean.find('\n').map_or(0, |at| at + 1);
+        let mut source = String::new();
+        source.push_str(clean.get(..split_at).unwrap_or_default());
+        source.push_str(DECOY);
+        source.push_str(clean.get(split_at..).unwrap_or_default());
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `fn crc32` 2 times, not once")),
+            "{violations:?}"
         );
-        source.push_str(&tests_support::clean_checksum_module());
+    }
+
+    #[test]
+    fn a_decoy_spelled_past_a_raw_identifier_rename_is_reported() {
+        // Codex's ninth-round finding: a purely textual `fn crc32` search does not see
+        // that `fn r#crc32` names the same item — Rust's raw-identifier marker exists
+        // precisely so a keyword or a reserved word can be used as a name, and it changes
+        // nothing about which item the plain spelling resolves to. A private nested
+        // module can therefore keep an exact, plain-spelled decoy under the pinned name
+        // while the real, module-scope function is renamed to its raw form and altered:
+        // a textual count sees exactly one `fn crc32` (the decoy) and waves every pin
+        // through to check it, while the unqualified `crc32` the shipped `Catalogued`
+        // binding calls still resolves the altered `r#crc32`. Counting structurally with
+        // `crate::parse::fn_declaration_count`, which un-raws identifiers before
+        // comparing, is what catches the pair as two declarations of the same name.
+        const DECOY: &str = "mod decoy {\n    use super::crc32_nibble;\n    pub(crate) const \
+             fn crc32(bytes: &[u8]) -> u32 {\n        let mut crc: u32 = 0xFFFF_FFFF;\n        \
+             let _ = crc32_nibble(0);\n        crc ^ 0xFFFF_FFFF\n    }\n}\n\n";
+        let clean = tests_support::clean_checksum_module().replace(
+            "pub(crate) const fn crc32(bytes",
+            "pub(crate) const fn r#crc32(bytes",
+        );
+        let split_at = clean.find('\n').map_or(0, |at| at + 1);
+        let mut source = String::new();
+        source.push_str(clean.get(..split_at).unwrap_or_default());
+        source.push_str(DECOY);
+        source.push_str(clean.get(split_at..).unwrap_or_default());
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
             violations.iter().any(|violation| violation
@@ -15360,6 +15459,31 @@ mod deferred_answer_pins {
         let source = tests_support::clean_checksum_module().replace(
             "#[inline(always)]\nconst fn crc32_nibble_table",
             "const fn crc32_nibble_table",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("is not declared `#[inline(always)]`")
+                && violation.detail.contains("crc32_nibble_table")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_always_swallowed_by_a_macro_call_is_not_credited() {
+        // Codex's ninth-round finding: bounding the search window by the previous item's
+        // `}` still let anything *inside* that window vouch for the attribute, including a
+        // macro invocation's own arguments. `ignore!(#[inline(always)]);` contains the
+        // exact attribute text immediately before `crc32_nibble_table`'s real declaration
+        // while attaching the attribute to nothing — the compiler receives no
+        // force-inlining directive at all, so ADR 0044's measured 5-21% regression can
+        // return even though the old `.contains` scan read this as satisfied. The
+        // occurrence now has to sit at bracket depth zero within the window, which an
+        // unclosed macro-call paren rules out.
+        let source = tests_support::clean_checksum_module().replace(
+            "#[inline(always)]\nconst fn crc32_nibble_table",
+            "ignore!(#[inline(always)]);\nconst fn crc32_nibble_table",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(
@@ -16019,7 +16143,7 @@ mod deferred_answer_pins {
         // nothing, and that has to be loud rather than green.
         let violations = check_integrity_check(&[layer(
             INTEGRITY_CHECK_PATH,
-            "//! Nothing here.\npub(crate) const fn crc16(b: &[u8]) -> u16 { 0x1021 0xFFFF }\n",
+            "//! Nothing here.\npub(crate) const fn crc16(b: &[u8]) -> u16 { 0x1021; 0xFFFF }\n",
         )]);
         assert!(
             violations.iter().any(|v| v.detail.contains("fn crc32")),
