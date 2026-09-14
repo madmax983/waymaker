@@ -6046,6 +6046,55 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_non_rendering_tag_inside_a_heading_does_not_satisfy_adr_structure() {
+        // Codex, pull request #138, round 35, finding 1: unlike every other collector
+        // in this module, the first version of `heading_lines` had no
+        // `Event::InlineHtml` arm at all, so an inline `<script>` written inside a
+        // heading never reached `open_non_rendering_tag` and the text between its open
+        // and close tags — ordinary `Event::Text`, invisible to a reader in raw-text
+        // parsing mode — was collected as if the heading had rendered it:
+        // `## <script>Context</script>` satisfied the `## Context` section check even
+        // though a browser shows no text there at all.
+        let contents =
+            clean_adr("one").replace("## Context\n\nx\n", "## <script>Context</script>\n\nx\n");
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("## Context")),
+            "an inline `<script>` heading satisfied the section check: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_status_field_with_a_trailing_comment_naming_a_non_rendering_tag_still_counts() {
+        // Codex, pull request #138, round 35, finding 2: `opens_non_rendering_element`
+        // reads an `Event::InlineHtml`'s raw text for a tag *spelling*, not a real
+        // open tag, so a self-contained inline comment whose own text merely contains
+        // one — `<!-- <script> example -->` — matched it and disqualified a real,
+        // complete field the same way a genuine unclosed `<script>` would, even though
+        // the comment carries no real tag at all. The comment check now runs first and
+        // exclusively, the same fix `track_non_rendering_html` was given for the same
+        // shape of bug (round 33, finding 3).
+        let contents = clean_adr("one").replace(
+            "- Status: accepted\n",
+            "- Status: accepted <!-- <script> example -->\n",
+        );
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("- Status:")),
+            "a trailing comment naming a non-rendering tag disqualified a real field: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn adr_status_ignores_a_decoy_status_inside_a_fenced_example() {
         // Issue #82: `hardware-attestation` and `deferred-questions` read `adr_status`
         // straight off `adr.contents`. A decoy `- Status:` line shown as an example must
@@ -8020,6 +8069,40 @@ mod tests {
                 clause.id
             );
         }
+    }
+
+    #[test]
+    fn a_storage_clause_message_hidden_in_a_span_attribute_is_reported() {
+        // Codex, pull request #138, round 35, finding 3: `table_rows`'s
+        // `Event::InlineHtml` arm used to keep an inline tag's entire raw text
+        // verbatim in the cell, so a decoy attribute unrelated to any link
+        // destination — `<span title="...">` — carried the required discharge text
+        // into the row just as readily as a real `<a href="...">`'s did, letting an
+        // otherwise-wrong row satisfy this check from text no reader ever sees.
+        // `anchor_href` now extracts only a genuine `<a>` tag's `href`, so a `<span>`
+        // attribute contributes nothing to the cell.
+        let (claude_md, mut adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES[0];
+        for adr in &mut adrs {
+            if adr.name == STORAGE_CONFORMANCE_ADR {
+                let real_row = format!("| `{}` | {} |", clause.id, clause.discharge.message());
+                let decoy_row = format!(
+                    "| `{}` | <span title=\"{}\">elsewhere</span> |",
+                    clause.id,
+                    clause.discharge.message()
+                );
+                assert!(
+                    adr.contents.contains(&real_row),
+                    "fixture row not found: {real_row}"
+                );
+                adr.contents = adr.contents.replace(&real_row, &decoy_row);
+            }
+        }
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&clauses));
+        assert!(
+            violations.iter().any(|v| v.subject == clause.id),
+            "a discharge message hidden in a span attribute still counted: {violations:?}"
+        );
     }
 
     fn storage_inputs() -> (String, Vec<AdrFile>, String) {

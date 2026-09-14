@@ -1511,6 +1511,34 @@ fn is_line_break_tag(html: &str) -> bool {
     rest[..name_end].eq_ignore_ascii_case("br")
 }
 
+/// An anchor tag's `href` attribute value, if `html` is a well-formed `<a ...>` opening
+/// tag carrying one.
+///
+/// A reader sees a link's destination — `<a href="tests/spine.rs">recovery proof</a>`
+/// renders as a clickable label a browser resolves against `href` — but does not see any
+/// other attribute an anchor or any other inline tag carries. `table_rows`'s
+/// `Event::InlineHtml` arm used to keep such a tag's raw text verbatim so `href`'s value
+/// reached the row as a substring (round 15), but a decoy attribute unrelated to the
+/// link destination — `<span title="clause-id headline proof">` — rode along with it
+/// just as verbatim, letting an otherwise empty cell satisfy a documentation check from
+/// text no reader ever sees (Codex, pull request #138, round 35, finding 3). This
+/// extracts only the one attribute a reader's own click already exposes, and only from a
+/// genuine `<a` open tag — every other tag, and an anchor's own `</a>` close, carries
+/// nothing this function returns.
+fn anchor_href(html: &str) -> Option<&str> {
+    find_opening_tag(html, 0, "a")?;
+    let lower = html.to_ascii_lowercase();
+    let marker = "href=";
+    let start = lower.find(marker)? + marker.len();
+    let quote = *html.as_bytes().get(start)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let value_start = start + 1;
+    let end = value_start + html.get(value_start..)?.find(quote as char)?;
+    Some(&html[value_start..end])
+}
+
 /// `contents` with every fenced code block, blockquote and HTML comment removed,
 /// keeping the exact source bytes of everything else — link syntax, code span
 /// backticks, real (non-comment) HTML, and all.
@@ -1815,11 +1843,23 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // drops before `End(TagEnd::Item)` can try matching an empty prefix.
             // Checked by the tag *opening* alone — a stray, unmatched close needs no
             // separate case, since the item is already disqualified by then.
+            //
+            // A comment is checked first and exclusively (Codex, round 35, finding 2):
+            // `opens_non_rendering_element`/`is_line_break_tag` read `html`'s raw text
+            // for a tag *spelling*, not a real tag, so a self-contained inline comment
+            // whose own text merely contains one — `- Status: accepted <!-- <script>
+            // example -->` — matched `opens_non_rendering_element` on the comment's
+            // contents and disqualified a real, complete field, the same class of bug
+            // `track_non_rendering_html` was given a comment-first check to close
+            // (round 33, finding 3). A comment can only ever disqualify by spanning a
+            // line break; it is never itself a real opening tag or a `<br>`.
             Event::InlineHtml(html)
                 if collecting
-                    && (is_line_break_tag(&html)
-                        || opens_non_rendering_element(&html).is_some()
-                        || (html.starts_with("<!--") && html.contains('\n'))) =>
+                    && if html.starts_with("<!--") {
+                        html.contains('\n')
+                    } else {
+                        is_line_break_tag(&html) || opens_non_rendering_element(&html).is_some()
+                    } =>
             {
                 collecting = false;
             }
@@ -1845,7 +1885,12 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
 /// `markdown_prose`'s raw output is what closes it, at every level a heading can be
 /// written at, not only the first. Fenced code blocks, blockquotes, HTML comments and
 /// non-rendering elements are all hidden, for the reasons `markdown_prose` already
-/// hides each.
+/// hides each — inline ones (`## <script>Context</script>`) included (Codex, pull
+/// request #138, round 35, finding 1): unlike every other collector in this module,
+/// the first version of this function had no `Event::InlineHtml` arm at all, so an
+/// inline non-rendering tag never reached `open_non_rendering_tag`, and the `Context`
+/// text between its open and close tags — ordinary `Event::Text`, invisible to a reader
+/// — was collected as if the heading had rendered it.
 #[must_use]
 pub fn heading_lines(contents: &str) -> Vec<String> {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -1866,6 +1911,9 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
         match event {
             Event::Html(html) => {
                 visible_html_ranges(&html, &mut in_html_comment, &mut open_non_rendering_tag);
+            }
+            Event::InlineHtml(html) => {
+                track_non_rendering_html(&html, &mut open_non_rendering_tag);
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_add(1);
@@ -2016,21 +2064,32 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             // Raw HTML, `<a href="tests/spine.rs">recovery proof</a>`, is not a
             // `Tag::Link` at all — it is two `InlineHtml` events around the label's own
             // `Event::Text` (Codex, pull request #138, round 15) — so the destination is
-            // read the way `visible_source` treats real HTML: kept verbatim rather than
-            // parsed apart, since the tag's own text already carries the `href` value as
-            // a literal substring. An inline comment is excluded (Codex, round 16), for
-            // `visible_source`'s reason: `| <!-- \`id\` --> |` is a hidden decoy, not a
-            // real cell, and keeping its text would let it stand in for the real one.
-            // A non-rendering element — `<script>`, `<style>`, `<template>` — is
-            // excluded the same way (Codex, round 30), and its own open/close tags
-            // update `open_non_rendering_tag` instead of joining the cell's text: a
-            // required value placed inside one is invisible to a reader.
+            // extracted explicitly rather than kept as the tag's raw text (Codex, round
+            // 35, finding 3, correcting round 15's own fix): a reader sees a link's
+            // `href`, resolved as the destination a click follows, but not any other
+            // attribute an anchor or any other inline tag carries — `<span
+            // title="\`clause-id\` headline proof">` kept verbatim just as readily and let
+            // an otherwise empty cell satisfy a check from text no reader ever sees.
+            // `anchor_href` returns only that one value, and only from a genuine `<a`
+            // open tag; every other tag — including an anchor's own `</a>` close —
+            // contributes nothing here, matching what a reader actually sees beyond the
+            // label `Event::Text` already carried into the cell. An inline comment is
+            // excluded (Codex, round 16), for `visible_source`'s reason: `| <!--
+            // \`id\` --> |` is a hidden decoy, not a real cell, and keeping its text
+            // would let it stand in for the real one. A non-rendering element —
+            // `<script>`, `<style>`, `<template>` — is excluded the same way (Codex,
+            // round 30), and its own open/close tags update `open_non_rendering_tag`
+            // instead of joining the cell's text: a required value placed inside one is
+            // invisible to a reader.
             Event::InlineHtml(html)
                 if !track_non_rendering_html(&html, &mut open_non_rendering_tag)
                     && in_row
                     && !html.starts_with("<!--") =>
             {
-                cell.push_str(&html);
+                if let Some(href) = anchor_href(&html) {
+                    cell.push_str(href);
+                    cell.push(' ');
+                }
             }
             _ => {}
         }
