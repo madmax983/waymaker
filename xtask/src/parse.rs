@@ -613,22 +613,61 @@ fn collect_type_aliases<'a>(
 /// enclosing module's own imports — so [`nested_body_items`]'s descent into them keeps
 /// inheriting whatever table the caller passes down; only [`syn::Item::Mod`] opens a
 /// new scope.
+///
+/// Round 21 found an asymmetry left behind by round 20's own fix: the plain-path type
+/// aliases [`collect_type_aliases`] collects already reach any nesting depth
+/// [`nested_body_items`] covers — a local `type R = super::Recovery;` inside a function
+/// body has been found since round 17 — but the `use`-alias loop above only ever read
+/// `items` directly, never descending into a body at all. `fn install() { use
+/// core::clone::Clone as C; impl C for Recovery { .. } }` is legal Rust exactly like
+/// round 17's local type alias, and the same fix applies: [`collect_use_aliases_in_scope`]
+/// gives the `use`-alias half the identical nested-body descent the type-alias half
+/// already had, stopping at the same `Item::Mod` boundary [`module_scope_aliases`]
+/// itself does not cross.
 fn module_scope_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAlias> {
     let items: Vec<&syn::Item> = items.into_iter().collect();
     let mut aliases = Vec::new();
-    for item in items.iter().copied() {
-        if has_cfg_test(item_attrs(item)) {
-            continue;
-        }
-        if let syn::Item::Use(use_item) = item {
-            collect_tree_aliases(&use_item.tree, &mut Vec::new(), &mut aliases);
-        }
-    }
+    collect_use_aliases_in_scope(items.iter().copied(), &mut aliases);
     // `type R = super::Recovery;` binds a local name to a path exactly the way
     // `use super::Recovery as R;` does, so it belongs in the same table and at the same
     // scope.
     collect_type_aliases(items.iter().copied(), &mut aliases);
     aliases
+}
+
+/// The `use` aliases visible in one module scope's own `items`, at any nesting depth
+/// [`nested_body_items`] covers — a function, method, or default trait-method body; a
+/// `const`/`static` initializer; an associated const's default — but never crossing
+/// into a nested `Item::Mod`, for the reason [`module_scope_aliases`] itself does not.
+///
+/// [`collect_type_aliases`]'s own nested-body descent, just for `use` items instead of
+/// `type` items — see [`module_scope_aliases`]'s doc for why round 21 needed this
+/// alongside it rather than the other way around.
+fn collect_use_aliases_in_scope<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+    aliases: &mut Vec<UseAlias>,
+) {
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Use(use_item) => {
+                collect_tree_aliases(&use_item.tree, &mut Vec::new(), aliases);
+            }
+            syn::Item::Fn(_)
+            | syn::Item::Impl(_)
+            | syn::Item::Trait(_)
+            | syn::Item::Const(_)
+            | syn::Item::Static(_)
+            | syn::Item::Enum(_)
+            | syn::Item::Type(_)
+            | syn::Item::Struct(_) => {
+                collect_use_aliases_in_scope(nested_body_items(item), aliases);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Strips any number of redundant `(..)` wrappers from a type, so `(Recovery)` and
@@ -1996,6 +2035,31 @@ fn type_items(ty: &syn::Type) -> Vec<&syn::Item> {
     visitor.items
 }
 
+/// Every [`type_items`] finds in a function or method signature's own parameter and
+/// return types, in addition to whatever its body carries.
+///
+/// Round 21 of Codex review on this change (PR #143) found `fn hidden(_: [(); { impl
+/// Clone for super::Recovery { .. }; 0 }]) {}` reaching neither scanner: every prior
+/// round that walked a function or method descended only into its *body*
+/// ([`block_items`]), never its signature, and a parameter type — or a return type — is
+/// exactly as capable of burying a block as a type alias's, a struct field's, or an
+/// enum variant field's own type already proved.
+fn fn_signature_type_items(signature: &syn::Signature) -> Vec<&syn::Item> {
+    signature
+        .inputs
+        .iter()
+        .filter_map(|argument| match argument {
+            syn::FnArg::Typed(typed) => Some(type_items(&typed.ty)),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .flatten()
+        .chain(match &signature.output {
+            syn::ReturnType::Type(_, ty) => type_items(ty),
+            syn::ReturnType::Default => Vec::new(),
+        })
+        .collect()
+}
+
 /// The shared walk [`block_items`], [`expr_items`] and [`type_items`] each drive: every
 /// `Stmt::Item` at any nesting depth of control flow, stopping at the item itself
 /// rather than descending into it — every caller of any of the three already recurses
@@ -2057,15 +2121,26 @@ impl<'ast> syn::visit::Visit<'ast> for BlockItemVisitor<'ast> {
 /// only its discriminant — can each carry a buried block (`enum E { V([(); { impl
 /// Clone for super::Recovery { .. }; 0 }]) }`), so every field of every variant is
 /// walked with [`type_items`] too, alongside the discriminant.
+///
+/// Round 21 found the same gap one level up: a function's or method's own *signature*
+/// — its parameter types and its return type — can carry a buried block exactly the
+/// way its body can, and every arm here that reads a body read only
+/// [`block_items`], never [`fn_signature_type_items`] too.
 fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
     match item {
-        syn::Item::Fn(function) => block_items(&function.block),
+        syn::Item::Fn(function) => block_items(&function.block)
+            .into_iter()
+            .chain(fn_signature_type_items(&function.sig))
+            .collect(),
         syn::Item::Impl(implementation) => implementation
             .items
             .iter()
             .flat_map(|member| match member {
                 syn::ImplItem::Fn(method) if !has_cfg_test(&method.attrs) => {
                     block_items(&method.block)
+                        .into_iter()
+                        .chain(fn_signature_type_items(&method.sig))
+                        .collect()
                 }
                 syn::ImplItem::Const(constant) if !has_cfg_test(&constant.attrs) => {
                     expr_items(&constant.expr)
@@ -2077,9 +2152,13 @@ fn nested_body_items(item: &syn::Item) -> Vec<&syn::Item> {
             .items
             .iter()
             .flat_map(|member| match member {
-                syn::TraitItem::Fn(method) if !has_cfg_test(&method.attrs) => {
-                    method.default.as_ref().map_or_else(Vec::new, block_items)
-                }
+                syn::TraitItem::Fn(method) if !has_cfg_test(&method.attrs) => method
+                    .default
+                    .as_ref()
+                    .map_or_else(Vec::new, block_items)
+                    .into_iter()
+                    .chain(fn_signature_type_items(&method.sig))
+                    .collect(),
                 syn::TraitItem::Const(constant) if !has_cfg_test(&constant.attrs) => constant
                     .default
                     .as_ref()
@@ -2176,7 +2255,10 @@ fn impl_member_bodies(
         .filter_map(|member| match member {
             syn::ImplItem::Fn(method) => Some((
                 impl_gated || has_cfg_test(&method.attrs),
-                block_items(&method.block),
+                block_items(&method.block)
+                    .into_iter()
+                    .chain(fn_signature_type_items(&method.sig))
+                    .collect(),
             )),
             syn::ImplItem::Const(constant) => Some((
                 impl_gated || has_cfg_test(&constant.attrs),
@@ -2243,6 +2325,10 @@ fn enum_variant_bodies(
 
 /// [`impl_member_bodies`], for a trait's own default method bodies and default
 /// associated consts.
+///
+/// Every declared method contributes its signature's own [`fn_signature_type_items`]
+/// regardless of whether it has a default body — round 21's finding applies just as
+/// much to a trait method with none, since the signature is parsed either way.
 fn trait_member_bodies(
     trait_item: &syn::ItemTrait,
     trait_gated: bool,
@@ -2251,12 +2337,16 @@ fn trait_member_bodies(
         .items
         .iter()
         .filter_map(|member| match member {
-            syn::TraitItem::Fn(method) => method.default.as_ref().map(|block| {
-                (
+            syn::TraitItem::Fn(method) => {
+                let body_items = method.default.as_ref().map_or_else(Vec::new, block_items);
+                Some((
                     trait_gated || has_cfg_test(&method.attrs),
-                    block_items(block),
-                )
-            }),
+                    body_items
+                        .into_iter()
+                        .chain(fn_signature_type_items(&method.sig))
+                        .collect(),
+                ))
+            }
             syn::TraitItem::Const(constant) => constant.default.as_ref().map(|(_, expr)| {
                 (
                     trait_gated || has_cfg_test(&constant.attrs),
@@ -2317,7 +2407,9 @@ fn collect_child_modules<'a>(
             syn::Item::Fn(function) => {
                 let item_gated = gated || has_cfg_test(&function.attrs);
                 collect_child_modules(
-                    block_items(&function.block),
+                    block_items(&function.block)
+                        .into_iter()
+                        .chain(fn_signature_type_items(&function.sig)),
                     parent_dir,
                     child_dir,
                     item_gated,

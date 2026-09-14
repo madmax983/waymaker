@@ -11620,6 +11620,82 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_impl_through_a_block_local_use_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 21: `type` aliases
+        // declared inside a function body have been chased at any nesting depth
+        // `nested_body_items` covers since round 17, but the parallel `use`-alias loop
+        // only ever read a scope's own direct items, never descending into a body — so
+        // a reached child file's `fn install() { use core::clone::Clone as C; impl C
+        // for super::Recovery { .. } }`, legal Rust exactly like round 17's local type
+        // alias, resolved `C` to nothing and the impl went unmatched.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "fn install() {\n",
+                "    use core::clone::Clone as C;\n",
+                "    impl C for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_function_signature_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 21: every prior round
+        // that walked a function or method descended only into its body, never its
+        // signature — but a parameter type (or a return type) can carry a buried block
+        // exactly the way a type alias's, a struct field's, or an enum variant field's
+        // own type already could.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "fn hidden(_: [(); {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}]) {\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
