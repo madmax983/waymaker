@@ -11448,6 +11448,23 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_unterminated_character_literal_falls_back_to_plain_text() {
+        // No closing `'` follows within the literal's own reach, so the opening `'` is not
+        // a character literal. It falls through as an ordinary character, and the real `]`
+        // after it still closes the attribute.
+        let fixture = "#[foo(bar = 'x)] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
+    fn a_raw_string_and_a_character_literal_both_nest_inside_a_bracket_group() {
+        // `#[cfg(all(a, b))]` proves nested nested brackets alone; this proves a literal
+        // survives inside one too, with a real `]` right after it in the same group.
+        let fixture = "#[cfg(all(a, r#\"]\"#, ']'))] impl Bank { pub fn raw() {} }\n";
+        assert!(counted(fixture).contains(&"raw".to_owned()), "{fixture}");
+    }
+
+    #[test]
     fn a_same_line_attribute_does_not_hide_an_impl_block_from_the_method_pin() {
         // The reader beside `public_functions` had the same blindness, and it is what
         // `ctx-facade` pins `Ctx`'s methods with — so a `pub(crate)` escape hatch behind a
