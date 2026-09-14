@@ -11560,6 +11560,24 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_future_renamed_through_a_second_alias_is_still_a_fifth_future() {
+        // Issue #109 checklist item: a re-export of an alias, not a direct alias.
+        // Example: `use .. as Pollable;` then `pub use Pollable as Awaitable;`.
+        // The old code resolved only the first hop. It read `Awaitable`,
+        // not `Future`. So it missed `Sneaky`.
+        let sneaky = format!(
+            "{}\nuse core::future::Future as Pollable;\npub use Pollable as Awaitable;\nimpl \
+             Awaitable for Sneaky {{}}\n",
+            tests_support::clean_ctx_facade()
+        );
+        let details = facade_details(CTX_FACADE_PATH, &sneaky);
+        assert!(
+            details.iter().any(|detail| detail.contains("Sneaky")),
+            "a future renamed through a second alias went unreported: {details:?}"
+        );
+    }
+
+    #[test]
     fn a_raw_future_trait_name_is_still_a_fifth_future() {
         // Issue #90: `r#Future` and `Future` name the same trait. This rule must
         // catch a fifth future written with the raw spelling.

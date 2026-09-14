@@ -350,23 +350,34 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     if path.leading_colon.is_some() {
         return segments;
     }
-    if let Some(first) = segments.first() {
-        if let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) {
-            let mut resolved = alias.target.clone();
-            resolved.extend(segments.drain(1..));
-            return resolved;
-        }
+    // A renamed re-export chains one alias to another. Example:
+    // `use core::future::Future as Pollable; pub use Pollable as Awaitable;`
+    // (issue #109). The loop below follows the chain. It does one hop
+    // per alias in the file. This bound stops a crafted cycle
+    // (`use a as b; use b as a;`) from looping forever.
+    for _ in 0..aliases.len() {
+        let Some(first) = segments.first() else {
+            break;
+        };
+        let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) else {
+            break;
+        };
+        let mut resolved = alias.target.clone();
+        resolved.extend(segments.drain(1..));
+        segments = resolved;
     }
     segments
 }
 
 /// The self types of every `impl <path ending in Future> for T` in `contents`.
 ///
-/// The trait is matched on its resolved last segment, so `Future` imported under
-/// any alias still identifies the implementor (issue #109). Implementations of a
-/// different trait that merely ends in `Future` keep the old textual check's
-/// verdict; only the `Future` that can be `.await`ed matters to the facade rule,
-/// and the four pinned futures are all bare `impl Future for ...`.
+/// The check matches the trait by its resolved last segment. So `Future`
+/// still identifies the implementor when the file imports it under an
+/// alias, or renames it through a chain of aliases (issue #109). An
+/// `impl` of a different trait that also ends in `Future` keeps the old
+/// textual check's verdict. Only the `Future` trait matters here — a
+/// workflow can `.await` only that trait. The four pinned futures are all
+/// bare `impl Future for ...`.
 ///
 /// # Errors
 ///

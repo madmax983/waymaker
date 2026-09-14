@@ -1140,9 +1140,13 @@ Stated so that nobody mistakes silence for coverage:
   from text patterns to real parsing (`syn` for Rust, `pulldown-cmark` for Markdown), so
   comments, strings, char literals, `use` aliases and `#[path]` modules no longer blind
   them. Parsing is not name resolution: glob imports are not followed, macros are not
-  expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. Markdown
-  parsing does not check that a rendered claim is true, only that it is rendered prose
-  rather than a code fence. The scanners that stayed textual are the ones whose rule is
+  expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. Alias
+  resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
+  within one file (issue #109), but an alias declared in one module and reached through a
+  `use` in another is invisible, the same limit `capacity-reserve`, `recovery-surface` and
+  `storage-contract` each record for the one file they pin. Markdown parsing does not check
+  that a rendered claim is true, only that it is rendered prose rather than a code fence.
+  The scanners that stayed textual are the ones whose rule is
   about *spelling* — a forbidden vocabulary item, a handwritten `unsafe` keyword — and they
   read comment- and string-stripped text, because there a mention in prose is a false
   positive, not an evasion.
