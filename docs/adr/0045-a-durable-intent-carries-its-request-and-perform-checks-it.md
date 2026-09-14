@@ -83,7 +83,15 @@ body rather than two, because `CheckedDispatch` has one legitimate origin rather
 schedule and a redelivery. `EFFECT_NO_SELF_LITERAL` alone refuses a `Self` literal inside
 `CheckedDispatch`'s own `impl` and a trait built for it; it says nothing about a sibling
 `pub(crate)` function elsewhere in the file naming the type directly. Codex found that hole
-on a third round of review of this change.
+on a third round of review of this change, and a fourth on the round after: the scan
+resolved only `use` aliases, so `type Unchecked<'a> = CheckedDispatch<'a>;` followed by a
+literal spelled `Unchecked { .. }` built the type under a name the pin never compared
+against. `struct_literal_counts` now resolves `type` aliases the same way it already
+resolved `use` aliases, chased through a chain of either kind — `type A = B; type B =
+CheckedDispatch;` is two aliases, and a literal spelled `A { .. }` has to reach
+`CheckedDispatch` through both. The fix lives in the shared scanner rather than in this rule
+alone, so `EFFECT_CONSTRUCTIONS` and every other construction pin built on
+`struct_literal_counts` closed the same gap at once.
 
 ## Consequences
 

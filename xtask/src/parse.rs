@@ -235,6 +235,63 @@ fn collect_item_aliases(
     }
 }
 
+/// Every `use` binding and `type` alias in `items`, file scope and inline modules alike.
+///
+/// A `use` alias and a `type` alias resolve the same way: both map a local name to the path
+/// it stands for, so `use Sealable as S;` followed by `S { .. }` and
+/// `type Unchecked<'a> = CheckedDispatch<'a>;` followed by `Unchecked { .. }` are one shape
+/// to every caller that resolves through this list — `struct_literal_counts`,
+/// `resolved_path_uses` and `future_trait_implementors` all do. Codex found the type-alias
+/// gap on a third round of review of issue #92's construction-site pin: a `type` alias
+/// forwarded to `CheckedDispatch`, and a literal spelled through the alias's name was
+/// invisible to a scan that resolved only `use` bindings.
+fn collect_all_aliases(items: &[syn::Item]) -> Vec<UseAlias> {
+    let mut aliases = Vec::new();
+    collect_item_aliases(items, &mut Vec::new(), &mut aliases);
+    collect_type_aliases(items, &mut aliases);
+    aliases
+}
+
+/// Every `type` alias in `items`, file scope and inline modules alike, whose right-hand side
+/// is a plain type path.
+///
+/// `type Unchecked<'a> = CheckedDispatch<'a>;` resolves `Unchecked` to `CheckedDispatch` the
+/// same way a `use` alias resolves an imported name — generics on either side are not part of
+/// a struct literal's path and are dropped. A right-hand side that is not a type path (a
+/// tuple, a reference, a trait object, a qualified `<T as Trait>::Type`) introduces no alias:
+/// there is no single final segment for a struct literal to be counted against.
+fn collect_type_aliases(items: &[syn::Item], aliases: &mut Vec<UseAlias>) {
+    for item in items {
+        // A `#[cfg(test)]` alias is not in the shipped code, matching `collect_item_aliases`.
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Type(type_item) => {
+                if let syn::Type::Path(type_path) = type_item.ty.as_ref() {
+                    if type_path.qself.is_none() {
+                        aliases.push(UseAlias {
+                            local: ident_name(&type_item.ident),
+                            target: type_path
+                                .path
+                                .segments
+                                .iter()
+                                .map(|segment| ident_name(&segment.ident))
+                                .collect(),
+                        });
+                    }
+                }
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = module.content.as_ref() {
+                    collect_type_aliases(nested, aliases);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_tree_aliases(
     tree: &syn::UseTree,
     prefix: &mut Vec<String>,
@@ -290,7 +347,7 @@ impl ResolvedPath {
     }
 }
 
-/// Every path written in `contents`, with the file's `use` aliases resolved.
+/// Every path written in `contents`, with the file's `use` and `type` aliases resolved.
 ///
 /// The visitor skips `use` items themselves: importing a name is not using it.
 /// Paths inside macro invocations are invisible to `syn`'s visitor, so a pinned
@@ -328,11 +385,7 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
     }
 
     let file = parse_rust(contents)?;
-    let aliases = {
-        let mut collected = Vec::new();
-        collect_item_aliases(&file.items, &mut Vec::new(), &mut collected);
-        collected
-    };
+    let aliases = collect_all_aliases(&file.items);
     let mut visitor = PathVisitor {
         aliases: &aliases,
         paths: Vec::new(),
@@ -350,12 +403,20 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     if path.leading_colon.is_some() {
         return segments;
     }
-    if let Some(first) = segments.first() {
-        if let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) {
-            let mut resolved = alias.target.clone();
-            resolved.extend(segments.drain(1..));
-            return resolved;
-        }
+    // Chased rather than substituted once: `type A = B; type B = CheckedDispatch;` is two
+    // aliases, and a literal spelled `A { .. }` has to reach `CheckedDispatch` through both.
+    // Bounded by the alias count so a cycle — which no legal Rust ever produces — cannot loop
+    // for ever; it just stops resolving, the same answer a one-hop version already gave.
+    for _ in 0..=aliases.len() {
+        let Some(first) = segments.first() else {
+            break;
+        };
+        let Some(alias) = aliases.iter().find(|candidate| candidate.local == *first) else {
+            break;
+        };
+        let mut resolved = alias.target.clone();
+        resolved.extend(segments.drain(1..));
+        segments = resolved;
     }
     segments
 }
@@ -373,8 +434,7 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn future_trait_implementors(contents: &str) -> Result<Vec<String>, syn::Error> {
     let file = parse_rust(contents)?;
-    let mut aliases = Vec::new();
-    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    let aliases = collect_all_aliases(&file.items);
     let mut implementors = Vec::new();
     collect_future_implementors(&file.items, &aliases, &mut implementors);
     Ok(implementors)
@@ -534,13 +594,16 @@ pub struct LiteralCounts {
 }
 
 /// Counts the struct literals in `contents` whose path's final segment is `name` — after
-/// resolving the file's `use` aliases — in total and inside a function body.
+/// resolving the file's `use` and `type` aliases — in total and inside a function body.
 ///
 /// `use Sealable as S;` followed by `S { .. }` counts (issue #99): the literal's path
 /// resolves through the alias to the segments of `Sealable`'s import path, so the final
-/// segment is `Sealable` whatever the construction site spells. Items under exactly
-/// `#[cfg(test)]` are skipped, structurally — the old textual pipeline blanked them
-/// after lexing comments and strings out, and `syn` sees attributes directly (issue #51).
+/// segment is `Sealable` whatever the construction site spells. `type Unchecked<'a> =
+/// CheckedDispatch<'a>;` followed by `Unchecked { .. }` counts the same way (issue #92,
+/// Codex's third round): a `type` alias is resolved exactly like a `use` alias, chased
+/// through a chain of either. Items under exactly `#[cfg(test)]` are skipped, structurally —
+/// the old textual pipeline blanked them after lexing comments and strings out, and `syn`
+/// sees attributes directly (issue #51).
 ///
 /// Struct literals, not declarations or patterns: `syn` reads [`syn::ExprStruct`], so
 /// `struct Sealable {`, `impl Sealable {`, `fn barrier(self) -> Sealable {`, and
@@ -596,8 +659,7 @@ pub fn struct_literal_counts(
     }
 
     let file = parse_rust(contents)?;
-    let mut aliases = Vec::new();
-    collect_item_aliases(&file.items, &mut Vec::new(), &mut aliases);
+    let aliases = collect_all_aliases(&file.items);
 
     let mut total = Literals {
         aliases: &aliases,
@@ -1493,6 +1555,46 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.inside, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_type_alias_resolves_to_the_type_it_stands_for() {
+        // Codex, issue #92's third round: a `type` alias must resolve the same way a `use`
+        // alias does, or `Unchecked { .. }` hides a `CheckedDispatch` construction from a
+        // scan that only chased `use` bindings.
+        let counts = struct_literal_counts(
+            "type Unchecked<'a> = Foo<'a>; fn forge() -> Unchecked<'static> { Unchecked {} }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_chained_type_alias_still_resolves() {
+        // `type A = B; type B = Foo;` is two aliases, and `A { .. }` has to reach `Foo`
+        // through both — a one-hop resolver would stop at `B` and count nothing.
+        let counts = struct_literal_counts(
+            "type A = B; type B = Foo; fn forge() -> A { A {} }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_type_alias_of_a_use_alias_still_resolves() {
+        // A chain need not be all one kind: `use Sealable as S; type Unchecked = S;` mixes a
+        // `use` alias and a `type` alias, and both have to be chased to reach `Sealable`.
+        let counts = struct_literal_counts(
+            "use Sealable as S; type Unchecked = S; fn forge() -> Unchecked { Unchecked {} }",
+            "Sealable",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 
     #[test]

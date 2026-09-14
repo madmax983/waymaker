@@ -12126,6 +12126,26 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_built_through_a_type_alias_is_reported() {
+        // Codex, issue #92's third round: `type Unchecked<'a> = CheckedDispatch<'a>;`
+        // followed by a literal spelled `Unchecked { .. }` is a second construction site a
+        // scan that resolved only `use` aliases could not see. `struct_literal_counts` now
+        // resolves `type` aliases too, so this is caught the same way the plain sibling
+        // forge above is.
+        let source = tests_support::clean_effect_module()
+            + "type Unchecked<'a> = CheckedDispatch<'a>;\n\
+               pub(crate) fn forge(intent: DurableIntent) -> Unchecked<'static> {\n\
+               \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_checked_dispatch_never_built_inside_perform_is_reported() {
         let source = tests_support::clean_effect_module().replace(
             "pub fn perform(&self) -> CheckedDispatch<'_> {\n        CheckedDispatch {\n            intent: self.intent,\n            bytes: &[],\n        }\n    }",
