@@ -58,6 +58,10 @@ pub struct ManifestDep {
     pub name: String,
     /// The table it was declared in.
     pub kind: DepKind,
+    /// The local name, if the manifest renamed this dependency with `package = "..."`.
+    ///
+    /// Rust source names the crate by this, not by `name`, when it is set.
+    pub rename: Option<String>,
 }
 
 /// One binary target of a package.
@@ -188,6 +192,23 @@ impl Package {
         self.manifest_deps.push(ManifestDep {
             name: name.to_owned(),
             kind,
+            rename: None,
+        });
+        self.resolved_deps.push(name.to_owned());
+        if kind == DepKind::Normal {
+            self.normal_resolved_deps.push(name.to_owned());
+        }
+        self
+    }
+
+    /// Adds a declared and resolved dependency on `name`, renamed to `rename` by the
+    /// manifest's `package = "..."`.
+    #[must_use]
+    pub fn with_renamed_dependency(mut self, name: &str, rename: &str, kind: DepKind) -> Self {
+        self.manifest_deps.push(ManifestDep {
+            name: name.to_owned(),
+            kind,
+            rename: Some(rename.to_owned()),
         });
         self.resolved_deps.push(name.to_owned());
         if kind == DepKind::Normal {
@@ -206,6 +227,7 @@ impl Package {
         self.manifest_deps.push(ManifestDep {
             name: name.to_owned(),
             kind,
+            rename: None,
         });
         self
     }
@@ -535,7 +557,8 @@ impl PackageGraph {
                             let name = string_field(dep, "name")?;
                             let kind =
                                 DepKind::from_metadata(dep.get("kind").and_then(Value::as_str));
-                            Some(ManifestDep { name, kind })
+                            let rename = string_field(dep, "rename");
+                            Some(ManifestDep { name, kind, rename })
                         })
                         .collect()
                 })

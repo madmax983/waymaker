@@ -304,7 +304,7 @@ Everything no symbol names as the probe's stays charged to the layers, and the r
 | Incremental code flash | the `default` row, [`waymaker_core::budget::INCREMENTAL_CODE_FLASH_BYTES`](crates/waymaker-core/src/budget.rs) — 12 KiB | every allocated section whose bytes are stored in the image, minus the baseline, minus what the symbol table attributes to the probe |
 | Incremental code flash, with the façade | the `facade` row, `FACADE_CODE_FLASH_BYTES` — 13 KiB | the same measurement on the image that links `waymaker-embassy` as well |
 | Engine statics | both gated rows, 256 B | every allocated writable, non-thread-local section, minus the baseline |
-| Context | 128 B | `size_of` of the `Ctx` the firmware links, and a `const` assertion beside it that the `drive-firmware` stage evaluates for the target |
+| Context | 128 B | `size_of` of the `Ctx` the firmware links, and a `const` assertion beside it that the `facade-demo-firmware` stage evaluates for the target |
 | Runtime RAM | 768 B | the 512 B caller-owned scratch page, plus the kernel-state registry, plus the context, plus the largest statics delta of any row |
 | Kernel state | 128 B | a `const` assertion in [`waymaker_core::budget`](crates/waymaker-core/src/budget.rs), evaluated for the firmware target by every row of the matrix but the baseline |
 
