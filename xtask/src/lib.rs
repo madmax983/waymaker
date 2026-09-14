@@ -99,6 +99,7 @@ pub const RULES: &[&str] = &[
     "size-probe-reach",
     "storage-conformance",
     "storage-contract",
+    "storage-shapes",
     "swap-discipline",
     "timer-capability",
     "timer-record-fields",
@@ -705,6 +706,7 @@ fn collect_docs_inputs(
         adrs,
         spec_obligations: read_optional(&root.join(docs::SPEC_OBLIGATIONS_PATH))?,
         storage_clauses: read_optional(&root.join(docs::STORAGE_CLAUSES_PATH))?,
+        storage_shapes: read_optional(&root.join(docs::STORAGE_SHAPES_PATH))?,
         failure_rows: read_optional(&root.join(docs::FAILURE_ROWS_PATH))?,
         wire_format_spec: read_optional(&root.join(docs::WIRE_FORMAT_SPEC_PATH))?,
         wire_format_corpus: read_corpus(&root.join(docs::WIRE_FORMAT_CORPUS_DIR))?,
@@ -966,6 +968,10 @@ mod tests {
                 // two of its three halves for the same reason: the suite's own table is
                 // unreadable, and the record has no ADR for the conformance suite.
                 storage_clauses: None,
+                // Nor issue #130's shape table, so `storage-shapes` fires the same way:
+                // the suite's own table is unreadable, and the record has no ADR for the
+                // catalogue.
+                storage_shapes: None,
                 // Nor the failure matrix's three files, so `failure-matrix` fires.
                 failure_rows: None,
                 // Nor the byte-by-byte format document, so `wire-format` fires.
@@ -1042,6 +1048,7 @@ mod tests {
             "size-probe-reach",
             "storage-conformance",
             "storage-contract",
+            "storage-shapes",
             "swap-discipline",
             "timer-capability",
             "timer-record-fields",

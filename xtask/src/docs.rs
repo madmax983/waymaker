@@ -630,6 +630,71 @@ pub const STORAGE_CONTRACT_CLAUSES: &[StorageClause] = &[
     },
 ];
 
+/// The ADR that decides how issue #130 item 2's shape catalogue is held.
+///
+/// Named here rather than found by prefix, for the reason [`STORAGE_CONFORMANCE_ADR`] is.
+pub const STORAGE_SHAPES_ADR: &str = "0046-a-shape-catalogue-holds-the-suite-to-the-writers.md";
+
+/// Where the conformance crate's own shape table lives, relative to the workspace root.
+///
+/// Read rather than trusted, for the reason [`STORAGE_CLAUSES_PATH`] is: without reading it,
+/// a shape could be deleted from the crate with `CLAUDE.md` still describing it.
+pub const STORAGE_SHAPES_PATH: &str = "crates/waymaker-conformance/src/shape.rs";
+
+/// One `(operation, width)` shape a legal storage call can have, as the gate knows it.
+///
+/// The counterpart of [`waymaker-conformance`'s own table][crate]; `storage-shapes` fails a
+/// build in which the two disagree, in either direction.
+///
+/// [crate]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-conformance/src/shape.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageShape {
+    /// Stable identifier, cited by `CLAUDE.md`, by the ADR and by the crate.
+    pub id: &'static str,
+    /// The shape, in one sentence.
+    pub sentence: &'static str,
+    /// Which writer or reader in `waymaker-flash` issues it.
+    pub issued_by: &'static str,
+}
+
+/// Every `(operation, width)` shape a legal call above §12's contract can have.
+///
+/// Issue [#130](https://github.com/madmax983/waymaker/issues/130) item 2 asks that "every
+/// legal operation shape the firmware issues must appear in the suite". A program and an
+/// erase each have two rows, one unit and more than one; a read has the same two.
+pub const STORAGE_SHAPES: &[StorageShape] = &[
+    StorageShape {
+        id: "program-single-unit",
+        sentence: "A program of exactly one program unit.",
+        issued_by: "the commit seal in `append::Journal::commit` and `swap::Staged::commit`",
+    },
+    StorageShape {
+        id: "program-multi-unit",
+        sentence: "A program of more than one program unit in one call.",
+        issued_by: "the frame body in `append::Journal::stage` and the bank header in `swap::Prepared::stage`",
+    },
+    StorageShape {
+        id: "erase-single-block",
+        sentence: "An erase of exactly one erase block.",
+        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block",
+    },
+    StorageShape {
+        id: "erase-multi-block",
+        sentence: "An erase of more than one erase block in one call.",
+        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device with more than two erase blocks",
+    },
+    StorageShape {
+        id: "read-single-unit",
+        sentence: "A read of exactly one read unit.",
+        issued_by: "`recovery::Recovery::stage`'s frame reads, on a geometry where a header or record fits in one read unit",
+    },
+    StorageShape {
+        id: "read-multi-unit",
+        sentence: "A read of more than one read unit in one call.",
+        issued_by: "`recovery::Recovery::stage`'s whole-record read and its erased-tail walk",
+    },
+];
+
 /// The id of the diagram that has to agree with [`LAYERS`].
 pub const CRATE_DEPENDENCY_DIAGRAM: &str = "crate-dependency-flow";
 
@@ -1174,6 +1239,12 @@ pub struct DocsInputs {
     /// is: a conformance suite whose clause table cannot be read is a suite nothing is
     /// holding to the contract it claims to check.
     pub storage_clauses: Option<String>,
+    /// Contents of [`STORAGE_SHAPES_PATH`], when the workspace has it.
+    ///
+    /// `None` is a violation rather than a skip, for the reason
+    /// [`DocsInputs::storage_clauses`] is: a shape catalogue nobody can read is a catalogue
+    /// nothing is holding to the suite.
+    pub storage_shapes: Option<String>,
     /// Contents of [`FAILURE_ROWS_PATH`], when the workspace has it. `None` is a violation.
     pub failure_rows: Option<String>,
     /// Every `.bin` file under [`WIRE_FORMAT_CORPUS_DIR`], by name, with its bytes.
@@ -2215,6 +2286,265 @@ fn check_storage_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
                      discharged by `{}`, so the record and the gate disagree about what \
                      holds it up",
                     clause.discharge.message()
+                ),
+            ));
+        }
+    }
+    violations
+}
+
+/// Rule: issue #130 item 2's shape catalogue and the four places it lives agree.
+///
+/// The same shape as [`check_storage_conformance`]: a shape of [`STORAGE_SHAPES`] has to
+/// appear in `CLAUDE.md` with its sentence and issuer, in [`STORAGE_SHAPES_ADR`], and in the
+/// conformance crate's own table at [`STORAGE_SHAPES_PATH`] — and a shape the crate declares
+/// that the gate does not is a violation too, because a suite growing a shape nobody wrote
+/// down is the other way this rots.
+///
+/// What it cannot check is that a shape is really issued somewhere: that is inside the
+/// crate, and `crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape`
+/// is what fails a build over it.
+#[must_use]
+fn check_storage_shapes(
+    claude_md: Option<&str>,
+    adrs: &[AdrFile],
+    shapes: Option<&str>,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+
+    match shapes {
+        None => violations.push(Violation::new(
+            "storage-shapes",
+            STORAGE_SHAPES_PATH,
+            "the conformance suite's shape table is not where the gate looks for it, so \
+             nothing holds the suite to the shapes it claims to issue",
+        )),
+        Some(contents) => {
+            // Comments stripped first, for the reason `check_storage_conformance` strips
+            // them: a table commented out and replaced by an empty slice would otherwise
+            // declare all six shapes and check none of them.
+            let source = strip_rust_comments(contents);
+            let declared = storage_shape_rows(&source);
+            for shape in STORAGE_SHAPES {
+                let Some(row) = declared.get(shape.id) else {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        shape.id,
+                        format!(
+                            "{STORAGE_SHAPES_PATH} declares no shape with this id, so the catalogue has documentation and no suite behind it"
+                        ),
+                    ));
+                    continue;
+                };
+                if row.sentence != Some(shape.sentence) {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        shape.id,
+                        row.sentence.map_or_else(
+                            || {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH}'s row for this shape states no sentence, and docs::STORAGE_SHAPES says `{}`",
+                                    shape.sentence
+                                )
+                            },
+                            |named| {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH} states this shape as `{named}` and docs::STORAGE_SHAPES says `{}`",
+                                    shape.sentence
+                                )
+                            },
+                        ),
+                    ));
+                }
+                if row.issued_by != Some(shape.issued_by) {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        shape.id,
+                        row.issued_by.map_or_else(
+                            || {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH}'s row for this shape names no issuer, and docs::STORAGE_SHAPES says `{}`",
+                                    shape.issued_by
+                                )
+                            },
+                            |named| {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH} names this shape's issuer as `{named}` and docs::STORAGE_SHAPES says `{}`",
+                                    shape.issued_by
+                                )
+                            },
+                        ),
+                    ));
+                }
+            }
+            for id in declared.keys() {
+                if !STORAGE_SHAPES.iter().any(|shape| shape.id == *id) {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        (*id).to_owned(),
+                        format!(
+                            "{STORAGE_SHAPES_PATH} declares this shape and docs::STORAGE_SHAPES does not, so the suite issues something nobody wrote down"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    violations.extend(check_storage_shapes_are_written_down(claude_md));
+    violations.extend(check_storage_shapes_are_decided(adrs));
+    violations
+}
+
+/// Every `(shape id, sentence, issuer)` triple [`STORAGE_SHAPES_PATH`] declares.
+///
+/// Matched on the table's own `id: "..."`, `sentence: "..."` and `issued_by: "..."` fields,
+/// the same way [`storage_clause_rows`] matches `Clause`'s.
+fn storage_shape_rows(contents: &str) -> BTreeMap<&str, StorageShapeRow<'_>> {
+    let mut rows = BTreeMap::new();
+    let Some(body) = const_slice_body(contents, "SHAPES") else {
+        return rows;
+    };
+    for row in struct_rows(body, "Shape") {
+        let Some(id) = quoted_field(row, "id: \"") else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        rows.insert(
+            id,
+            StorageShapeRow {
+                sentence: quoted_field(row, "sentence: \""),
+                issued_by: quoted_field(row, "issued_by: \""),
+            },
+        );
+    }
+    rows
+}
+
+/// What one row of the conformance crate's shape table declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageShapeRow<'a> {
+    /// The sentence the crate states the shape as.
+    sentence: Option<&'a str>,
+    /// Who the crate says issues it.
+    issued_by: Option<&'a str>,
+}
+
+/// The half of `storage-shapes` that reads `CLAUDE.md`.
+fn check_storage_shapes_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
+    let Some(contents) = claude_md else {
+        // `claude-md` already reports the missing file.
+        return Vec::new();
+    };
+    let contents = without_fenced_code(&without_html_comments(contents));
+    let mut violations = Vec::new();
+    for shape in STORAGE_SHAPES {
+        let rows: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", shape.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                if rows.is_empty() {
+                    "CLAUDE.md has no table row naming this storage shape in backticks, so a \
+                     contributor cannot tell which shape a change is touching"
+                        .to_owned()
+                } else {
+                    format!(
+                        "CLAUDE.md has {} table rows naming this storage shape, so which one \
+                         a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+
+        if !row.contains(shape.sentence) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "CLAUDE.md's table row for this shape does not state it as `{}`, which is \
+                     what docs::STORAGE_SHAPES reads",
+                    shape.sentence
+                ),
+            ));
+        }
+        if !row.contains(shape.issued_by) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "CLAUDE.md's table row does not say this shape is issued by `{}`, so the \
+                     row states a shape without saying what issues it",
+                    shape.issued_by
+                ),
+            ));
+        }
+    }
+    let count = format!("All {} storage shapes", STORAGE_SHAPES.len());
+    if !contents.contains(&count) {
+        violations.push(Violation::new(
+            "storage-shapes",
+            "shape count",
+            format!("CLAUDE.md does not say `{count}`, which is what the table holds"),
+        ));
+    }
+    violations
+}
+
+/// The half of `storage-shapes` that reads the decision record.
+fn check_storage_shapes_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
+    let Some(adr) = adrs.iter().find(|adr| adr.name == STORAGE_SHAPES_ADR) else {
+        return vec![Violation::new(
+            "storage-shapes",
+            STORAGE_SHAPES_ADR,
+            "the storage-shape catalogue has no decision record, so where it lives and what \
+             it covers are choices nobody wrote down",
+        )];
+    };
+    let contents = without_fenced_code(&without_html_comments(&adr.contents));
+    let mut violations = Vec::new();
+    for shape in STORAGE_SHAPES {
+        let rows: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", shape.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                if rows.is_empty() {
+                    format!(
+                        "{STORAGE_SHAPES_ADR} has no table row naming this shape in \
+                         backticks, so the catalogue has a suite and no decision record \
+                         behind it"
+                    )
+                } else {
+                    format!(
+                        "{STORAGE_SHAPES_ADR} has {} table rows naming this shape, so which \
+                         one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+        if !row.contains(shape.issued_by) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "{STORAGE_SHAPES_ADR}'s table row does not say this shape is issued by \
+                     `{}`, so the record and the gate disagree about what issues it",
+                    shape.issued_by
                 ),
             ));
         }
@@ -3789,6 +4119,11 @@ pub fn check_documentation(inputs: &DocsInputs, rules: &[&str]) -> Vec<Violation
         &inputs.adrs,
         inputs.storage_clauses.as_deref(),
     ));
+    violations.extend(check_storage_shapes(
+        inputs.claude_md.as_deref(),
+        &inputs.adrs,
+        inputs.storage_shapes.as_deref(),
+    ));
     violations.extend(check_hardware_attestation(
         inputs.claude_md.as_deref(),
         &inputs.adrs,
@@ -4032,9 +4367,9 @@ pub mod tests_support {
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
         DIAGRAMS, DocsInputs, FAILURE_MATRIX_ADR, FAILURE_ROWS, HARDWARE_TARGETS, QuestionStatus,
         RECOVERY_SPEC_ADR, SETTLED_DECISIONS, SETTLED_DECISIONS_ADR, SPEC_CLAUSES,
-        STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES, WIRE_FORMAT_CONSTANTS,
-        WIRE_FORMAT_CORPUS_DIR, WIRE_FORMAT_RECORD_KINDS, WIRE_FORMAT_SPEC_PATH, adr_number,
-        rule_count_phrases,
+        STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES, STORAGE_SHAPES, STORAGE_SHAPES_ADR,
+        WIRE_FORMAT_CONSTANTS, WIRE_FORMAT_CORPUS_DIR, WIRE_FORMAT_RECORD_KINDS,
+        WIRE_FORMAT_SPEC_PATH, adr_number, rule_count_phrases,
     };
     use crate::policy::LAYERS;
 
@@ -4205,6 +4540,19 @@ pub mod tests_support {
                 STORAGE_CONTRACT_CLAUSES.len()
             ),
         );
+        for shape in STORAGE_SHAPES {
+            line(
+                body,
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    shape.id, shape.sentence, shape.issued_by
+                ),
+            );
+        }
+        line(
+            body,
+            format_args!("All {} storage shapes.", STORAGE_SHAPES.len()),
+        );
         for row in FAILURE_ROWS {
             line(
                 body,
@@ -4303,6 +4651,23 @@ pub mod tests_support {
         body
     }
 
+    /// A shape table that declares exactly the shapes the gate expects.
+    #[must_use]
+    pub fn clean_storage_shapes() -> String {
+        let mut body = String::from("//! The shape table.\npub const SHAPES: &[Shape] = &[\n");
+        for shape in STORAGE_SHAPES {
+            line(
+                &mut body,
+                format_args!(
+                    "    Shape {{ id: \"{}\", sentence: \"{}\", issued_by: \"{}\" }},",
+                    shape.id, shape.sentence, shape.issued_by
+                ),
+            );
+        }
+        body.push_str("];\n");
+        body
+    }
+
     /// A clause table that declares exactly the clauses the gate expects.
     #[must_use]
     pub fn clean_spec_obligations() -> String {
@@ -4340,6 +4705,21 @@ pub mod tests_support {
             line(
                 &mut body,
                 format_args!("| `{}` | {} |", clause.id, clause.discharge.message()),
+            );
+        }
+        body
+    }
+
+    /// The ADR that records issue #130 item 2's shape catalogue, naming every shape.
+    #[must_use]
+    pub fn clean_storage_shapes_adr() -> String {
+        let mut body = clean_adr("the storage-shape catalogue");
+        line(&mut body, format_args!("| Shape | Issued by |"));
+        line(&mut body, format_args!("| --- | --- |"));
+        for shape in STORAGE_SHAPES {
+            line(
+                &mut body,
+                format_args!("| `{}` | {} |", shape.id, shape.issued_by),
             );
         }
         body
@@ -4407,6 +4787,13 @@ pub mod tests_support {
                 STORAGE_CONFORMANCE_ADR.to_owned(),
                 clean_storage_conformance_adr(),
             ),
+        );
+
+        let shapes_number =
+            adr_number(STORAGE_SHAPES_ADR).expect("the storage-shapes ADR is numbered");
+        bodies.insert(
+            shapes_number,
+            (STORAGE_SHAPES_ADR.to_owned(), clean_storage_shapes_adr()),
         );
 
         let highest = bodies.keys().copied().max().unwrap_or(0);
@@ -4612,6 +4999,7 @@ pub mod tests_support {
             adrs: clean_adrs(),
             spec_obligations: Some(clean_spec_obligations()),
             storage_clauses: Some(clean_storage_clauses()),
+            storage_shapes: Some(clean_storage_shapes()),
             failure_rows: Some(clean_failure_rows()),
             failure_model_tests: Some(clean_failure_model_tests()),
             failure_rig_tests: Some(clean_failure_rig_tests()),
@@ -6961,6 +7349,7 @@ mod tests {
                 "recovery-spec",
                 "settled-decisions",
                 "storage-conformance",
+                "storage-shapes",
                 "wire-format"
             ]
         );
