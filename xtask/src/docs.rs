@@ -2278,16 +2278,19 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for adr in adrs {
-        // An ADR whose `- Status:` and `- Date:` sit inside an HTML comment renders with no
-        // metadata at all, and every check below would otherwise find them.
-        let prose = crate::parse::markdown_prose(
-            &without_html_comments(&adr.contents),
-            crate::parse::InlineCode::Drop,
-        );
-        // Any rendered line, as before: the rule is "every ADR carries a title", not
-        // "the title is the first thing in the file". A `# ` title inside a fenced
-        // example still satisfies nothing, because fences never reach the prose.
-        if !prose.lines().any(|line| line.starts_with("# ")) {
+        // Real heading events, not rendered lines (Codex, pull request #138, round 34):
+        // `markdown_prose` preserves real, non-comment HTML content unchanged, so a
+        // decoy line that merely *looks* like a title — `# Decoy` inside a raw `<div>`
+        // — rendered identically to a genuine one and satisfied this the same way an
+        // escaped list marker used to satisfy `adr_status` before issue #82's fix. The
+        // rule is still "every ADR carries a title", not "the title is the first thing
+        // in the file": any level-1 heading anywhere satisfies it, and one inside a
+        // fenced example, a blockquote, an HTML comment or a non-rendering element
+        // still does not, for `heading_lines`'s own reasons — which also close the same
+        // gap for the section headings checked below, at every level a decoy could
+        // stand in for one.
+        let headings = crate::parse::heading_lines(&adr.contents);
+        if !headings.iter().any(|line| line.starts_with("# ")) {
             violations.push(Violation::new(
                 "adr-structure",
                 adr.name.clone(),
@@ -2343,7 +2346,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         for heading in ADR_REQUIRED_HEADINGS {
-            if !prose.lines().any(|line| line.trim_end() == *heading) {
+            if !headings.iter().any(|line| line.trim_end() == *heading) {
                 violations.push(Violation::new(
                     "adr-structure",
                     adr.name.clone(),
@@ -5998,6 +6001,51 @@ mod tests {
     }
 
     #[test]
+    fn a_decoy_title_inside_an_html_block_does_not_satisfy_adr_structure() {
+        // Codex, pull request #138, round 34: `check_adr_structure` used to scan
+        // `markdown_prose`'s rendered output for a line starting with `# ` — but
+        // `markdown_prose` preserves real, non-comment HTML content unchanged (round
+        // 18), so a `# Decoy` line written inside a raw `<div>` rendered identically to
+        // a genuine ATX heading and satisfied the rule the same way an escaped list
+        // marker satisfied `adr_status` before issue #82's fix. A browser shows that
+        // line as a literal hash character, not an `<h1>`. `heading_lines` reads the
+        // parser's own heading events instead of text-matching the rendering
+        // convention, so a decoy inside an HTML block cannot stand in for a title —
+        // and the same function closes the identical gap for the required `## `
+        // section headings checked below.
+        let contents = clean_adr("one").replace("# ADR: one\n", "<div>\n# Decoy\n</div>\n");
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("title")),
+            "a `# ` line inside a raw HTML block satisfied the title check: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_section_heading_inside_an_html_block_does_not_satisfy_adr_structure() {
+        // Codex, pull request #138, round 34: the `## Context` / `## Decision` /
+        // `## Consequences` half of `check_adr_structure` read the same rendered-text
+        // scan as the title check, so a decoy `## Context` inside a raw `<div>` closed
+        // the same gap `heading_lines` closes for the title above.
+        let contents =
+            clean_adr("one").replace("## Context\n\nx\n", "<div>\n## Context\n</div>\n\nx\n");
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("## Context")),
+            "a `## Context` line inside a raw HTML block satisfied the section check: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn adr_status_ignores_a_decoy_status_inside_a_fenced_example() {
         // Issue #82: `hardware-attestation` and `deferred-questions` read `adr_status`
         // straight off `adr.contents`. A decoy `- Status:` line shown as an example must
@@ -6965,6 +7013,36 @@ mod tests {
         let violations = check_settled_decisions(&[]);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].subject, SETTLED_DECISIONS_ADR);
+    }
+
+    #[test]
+    fn a_decision_id_hidden_in_an_html_attribute_does_not_count() {
+        // Codex, pull request #138, round 34: `visible_html_ranges` kept a block-level
+        // `Event::Html` line's raw bytes whenever they fell outside a non-rendering
+        // element's own delimiters — attribute text and tag markup included — so an id
+        // sitting inside an ordinary attribute, `<div data-note="id">`, read as visible
+        // just as if it were the element's real inner text, even though no browser ever
+        // renders an attribute's value as page content. `visible_html_ranges` now
+        // strips tag markup itself (`find_any_tag`/`HidingMarker::Markup`), so only
+        // genuine inner text survives into `markdown_prose`'s output.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div data-note=\"{}\">visible</div>\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision id hidden in an HTML attribute still counted: {violations:?}"
+        );
     }
 
     #[test]

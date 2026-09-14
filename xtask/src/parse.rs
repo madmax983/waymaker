@@ -1267,32 +1267,59 @@ fn track_non_rendering_html(html: &str, stack: &mut Vec<&'static str>) -> bool {
     }
 }
 
-/// One place in a line that stops content from being visible: a comment opener, or a
-/// non-rendering element's opening tag.
+/// One place in a line that stops content from being visible: a comment opener, a
+/// non-rendering element's opening tag, or an ordinary tag's own markup.
 enum HidingMarker {
     /// The byte offset of a `<!--`.
     Comment(usize),
     /// The byte range and name of a non-rendering element's opening tag.
     Tag(usize, usize, &'static str),
+    /// The byte range of an ordinary tag's own markup — the angle brackets, the name
+    /// and any attributes, excluded without changing any tracked state.
+    Markup(usize, usize),
 }
 
-/// The earliest of a comment opener (`<!--`) or a non-rendering element's opening tag,
-/// at or after `from` in `line`.
-fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
-    let comment = line[from..].find("<!--").map(|offset| from + offset);
-    let tag = find_any_opening_tag(line, from);
-    match (comment, tag) {
-        (None, None) => None,
-        (Some(start), None) => Some(HidingMarker::Comment(start)),
-        (None, Some((start, end, tag))) => Some(HidingMarker::Tag(start, end, tag)),
-        (Some(comment_start), Some((tag_start, tag_end, tag))) => {
-            if comment_start <= tag_start {
-                Some(HidingMarker::Comment(comment_start))
-            } else {
-                Some(HidingMarker::Tag(tag_start, tag_end, tag))
-            }
+/// The byte range of the next HTML tag — opening or closing, any name — at or after
+/// `from` in `line`, from `<` through the next `>`. A comment opener (`<!--`) is not a
+/// tag and is skipped, since comments are tracked separately with their own semantics
+/// and can span lines a naive "next `>`" search would close early against.
+fn find_any_tag(line: &str, from: usize) -> Option<(usize, usize)> {
+    let mut cursor = from;
+    loop {
+        let start = cursor + line.get(cursor..)?.find('<')?;
+        if line[start..].starts_with("<!--") {
+            cursor = start + "<!--".len();
+            continue;
         }
+        let end = line[start..].find('>').map(|offset| start + offset + 1)?;
+        return Some((start, end));
     }
+}
+
+/// The earliest of a comment opener (`<!--`), a non-rendering element's opening tag, or
+/// any other tag's own markup, at or after `from` in `line`.
+///
+/// A tag's markup is never visible text (Codex, pull request #138, round 34): a browser
+/// renders `<div data-note="All 6 recovery invariants">` as nothing at all, not as those
+/// characters, so keeping the whole line verbatim — as every fix from round 18 on did —
+/// let an attribute value neither reader nor round-18's own "what a reader sees"
+/// justification ever meant to expose satisfy a `.contains()` check. `Tag` (an opening
+/// non-rendering tag) is preferred over `Markup` at the same starting position, since a
+/// `<script>`/`<style>`/`<template>` open is both — an ordinary tag *and* one that has
+/// to change tracked state, which excluding it as plain markup would not do.
+fn next_hiding_marker(line: &str, from: usize) -> Option<HidingMarker> {
+    let mut candidates: Vec<(usize, HidingMarker)> = Vec::new();
+    if let Some(start) = line[from..].find("<!--").map(|offset| from + offset) {
+        candidates.push((start, HidingMarker::Comment(start)));
+    }
+    if let Some((start, end, tag)) = find_any_opening_tag(line, from) {
+        candidates.push((start, HidingMarker::Tag(start, end, tag)));
+    }
+    if let Some((start, end)) = find_any_tag(line, from) {
+        candidates.push((start, HidingMarker::Markup(start, end)));
+    }
+    candidates.sort_by_key(|&(start, _)| start);
+    candidates.into_iter().next().map(|(_, marker)| marker)
 }
 
 /// What [`next_non_rendering_marker`] found next while a non-rendering element was open.
@@ -1449,6 +1476,10 @@ fn visible_html_ranges(
             Some(HidingMarker::Tag(start, end, tag)) => {
                 ranges.push(cursor..start);
                 open_non_rendering.push(tag);
+                cursor = end;
+            }
+            Some(HidingMarker::Markup(start, end)) => {
+                ranges.push(cursor..start);
                 cursor = end;
             }
         }
@@ -1796,6 +1827,80 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
         }
     }
     None
+}
+
+/// Every real, visible Markdown heading in `contents`, rendered `"#".repeat(level) + "
+/// " + text` — the same convention [`markdown_prose`] renders one with — in source
+/// order.
+///
+/// Reads the parser's own heading events rather than scanning `markdown_prose`'s
+/// rendered output for a line starting with `#` (Codex, pull request #138, round 34):
+/// that is how a real heading renders, but it is also exactly how a literal `# Decoy`
+/// line *inside a raw HTML block* renders, since `markdown_prose` preserves real,
+/// non-comment HTML content unchanged (round 18) — and a browser shows that line as a
+/// literal hash character, not a semantic `<h1>` or `<h2>`. Reading the event a real ATX
+/// heading produces, rather than text-matching the convention `markdown_prose` happens
+/// to render it with, cannot be fooled by the collision; comparing a caller's wanted
+/// line (`"# Title"`, `"## Context"`) against this list rather than against
+/// `markdown_prose`'s raw output is what closes it, at every level a heading can be
+/// written at, not only the first. Fenced code blocks, blockquotes, HTML comments and
+/// non-rendering elements are all hidden, for the reasons `markdown_prose` already
+/// hides each.
+#[must_use]
+pub fn heading_lines(contents: &str) -> Vec<String> {
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+    let mut in_fence = false;
+    let mut blockquote_depth: u32 = 0;
+    let mut in_html_comment = false;
+    let mut open_non_rendering_tag: Vec<&'static str> = Vec::new();
+    let mut collecting = false;
+    let mut current = String::new();
+    let mut lines = Vec::new();
+
+    for event in Parser::new_ext(contents, Options::empty()) {
+        let hidden = in_fence
+            || blockquote_depth > 0
+            || in_html_comment
+            || !open_non_rendering_tag.is_empty();
+        match event {
+            Event::Html(html) => {
+                visible_html_ranges(&html, &mut in_html_comment, &mut open_non_rendering_tag);
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_add(1);
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                blockquote_depth = blockquote_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                if matches!(kind, CodeBlockKind::Fenced(_)) {
+                    in_fence = true;
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => in_fence = false,
+            Event::Start(Tag::Heading { level, .. }) if !hidden => {
+                collecting = true;
+                current.clear();
+                for _ in 0..level as usize {
+                    current.push('#');
+                }
+                current.push(' ');
+            }
+            Event::End(TagEnd::Heading(_)) if collecting => {
+                collecting = false;
+                lines.push(std::mem::take(&mut current));
+            }
+            Event::Text(text) if collecting && !hidden => current.push_str(&text),
+            Event::Code(code) if collecting && !hidden => {
+                current.push('`');
+                current.push_str(&code);
+                current.push('`');
+            }
+            _ => {}
+        }
+    }
+    lines
 }
 
 /// Every real Markdown table row in `contents`, rendered as `| cell | cell | ... |` with
