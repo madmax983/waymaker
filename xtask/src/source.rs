@@ -21218,6 +21218,39 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_width_truncated_left_shift_is_reported() {
+        // Codex's next-round finding: `128u8 << 1` is `0u8` in real Rust — the ninth bit a
+        // full-width shift would keep has nowhere to live in an eight-bit register — but
+        // `evaluate_binary_op`'s own `Shl` arm computed `left.checked_shl(shift)` over the
+        // shared `i128` storage with no truncation at all, answering `256` instead. Each of
+        // `P0` through `P3` picks between a dense branch (`n`) and a sparse one (`n`'s own
+        // decade, `100`/`110`/`120`/`130`) based on whether `(128u8 << 1) == 0`; the untruncated
+        // fold took the sparse branch every time, so this match never read as dense. `Shl`
+        // is now evaluated by `evaluate_shl_op`, which truncates the shifted value to the
+        // left operand's own declared width the same narrow way `evaluate_bitwise_not`
+        // already reads one — a literal's own suffix, a cast's destination type, or a
+        // path's declared type — so `(128u8 << 1) == 0` now folds to `true` and the dense
+        // branch is what every constant here resolves to.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn shl_truncation_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = if (128u8 << 1) == 0 { 0 } else { 100 };\n    \
+             const P1: u8 = if (128u8 << 1) == 0 { 1 } else { 110 };\n    \
+             const P2: u8 = if (128u8 << 1) == 0 { 2 } else { 120 };\n    \
+             const P3: u8 = if (128u8 << 1) == 0 { 3 } else { 130 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.

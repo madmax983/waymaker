@@ -3646,23 +3646,26 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
 /// addition's — `i128::checked_shr` performs an *arithmetic* shift, sign-extending a
 /// negative value's own top bits, where the unsigned `u128` shift `rustc` performs for an
 /// upper-half value zero-fills instead, so `u128::MAX >> 127` folds to `-1` here rather than
-/// the `1` a real unsigned shift gives. `Shl` has no such split: a left shift's own bit
-/// pattern is identical whichever domain it is read in, since it only ever moves bits toward
-/// the top and drops what falls off, so it stays exactly where it is. [`evaluate_shift_op`]
-/// is where `Shr` lives now, folded the same way [`evaluate_ordering_op`] folds ordering.
+/// the `1` a real unsigned shift gives. [`evaluate_shift_op`] is where `Shr` lives now,
+/// folded the same way [`evaluate_ordering_op`] folds ordering.
+///
+/// Codex's next-round finding: `Shl` was kept here on the reasoning that a left shift's own
+/// bit pattern is identical whichever domain it is read in — true, and not the question:
+/// this function is never handed the operand *expressions*, only their already-resolved
+/// values, so it has no way to learn how wide the shifted operand's own type is and to
+/// truncate the result to it the way real Rust does. `128u8 << 1` is `0u8`, not the `256`
+/// this used to answer. [`evaluate_shl_op`] is where `Shl` lives now, needing the left
+/// operand's own expression for exactly that reason.
 fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
     match op {
         syn::BinOp::BitAnd(_) => Some(left & right),
         syn::BinOp::BitOr(_) => Some(left | right),
         syn::BinOp::BitXor(_) => Some(left ^ right),
-        syn::BinOp::Shl(_) => u32::try_from(right)
-            .ok()
-            .and_then(|shift| left.checked_shl(shift)),
         syn::BinOp::Eq(_) => Some(i128::from(left == right)),
         syn::BinOp::Ne(_) => Some(i128::from(left != right)),
-        // `&&`/`||`, the four ordering comparisons, `Div`/`Rem`, `Add`/`Sub`/`Mul` and `Shr`
-        // are not folded here at all — [`literal_or_const_value`]'s own `Expr::Binary` case
-        // handles each in a match arm of its own, before this function's caller would
+        // `&&`/`||`, the four ordering comparisons, `Div`/`Rem`, `Add`/`Sub`/`Mul`, `Shr` and
+        // `Shl` are not folded here at all — [`literal_or_const_value`]'s own `Expr::Binary`
+        // case handles each in a match arm of its own, before this function's caller would
         // otherwise require both operands to resolve (for `&&`/`||`) or lose the operand
         // expressions this function never sees (for every other one of them).
         _ => None,
@@ -3926,10 +3929,17 @@ fn evaluate_division_op(
     Some(reinterpreted)
 }
 
-/// Whether `op` is one of the six operators [`evaluate_additive_or_shift_op`] routes —
-/// `Div`/`Rem`/`Add`/`Sub`/`Mul`/`Shr` — factored into its own small function so the guard
-/// naming them in [`literal_or_const_value`]'s own `match` stays one line, the same reason
-/// every other arm in that function is kept under clippy's per-function line count.
+/// Whether `op` is one of the seven operators [`evaluate_additive_or_shift_op`] routes —
+/// `Div`/`Rem`/`Add`/`Sub`/`Mul`/`Shr`/`Shl` — factored into its own small function so the
+/// guard naming them in [`literal_or_const_value`]'s own `match` stays one line, the same
+/// reason every other arm in that function is kept under clippy's per-function line count.
+///
+/// Codex's next-round finding: `Shl` used to stay in [`evaluate_binary_op`] on the
+/// reasoning that a left shift's own *bit pattern* does not depend on which domain it is
+/// read in — true, and beside the point [`evaluate_shl_op`]'s own doc comment states: which
+/// bits *survive* the shift depends on the operand's own width, which `evaluate_binary_op`
+/// has no way to ask for since it is never handed the operand expressions at all. Routed
+/// here instead, the identical way `Shr` already is, for the identical reason.
 const fn is_additive_or_shift_or_division_op(op: syn::BinOp) -> bool {
     matches!(
         op,
@@ -3939,11 +3949,12 @@ const fn is_additive_or_shift_or_division_op(op: syn::BinOp) -> bool {
             | syn::BinOp::Sub(_)
             | syn::BinOp::Mul(_)
             | syn::BinOp::Shr(_)
+            | syn::BinOp::Shl(_)
     )
 }
 
-/// Routes `Div`/`Rem` to [`evaluate_division_op`], `Shr` to [`evaluate_shift_op`], and
-/// `Add`/`Sub`/`Mul` to [`evaluate_additive_op`] — factored out of
+/// Routes `Div`/`Rem` to [`evaluate_division_op`], `Shr` to [`evaluate_shift_op`], `Shl` to
+/// [`evaluate_shl_op`], and `Add`/`Sub`/`Mul` to [`evaluate_additive_op`] — factored out of
 /// [`literal_or_const_value`]'s own `Expr::Binary` case to keep that function under
 /// clippy's line count, the same reason the ordering case is factored the way it is.
 fn evaluate_additive_or_shift_op(
@@ -3957,6 +3968,7 @@ fn evaluate_additive_or_shift_op(
             evaluate_division_op(op, left_expr, right_expr, resolve)
         }
         syn::BinOp::Shr(_) => evaluate_shift_op(left_expr, right_expr, resolve),
+        syn::BinOp::Shl(_) => evaluate_shl_op(left_expr, right_expr, resolve),
         _ => evaluate_additive_op(op, left_expr, right_expr, resolve),
     }
 }
@@ -4027,9 +4039,8 @@ fn evaluate_additive_op(
 /// value zero-fills instead. Only the left operand — the value being shifted, whose type the
 /// result shares — is asked; the shift amount on the right may legally be a different,
 /// narrower type in real Rust (`huge_u128 >> 5u32`), so confirming *its* type would say
-/// nothing about the one that matters. `Shl` has no such split and stays in
-/// [`evaluate_binary_op`]: a left shift's own bit pattern is identical whichever domain it is
-/// read in, since it only ever moves bits toward the top and drops what falls off.
+/// nothing about the one that matters. [`evaluate_shl_op`] needs the identical expression for
+/// a different reason of its own — see that function's doc comment.
 fn evaluate_shift_op(
     left_expr: &syn::Expr,
     right_expr: &syn::Expr,
@@ -4057,6 +4068,51 @@ fn evaluate_shift_op(
     )]
     let reinterpreted = result as i128;
     Some(reinterpreted)
+}
+
+/// `left_expr << right_expr`'s own value, truncated to the *shifted* operand's own declared
+/// width — needing the left operand's own expression for a different reason than
+/// [`evaluate_shift_op`]'s own doc comment states for `Shr`: a left shift's own bit pattern
+/// really is identical whichever domain it is read in, since it only ever moves bits toward
+/// the top and drops what falls off — but *which* bits fall off depends on how wide the
+/// operand's own type is, and this scan's shared `i128` storage has no width of its own to
+/// drop them from. `128u8 << 1` is `0u8` in real Rust, not `256`, because the ninth bit the
+/// full-width shift would keep has nowhere to live in an eight-bit register.
+///
+/// Codex's next-round finding: the version of this fold that lived in
+/// [`evaluate_binary_op`] computed `left.checked_shl(shift)` and returned that raw,
+/// full-width result directly, so `if (128u8 << 1) == 0 { .. } else { .. }` read the shift
+/// as `256` and took the wrong branch of every constant built from it. The operand's own
+/// width is read the identical narrow way [`evaluate_bitwise_not`]'s own operand search
+/// already does, in the same order: a literal's own suffix first, then a cast's own
+/// destination type, then a bare path's declared type through `resolve.width` — `None` for
+/// anything this scan cannot confirm a width for, which declines to fold rather than
+/// guessing one and getting it wrong the way the unwidth-aware version did.
+fn evaluate_shl_op(
+    left_expr: &syn::Expr,
+    right_expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    let left = literal_or_const_value(left_expr, resolve)?;
+    let right = literal_or_const_value(right_expr, resolve)?;
+    let shift = u32::try_from(right).ok()?;
+    let shifted = left.checked_shl(shift)?;
+    if let Some(int) = as_suffixed_int_literal(left_expr) {
+        let ty = syn::parse_str::<syn::Type>(int.suffix()).ok()?;
+        return apply_integer_cast(shifted, &ty);
+    }
+    if let syn::Expr::Cast(cast) = strip_parens(left_expr) {
+        return apply_integer_cast(shifted, &cast.ty);
+    }
+    let syn::Expr::Path(path) = strip_parens(left_expr) else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let width_name = (resolve.width)(&path.path)?;
+    let ty = syn::parse_str::<syn::Type>(width_name).ok()?;
+    apply_integer_cast(shifted, &ty)
 }
 
 /// `left && right` or `left || right`'s own value (`is_and` selects which), evaluated
