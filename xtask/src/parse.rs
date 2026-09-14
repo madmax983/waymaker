@@ -1422,15 +1422,76 @@ fn blank_string_literal_tree(tree: proc_macro2::TokenTree) -> proc_macro2::Token
     }
 }
 
+/// Drops every macro invocation's argument tokens from `stream`.
+///
+/// `syn` does not expand macros (this module's own header states the limit). A macro
+/// argument might never run as code: `stringify!(crc32(input))` does not call `crc32`.
+/// It turns the argument's tokens into a string at compile time. A call-boundary scan
+/// cannot tell this case from a real call, so this function drops the argument instead
+/// of rendering it. The macro's name and its `!` stay, so a real call right after a
+/// macro invocation in the same statement still renders at its own token boundary.
+///
+/// A macro invocation is matched by shape: an identifier, then `!`, then a delimited
+/// group. Rust grammar has no other reading of that shape — a bare `!` never follows an
+/// identifier with nothing between them except as a macro call. The logical-not `!` is
+/// a prefix operator and always needs an operator, a delimiter, or the start of an
+/// expression before it, never an identifier.
+fn blank_macro_arguments(stream: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    let tokens: Vec<proc_macro2::TokenTree> = stream.into_iter().collect();
+    let mut kept: Vec<proc_macro2::TokenTree> = Vec::with_capacity(tokens.len());
+    let mut rest: &[proc_macro2::TokenTree] = &tokens;
+    loop {
+        if let [
+            name @ proc_macro2::TokenTree::Ident(_),
+            proc_macro2::TokenTree::Punct(bang),
+            proc_macro2::TokenTree::Group(group),
+            after @ ..,
+        ] = rest
+            && bang.as_char() == '!'
+        {
+            kept.push(name.clone());
+            kept.push(proc_macro2::TokenTree::Punct(bang.clone()));
+            let mut emptied =
+                proc_macro2::Group::new(group.delimiter(), proc_macro2::TokenStream::new());
+            emptied.set_span(group.span());
+            kept.push(proc_macro2::TokenTree::Group(emptied));
+            rest = after;
+            continue;
+        }
+        let Some((first, after)) = rest.split_first() else {
+            break;
+        };
+        kept.push(blank_macro_argument_tree(first.clone()));
+        rest = after;
+    }
+    kept.into_iter().collect()
+}
+
+/// [`blank_macro_arguments`], one token at a time, for a token that does not start a
+/// macro invocation. A group recurses, so a macro call nested inside an `if` or a
+/// block is still found.
+fn blank_macro_argument_tree(tree: proc_macro2::TokenTree) -> proc_macro2::TokenTree {
+    match tree {
+        proc_macro2::TokenTree::Group(group) => {
+            let mut replaced =
+                proc_macro2::Group::new(group.delimiter(), blank_macro_arguments(group.stream()));
+            replaced.set_span(group.span());
+            proc_macro2::TokenTree::Group(replaced)
+        }
+        other => other,
+    }
+}
+
 /// The body of a function or method block as text the token-based scans understand.
 ///
 /// The statements rendered without the outer braces — the way `braced_body` returned
 /// them — with `quote`'s spaces around `::` collapsed again: the call scans look for
 /// `C::name(` and `name::<`, and the spaced rendering would hide both. String and
-/// byte-string literals are blanked first (issue #158). A literal is the only token
-/// whose rendered text can spell a callee's name without a real call to it. What the
-/// scans do with the text is otherwise unchanged; this is only the bridge from the
-/// resolved item back to the textual analyses.
+/// byte-string literals are blanked first (issue #158), and so is every macro
+/// invocation's argument list. A literal or a macro argument is the only rendered text
+/// that can spell a callee's name without a real call to it. What the scans do with the
+/// text is otherwise unchanged; this is only the bridge from the resolved item back to
+/// the textual analyses.
 ///
 /// A raw marker is not stripped here (issue #90). It does not need to be: every
 /// consumer matches a substring at a token boundary, and `#` is such a boundary, so
@@ -1439,7 +1500,7 @@ fn blank_string_literal_tree(tree: proc_macro2::TokenTree) -> proc_macro2::Token
 fn block_text(block: &syn::Block) -> String {
     let mut body = String::new();
     for stmt in &block.stmts {
-        let blanked = blank_string_literals(stmt.to_token_stream());
+        let blanked = blank_macro_arguments(blank_string_literals(stmt.to_token_stream()));
         body.push_str(&blanked.to_string());
         body.push(' ');
     }
