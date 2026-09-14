@@ -661,6 +661,16 @@ fn consume_scope_prefix(segments: &mut Vec<String>, scope: &mut usize) {
 /// of, with no `super::` needed, before it falls back to the enclosing module. So a lookup
 /// that misses at `scope` continues outward only while each scope it crosses is marked
 /// transparent (`true`), stopping at — but still checking — the first opaque one.
+///
+/// A chained alias is resolved from where *it* was declared, not from the original use
+/// site: once a name is found at `probe`, `scope` moves there before the next segment is
+/// looked up. Real Rust resolves an alias's right-hand side lexically, at its own
+/// declaration — `type Unchecked = CheckedDispatch;` at module scope means the
+/// `CheckedDispatch` visible *there*, even when `Unchecked { .. }` is written inside a block
+/// that shadows `CheckedDispatch` with its own, unrelated `type CheckedDispatch = Decoy;`.
+/// Leaving `scope` at the use site let that inner shadow win regardless of where the alias
+/// chasing it was actually declared, hiding a real construction behind an unrelated,
+/// same-named local alias (Codex review, PR #183).
 fn resolve_segments_through_blocks(
     path: &syn::Path,
     stack: &[(Vec<UseAlias>, bool)],
@@ -697,6 +707,7 @@ fn resolve_segments_through_blocks(
         let Some(alias) = found else {
             break;
         };
+        scope = probe;
         let mut resolved = alias.target.clone();
         resolved.extend(segments.drain(1..));
         segments = resolved;
@@ -915,6 +926,41 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
                 current = &field.base;
             }
         }
+
+        /// [`Self::note`], recursed through a destructuring assignment's own shape.
+        ///
+        /// `(dispatch.bytes, dispatch.intent) = (other, other_intent);` is valid Rust since
+        /// destructuring assignment stabilized, and its left side parses as an ordinary
+        /// `Expr::Tuple` of field-access expressions — not one `Expr::Field` chain, so
+        /// `note`'s own `while let` never matches it, and the *assignment* meaning is
+        /// something only this call site knows; the default traversal that would otherwise
+        /// reach each field walks them as plain reads (Codex review, PR #183). A struct
+        /// pattern (`Foo { bytes, .. } = dispatch;`) reuses struct-literal syntax as an
+        /// assignment target the same way, with its fields as the assignable places; `..`
+        /// carries no place of its own. An array pattern (`[a, b] = pair;`) is the third
+        /// shape `syn` allows here. Anything else — a bare place, an index, a dereference —
+        /// is a single target and goes straight to `note`.
+        fn note_assignment_target(&mut self, expr: &syn::Expr) {
+            match expr {
+                syn::Expr::Tuple(tuple) => {
+                    for element in &tuple.elems {
+                        self.note_assignment_target(element);
+                    }
+                }
+                syn::Expr::Array(array) => {
+                    for element in &array.elems {
+                        self.note_assignment_target(element);
+                    }
+                }
+                syn::Expr::Struct(structure) => {
+                    for field in &structure.fields {
+                        self.note_assignment_target(&field.expr);
+                    }
+                }
+                syn::Expr::Paren(paren) => self.note_assignment_target(&paren.expr),
+                _ => self.note(expr),
+            }
+        }
     }
 
     impl<'ast> syn::visit::Visit<'ast> for Mutations<'_> {
@@ -933,7 +979,7 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
         }
 
         fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
-            self.note(&node.left);
+            self.note_assignment_target(&node.left);
             syn::visit::visit_expr_assign(self, node);
         }
 
@@ -2491,6 +2537,29 @@ mod raw_identifier_tests {
     }
 
     #[test]
+    fn a_chained_alias_resolves_at_its_own_declaration_scope_not_the_use_site() {
+        // Codex, PR #183's own review: real Rust resolves an alias's right-hand side
+        // lexically, at *its own* declaration — `type Unchecked = Foo;` at module scope
+        // means the `Foo` visible there, whatever a block using `Unchecked` later shadows
+        // `Foo` with. The lookup that finds `Unchecked` falls through the block (transparent)
+        // to the module (opaque) — but the alias it finds still has to be chased from where
+        // *it* lives, not from the block the caller happened to be standing in, or the
+        // block's own decoy `Foo` would resolve first and a real `Unchecked { .. }`
+        // construction of the guarded type would go uncounted.
+        let counts = struct_literal_counts(
+            "type Unchecked = Foo;\n\
+             fn f() {\n\
+             \x20   type Foo = Decoy;\n\
+             \x20   let _ = Unchecked {};\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
     fn a_parenthesized_type_alias_still_resolves() {
         // Codex, issue #92's sixth round: `(Foo)` is valid Rust on a `type` alias's
         // right-hand side, `#[allow(unused_parens)]` lets it through `-D warnings`, and
@@ -2527,6 +2596,38 @@ mod raw_identifier_tests {
             "fn tamper(mut dispatch: Foo) -> Foo {\n\
              \x20   dispatch.bytes = other;\n\
              \x20   dispatch\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["bytes"], "{found:?}");
+    }
+
+    #[test]
+    fn a_destructuring_tuple_assignment_is_reported() {
+        // Codex, PR #183's own review: `(dispatch.bytes, dispatch.intent) = (a, b);` is valid
+        // Rust — destructuring assignment stabilized in 1.59 — and its left side parses as an
+        // `Expr::Tuple` of field accesses, not the one `Expr::Field` chain `note` matches. The
+        // default traversal `visit_expr_assign` falls back to would walk each field as a
+        // plain read, with nothing to say either one is being written to.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, a: Bytes, b: Id) {\n\
+             \x20   (dispatch.bytes, dispatch.intent) = (a, b);\n}",
+            &["bytes", "intent"],
+        )
+        .expect("the fixture parses");
+        let mut sorted = found;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["bytes", "intent"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_destructuring_struct_assignment_is_reported() {
+        // The struct-pattern shape of destructuring assignment: `Wrap { field: dispatch.bytes,
+        // .. } = source;` reuses struct-literal syntax as an assignment target, with each
+        // field's expression as the place actually being written to.
+        let found = mutated_field_names(
+            "fn tamper(mut dispatch: Foo, source: Wrap) {\n\
+             \x20   Wrap { field: dispatch.bytes, .. } = source;\n}",
             &["bytes"],
         )
         .expect("the fixture parses");
