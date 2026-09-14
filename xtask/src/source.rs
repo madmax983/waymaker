@@ -18711,6 +18711,68 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_blocks_holding_a_cfg_test_statement_is_reported() {
+        // Codex's next-round finding: `block_const_exprs`, `block_let_exprs` and
+        // `block_ignored_let_count` each already skip a `#[cfg(test)]`-gated statement, the
+        // same way `MatchVisitor::visit_block`'s own production walk does — but
+        // `evaluate_block`'s own statement-count check compared their filtered total
+        // against `block.stmts`'s own *raw* length, so a block holding one of those
+        // alongside an otherwise-complete set of local declarations counted one statement
+        // more than the filtered collectors ever could, and every one of `P0` through
+        // `P3`'s initializers stayed unresolved. The count is now taken over the identical
+        // filtered statement list the tail is split from, so a `#[cfg(test)]` statement
+        // costs the block nothing — matching what a real, shipped build of it looks like.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn cfg_gated_statement_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = { #[cfg(test)] let _ = (); let value = 0; value };\n    \
+             const P1: u8 = { #[cfg(test)] let _ = (); let value = 1; value };\n    \
+             const P2: u8 = { #[cfg(test)] let _ = (); let value = 2; value };\n    \
+             const P3: u8 = { #[cfg(test)] let _ = (); let value = 3; value };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_unsigned_u128_division_is_reported() {
+        // Codex's next-round finding: `evaluate_binary_op` divided the shared 128-bit
+        // storage as a plain signed `i128`, which is not sound for the identical reason
+        // ordering comparisons are not — `0xffffffffffffffffffffffffffffffffu128 / 2` is a
+        // real `u128` division `rustc` performs unsigned, but the dividend's own stored
+        // `i128` bit pattern is negative (`-1`), and `i128::checked_div` divides that
+        // negative value as itself, landing on a wrong, much smaller quotient. A constant
+        // built from that division therefore stayed unresolved, and a match over
+        // constants derived from it went undetected. `evaluate_division_op` folds `Div`
+        // and `Rem` the same way `evaluate_ordering_op` folds the four comparisons: an
+        // operand negative in this domain is reinterpreted as `u128` once its own
+        // declaration confirms that is what it means.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn unsigned_division_pattern_table(nibble: u32) -> u32 {\n    \
+             const Q: u128 = 0xffffffffffffffffffffffffffffffffu128 / 2;\n    \
+             const P0: u128 = (Q / Q) * 0;\n    const P1: u128 = (Q / Q) * 1;\n    \
+             const P2: u128 = (Q / Q) * 2;\n    const P3: u128 = (Q / Q) * 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_blocks_with_an_ignored_let_binding_is_reported() {
         // Codex's next-round finding: `const P0: u8 = { let _ =
         // core::marker::PhantomData::<()>; 0 };` holds a statement `block_let_exprs`

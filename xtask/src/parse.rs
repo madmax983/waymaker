@@ -2882,7 +2882,22 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
         return None;
     }
     let ignored_lets = block_ignored_let_count(block);
-    let (tail, rest) = block.stmts.split_last()?;
+    // Codex's next-round finding: `block_const_exprs`, `block_let_exprs` and
+    // `block_ignored_let_count` each already skip a `#[cfg(test)]`-gated statement, the
+    // same way `MatchVisitor::visit_block`'s own production walk does — but `rest` here
+    // was still `block.stmts`' own *raw* slice, so a block holding one of those alongside
+    // an otherwise-complete set of local declarations counted one statement more than the
+    // filtered collectors ever could, and the whole block read as unresolved. Filtering
+    // the statements the identical way before splitting off the tail is not just the count
+    // fix: a cfg-gated statement written *last* in source order would otherwise be taken
+    // for the block's own tail value, when `rustc` would really return whatever the last
+    // *production* statement is.
+    let production_stmts: Vec<&syn::Stmt> = block
+        .stmts
+        .iter()
+        .filter(|stmt| !stmt_is_cfg_test(stmt))
+        .collect();
+    let (tail, rest) = production_stmts.split_last()?;
     if rest.len() != locals.len() + ignored_lets {
         return None;
     }
@@ -2975,13 +2990,19 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
 /// `i128`/`u128` a value is really meant as; `Lt`/`Le`/`Gt`/`Ge` are not, for the reason
 /// [`evaluate_ordering_op`] states, and are folded there instead — the same split `&&`/`||`
 /// already have with [`evaluate_short_circuit_op`].
+///
+/// Codex's next-round finding: `Div`/`Rem` are not sound here for the identical reason
+/// ordering is not — `left.checked_div(right)` divides the shared 128-bit storage as a
+/// *signed* `i128`, and an upper-half `u128` value that storage reinterprets as negative
+/// divides to a completely different quotient than the unsigned division `rustc` performs.
+/// [`evaluate_division_op`] is where the two operators live now, needing the operand
+/// *expressions* [`is_definitely_unsigned`] reads, exactly as [`evaluate_ordering_op`]
+/// already does.
 fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
     match op {
         syn::BinOp::Add(_) => left.checked_add(right),
         syn::BinOp::Sub(_) => left.checked_sub(right),
         syn::BinOp::Mul(_) => left.checked_mul(right),
-        syn::BinOp::Div(_) => left.checked_div(right),
-        syn::BinOp::Rem(_) => left.checked_rem(right),
         syn::BinOp::BitAnd(_) => Some(left & right),
         syn::BinOp::BitOr(_) => Some(left | right),
         syn::BinOp::BitXor(_) => Some(left ^ right),
@@ -2993,11 +3014,11 @@ fn evaluate_binary_op(op: syn::BinOp, left: i128, right: i128) -> Option<i128> {
             .and_then(|shift| left.checked_shr(shift)),
         syn::BinOp::Eq(_) => Some(i128::from(left == right)),
         syn::BinOp::Ne(_) => Some(i128::from(left != right)),
-        // `&&`/`||` and the four ordering comparisons are not folded here at all —
-        // [`literal_or_const_value`]'s own `Expr::Binary` case handles each in a match arm
-        // of its own, before this function's caller would otherwise require both operands
-        // to resolve (for `&&`/`||`) or lose the operand expressions this function never
-        // sees (for ordering).
+        // `&&`/`||`, the four ordering comparisons and `Div`/`Rem` are not folded here at
+        // all — [`literal_or_const_value`]'s own `Expr::Binary` case handles each in a
+        // match arm of its own, before this function's caller would otherwise require both
+        // operands to resolve (for `&&`/`||`) or lose the operand expressions this function
+        // never sees (for ordering and division).
         _ => None,
     }
 }
@@ -3104,6 +3125,69 @@ fn evaluate_ordering_op(
         syn::BinOp::Ge(_) => ordering.is_ge(),
         _ => return None,
     }))
+}
+
+/// `left_expr op right_expr`'s own value, for `Div`/`Rem` — [`evaluate_ordering_op`]'s own
+/// reasoning, applied to the other pair of operators this domain's shared storage makes
+/// ambiguous. Factored out of [`evaluate_binary_op`] for the identical reason: division
+/// needs the operand *expressions* themselves, not only their resolved values, to tell a
+/// genuinely negative operand apart from an upper-half `u128` one wrapped around.
+///
+/// Codex's next-round finding: `0xffffffffffffffffffffffffffffffffu128 / 2` is a real
+/// `u128` division `rustc` performs unsigned, landing well inside the positive half of
+/// `u128`'s own range — but the dividend's stored `i128` bit pattern is negative, and
+/// `i128::checked_div` divides that negative value as itself, landing on a completely
+/// different (and much smaller in magnitude) quotient. Exactly [`evaluate_ordering_op`]'s
+/// own ambiguity, resolved the same way: an operand negative in this domain needs its type
+/// confirmed unsigned before its bit pattern is reinterpreted as `u128` for the arithmetic,
+/// and both operands non-negative divide identically whichever domain they are really meant
+/// as, so plain `i128` division still answers that case. A `u128` division whose own
+/// *quotient* lands back in the upper half is reinterpreted as its own two's-complement bit
+/// pattern on the way out, the same convention [`lit_value`] and [`apply_integer_cast`]
+/// already use for a `u128` value at or above `2^127`.
+fn evaluate_division_op(
+    op: syn::BinOp,
+    left_expr: &syn::Expr,
+    right_expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+) -> Option<i128> {
+    let left = literal_or_const_value(left_expr, resolve)?;
+    let right = literal_or_const_value(right_expr, resolve)?;
+    if (left < 0 && !is_definitely_unsigned(left_expr, resolve))
+        || (right < 0 && !is_definitely_unsigned(right_expr, resolve))
+    {
+        return None;
+    }
+    if left >= 0 && right >= 0 {
+        return match op {
+            syn::BinOp::Div(_) => left.checked_div(right),
+            syn::BinOp::Rem(_) => left.checked_rem(right),
+            _ => None,
+        };
+    }
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "reinterpreting the shared 128-bit storage as unsigned, once an explicit \
+                  suffix or cast has confirmed that is what a negative operand means, not \
+                  converting a value"
+    )]
+    let (left_unsigned, right_unsigned) = (left as u128, right as u128);
+    if right_unsigned == 0 {
+        return None;
+    }
+    let result = match op {
+        syn::BinOp::Div(_) => left_unsigned / right_unsigned,
+        syn::BinOp::Rem(_) => left_unsigned % right_unsigned,
+        _ => return None,
+    };
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "deliberate two's-complement bit reinterpretation of a `u128` result at or \
+                  above 2^127, the same convention every other u128-domain value in this \
+                  scan uses, not a value conversion"
+    )]
+    let reinterpreted = result as i128;
+    Some(reinterpreted)
 }
 
 /// `left && right` or `left || right`'s own value (`is_and` selects which), evaluated
@@ -3227,6 +3311,13 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
             ) =>
         {
             evaluate_ordering_op(binary.op, &binary.left, &binary.right, resolve)
+        }
+        // [`evaluate_division_op`] holds the rationale for why `Div`/`Rem` are not folded
+        // through `evaluate_binary_op` like every other arithmetic operator is.
+        syn::Expr::Binary(binary)
+            if matches!(binary.op, syn::BinOp::Div(_) | syn::BinOp::Rem(_)) =>
+        {
+            evaluate_division_op(binary.op, &binary.left, &binary.right, resolve)
         }
         // [`evaluate_binary_op`] holds the rationale for every operator this folds,
         // arithmetic and comparison alike, since both are one decision rather than two.
