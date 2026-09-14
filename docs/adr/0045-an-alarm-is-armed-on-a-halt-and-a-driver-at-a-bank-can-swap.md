@@ -65,14 +65,37 @@ device may already have sealed a bank under), and drives `Swap::beginning` throu
 run leaves no bank behind holding a stale seal. `Progress::Migrated { run }` is the new
 answer `boot` gives when this succeeds.
 
-Every field `swap_in` hands to `Swap::beginning` is either read from the device this same
-boot (`booted`, `run`) or the caller's own already-supplied `reserve` — closing ADR 0022's
-two named preconditions for a caller that only ever swaps through this driver, since neither
-value can be a caller-carried, potentially stale copy any more, and closing issue #110's own
-third: a capacity check that was nobody's obligation before is now the swap's own first
-statement.
+The two fields ADR 0022 named as `Swap::beginning`'s unverified preconditions — `booted` and
+`run` — are read from the device fresh on this same boot rather than carried in by a caller,
+closing that gap for a caller that only ever swaps through this driver. `swap_in`'s other
+inputs are not preconditions of the same shape: `bank.layout` is the geometry `Driver::at_bank`
+was configured with, fixed for the life of the driver rather than read per boot, and
+`next_header.input` is the workflow's own new content — checked by `verify_header_identity`
+below on the *next* boot, not by anything `Swap::beginning` itself could verify against a run
+that has not started yet. Closing issue #110's own third precondition is separate again: a
+capacity check that was nobody's obligation before is now the swap's own first statement.
+
+`swap_in` also refuses before touching the device in three cases a code review round added.
+An effect already scheduled and not yet resolved has a durable schedule record in the bank
+about to be reclaimed, so a live call refuses with `DriveError::EffectOutstanding` rather than
+forfeiting an identity no crash took. A next-run input wider than the run's own declared
+`run_input_bytes` bound would install a journal below `Reserve::for_layout`'s own floor,
+stranding the very run it just started, so it is refused with `DriveError::NextRunInputTooLong`
+before any byte moves. And a bank a swap has just installed carries no `RunStarted` record yet
+for `begin` to check the next workflow's identity against, so `verify_header_identity` makes
+the same comparison `begin` makes against a journal, against the header instead — refusing
+with `DriveError::NotThisWorkflow` when they disagree, on the very first boot of the bank a
+swap installed.
 
 ## Consequences
+
+**`Ctx::timer` takes a third argument, and `TimerFuture` lost its derived `Debug`.**
+`Ctx::timer(spec, alarm)` now borrows an `&mut dyn Alarm` for the future's own lifetime,
+alongside the journal and the spec it already took; every caller — the reference workflows,
+the size probe, the test suites — passes one, `&mut NoAlarm` where nothing else is armed.
+`TimerFuture` could not keep its `#[derive(Debug)]` once it held a `&mut dyn Alarm`, which has
+none; a hand-written impl that skipped the field would have needed a method `CTX_SURFACE`
+does not pin, so the derive is dropped rather than replaced.
 
 **The façade's `continue_as_new` join needed no changes of its own.**
 `waymaker-embassy::journal::Journal::continue_as_new` was already a pass-through to
@@ -108,10 +131,11 @@ its second bank provisioned into, rather than one bank sealed twice over with th
 sealing left to a swap that has not happened yet.
 
 **What this does not close.** `Swap::beginning`'s third precondition — that `next.run` is
-fresh for the *whole device*, not merely different from the run being retired — is closed
-for a device that only ever swaps through this driver, by the same argument ADR 0022's
-`RunId::successor()` monotonicity gives; it is not closed for one that does not, and
-`SwapError::RunReused` still only catches the adjacent case. Nothing obliges a caller to use
+fresh for the *whole device*, not merely different from the run being retired — is closed for
+a device that only ever swaps through this driver: `RunId::successor()` only ever advances, so
+a run id this driver mints has never been sealed under before, on this bank or the other one.
+It is not closed for a device that swaps by another route, and `SwapError::RunReused` still
+only catches the adjacent case. Nothing obliges a caller to use
 `Driver::at_bank` over `Driver::new` — a region-pointed driver remains a legitimate,
 supported shape, and its `continue_as_new` refusal is not a defect to fix but the honest
 answer for a driver that cannot name a bank. And this driver's own crash safety rests on
@@ -120,10 +144,14 @@ exhaustively sweep the same `Swap`/`Prepared`/`Staged`/`Sealable`/`Installed` ty
 driver calls unmodified, at every crash point across all seven steps — `swap_in` is new
 glue over an already-swept protocol, verified here on the fault-free path
 (`crates/waymaker-drive/tests/continue_as_new.rs`: a real two-bank device, a real swap, the
-next boot reading back the installed bank's own bytes) rather than by a crash sweep of the
-driver's own construction of it. A crash sweep through `continue_as_new` itself — covering
-the bank-selection reads alongside the seven steps as one driver-level operation — is not yet
-part of this workspace's suite, and CLAUDE.md's "what is not checked" says so.
+next boot reading back the installed bank's own bytes, its seal naming the right generation,
+and a third boot proving that read came from the bank the swap installed rather than from a
+stale one; the same file's own refusals — an effect left outstanding, a next-run input over
+the bound, a run id at the ceiling — each with the device read back untouched) rather than by
+a crash sweep of the driver's own construction of it. A crash sweep through `continue_as_new`
+itself — covering the bank-selection reads alongside the seven steps as one driver-level
+operation — is not yet part of this workspace's suite, and CLAUDE.md's "what is not checked"
+says so.
 
 ## Alternatives considered
 
@@ -136,19 +164,24 @@ too.
 **A default, no-op body for `Alarm::wake_after`**, so `NoAlarm` could be `impl Alarm for
 NoAlarm {}` with nothing to duplicate. Rejected: a default body is a firmware author's silent
 no-op waiting to happen — an alarm driver that forgot to override it would compile clean and
-never wake anything — and the one place `NoAlarm`'s own `{}` impl would have needed the
-default, `waymaker-embassy/src/clock.rs`, already declares `PersistentTimer::arm` under the
-same name family; keeping `Alarm` and `NoAlarm` in a module of their own
-(`waymaker-embassy::alarm`) sidesteps that collision without leaning on a default that would
-have weakened every other implementor's contract to do it.
+never wake anything.
+
+**Declaring `Alarm` and `NoAlarm` in `waymaker-embassy/src/clock.rs`**, beside
+`PersistentTimer`, where design document §11's other clock vocabulary already lives. Rejected
+on a gate rather than a design ground: `timer-capability` scans that file's text for a name
+declared more than once, and a trait's own signature plus its `impl` body in the same file are
+two textual occurrences of `wake_after` it cannot tell apart from a genuine duplicate
+declaration. A module of their own (`waymaker-embassy::alarm`) sidesteps the scan rather than
+arguing with it, matching the split this codebase already keeps elsewhere between a trait's
+declaration and its implementation.
 
 **Extending `Driver`'s existing fields with an `Option<BankLayout>`** rather than an internal
 `Pointing` enum with two full constructors. Rejected: a `Driver { region: JournalRegion, run:
 RunId, layout: Option<BankLayout>, .. }` can be built in states nothing should ever
 construct — a `layout` disagreeing with `region`, or present alongside a `run` `boot` would
 ignore — where the enum makes the two shapes exhaustive and mutually exclusive by
-construction, matching how `waymaker-flash`'s own `Source`/`Retired` types are shaped for
-the same reason.
+construction, matching how this driver's own `Source` type — and `waymaker-flash`'s
+`Retired`, beside it in `swap_in` — are each shaped for the same reason.
 
 **Deferring `reclaim` and adding a `Driver` method to perform it later.** Rejected for the
 same reason ADR 0022 gives `Swap::beginning` no separate "resume" entry point: a caller that

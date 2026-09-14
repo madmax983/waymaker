@@ -3238,16 +3238,28 @@ what `bank::select` decided for the length of that boot — closing the two prec
 this driver could be carrying stale. `Boundary::continue_as_new` on a bank-pointed driver now
 performs the whole seven-step swap, mints the next run with the new `RunId::successor()`,
 and checks `Reserve::for_layout` before touching the device — closing issue #110's third
-precondition, that nothing obliged a capacity check before swapping. `Driver::new`, pointed
-at a fixed region, is unchanged and still refuses with `DriveError::ContinueUnsupported`: a
-region genuinely does not name a bank. The façade needed no changes of its own for this half
-— `Journal::continue_as_new` was already a pass-through to `Boundary::continue_as_new`, so a
-driver behind it that can swap makes an awaited `ctx.continue_as_new(..)` really swap,
-unchanged. `crates/waymaker-drive/tests/continue_as_new.rs` drives a real two-bank device
-through the swap and reads the installed bank's bytes back the way a cold boot has to,
-rather than trusting the call that wrote them; what it does not yet do is a crash sweep of
-`continue_as_new` itself; the seven steps it calls are already exhaustively swept one layer
-down, in `crates/waymaker-flash/tests/swap.rs` and `crates/waymaker-fault/tests/swap.rs`,
+precondition, that nothing obliged a capacity check before swapping. Review of this change
+found three more ways a live call could go wrong that no test had driven yet, and each is a
+refusal before any byte moves: an effect scheduled and not yet resolved has a durable
+schedule record in the bank about to be reclaimed, so `swap_in` refuses with
+`DriveError::EffectOutstanding` rather than forfeiting an identity no crash took; a next-run
+input wider than the run's own declared bound would install a journal below
+`Reserve::for_layout`'s own floor, so it is `DriveError::NextRunInputTooLong`; and a bank a
+swap has just installed has no `RunStarted` record yet for `begin` to check the next
+workflow's identity against, so the new `verify_header_identity` makes the same comparison
+against the header instead, refusing with `DriveError::NotThisWorkflow` when they disagree.
+`Driver::new`, pointed at a fixed region, is unchanged and still refuses with
+`DriveError::ContinueUnsupported`: a region genuinely does not name a bank. The façade needed
+no changes of its own for this half — `Journal::continue_as_new` was already a pass-through to
+`Boundary::continue_as_new`, so a driver behind it that can swap makes an awaited
+`ctx.continue_as_new(..)` really swap, unchanged. `crates/waymaker-drive/tests/continue_as_new.rs`
+drives a real two-bank device through the swap and reads the installed bank's bytes and its
+seal's generation back the way a cold boot has to, rather than trusting the call that wrote
+them, then boots a third time with a mismatched workflow to prove that read came from the
+bank the swap installed and not a stale one; the three refusals above each have a test of
+their own, reading the device back untouched afterwards. What it does not yet do is a crash
+sweep of `continue_as_new` itself; the seven steps it calls are already exhaustively swept one
+layer down, in `crates/waymaker-flash/tests/swap.rs` and `crates/waymaker-fault/tests/swap.rs`,
 unmodified. Measured cost: zero bytes on every `cargo xtask size` row, and zero heap blocks
 on `cargo xtask profile`. See
 [ADR 0045](docs/adr/0045-an-alarm-is-armed-on-a-halt-and-a-driver-at-a-bank-can-swap.md).

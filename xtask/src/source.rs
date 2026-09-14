@@ -6619,8 +6619,10 @@ const FUTURE_POLL: &str = "poll";
 
 /// Every method the durable half declares.
 ///
-/// Four, one per thing a workflow can ask for. A fifth is a question the façade would be
-/// answering for itself.
+/// Five. Four are one per thing a workflow can ask for. The fifth, `deadline_remaining`, is
+/// not a new question: it reads back how long a halt already recorded still has to wait, so
+/// the façade's timer future can arm an alarm instead of asking the durable half again
+/// straight away. A sixth would be a question the façade could answer for itself.
 pub const CTX_JOURNAL_SURFACE: &[&str] = &[
     "continue_as_new",
     "deadline_remaining",

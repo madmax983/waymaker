@@ -7,7 +7,7 @@
 //! can.
 
 use waymaker_core::version::VersionRange;
-use waymaker_core::{Outcome, RunId};
+use waymaker_core::{ActivityKind, Outcome, RunId};
 use waymaker_drive::{
     Boundary, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
 };
@@ -15,6 +15,7 @@ use waymaker_fault::Device;
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
 use waymaker_flash::capacity::{Bounds, Reserve};
 use waymaker_flash::frame::ProgramAlign;
+use waymaker_flash::recovery::JournalRegion;
 use waymaker_flash::storage::{Geometry, StableStorage};
 
 const WORKFLOW_KIND: u16 = 0x00A1;
@@ -164,6 +165,48 @@ impl Workflow for JustStarted<'_> {
     }
 }
 
+/// A workflow that leaves an effect outstanding and then asks to migrate anyway.
+///
+/// §07's schedule record is already durable in bank A's journal when `continue_as_new`
+/// runs — the effect is committed, not merely asked for — so a swap that went ahead would
+/// forfeit an identity a crash never took.
+struct ScheduleThenContinue;
+
+impl Workflow for ScheduleThenContinue {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let _ = boundary.schedule(ActivityKind(1), b"an-effect-in-flight")?;
+        Err(boundary.continue_as_new(NEXT_INPUT))
+    }
+}
+
+/// Wider than [`BOUNDS`]'s `run_input_bytes`.
+const OVERSIZED_INPUT: [u8; 65] = [b'x'; 65];
+
+/// A workflow that asks `continue_as_new` for more than the run's own bound allows.
+struct ContinueWithOversizedInput;
+
+impl Workflow for ContinueWithOversizedInput {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Err(boundary.continue_as_new(&OVERSIZED_INPUT))
+    }
+}
+
 const fn scratch<'a>(page: &'a mut [u8; 512], result: &'a mut [u8; 16]) -> Scratch<'a> {
     Scratch { page, result }
 }
@@ -202,6 +245,14 @@ fn a_driver_at_a_bank_performs_a_real_swap_and_installs_the_next_run_in_the_othe
     assert_eq!(b_version, WORKFLOW_VERSION);
     assert_eq!(b_schema, INPUT_SCHEMA);
     assert_eq!(b_input, NEXT_INPUT);
+
+    // And the seal that made B authoritative names the generation after the one this
+    // device booted from — not merely *a* valid seal, which an understated generation
+    // would still decode as.
+    assert_eq!(
+        generation_on(&mut device, BankId::B),
+        Generation::FIRST.successor()
+    );
 }
 
 #[test]
@@ -237,10 +288,100 @@ fn the_next_boot_of_the_same_layout_replays_the_bank_the_swap_installed() {
         ),
         "{progress:?}"
     );
-    // And it is the installed run's own journal it replayed, not a coincidence of layout:
-    // `JustStarted` completes on its very first record, so this only holds if `begin`
-    // matched `next_run`'s bank rather than falling back to bank A's stale one.
     let _ = next_run;
+
+    // The proof that boot 2 replayed the bank the swap installed, rather than a coincidence
+    // of layout: boot 2 wrote a real `RunStarted` into bank B over `NEXT_INPUT`, so a third
+    // boot declaring a *different* input over the same layout can only be refused by reading
+    // that same record back. A stale fallback to bank A's own `RunStarted` — over
+    // `FIRST_INPUT` — would refuse this boot too, for the wrong reason, so the input below is
+    // chosen to differ from both.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted {
+            input: b"neither-run-ever-declared-this",
+        },
+        scratch(&mut page, &mut result),
+    );
+    assert_eq!(progress, Err(DriveError::NotThisWorkflow));
+}
+
+#[test]
+fn a_committed_effect_is_not_forfeited_by_a_live_continue_as_new() {
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ScheduleThenContinue,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(progress, Err(DriveError::EffectOutstanding));
+
+    // The swap never started: bank A is still the only sealed bank, carrying the run it
+    // always did, and bank B holds nothing a swap would have installed.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+    assert_eq!(header_on(&mut device, BankId::B), None);
+}
+
+#[test]
+fn an_oversized_next_run_input_is_refused_before_the_device_is_touched() {
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueWithOversizedInput,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(
+        progress,
+        Err(DriveError::NextRunInputTooLong {
+            bytes: OVERSIZED_INPUT.len(),
+            bound: BOUNDS.run_input_bytes,
+        })
+    );
+
+    // Refused before the device was asked for anything: bank A still boots the run it
+    // always did, and bank B was never erased.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+    assert_eq!(header_on(&mut device, BankId::B), None);
+}
+
+#[test]
+fn a_run_id_at_the_ceiling_is_refused_rather_than_reissued() {
+    let mut device = Device::new(geometry());
+    install(
+        &mut device,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            run: RunId(u64::MAX),
+            ..first_header()
+        },
+    );
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(progress, Err(DriveError::RunIdExhausted));
+    // No successor id exists to install, so nothing was written: bank B stays empty.
+    assert_eq!(header_on(&mut device, BankId::B), None);
 }
 
 #[test]
@@ -322,21 +463,36 @@ fn a_stale_bank_is_never_a_candidate_once_a_later_generation_exists() {
     assert_eq!(b_run, run);
 }
 
+/// `RunId::successor()` itself, directly — the unit this crate's own `a_run_id_at_the_ceiling_is_refused_rather_than_reissued`
+/// exercises through a real boot, above.
 #[test]
-fn the_run_id_a_swap_installs_never_wraps() {
+fn run_id_successor_refuses_only_at_the_ceiling() {
     assert_eq!(RunId(u64::MAX).successor(), None);
     assert_eq!(RunId(0).successor(), Some(RunId(1)));
 }
 
 /// Bank A's journal region, as a cold boot pointed at a fixed region would have to be
 /// handed it.
-fn first_region() -> waymaker_flash::recovery::JournalRegion {
-    let Ok(region) =
-        waymaker_flash::recovery::JournalRegion::of(layout(), BankId::A, &first_header())
-    else {
+fn first_region() -> JournalRegion {
+    let Ok(region) = JournalRegion::of(layout(), BankId::A, &first_header()) else {
         unreachable!("bank A holds a journal behind its header")
     };
     region
+}
+
+/// The generation a bank's seal names, read back the way a cold boot has to: header and
+/// seal, decoded together rather than assumed from the call that wrote them.
+fn generation_on(device: &mut Device, id: BankId) -> Option<Generation> {
+    let region = layout().bank(id);
+    let mut header = [0_u8; 512];
+    let Ok(()) = device.read(region.base(), &mut header) else {
+        unreachable!("a bank's header is inside the device")
+    };
+    let mut seal = [0_u8; bank::SEAL_BYTES];
+    let Ok(()) = device.read(region.seal_offset(), &mut seal) else {
+        unreachable!("a bank's seal is inside the device")
+    };
+    bank::sealed_generation(&header, &seal)
 }
 
 #[test]

@@ -214,6 +214,20 @@ pub enum DriveError<E> {
     /// [`SwapStepError`]'s own documentation. The retiring bank is untouched until the last
     /// step, so the device still boots the old run either way.
     SwapStep(SwapStepError<E>),
+    /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new)'s next run input is
+    /// wider than the run's own declared bound.
+    ///
+    /// Refused before the device is touched. `Swap::beginning`'s own gate only asks that
+    /// the header and one opening record fit the bank; it says nothing about the bound
+    /// *this* run priced its exits against, and installing a header wider than that bound
+    /// would price the new run's own journal below `Reserve::for_layout`'s floor —
+    /// stranding it the moment it is booted, with `DriveError::Reserve` on every boot after.
+    NextRunInputTooLong {
+        /// How many bytes the workflow passed.
+        bytes: usize,
+        /// The declared bound it was measured against.
+        bound: u16,
+    },
 }
 
 /// The two buffers a boot borrows.
@@ -400,6 +414,11 @@ impl<C: IntegrityCheck> Driver<C> {
             Pointing::Region(region, run) => (region, run, None),
             Pointing::Bank(layout) => {
                 let facts = select_bank::<S, C>(layout, storage, page)?;
+                // §10's `input` is durably recorded in the header for exactly this: an
+                // erased journal writes `RunStarted` from `workflow.identity()` alone, with
+                // nothing else to check it against, so a workflow booting the bank a swap
+                // just installed would otherwise be trusted to claim any input it liked.
+                verify_header_identity::<S, C, W>(layout, facts.id, storage, page, workflow)?;
                 let bank = BankContext {
                     layout,
                     booted: Authority::Bank {
@@ -474,8 +493,8 @@ struct BankFacts {
 /// `page`.
 ///
 /// A bank failing any of those is not a candidate at any generation, exactly as
-/// [`bank::sealed_generation_with`] documents: this function only adds the two reads that
-/// answer are read from rather than handed in, and the scalar fields
+/// [`bank::sealed_generation_with`] documents. This function only adds the two reads that
+/// answer is read *from* rather than handed in, and keeps the scalar fields
 /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) needs later.
 fn read_bank<S, C>(
     layout: BankLayout,
@@ -552,6 +571,51 @@ where
     // Unreachable: `select` names a bank only when its generation came from `Some`, which
     // is only ever produced beside the rest of that same bank's facts.
     .ok_or(DriveError::NoAuthoritativeBank)
+}
+
+/// Refuses a boot whose workflow does not match what bank `id`'s own header declares.
+///
+/// [`begin`] makes this comparison against the *journal*'s `RunStarted` record, but an
+/// erased journal has none — it writes one from `workflow.identity()` alone, with nothing
+/// else to check it against. A bank a swap just installed is exactly that: its header
+/// durably records the workflow and input `continue_as_new` was asked for, and until a
+/// first boot writes the opening record, `begin` cannot enforce it. This is the same
+/// comparison `begin` makes, against the header instead of the journal, so that recording
+/// stays enforced rather than becoming unreachable the moment it is written.
+fn verify_header_identity<S, C, W>(
+    layout: BankLayout,
+    id: BankId,
+    storage: &mut S,
+    page: &mut [u8],
+    workflow: &W,
+) -> Result<(), DriveError<S::Error>>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+    W: Workflow + ?Sized,
+{
+    let region = layout.bank(id);
+    let header_len = page.len().min(region.payload_bytes() as usize);
+    let Some(header_buf) = page.get_mut(..header_len) else {
+        // Unreachable: `select_bank` already read this many bytes of this same bank.
+        return Err(DriveError::NoAppendPoint);
+    };
+    storage
+        .read(region.base(), header_buf)
+        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
+    let Ok(header) = bank::decode_header_with::<C>(header_buf) else {
+        // Unreachable: `select_bank` already decoded this exact bank successfully.
+        return Err(DriveError::NoAppendPoint);
+    };
+    let identity = workflow.identity();
+    let (workflow_kind, input) = (header.workflow_kind, header.input);
+    if workflow_kind != identity.kind || input != identity.input {
+        return Err(DriveError::NotThisWorkflow);
+    }
+    identity
+        .versions
+        .admits(header.workflow_version)
+        .map_err(DriveError::Kernel)
 }
 
 /// Design document §06 steps 1 and 2: the run's own record, from history or newly written.
@@ -1859,10 +1923,29 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
         let Some(bank) = self.bank else {
             return Err(DriveError::ContinueUnsupported);
         };
+        // §07's two halves were left out of order: an effect scheduled and not yet
+        // resolved has a durable schedule record in the bank this call is about to
+        // reclaim, and §10's swap forfeits an effect's identity on purpose only when a
+        // *crash* leaves one behind — never as the ordinary answer to a live call. Every
+        // other boundary method refuses the same way; this is the same refusal.
+        if self.pending.is_some() {
+            return Err(DriveError::EffectOutstanding);
+        }
         // §10's reserve, consulted before the device is touched rather than left to a
         // caller's discretion: the `Bounds` this run was priced against have to fit the
         // bank the swap installs into, and both banks of one layout are the same size.
         Reserve::for_layout(self.reserve.bounds(), bank.layout).map_err(DriveError::Reserve)?;
+        // `Reserve::for_layout` prices the *bound* the run declared, not the bytes this
+        // call was actually handed — a header wider than that bound still fits
+        // `Swap::beginning`'s own, weaker gate, and installs a journal below
+        // `Reserve::for_layout`'s own floor, stranding the run it just started.
+        let bound = self.reserve.bounds().run_input_bytes;
+        if input.len() > usize::from(bound) {
+            return Err(DriveError::NextRunInputTooLong {
+                bytes: input.len(),
+                bound,
+            });
+        }
         let next_run = bank.run.successor().ok_or(DriveError::RunIdExhausted)?;
         let Some(storage) = take_storage(&mut self.source) else {
             return Err(DriveError::NoAppendPoint);
