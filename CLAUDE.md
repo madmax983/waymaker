@@ -3555,3 +3555,12 @@ kind of input this design has never claimed to survive: this function's whole po
 check exists for authors, not adversaries. Tracked as issue
 [#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
 one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #165 then closes that gap. `NamedFn` now carries `end_line`, the line of the
+function's closing brace. `book.rs`'s `declares_test` now checks the candidate's whole
+span against the anchor: the start line and the end line. It no longer checks the start
+line alone. The check refuses a candidate when its end line falls outside the anchor,
+even if its start line falls inside it. The test
+`an_anchor_end_marker_between_fn_and_the_name_does_not_count_as_containing_the_test`
+repeats the issue's own repro: an `ANCHOR_END` marker between `fn` and the name. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
