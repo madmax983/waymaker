@@ -3123,7 +3123,9 @@ pub fn public_functions_reachable(
     sources: &[LayerSource],
     graph: &PackageGraph,
 ) -> Vec<PublicFunction> {
-    scan_public_functions(sources, |crate_name| external_path_roots(graph, crate_name))
+    scan_public_functions(sources, |crate_name| {
+        external_path_roots(graph, crate_name, sources)
+    })
 }
 
 /// The scan both [`public_functions`] and [`public_functions_reachable`] run, differing
@@ -3409,21 +3411,74 @@ fn impl_trait_name<'a>(line: &'a str, external_roots: &HashSet<String>) -> Optio
 /// uses its local name, not its package name — the two can differ. This closes
 /// issue [#141](https://github.com/madmax983/waymaker/issues/141): a private trait
 /// can no longer hide a live impl of a real dependency's trait.
-fn external_path_roots(graph: &PackageGraph, crate_name: &str) -> HashSet<String> {
+///
+/// A dependency name is not always the external crate. `crate_name` could also
+/// declare its own `mod serde { .. }`, and Rust resolves a path through that
+/// module's own scope to the local one, not to the dependency. Such a name is
+/// dropped from the roots this returns, so it keeps checking against private
+/// trait names as it did before real dependencies were added here — the same
+/// answer a dependency this function does not know about would get. Codex found
+/// this on this pull request's own review.
+fn external_path_roots(
+    graph: &PackageGraph,
+    crate_name: &str,
+    sources: &[LayerSource],
+) -> HashSet<String> {
     let mut roots: HashSet<String> = EXTERNAL_PATH_ROOTS
         .iter()
         .map(|root| (*root).to_owned())
         .collect();
     if let Some(package) = graph.find(crate_name) {
-        roots.extend(package.manifest_deps.iter().map(|dependency| {
-            dependency
-                .rename
-                .as_deref()
-                .unwrap_or(&dependency.name)
-                .replace('-', "_")
-        }));
+        let shadowed = local_module_names(sources, crate_name);
+        roots.extend(
+            package
+                .manifest_deps
+                .iter()
+                .map(|dependency| {
+                    dependency
+                        .rename
+                        .as_deref()
+                        .unwrap_or(&dependency.name)
+                        .replace('-', "_")
+                })
+                .filter(|root| !shadowed.contains(root)),
+        );
     }
     roots
+}
+
+/// The names of every module `crate_name` declares — `mod <name>;` or `mod <name> {`,
+/// at any visibility, anywhere in the crate.
+///
+/// Read the same way [`private_trait_names`] reads trait declarations, and for the
+/// same reason: a `mod` can live in one file while a use of its name lives in
+/// another. A floor, not a proof — it does not know which file's *scope* a name is
+/// declared or used in, so it drops a dependency name from consideration crate-wide
+/// on any collision, even in a file where nothing shadows it.
+fn local_module_names(sources: &[LayerSource], crate_name: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == crate_name)
+    {
+        let code = crate::source::without_test_modules(&crate::source::code_only(&source.contents));
+        for line in code.lines() {
+            let classified = without_leading_attributes(line.trim());
+            if let Some(name) = module_declaration(classified) {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// The name a `mod <name>;` or `mod <name> {` line declares. `None` for any other
+/// line, `use` and `extern crate` included.
+fn module_declaration(line: &str) -> Option<&str> {
+    let rest = skip_restricted_visibility(line.strip_prefix("pub ").unwrap_or(line));
+    rest.strip_prefix("mod ")?
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .find(|token| !token.is_empty())
 }
 
 /// Path roots no crate in this workspace can declare a module or a trait under,
@@ -7336,6 +7391,39 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["run"]);
+    }
+
+    #[test]
+    fn a_dependency_name_shadowed_by_a_local_module_keeps_checking_private_traits() {
+        // A crate can declare its own `mod serde { .. }`. Rust then resolves
+        // `serde::Serialize` inside that module's scope to the local trait, not the
+        // dependency's. Treating `serde` as always-external here would demand a
+        // call the probe structurally cannot make — issue #49's failure, the one
+        // #141's own fix must not reintroduce. Codex found this on this pull
+        // request's own review.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "mod serde {\n\
+                           \x20   pub(crate) trait Serialize {\n\
+                           \x20       fn hidden(&self);\n\
+                           \x20   }\n\
+                           }\n"
+                .to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn hidden(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        assert!(functions.is_empty(), "{functions:?}");
     }
 
     #[test]
