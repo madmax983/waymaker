@@ -2492,11 +2492,23 @@ fn resolve_ancestor_single_segment(
 /// a match inside that child reading `super::P0` find the child's own value instead of the
 /// parent's, since the child's own scope is innermost and an unrestricted search never
 /// learns to stop before it. `self::P0` has the identical shape of gap (`levels_up: 0`),
-/// solved the same way [`resolve_ancestor_single_segment`] solves `super`'s. `crate::P0`
-/// stays anchored at this file's own root (depth `1`): unlike `self`/`super`, it never
-/// names a module `module_path`'s own prefix could still reach, since a bare `crate::NAME`
-/// always names something at the crate's true root, which no scan of one file down in an
-/// out-of-line tree can see beyond its own top scope.
+/// solved the same way [`resolve_ancestor_single_segment`] solves `super`'s.
+///
+/// `crate::P0` is not the same question at all, and Codex's next finding is that the
+/// earlier version answered it as though it were: it resolved `crate::NAME` against this
+/// *file's* own root (depth `1`), on the reasoning that a bare `crate::NAME` names
+/// something at the crate's true root and this scan cannot see past its own top scope —
+/// true of the second half and exactly backwards on the first. The scanned file
+/// (`crc.rs`) is itself one submodule of `waymaker-flash`, `crate::crc`, not the crate's
+/// own root `crate` — so `crate::P0` names a constant declared in `waymaker-flash`'s
+/// `lib.rs`, which is outside the checksum module's own tree this scan ever reads, and
+/// answering from this file's root was answering a different, unasked question
+/// (`crc::P0` in Rust's own naming, which a bare unanchored `P0` or a `self::P0` already
+/// reach correctly). Resolved as always-unresolved instead: `AnchoredLookup::Resolved` is
+/// still returned unconditionally, so a `crate::P0` this scan cannot see behind still
+/// fails closed to "not dense" rather than falling through to `resolve_qualified_path`'s
+/// own unrelated handling, which could otherwise resolve a same-named `crc::P0` by
+/// coincidence and answer with the wrong module's value.
 ///
 /// [`resolve_anchored_single_segment`]'s answer: either the shape does not apply and the
 /// caller's own unrelated handling decides, or it does, with whatever value (`None`
@@ -2520,10 +2532,16 @@ fn resolve_anchored_single_segment(
         return AnchoredLookup::NotApplicable;
     };
     if first == "crate" {
-        let (true, Some(&name)) = (rest.len() == 1, rest.first()) else {
+        let (true, Some(_)) = (rest.len() == 1, rest.first()) else {
             return AnchoredLookup::NotApplicable;
         };
-        return AnchoredLookup::Resolved(scopes.resolve_from(name, 1));
+        // A bare `crate::NAME` names the crate's true root, `waymaker-flash/src/lib.rs`
+        // — outside the checksum module's own tree this scan ever reads, and never this
+        // scanned *file's* own root the way the removed `scopes.resolve_from(name, 1)`
+        // answered it. Anchored and always unresolved, so the caller fails closed rather
+        // than falling through to `resolve_qualified_path`, which could otherwise answer
+        // with a same-named constant from the wrong module entirely.
+        return AnchoredLookup::Resolved(None);
     }
     if first == "self" {
         let (true, Some(&name)) = (rest.len() == 1, rest.first()) else {

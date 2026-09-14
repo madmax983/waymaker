@@ -8987,22 +8987,63 @@ fn missing_value(numbered: &[crate::parse::FoundArm]) -> Option<i128> {
 #[must_use]
 fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
     let total = found.arms.len();
-    let Some(last) = total.checked_sub(1) else {
-        return false;
-    };
     if total < MINIMUM_DENSE_TABLE_ARMS {
         return false;
     }
-    let Some(wildcard) = found.arms.get(last) else {
-        return false;
-    };
-    if !wildcard.is_wild {
-        return false;
+    if let Some(last) = total.checked_sub(1) {
+        if let Some(wildcard) = found.arms.get(last) {
+            if wildcard.is_wild {
+                if let Some(numbered) = found.arms.get(..last) {
+                    if missing_value(numbered).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
     }
-    let Some(numbered) = found.arms.get(..last) else {
+    // Codex's finding: a match over a `#[repr(_)]` enum that names every variant
+    // explicitly — a real, common shape once `visit_item_enum` resolves the
+    // discriminants at all — has no wildcard, but `rustc` still lowers a fully dense,
+    // gap-free set of arms to the identical indexed table a `numbered` set plus a
+    // wildcard gets. `wildcard.is_wild` required a final catch-all unconditionally,
+    // which is a spelling requirement `rustc`'s own exhaustiveness check does not share
+    // — the same shape of gap issue #44's `has_dense_arm_patterns` closed for "does the
+    // last arm have to be `_`" answered for one axis and not the other.
+    fully_dense_arm_patterns(&found.arms)
+}
+
+/// Whether every one of `arms`' patterns resolves, together covering a run of
+/// consecutive integers with no gap at all — the wildcard-free twin of the single-gap
+/// window [`missing_value`] looks for, for a match that names every value explicitly
+/// (an exhaustive enum match, most often) rather than leaving one for a catch-all.
+fn fully_dense_arm_patterns(arms: &[crate::parse::FoundArm]) -> bool {
+    let mut values = Vec::new();
+    for arm in arms {
+        if arm.pattern.is_empty() {
+            return false;
+        }
+        values.extend(arm.pattern.iter().copied());
+    }
+    let Some(base) = values.iter().copied().min() else {
         return false;
     };
-    missing_value(numbered).is_some()
+    let mut covered = vec![false; values.len()];
+    for value in values {
+        let Some(offset) = value
+            .checked_sub(base)
+            .and_then(|offset| usize::try_from(offset).ok())
+        else {
+            return false;
+        };
+        let Some(slot) = covered.get_mut(offset) else {
+            return false;
+        };
+        if *slot {
+            return false;
+        }
+        *slot = true;
+    }
+    covered.iter().all(|seen| *seen)
 }
 
 /// Whether every one of `found`'s arms calls one consistent callee with its own pattern's
@@ -15646,6 +15687,32 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_exhaustive_dense_match_with_no_wildcard_is_reported() {
+        // Codex's thirty-third-round finding: `has_dense_arm_patterns` required the
+        // final arm to be a wildcard unconditionally, but a match over a `#[repr(u8)]`
+        // enum that names every variant explicitly — legal, ordinary Rust, and the more
+        // common shape for an exhaustive enum match — has no wildcard at all, and
+        // `rustc` still lowers a fully dense, gap-free set of arms to the identical
+        // indexed table a `numbered`-plus-wildcard spelling gets. `fully_dense_arm_patterns`
+        // is the wildcard-free twin of `missing_value`'s own window: every arm resolves,
+        // and together they cover a run of consecutive integers with no gap anywhere.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[repr(u8)]\nenum Indices {\n    P0,\n    P1,\n    P2,\n    P3,\n}\n\nconst \
+             fn exhaustive_enum_pattern_table(index: Indices) -> u32 {\n    match index {\n        \
+             Indices::P0 => 0,\n        Indices::P1 => 1,\n        Indices::P2 => 2,\n        \
+             Indices::P3 => 3,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_cfg_test_gated_local_match_in_an_ordinary_function_is_not_reported() {
         // Codex's thirtieth-round finding: `syn::visit::visit_block`'s default walk
         // descends into every statement unconditionally, so a `#[cfg(test)] let expected =
@@ -15955,6 +16022,35 @@ mod deferred_answer_pins {
         ]);
         assert!(
             violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_crate_and_one_segment_does_not_resolve_locally() {
+        // Codex's thirty-third-round finding: `crate::P0` was resolved against the
+        // *scanned file's* own root (depth 1), on the reasoning that this scan cannot
+        // see the crate's real root anyway — true, but the fallback it used was still
+        // wrong, since `crc.rs` is itself one submodule (`crate::crc`), never the
+        // crate's own root (`crate`). A dense-looking match written as `crate::P0`
+        // through `crate::P3` plus a wildcard, even where this file *also* happens to
+        // declare identically-named, identically-dense local constants of its own, must
+        // not be reported by coincidentally resolving against the wrong module's
+        // constants — `crate::NAME` now always fails closed to unresolved, since the
+        // module it really names (`waymaker-flash`'s own `lib.rs`) is outside the tree
+        // this scan reads at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+             3;\n\nconst fn crate_qualified_pattern_table(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        crate::P0 => 0,\n        crate::P1 => 1,\n        \
+             crate::P2 => 2,\n        crate::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
             "{violations:?}"
