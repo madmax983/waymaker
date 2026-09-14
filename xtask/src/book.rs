@@ -749,21 +749,41 @@ fn anchors(sample: &str) -> Vec<Anchor> {
 /// unconditionally fails in both directions: it can vouch for an unrelated real test while
 /// an untested decoy sits in the anchor (round 5), and it can just as wrongly refuse an
 /// anchor whose own declaration is real and runs, because some other same-named declaration
-/// earlier in the file happens not to be a test (Codex, review round 6). A candidate whose
-/// own line falls inside `anchor` is preferred over every other candidate; only when none do
-/// is the first taken, which keeps the existing "declared, but outside the anchor" report for
-/// a file with exactly one declaration of the name.
+/// earlier in the file happens not to be a test (round 6). And stopping at the first
+/// *in-anchor* candidate is the same mistake one level in: two same-named declarations can
+/// both sit inside one anchor — an ordinary helper in one nested module and a real `#[test]`
+/// in another — and the first one found need not be the qualifying one (Codex, review round
+/// 7). [`verdict`] is tried against every in-anchor candidate in turn, and the first that
+/// qualifies wins; only when *no* candidate sits inside `anchor` at all does the search widen
+/// to every declaration in the file, which keeps the existing "declared, but outside the
+/// anchor" report for a file with exactly one declaration of the name.
 fn declares_test(
     sample: &str,
     name: &str,
     anchor: std::ops::RangeInclusive<usize>,
 ) -> Result<usize, String> {
     let candidates = crate::parse::fns_matching(sample, name, true);
-    let function = candidates
+    let mut in_anchor = candidates
         .iter()
-        .find(|function| anchor.contains(&function.line.saturating_sub(1)))
-        .or_else(|| candidates.first())
-        .ok_or_else(|| format!("declares no `#[test] fn {name}`"))?;
+        .filter(|function| anchor.contains(&function.line.saturating_sub(1)))
+        .peekable();
+    let pool: Box<dyn Iterator<Item = &crate::parse::NamedFn>> = if in_anchor.peek().is_some() {
+        Box::new(in_anchor)
+    } else {
+        Box::new(candidates.iter())
+    };
+    let mut last_reason = None;
+    for function in pool {
+        match verdict(function, name) {
+            Ok(at) => return Ok(at),
+            Err(reason) => last_reason.get_or_insert(reason),
+        };
+    }
+    Err(last_reason.unwrap_or_else(|| format!("declares no `#[test] fn {name}`")))
+}
+
+/// Whether `function` is a test nothing can skip, and its position if it is.
+fn verdict(function: &crate::parse::NamedFn, name: &str) -> Result<usize, String> {
     let at = function.line.saturating_sub(1);
     let mut tested = false;
     for attribute in &function.attrs {
@@ -2620,6 +2640,44 @@ mod tests {
             !fired(&check(&inputs), BOOK),
             "a real test in the anchor was refused because of an earlier non-test of the \
              same name"
+        );
+    }
+
+    #[test]
+    fn a_qualifying_test_is_found_even_behind_a_non_test_inside_the_same_anchor() {
+        // Codex, review round 7 of issue #97: stopping at the first *in-anchor* candidate
+        // is round 6's mistake one level in. Two same-named declarations can both sit
+        // inside one anchor — an ordinary helper first, a real `#[test]` second — and the
+        // first is not the qualifying one.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "// ANCHOR: a_first_sample\nfn a_first_sample() {}\n#[test]\nfn a_first_sample() {\n    \
+             assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            !fired(&check(&inputs), BOOK),
+            "a real test was refused because a non-test of the same name shares its anchor"
+        );
+    }
+
+    #[test]
+    fn an_anchor_marker_between_fn_and_the_name_does_not_count_as_containing_the_test() {
+        // Codex, review round 7 of issue #97: a line comment between `fn` and its
+        // identifier is legal Rust, so `declares_test` used to read the *identifier's*
+        // line as the test's position — inside the anchor here — while the `fn` keyword
+        // itself sits outside it. mdBook would then render `a_first_sample() { .. }` with
+        // no `fn` at all: not the tested function the book claims to show.
+        let mut inputs = good_book();
+        inputs.samples[0].1 = inputs.samples[0].1.replacen(
+            "// ANCHOR: a_first_sample\n#[test]\nfn a_first_sample() {\n    assert!(true);\n}\n",
+            "#[test]\nfn\n// ANCHOR: a_first_sample\na_first_sample() {\n    assert!(true);\n}\n",
+            1,
+        );
+        assert!(
+            fired(&check(&inputs), BOOK),
+            "an anchor missing its own `fn` keyword was accepted as showing a real test"
         );
     }
 

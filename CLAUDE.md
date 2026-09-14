@@ -3268,11 +3268,30 @@ candidate answers "is the anchor's own declaration a real test" directly, rather
 some declaration of this name run," which is a different question in each direction once a
 name can be declared more than once.
 
+Round 7 found two more, both in the sixth's own fix. The first is the sixth's mistake one
+level in: preferring the first *in-anchor* candidate is still "the first match," now scoped
+to a smaller pool rather than answered. Two same-named declarations can both sit inside one
+anchor — an ordinary helper in one nested module, a real `#[test]` in another — and the
+first one is not necessarily the qualifying one. `declares_test` now tries every in-anchor
+candidate in turn (widening to every declaration in the file only when none sit in the
+anchor at all) and takes the first that actually qualifies, via a `verdict` helper the
+per-candidate check was pulled into.
+
+The second is sharper: [`crate::parse::NamedFn::line`] read the function's *identifier*
+span, and a line comment between the `fn` keyword and the name — legal Rust, since a comment
+is whitespace to the lexer — can put the keyword outside an anchor whose line range still
+contains the identifier. mdBook would then render the fragment starting after `fn`, which is
+not the tested function the check claims to have found. `line` now reads
+`Signature::fn_token`'s own span instead, the start of the item rather than the start of its
+name.
+
 The parametrized test grew eleven cases across the first four rounds, one or more per bug
-found, and every earlier one still passes unmodified against each fix in turn. The fifth and
-sixth bugs were not spellings any single attribute check could see — they were a mismatch
-between two different functions of one name, in each direction — so
-`a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name` and
-`a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor` each stand beside
-that parametrized test rather than inside it. No new ADR: nothing here moves a must-not-own
-cell, a dependency edge, or a rule id.
+found, and every earlier one still passes unmodified against each fix in turn. Rounds five
+through seven were not spellings any single attribute check could see — each was a mismatch
+between which declaration answered and which one the anchor actually meant — so
+`a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name`,
+`a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor`,
+`a_qualifying_test_is_found_even_behind_a_non_test_inside_the_same_anchor` and
+`an_anchor_marker_between_fn_and_the_name_does_not_count_as_containing_the_test` each stand
+beside that parametrized test rather than inside it. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
