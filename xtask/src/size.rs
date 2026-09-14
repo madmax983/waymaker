@@ -3083,6 +3083,9 @@ enum Block {
 
 /// Every function of the layers that a caller outside the crate can reach.
 ///
+/// Judges each `impl <Trait> for <Type>` against the fixed roots in
+/// `EXTERNAL_PATH_ROOTS`.
+///
 /// `pub fn` is not the whole answer, and assuming it was left a hole big enough to drive a
 /// storage backend through: a method of a `trait`, and a method of an `impl Trait for
 /// Type`, carry no `pub` at all — the trait's visibility is what makes them callable. A
@@ -3091,13 +3094,50 @@ enum Block {
 ///
 /// Scanned rather than parsed, like every other rule here, and `#[cfg(test)]` modules are
 /// skipped by brace depth: a test helper is not code the firmware links.
+///
+/// # A floor, not a proof
+///
+/// A real dependency not on the fixed list — `serde`, say — can still read as local, so a
+/// private trait of the same name can hide a live external impl. [`public_functions_reachable`]
+/// closes that gap with a real dependency graph. This function stays for a caller with no
+/// graph in hand. Issue [#141](https://github.com/madmax983/waymaker/issues/141).
 #[must_use]
 pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
+    scan_public_functions(sources, |_crate_name| {
+        EXTERNAL_PATH_ROOTS
+            .iter()
+            .map(|root| (*root).to_owned())
+            .collect()
+    })
+}
+
+/// Every function of the layers that a caller outside the crate can reach.
+///
+/// Judges each `impl <Trait> for <Type>` against `graph`'s real dependency names, as well
+/// as the fixed roots in `EXTERNAL_PATH_ROOTS`. A private trait can no longer hide a live
+/// impl of a trait the crate really depends on — `impl serde::Serialize for Bank`, say,
+/// beside a local, unrelated `trait Serialize`. Issue
+/// [#141](https://github.com/madmax983/waymaker/issues/141).
+#[must_use]
+pub fn public_functions_reachable(
+    sources: &[LayerSource],
+    graph: &PackageGraph,
+) -> Vec<PublicFunction> {
+    scan_public_functions(sources, |crate_name| external_path_roots(graph, crate_name))
+}
+
+/// The scan both [`public_functions`] and [`public_functions_reachable`] run, differing
+/// only in what `external_roots_for` says a crate's dependency names are.
+fn scan_public_functions(
+    sources: &[LayerSource],
+    external_roots_for: impl Fn(&str) -> HashSet<String>,
+) -> Vec<PublicFunction> {
     let mut found = Vec::new();
     for source in sources {
         // A trait can live in one file. Its `impl` can live in another. Collect the
         // crate's private trait names first, before any `impl` in the crate is read.
         let private_traits = private_trait_names(sources, &source.crate_name);
+        let external_roots = external_roots_for(&source.crate_name);
 
         let mut depth: i32 = 0;
         let mut test_module: Option<i32> = None;
@@ -3145,7 +3185,8 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     // rather than above it. Review of issue #35 landed exactly that and
                     // watched nine surface pins and `size-probe-reach` stay green, so it is
                     // closed in the reader they share rather than in one rule.
-                    let declared_here = declaration_kind(classified, &private_traits);
+                    let declared_here =
+                        declaration_kind(classified, &private_traits, &external_roots);
                     let inline = declared_here.is_some() && opens > 0;
                     // The member's *own* prefix, which is what follows the block's opening
                     // brace — not the whole line before the `fn` keyword. Testing that the
@@ -3169,7 +3210,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     }
                 }
 
-                if let Some(kind) = declaration_kind(classified, &private_traits) {
+                if let Some(kind) = declaration_kind(classified, &private_traits, &external_roots) {
                     pending = Some(kind);
                 }
                 if opens > 0 {
@@ -3213,7 +3254,14 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
 ///
 /// `None` for every other line, so that a block nobody declared — a `mod`, a function body
 /// — is pushed as [`Block::Other`] and the stack still mirrors the brace depth.
-fn declaration_kind(line: &str, private_traits: &HashSet<String>) -> Option<Block> {
+///
+/// `external_roots` is the set of path roots that can never name a trait this crate
+/// declares — see [`external_path_roots`].
+fn declaration_kind(
+    line: &str,
+    private_traits: &HashSet<String>,
+    external_roots: &HashSet<String>,
+) -> Option<Block> {
     if let Some((_, public)) = trait_declaration(line) {
         return Some(if public { Block::Trait } else { Block::Other });
     }
@@ -3221,7 +3269,7 @@ fn declaration_kind(line: &str, private_traits: &HashSet<String>) -> Option<Bloc
         // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
         // makes its unmarked methods callable from outside, and only while `Storage` is
         // itself a trait the probe has a path to.
-        return Some(match impl_trait_name(line) {
+        return Some(match impl_trait_name(line, external_roots) {
             Some((name, true)) if private_traits.contains(name) => Block::Other,
             Some(_) => Block::TraitImpl,
             None => Block::Other,
@@ -3316,13 +3364,13 @@ fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<Str
 ///
 /// A path names its last segment: `crate::sealed::Sealed` and `sealed::Sealed` both
 /// name `Sealed`. The second field is `false` only when the path's first segment is
-/// one of [`EXTERNAL_PATH_ROOTS`] — `core::fmt::Debug` names an external trait, and
-/// its last segment must never be checked against this crate's own private trait
-/// names, a private trait happening to share that name is a different trait, in a
-/// different crate. Every other qualified path — `crate::`, `self::`, `super::`, or a
-/// bare relative path such as `sealed::Sealed` — can still name a trait this crate
-/// itself declares, so its last segment is checked.
-fn impl_trait_name(line: &str) -> Option<(&str, bool)> {
+/// in `external_roots` — `core::fmt::Debug` names an external trait, and its last
+/// segment must never be checked against this crate's own private trait names, a
+/// private trait happening to share that name is a different trait, in a different
+/// crate. Every other qualified path — `crate::`, `self::`, `super::`, or a bare
+/// relative path such as `sealed::Sealed` — can still name a trait this crate itself
+/// declares, so its last segment is checked.
+fn impl_trait_name<'a>(line: &'a str, external_roots: &HashSet<String>) -> Option<(&'a str, bool)> {
     let (before, _after) = line.split_once(" for ")?;
     let before = before.strip_prefix("impl").unwrap_or(before);
     let before = skip_leading_generic_params(before);
@@ -3339,24 +3387,49 @@ fn impl_trait_name(line: &str) -> Option<(&str, bool)> {
         name = segment;
         qualified = true;
     }
-    let local = !qualified || !EXTERNAL_PATH_ROOTS.contains(&first);
+    let local = !qualified || !external_roots.contains(first);
     Some((name, local))
 }
 
-/// Path roots no crate in this workspace can declare a module or a trait under.
+/// Path roots `crate_name` can never declare a module or a trait under: the fixed
+/// names in [`EXTERNAL_PATH_ROOTS`], plus every crate `crate_name` really depends
+/// on, read from `graph`.
 ///
 /// A qualified trait path starting with one of these is always a foreign trait, so
 /// its name is never checked against this crate's own private trait names. Every
 /// other root — `crate`, `self`, `super`, or a bare relative path such as `sealed` —
 /// can still resolve to a trait this crate declares itself.
 ///
-/// A floor, not a proof: a real dependency root this list does not name — `serde` in
-/// `impl serde::Serialize for Bank`, say — reads as potentially local too. A private
-/// trait declared under that exact name in the same crate would then hide a live,
-/// reachable impl. Closing that needs the crate's real dependency names, which this
-/// function has no path to; [`PackageGraph`] holds them elsewhere in this module, and
-/// issue [#141](https://github.com/madmax983/waymaker/issues/141) is where wiring it
-/// through is owed.
+/// Reads declared dependency names rather than resolved ones: a name in the
+/// manifest is in the extern prelude whether or not this build enabled it, and a
+/// declared name needs no matching package elsewhere in `graph`.
+///
+/// A dependency's crate-root spelling is its package name with every `-` swapped
+/// for `_`, the same rule cargo uses to name its own extern-prelude entry. Closes
+/// issue [#141](https://github.com/madmax983/waymaker/issues/141): a private trait
+/// can no longer hide a live impl of a trait the crate really depends on.
+fn external_path_roots(graph: &PackageGraph, crate_name: &str) -> HashSet<String> {
+    let mut roots: HashSet<String> = EXTERNAL_PATH_ROOTS
+        .iter()
+        .map(|root| (*root).to_owned())
+        .collect();
+    if let Some(package) = graph.find(crate_name) {
+        roots.extend(
+            package
+                .manifest_deps
+                .iter()
+                .map(|dependency| dependency.name.replace('-', "_")),
+        );
+    }
+    roots
+}
+
+/// Path roots no crate in this workspace can declare a module or a trait under,
+/// whatever its own dependencies are — the three names every crate's implicit
+/// prelude carries.
+///
+/// Used alone by [`public_functions`], for a caller with no dependency graph in
+/// hand. [`external_path_roots`] adds a crate's real dependencies to this floor.
 const EXTERNAL_PATH_ROOTS: &[&str] = &["core", "std", "alloc"];
 
 /// Removes one leading `<...>` group from `text`, balanced across any nested pair.
@@ -3676,8 +3749,12 @@ fn function_name(line: &str) -> Option<&str> {
 /// call graph. What it does catch, mechanically and every time, is the case that arrives
 /// silently: a layer gains a function and nobody wires the probe up to it.
 #[must_use]
-pub fn check_probe_reach(sources: &[LayerSource], probe: Option<&str>) -> Vec<Violation> {
-    let functions = public_functions(sources);
+pub fn check_probe_reach(
+    sources: &[LayerSource],
+    graph: &PackageGraph,
+    probe: Option<&str>,
+) -> Vec<Violation> {
+    let functions = public_functions_reachable(sources, graph);
     if functions.is_empty() {
         return Vec::new();
     }
@@ -4052,7 +4129,7 @@ mod tests {
     use super::*;
     use crate::elf::tests_support::{Class, ElfBuilder, SectionSpec};
     use crate::elf::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE};
-    use crate::graph::{Package, PackageGraph};
+    use crate::graph::{DepKind, Package, PackageGraph};
 
     fn workspace(core_features: &[&str], embassy_features: &[&str]) -> PackageGraph {
         PackageGraph::new(vec![
@@ -6861,7 +6938,7 @@ mod tests {
     }
 
     fn reach_violations(sources: &[LayerSource], probe: &str) -> String {
-        check_probe_reach(sources, Some(probe))
+        check_probe_reach(sources, &PackageGraph::default(), Some(probe))
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -6887,6 +6964,7 @@ mod tests {
         assert!(
             check_probe_reach(
                 &kernel("pub fn advance() {}\n"),
+                &PackageGraph::default(),
                 Some("fn probe() { waymaker_core::advance(); }\n"),
             )
             .is_empty()
@@ -7121,6 +7199,85 @@ mod tests {
     }
 
     #[test]
+    fn a_real_dependency_is_not_hidden_by_a_same_named_private_trait() {
+        // `serde` is not on the fixed `EXTERNAL_PATH_ROOTS` list. Without the real
+        // dependency graph, a private trait named `Serialize` hides the live
+        // `impl serde::Serialize for Bank` and understates the size report. Issue #141.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["serialize"]);
+    }
+
+    #[test]
+    fn public_functions_alone_still_hides_an_impl_of_an_unlisted_dependency() {
+        // `public_functions` has no graph to consult, so a caller with no graph in hand
+        // keeps the old, narrower floor. Only `public_functions_reachable` closes #141.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        assert!(public_functions(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_real_dependency_check_probe_reach_requires_the_call() {
+        // The gate itself, end to end: `check_probe_reach` goes through
+        // `public_functions_reachable`, so a probe that never calls `serialize` is
+        // still reported even though the crate's own `Serialize` trait is private.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let violations = check_probe_reach(&sources, &graph, Some("fn probe() {}\n"));
+        let message = violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message.contains("serialize"), "{message}");
+    }
+
+    #[test]
     fn a_trait_declared_only_inside_a_block_comment_is_not_counted_as_private() {
         // A hand-rolled `//`-only comment skip leaves a block-commented trait
         // declaration counted as real. That hides a live impl of an unrelated
@@ -7345,7 +7502,12 @@ mod tests {
             "fn probe() { let f = seal(); }\n",
         ] {
             assert!(
-                check_probe_reach(&kernel("pub fn seal() {}\n"), Some(probe)).is_empty(),
+                check_probe_reach(
+                    &kernel("pub fn seal() {}\n"),
+                    &PackageGraph::default(),
+                    Some(probe)
+                )
+                .is_empty(),
                 "{probe} should count as a call"
             );
         }
@@ -7380,12 +7542,23 @@ mod tests {
     #[test]
     fn a_workspace_whose_layers_have_no_public_functions_yet_has_nothing_to_reach() {
         // Rung 0.0. The rule must be silent rather than demanding the probe call nothing.
-        assert!(check_probe_reach(&kernel("//! Docs only.\n"), Some("")).is_empty());
+        assert!(
+            check_probe_reach(
+                &kernel("//! Docs only.\n"),
+                &PackageGraph::default(),
+                Some("")
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn a_probe_with_no_source_cannot_be_shown_to_reach_anything() {
-        let violations = check_probe_reach(&kernel("pub fn advance() {}\n"), None);
+        let violations = check_probe_reach(
+            &kernel("pub fn advance() {}\n"),
+            &PackageGraph::default(),
+            None,
+        );
         assert!(!violations.is_empty());
     }
 
