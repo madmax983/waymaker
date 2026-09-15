@@ -260,6 +260,24 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     pub fn payload(&self) -> &[u8] {
         self.out.get(..self.payload).unwrap_or_default()
     }
+
+    /// Whether a dispatcher has answered [`Produced::Unserviceable`] for a still-outstanding
+    /// effect this boot.
+    ///
+    /// Every future this `Ctx` builds already refuses once this is set — see
+    /// [`ActivityFuture`], [`TimerFuture`], [`ContinueFuture`] and [`TerminalFuture`]'s own
+    /// `poll` bodies. It does not follow that the *workflow* stalls: a caller that polled the
+    /// stalled future directly rather than through `.await` — a `select!` that dropped it for
+    /// another branch, say — can still have the enclosing `async fn` return its own `Result`
+    /// on its own, with no boundary reached and no conclusion recorded. A bridge from this
+    /// façade to a synchronous driver reads this before trusting a raw `Poll::Ready` for
+    /// exactly that reason: the effect is still outstanding under its committed identity, and
+    /// a bridge that read the workflow's bare return value there would report a conclusion
+    /// the driver's own bookkeeping disagrees with.
+    #[must_use]
+    pub const fn unserviceable(&self) -> bool {
+        self.unserviceable
+    }
 }
 
 /// Where an activity boundary has got to.

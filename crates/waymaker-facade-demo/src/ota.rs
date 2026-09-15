@@ -249,6 +249,15 @@ impl<D: ActivityDispatcher> Workflow for Ota<D> {
                 // the run's two bounds. `Pending` with no ending is a workflow that
                 // suspended.
                 (Some(Conclusion::Refused), _) | (None, Poll::Pending) => None,
+                // An effect answered `Unserviceable` and is still outstanding, and the
+                // workflow returned on its own without ever recording a conclusion --
+                // past a `select!` that dropped the stalled future for another branch,
+                // say. Trusting the raw return here would report a completion or a
+                // failure while the effect is still outstanding under its committed
+                // identity, which is the same shape the driver's own boundary refuses as
+                // `DriveError::EffectOutstanding`. Treat it as the same clean stall a
+                // directly-`.await`ed `Unserviceable` already is.
+                (None, Poll::Ready(_)) if ctx.unserviceable() => None,
                 // The workflow returned without recording an ending, so its own `Result` is
                 // what the run ended with.
                 (None, Poll::Ready(Ok(()))) => Some(Ended::Completed(0)),

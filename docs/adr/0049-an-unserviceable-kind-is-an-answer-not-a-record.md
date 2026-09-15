@@ -86,7 +86,7 @@ two levels. `crates/waymaker-embassy/tests/wiring.rs`'s
 `a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_could_not` is the
 façade's own sequencing, over a fake journal: a table with no row leaves nothing resolved,
 and a second table that gains the row resolves the same effect under the same identity.
-`crates/waymaker-drive/tests/dispatch.rs`'s
+`crates/waymaker-facade-demo/tests/dispatch.rs`'s
 `a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_left_outstanding` is
 the same claim over real media: a table with no row commits a schedule record and writes
 nothing else; a second boot, over the same device, with a table that has the row, redelivers
@@ -152,6 +152,34 @@ same `Ctx`, asserting the journal is asked nothing further and, for the terminal
 `facade` row from 13114 B to **13122 B** of the 14336 B gate — the second and third rounds'
 combined cost, against the first round's own claim of nil, which was true only of that
 round's own diff.
+
+A fourth Codex round found the third round's own mechanism reaches only as far as `Ctx`'s own
+futures. `waymaker-facade-demo`'s `ota.rs` and `provisioning.rs` each bridge the façade
+through `waymaker-drive`'s synchronous boundary with the same shape: poll the workflow's
+`async fn` once, and if `ctx.conclusion()` answers `None` while the poll answered
+`Poll::Ready`, trust the workflow's own bare `Result` as what the run ended with. That
+fallback exists for a workflow whose `?` propagates an ordinary activity failure straight out
+of the function — but nothing stops a *cancelled* boundary reaching it too. A workflow that
+polled a stalled `ActivityFuture` directly rather than through `.await` — a `select!` that
+dropped it for another branch, say — can still return its own `Ok` or `Err` with the dropped
+effect still outstanding and no conclusion ever recorded through `ctx`. The bridge would then
+report a completion or a failure the driver's own boundary disagrees with, which is exactly
+the `DriveError::EffectOutstanding` shape this whole ADR exists to keep out of that path.
+
+`Ctx` gains a fourth accessor, `unserviceable`, answering whether the flag the third round
+added is set. Both bridges' match now refuses the raw-return fallback while it is:
+`(None, Poll::Ready(_)) if ctx.unserviceable() => None`, folding that case into the same
+clean stall a directly-`.await`ed `Unserviceable` already produces, ahead of the two arms
+that would otherwise trust `Ok(())` or `Err(_)`.
+`crates/waymaker-facade-demo/tests/dispatch.rs`'s
+`a_workflow_that_abandons_a_stalled_effect_and_returns_directly_still_waits` is the
+regression: a workflow polls its one activity once, drops it, and returns `Ok(())` directly
+— the shape a `select!` cancellation leaves — and the boot answers
+`Ok(Progress::Waiting { .. })` rather than `Err(DriveError::EffectOutstanding)`; reverting the
+new match arm reproduces the failure this test exists to catch. `size-probe-reach` requires
+the new accessor to cost something measurable: the size probe now calls it too, and the
+`facade` row's `probe` share grows by 8 B while `layers` holds at 13122 B, because reading one
+`bool` field optimises away entirely once a real caller only branches on it.
 
 ## Alternatives considered
 

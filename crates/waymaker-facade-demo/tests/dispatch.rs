@@ -205,6 +205,10 @@ impl Workflow for Wired {
                 (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => Some(bytes.len()),
                 (Some(Conclusion::Ended(Outcome::Failed(_)) | Conclusion::Refused), _)
                 | (None, Poll::Pending) => None,
+                // See `ota.rs`'s own bridge: an outstanding `Unserviceable` effect must not
+                // be reported as ended just because the workflow returned on its own past a
+                // dropped, stalled future.
+                (None, Poll::Ready(_)) if ctx.unserviceable() => None,
                 (None, Poll::Ready(_)) => Some(0),
             };
             // Read after `ctx`'s last use: the same `Suspended` the boundary returned, not
@@ -272,6 +276,86 @@ fn boot(
     )
 }
 
+/// A workflow whose body abandons a stalled activity and returns directly, the way a
+/// `select!` that dropped the losing branch for another would.
+///
+/// It wires no row at all, so the one activity it asks for always answers
+/// `Produced::Unserviceable`.
+struct Racing {
+    table: Table<'static, World, Offline>,
+    out: [u8; 8],
+}
+
+impl Racing {
+    const fn new(world: World) -> Self {
+        Self {
+            table: Table::over(world, NO_ROWS),
+            out: [0; 8],
+        }
+    }
+}
+
+impl Workflow for Racing {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: URL,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let (ended, suspended) = {
+            let mut bridge = Bridge::over(boundary);
+            let mut ctx = Ctx::new(&mut bridge, &mut self.table, &mut self.out);
+            // A `select!` that dropped this branch for another would leave the same shape:
+            // one poll, `Poll::Pending`, and the future gone -- with no boundary reached
+            // again and no conclusion ever recorded through `ctx`. `polled` is `Ready`
+            // because the workflow itself has nothing left to do afterward: it returns
+            // directly, as `Ok(())` never having gone through `ctx.complete`.
+            let polled: Poll<Result<(), ()>> = {
+                let mut activity = pin!(ctx.activity::<()>(DOWNLOAD, URL));
+                let _ = activity.as_mut().poll(&mut Task::from_waker(Waker::noop()));
+                Poll::Ready(Ok(()))
+            };
+            // The same match `ota.rs`'s and `provisioning.rs`'s own bridges carry: an
+            // outstanding `Unserviceable` effect must not be reported as ended just because
+            // the workflow returned on its own past a dropped, stalled future.
+            let ended = match (ctx.conclusion(), polled) {
+                (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => Some(bytes.len()),
+                (Some(Conclusion::Ended(Outcome::Failed(_)) | Conclusion::Refused), _)
+                | (None, Poll::Pending) => None,
+                (None, Poll::Ready(_)) if ctx.unserviceable() => None,
+                (None, Poll::Ready(_)) => Some(0),
+            };
+            (ended, bridge.take_suspended())
+        };
+        let Some(len) = ended else {
+            return Err(suspended.unwrap_or_else(Suspended::awaiting_dispatch));
+        };
+        Ok(Outcome::Completed(self.out.get(..len).unwrap_or_default()))
+    }
+}
+
+/// One boot of [`Racing`] over `device`.
+fn boot_racing(
+    device: &mut Device,
+    workflow: &mut Racing,
+) -> Result<waymaker_drive::Progress, DriveError<FaultError>> {
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let mut world = Unused { performed: 0 };
+    Driver::new(region(), RUN, reserve()).boot(
+        device,
+        &mut world,
+        workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    )
+}
+
 /// Every record the journal holds, as a kind and its bytes.
 fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
     let mut recovery = Recovery::new(region(), device);
@@ -294,6 +378,41 @@ fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
         });
     }
     out
+}
+
+#[test]
+fn a_workflow_that_abandons_a_stalled_effect_and_returns_directly_still_waits() {
+    // Codex round 4 on issue #111. Every future `Ctx` hands out already refuses once a
+    // dispatcher answers `Unserviceable`, but that cannot stop the *enclosing* `async fn`
+    // returning its own `Result` directly -- past a `select!` that dropped the stalled
+    // future for another branch, say. `Racing`'s own body does exactly that. Without the
+    // bridge's `ctx.unserviceable()` check this reports `Ok(Progress::Finished { .. })`
+    // while the effect is still outstanding; with it, the boot answers the same clean
+    // `Ok(Progress::Waiting)` a directly-`.await`ed `Unserviceable` already does.
+    let mut device = Device::new(geometry());
+    let mut workflow = Racing::new(World::default());
+
+    let progress = boot_racing(&mut device, &mut workflow);
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Waiting {
+            id: EffectId {
+                run: RUN,
+                seq: EffectSeq(0),
+            },
+        }),
+        "the abandoned effect still stalls the boot rather than reporting a false ending: \
+         {progress:?}"
+    );
+    assert_eq!(
+        history(&mut device)
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the run and the schedule only -- no terminal record for an effect still outstanding"
+    );
 }
 
 #[test]

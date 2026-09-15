@@ -2098,6 +2098,7 @@ fn ctx_facade() -> usize {
         Some(Conclusion::Refused) => 10,
         None => 11,
     });
+    kept = kept.wrapping_add(usize::from(ctx.unserviceable()));
 
     core::hint::black_box(kept.wrapping_add(dispatch_wiring()))
 }

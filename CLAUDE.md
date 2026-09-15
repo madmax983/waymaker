@@ -3704,10 +3704,24 @@ this issue exists to prevent, met one boundary over. `TimerFuture`, `ContinueFut
 conclusion once it is set. That same round found the test's own `Wired::run` still asserting
 the wrong thing — an earlier draft believed the bridge had no way to build a real `Suspended`
 for this stall, which was false: `ota.rs`'s bridge already carried the mechanism, and this
-crate's test harness had simply not used it. The code-flash cost was nil for the first
-round's own diff — `cargo xtask size`'s `facade` row measured 13174 B of layers both before
-and after, because removing `Unhandled`'s wrapping paid for the third `Produced` arm — and
-the second and third rounds' three added `&bool` fields moved that figure to **13122 B**.
+crate's test harness had simply not used it. A fourth round found the third round's own flag
+was read only by `Ctx`'s own futures: `ota.rs`'s and `provisioning.rs`'s bridges each fall
+back to the workflow's bare `Result` whenever `ctx.conclusion()` answers `None` and the poll
+answered `Ready`, which is right for an ordinary `?`-propagated activity failure and wrong
+for a workflow that polled a stalled `ActivityFuture` directly — a `select!` that dropped it
+for another branch — and then returned on its own with the effect still outstanding and
+nothing recorded. `Ctx` gains a fourth accessor, `unserviceable`, and both bridges now refuse
+that fallback while it answers true, folding the case into the same clean stall a direct
+`.await` already produces.
+`crates/waymaker-facade-demo/tests/dispatch.rs`'s
+`a_workflow_that_abandons_a_stalled_effect_and_returns_directly_still_waits` is the
+regression: it polls one activity once, drops it, and returns `Ok(())` directly, and the boot
+answers `Ok(Progress::Waiting)` rather than `Err(DriveError::EffectOutstanding)`. The
+code-flash cost was nil for the first round's own diff — `cargo xtask size`'s `facade` row
+measured 13174 B of layers both before and after, because removing `Unhandled`'s wrapping
+paid for the third `Produced` arm — the second and third rounds' three added `&bool` fields
+moved that figure to 13122 B, and the fourth round's new accessor holds it there: the size
+probe now calls it too, so its cost lands entirely in `probe` rather than `layers`.
 One thing stays the same throughout: a caller still cannot tell "the world is slow" from "no
 firmware will ever service this" from the return value alone. Both cases return
 `Poll::Pending` — a halted journal and an unpassed deadline already work the same way. Design
