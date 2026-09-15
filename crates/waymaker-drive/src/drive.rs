@@ -1391,18 +1391,23 @@ struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> 
     /// source, which has no business carrying a [`TimerSpec`] or a [`ClockCapability`] a
     /// caller never asked for.
     armed: Option<ArmedTimer>,
-    /// The [`TimerSpec`] the most recent [`Boundary::wait`](crate::Boundary::wait) named,
-    /// kept so [`Context::deadline_remaining`] can tell a repeat ask of the timer `armed`
-    /// describes from a caller that has moved on to a different one.
+    /// [`Some`] exactly when the most recent [`Boundary`](crate::Boundary) call was a
+    /// [`Boundary::wait`](crate::Boundary::wait), naming the spec it asked for — kept so
+    /// [`Context::deadline_remaining`] can tell a repeat ask of the timer `armed` describes
+    /// from a caller that has moved on, to a different spec or to a different boundary
+    /// entirely.
     ///
     /// A `select!` above this boundary that drops a still-open timer future and polls a
-    /// fresh one over a different spec does not close the first boundary — its schedule
-    /// record is already durable, and nothing but that same spec can ever resolve it.
-    /// Without this field, `deadline_remaining` had no way to see that the halt it is about
-    /// to report belongs to the timer the caller abandoned rather than the one it just asked
-    /// about, and reported the abandoned timer's frozen deadline as the new request's own —
-    /// arming a hardware alarm for a duration that never advances and never resolves what
-    /// was actually asked.
+    /// fresh one over a different spec, or a different future altogether, does not close the
+    /// first boundary — its schedule record is already durable, and nothing but that same
+    /// spec can ever resolve it. Without this field, `deadline_remaining` had no way to see
+    /// that the halt it is about to report belongs to the timer the caller abandoned rather
+    /// than the one it just asked about, and reported the abandoned timer's frozen deadline
+    /// as the new request's own — arming a hardware alarm for a duration that never advances
+    /// and never resolves what was actually asked. Every other `Boundary` method clears it on
+    /// entry, so a `call`, `schedule`, `resolve`, `gate` or `continue_as_new` halt never
+    /// answers with a timer's deadline either, even while that timer's own boundary is still
+    /// the one `stop` reports.
     last_wait: Option<TimerSpec>,
     /// The effect §07 step 3 committed, while a caller performs step 4 for itself.
     ///
@@ -2561,6 +2566,9 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn gate(&mut self, gate: GateId) -> Result<u16, Suspended> {
+        // Not a `wait`, so any deadline left over from an abandoned one no longer answers
+        // for this halt — see `deadline_remaining`'s own documentation.
+        self.last_wait = None;
         match self.decide_gate(gate) {
             GateDecision::Branch(version) => Ok(version),
             GateDecision::Stop => Err(Suspended::NEW),
@@ -2568,6 +2576,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn call(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Outcome<'_>, Suspended> {
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
         match self.decide(kind, input) {
             Decision::Replayed(conclusion, len) => Ok(self.observed(conclusion, len)),
             Decision::Dispatch(dispatchable) => self.dispatch(dispatchable, input),
@@ -2583,6 +2593,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn schedule(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Handoff<'_>, Suspended> {
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
         if self.pending.is_some() {
             if self.stop.is_none() {
                 self.stop = Some(Stop::Failed(DriveError::EffectOutstanding));
@@ -2607,6 +2619,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn resolve(&mut self, answered: Answered<'_>) -> Result<Outcome<'_>, Suspended> {
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
         let Some((conclusion, len)) = self.record_answer(answered) else {
             return Err(Suspended::NEW);
         };
@@ -2614,6 +2628,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn continue_as_new(&mut self, input: &[u8]) -> Suspended {
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
         // §10's reserve names its own remedy: "stop scheduling, and either end the run or
         // `continue_as_new`". A pre-mutation near-capacity refusal is that remedy offered
         // and not yet taken, so a workflow that reacts to it by asking to migrate is not

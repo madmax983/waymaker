@@ -12,7 +12,7 @@
 
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
-use waymaker_core::version::VersionRange;
+use waymaker_core::version::{GateId, VersionRange};
 use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, DOWNLOADED, Delayed, World};
 use waymaker_drive::{
@@ -975,5 +975,83 @@ fn a_wait_for_a_different_spec_than_the_one_still_open_reports_no_deadline() {
             .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
             .count(),
         1
+    );
+}
+
+/// A workflow that abandons an open deadline for a gate rather than for a different spec.
+///
+/// Codex found this on review of the fix above: `last_wait` was set only inside
+/// `decide_timer`, so a `select!` that drops a still-open timer future and moves on to *any
+/// other* boundary — not only a mismatched `wait` — left `last_wait` naming the abandoned
+/// spec. `deadline_remaining()` would then still answer with that timer's frozen deadline
+/// after a `gate`, `call`, `schedule`, `resolve` or `continue_as_new` halt, which have
+/// nothing to do with it — exactly the shape of bug the abandoned-timer fix was meant to
+/// close, one boundary over.
+struct AbandonsTimerForAGate {
+    input: [u8; 4],
+    spec: TimerSpec,
+    observed: bool,
+    remaining: Option<(ClockKind, u64)>,
+}
+
+impl AbandonsTimerForAGate {
+    const fn waiting(spec: TimerSpec) -> Self {
+        Self {
+            input: *b"seed",
+            spec,
+            observed: false,
+            remaining: None,
+        }
+    }
+}
+
+impl Workflow for AbandonsTimerForAGate {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: 12,
+            versions: VersionRange::exact(1),
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        // Arms `spec` and halts on it — a real `TimerScheduled` record, committed.
+        let _ = boundary.wait(self.spec);
+        // Stands in for a `select!` that dropped the timer future and moved on to an
+        // unrelated boundary. The open boundary is still the timer's.
+        let gated = boundary.gate(GateId(1));
+        self.remaining = boundary.deadline_remaining();
+        self.observed = true;
+        gated?;
+        Ok(Outcome::Completed(b"unreachable"))
+    }
+}
+
+#[test]
+fn a_non_wait_boundary_after_an_abandoned_timer_reports_no_deadline() {
+    let mut device = Device::new(geometry());
+    let mut world = booted(0);
+    let mut workflow = AbandonsTimerForAGate::waiting(TimerSpec::AfterBoot { ticks: 1_000 });
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "{progress:?}"
+    );
+    assert!(workflow.observed, "the gate call must still return");
+    assert_eq!(
+        workflow.remaining, None,
+        "a non-wait boundary must not be told an abandoned timer's own deadline"
     );
 }
