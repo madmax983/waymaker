@@ -7339,6 +7339,77 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_a_valueless_font_breakout_stays_hidden() {
+        // Codex, pull request #138, round 60, finding "Recognize valueless font
+        // breakout attributes": HTML5's `font` breakout condition is "carries a
+        // `color`, `face` or `size` attribute" — present at all, not "carries one
+        // with a value" — so `<font color>`, a boolean attribute with no `=value`,
+        // still breaks out of foreign content exactly as `<font color="red">`
+        // does. `is_foreign_breakout_tag` checked `attribute_value(span,
+        // attribute).is_some()`, which requires a real `=`, so `<svg><font
+        // color><script />decision-id headline</script></font></svg>` never broke
+        // out at all: `<svg>` stayed the innermost frame, the self-closing
+        // `<script />` read as bodyless under it, and the id and headline that
+        // follow read as ordinary, visible text a self-closing `<script>` never
+        // opened.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><font color><script />{} {}</script></font></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_inside_mglyph_still_counts() {
+        // Codex, pull request #138, round 60, finding "Preserve MathML parsing for
+        // mglyph children": WHATWG's one named exception to "an HTML integration
+        // point's descendants parse under ordinary HTML rules" is `<mglyph>` and
+        // `<malignmark>` — opened directly inside a MathML text integration point
+        // (`mi`/`mo`/`mn`/`ms`/`mtext`), either one is itself still processed
+        // under the foreign-content rules, reopening real MathML parsing (and the
+        // self-closing acknowledgment that comes with it) for its own descendants,
+        // rather than leaving the integration point's own `honors_self_closing:
+        // false` frame as the innermost one. `track_foreign_content_depth`
+        // recognized only foreign-content roots and HTML integration points as
+        // namespace changes, so `<math><mtext><mglyph><script
+        // /></mglyph>decision-id headline</mtext></math>` still had `mtext` as the
+        // innermost frame when `<script />` was reached, read its slash as
+        // ignored, and opened a real, unclosed `<script>` that swallowed the id
+        // and headline after it to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><mglyph><script /></mglyph>{} {}</mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_div_closing_through_a_hidden_span_still_counts() {
         // Codex, pull request #138, round 57, finding "Unwind all elements
         // through a matching ancestor": a real HTML5 parser searches its whole

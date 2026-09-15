@@ -1521,13 +1521,73 @@ fn honors_self_closing_now(foreign_content: &[ForeignFrame]) -> bool {
 /// points, which admit HTML content the same way.
 fn is_html_integration_point(span: &str, name: &str) -> bool {
     match name.to_ascii_lowercase().as_str() {
-        "foreignobject" | "desc" | "mi" | "mo" | "mn" | "ms" | "mtext" => true,
+        "foreignobject" | "desc" => true,
         "annotation-xml" => attribute_value(span, "encoding").is_some_and(|value| {
             value.eq_ignore_ascii_case("text/html")
                 || value.eq_ignore_ascii_case("application/xhtml+xml")
         }),
-        _ => false,
+        name => is_mathml_text_integration_point(name),
     }
+}
+
+/// Whether `name` is one of `MathML`'s five fixed "text integration points" — `mi`,
+/// `mo`, `mn`, `ms`, `mtext` — WHATWG's own term for the elements that admit ordinary
+/// HTML content the same way [`is_html_integration_point`] already checks. Factored
+/// out so [`track_foreign_content_depth`]'s `mglyph`/`malignmark` exception (Codex,
+/// pull request #138, round 60, "Preserve `MathML` parsing for mglyph children") can
+/// ask the same question of an already-open [`ForeignFrame`]'s own tracked name, not
+/// only a fresh tag's `span`.
+fn is_mathml_text_integration_point(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "mi" | "mo" | "mn" | "ms" | "mtext"
+    )
+}
+
+/// Whether a well-formed opening tag's own markup `span` carries `attribute` at all,
+/// with or without a value — [`has_hidden_attribute`]'s generalization to an arbitrary
+/// attribute name (Codex, pull request #138, round 60, "Recognize valueless font
+/// breakout attributes"): [`is_foreign_breakout_tag`]'s `font` check needs *presence*,
+/// not [`attribute_value`], because HTML5's own breakout condition is "carries a
+/// `color`, `face` or `size` attribute" full stop — a boolean attribute with no
+/// `=value` at all, `<font color>`, still counts, the same as `hidden` does for
+/// [`has_hidden_attribute`]. Quote-tracked the same way that function already is, so a
+/// name that merely *appears* inside another attribute's own quoted value is never
+/// mistaken for a real one.
+fn has_attribute(span: &str, attribute: &str) -> bool {
+    let bytes = span.as_bytes();
+    let attribute_bytes = attribute.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut index = 1 + markup_tag_name(span).len();
+    while let Some(&byte) = bytes.get(index) {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+            None => {
+                let spelled_here = bytes
+                    .get(index..)
+                    .and_then(|rest| rest.get(..attribute_bytes.len()))
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(attribute_bytes));
+                if spelled_here {
+                    let before_ok = index
+                        .checked_sub(1)
+                        .and_then(|before| bytes.get(before))
+                        .is_none_or(|&byte| byte == b'/' || byte.is_ascii_whitespace());
+                    let after_ok = bytes
+                        .get(index + attribute_bytes.len())
+                        .is_none_or(|&byte| {
+                            byte.is_ascii_whitespace() || matches!(byte, b'=' | b'/' | b'>')
+                        });
+                    if before_ok && after_ok {
+                        return true;
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 /// The value of `attribute` on a well-formed opening tag's own markup `span`, if it
@@ -1657,7 +1717,7 @@ fn is_foreign_breakout_tag(span: &str, name: &str) -> bool {
         || (name.eq_ignore_ascii_case("font")
             && ["color", "face", "size"]
                 .iter()
-                .any(|attribute| attribute_value(span, attribute).is_some()))
+                .any(|attribute| has_attribute(span, attribute)))
 }
 
 /// Updates `foreign_content` — the currently open foreign-content roots and HTML
@@ -1718,7 +1778,24 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
     if ends_with_self_closing_slash(span) {
         return;
     }
-    if is_foreign_content_root(name) {
+    // WHATWG's one named exception to "an HTML integration point's descendants parse
+    // under ordinary HTML rules" (Codex, pull request #138, round 60, "Preserve
+    // MathML parsing for mglyph children"): a `<mglyph>` or `<malignmark>` opened
+    // directly inside a MathML text integration point (`mi`/`mo`/`mn`/`ms`/`mtext`) is
+    // itself still processed under the *foreign*-content rules, not the HTML ones the
+    // integration point otherwise switches to — so it reopens real MathML parsing for
+    // its own descendants, self-closing acknowledged again, rather than leaving the
+    // enclosing integration point's frame (and its `honors_self_closing: false`) as
+    // the innermost one. `<math><mtext><mglyph><script /></mglyph>All 6 recovery
+    // invariants</mtext></math>` keeps the `<script />` bodyless this way; without it,
+    // the still-innermost `mtext` frame read the slash as ignored, opening a real,
+    // unclosed `<script>` that swallowed everything after it to end of document.
+    let is_mglyph_exception = !honors_self_closing_now(foreign_content)
+        && (name.eq_ignore_ascii_case("mglyph") || name.eq_ignore_ascii_case("malignmark"))
+        && foreign_content
+            .last()
+            .is_some_and(|frame| is_mathml_text_integration_point(&frame.name));
+    if is_mglyph_exception || is_foreign_content_root(name) {
         foreign_content.push(ForeignFrame {
             name: name.to_ascii_lowercase(),
             honors_self_closing: true,
@@ -1798,37 +1875,14 @@ fn track_ordinary_ancestor(
 /// too, and the hand-picked list — space, tab, line feed, carriage return — had left it
 /// out, so `<span hidden\u{c}>` read as an ordinary, unsuppressed tag whose own name
 /// happened to continue past `hidden` rather than a real boolean attribute.
+///
+/// [`has_attribute`]'s own fixed case (Codex, round 60): the two used to duplicate this
+/// same byte-scanning algorithm, one hardcoded to `hidden`'s own length and one
+/// parameterized, until `has_attribute`'s own presence check — built for
+/// [`is_foreign_breakout_tag`]'s `font` — was recognized as exactly this function
+/// generalized rather than a new one.
 fn has_hidden_attribute(span: &str) -> bool {
-    let bytes = span.as_bytes();
-    let mut quote: Option<u8> = None;
-    let mut index = 1 + markup_tag_name(span).len();
-    while let Some(&byte) = bytes.get(index) {
-        match quote {
-            Some(open) if byte == open => quote = None,
-            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
-            None => {
-                let spelled_here = bytes
-                    .get(index..)
-                    .and_then(|rest| rest.get(..6))
-                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(b"hidden"));
-                if spelled_here {
-                    let before_ok = index
-                        .checked_sub(1)
-                        .and_then(|before| bytes.get(before))
-                        .is_none_or(|&byte| byte == b'/' || byte.is_ascii_whitespace());
-                    let after_ok = bytes.get(index + 6).is_none_or(|&byte| {
-                        byte.is_ascii_whitespace() || matches!(byte, b'=' | b'/' | b'>')
-                    });
-                    if before_ok && after_ok {
-                        return true;
-                    }
-                }
-            }
-            Some(_) => {}
-        }
-        index += 1;
-    }
-    false
+    has_attribute(span, "hidden")
 }
 
 /// The byte range and lowercase name of the earliest opening tag, at or after `from`
