@@ -21,7 +21,7 @@ use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout};
 use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
-use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
+use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError, RegionError};
 use waymaker_flash::storage::StableStorage;
 use waymaker_flash::swap::{Retired, Swap, SwapError, SwapStepError};
 
@@ -228,6 +228,13 @@ pub enum DriveError<E> {
         /// The declared bound it was measured against.
         bound: u16,
     },
+    /// A bank's fully validated header names a journal layout this reader refuses.
+    ///
+    /// The seal and the header both checked out — this is not a device fault and no page
+    /// size fixes it — so it is deferred the same way a header too large for the caller's
+    /// page or one a device error kept from being read at all already are: ignored when the
+    /// other bank fully validates at a strictly higher generation, and reported otherwise.
+    Region(RegionError),
 }
 
 /// The two buffers a boot borrows.
@@ -709,8 +716,20 @@ where
     let Ok(header) = bank::decode_header_with::<C>(header_buf) else {
         return Ok(BankRead::Absent);
     };
-    let Ok(journal) = JournalRegion::of(layout, id, &header) else {
-        return Ok(BankRead::Absent);
+    // The seal and the header both checked out, so this bank's generation is not in
+    // question — only whether the journal layout its own header names is one this reader
+    // can use. Neither a bigger page nor a healthy device fixes that, but the other bank
+    // fully validating at a higher generation still can: the same deferral
+    // `BankRead::Oversized` and `BankRead::Unreadable` already give a header that cannot be
+    // read at all applies here to one that reads clean and names something unusable.
+    let journal = match JournalRegion::of(layout, id, &header) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return Ok(BankRead::Unreadable {
+                claimed_generation: generation,
+                error: DriveError::Region(error),
+            });
+        }
     };
     Ok(BankRead::Found(BankFacts {
         id,

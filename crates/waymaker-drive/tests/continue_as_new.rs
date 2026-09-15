@@ -17,7 +17,7 @@ use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
 use waymaker_flash::capacity::{Bounds, CapacityError, Refusal, Reserve};
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
-use waymaker_flash::recovery::{JournalRegion, RecoveryError};
+use waymaker_flash::recovery::{JournalRegion, RecoveryError, RegionError};
 use waymaker_flash::storage::{Geometry, StableStorage};
 
 const WORKFLOW_KIND: u16 = 0x00A1;
@@ -1778,6 +1778,56 @@ fn a_stale_banks_unreadable_header_never_blocks_the_intact_authoritative_bank() 
     // Bank A's header was never touched by the driver's own writes — only read, and that
     // read failed — so it still reads back exactly as installed, once the injected fault is
     // out of the way.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+}
+
+#[test]
+fn a_higher_generations_unusable_journal_layout_is_never_ignored_for_a_stale_banks_generation() {
+    // Codex found this on round 14, in the same shape rounds 9 and 10 found for a header
+    // that fails to *read* at all or that names an unsupported wire format: bank B's header
+    // and seal both check out fully, so its generation is not in question, but its header
+    // declares a program granularity this layout does not use — `JournalRegion::of` refuses
+    // it — and a page size or a healthy device fixes neither. Bank A is one generation
+    // lower and completely ordinary, so ignoring bank B here would revive a retired run.
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    let Some(mismatched_align) = ProgramAlign::new(4) else {
+        unreachable!("4 is a legal program alignment")
+    };
+    assert_ne!(
+        mismatched_align,
+        align(),
+        "the fixture needs a program alignment this layout does not use"
+    );
+    let mismatched_header = BankHeader {
+        align: mismatched_align,
+        ..first_header()
+    };
+    install(&mut device, BankId::B, later, &mismatched_header);
+
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(
+        progress,
+        Err(DriveError::Region(RegionError::AlignDisagreesWithBank)),
+        "bank B's own unusable layout must be the answer, not a silent fallback to bank A's \
+         lower, stale generation: {progress:?}"
+    );
+
+    // Refused before anything moved: bank A is untouched and still names the retired run's
+    // own identity, never having been booted.
     let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
     assert_eq!(a_run, RUN);
 }
