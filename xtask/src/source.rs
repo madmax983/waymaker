@@ -317,6 +317,23 @@ mod bare_metal_tests {
     }
 
     #[test]
+    fn a_rig_source_that_grows_an_allocator_is_caught() {
+        // Issue #82. `waymaker-rig` is firmware, not host code: ADR 0021 says a rig that
+        // can only run on a host is a simulation wearing a rig's name. It is one of the
+        // three crates in `NO_STD_TEST_SUPPORT_CRATES`, so this scan must name it, not
+        // only `waymaker-drive`.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-rig",
+            "crates/waymaker-rig/src/run.rs",
+            "extern crate alloc;\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule, "crate-attributes");
+        assert_eq!(violations[0].subject, "waymaker-rig");
+        assert!(violations[0].detail.contains("run.rs"), "{violations:?}");
+    }
+
+    #[test]
     fn a_host_side_test_support_crate_is_left_alone() {
         // `waymaker-fault` models media in a `Vec` and `waymaker-spec` enumerates a state
         // space. Asking either for `#![no_std]` would be asking it to stop doing its job.
