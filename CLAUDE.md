@@ -3971,6 +3971,48 @@ names a trait or a derive through a multi-segment `crate::` path today.
 `every_resolution` now fails closed on a `crate`-qualified path of any length, not only
 the bare one.
 
+Round 33 found three more, none of them in the alias-resolution machinery the merge had
+just split apart. The first is in `module_tree` itself, one layer below the alias scan:
+an unconditional `mod clone_impl;` whose resolved file opens with its own
+`#![cfg(test)]` inner attribute is exactly as test-only as one the parent gated with
+`#[cfg(test)] mod clone_impl;` — the attribute lands on the module the `mod` item names
+either way, only spelled where the module's own file can carry it instead of where it
+is declared — but `module_tree` classified a visited file from the *parent's* own
+gating alone and never read the file's own top-level attribute, so a `Clone` impl or a
+macro invocation that exists only under a file-level `#![cfg(test)]` was walked as
+production-reachable and rejected code that never ships. A new
+`crate::parse::crate_root_is_cfg_test_gated` parses a file and reads `has_cfg_test` on
+its own `syn::File::attrs`, and `module_tree` ORs that into the gating a child inherits
+alongside the parent's, so gating now compounds down the tree from either source. The
+second is in `push_resolved_names`: `#[derive(MakeClone)] struct Recovery;`, where
+`MakeClone` is a procedural derive macro, is legal Rust whose expansion this module
+cannot see — a derive macro is not bound to generate an implementation only for the
+trait its own name suggests, so it could expand to `impl Clone for Recovery` beside
+whatever else it derives — and recording the resolved name literally let it through as
+an ordinary, harmless-looking derive that simply is not `"Clone"`. Every name
+`every_resolution` produces is now filtered through `DERIVABLE_BUILTIN_TRAITS`, the nine
+traits `derive` can name without a third-party macro; anything else, `UNRESOLVED_DERIVE`
+and `LOCAL_SHADOWED_TYPE` included, is recorded as `UNRESOLVED_DERIVE` and fails closed
+the same way an alias this scan gave up chasing already does. The third closes the last
+of four positions a macro invocation can occupy: `declares_item_macro` flagged one at
+item, statement and type position, but never *expression* position, and `const _: () =
+make_clone!();` is legal Rust whose macro sits there — a block is a legal expression and
+Rust's block grammar admits item statements inside one, the same construct round 15
+already found reaching an `impl` through a function body, so an arbitrary macro can
+expand to `{ impl Clone for Recovery { .. }; }` and still type as `()`. A new
+`visit_expr_macro` override flags one there too, but only when the invoked path is not
+one of `is_known_safe_expression_macro`'s roughly thirty compiler-builtin or
+standard-library macros — `assert!`, `matches!`, `write!` and the rest — whose expansion
+is fixed and fully specified by the reference and never emits a freestanding item, since
+`waymaker-flash` itself calls several of them in expression position throughout its own
+production code and flagging every invocation there would reject the file this rule
+exists to protect. All three were verified against real compilation: the first by
+injecting a scratch `#[cfg(test)]`-gated child file with a real `Clone` impl into
+`waymaker-flash`'s own `recovery` module and building it, the second and third by a
+standalone two-crate `rustc` example each, since a real derive macro and a real
+function-like macro cannot be added to `waymaker-flash` without an external dependency
+the layering forbids.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

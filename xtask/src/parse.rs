@@ -185,6 +185,26 @@ pub fn inner_attributes(contents: &str) -> Result<Vec<String>, syn::Error> {
     Ok(file.attrs.iter().map(attribute_text).collect())
 }
 
+/// Whether `contents` carries a top-level `#![cfg(test)]`, exactly as `has_cfg_test`
+/// reads it on an item's own attributes.
+///
+/// A file reached through an unconditional `mod name;` is exactly as test-only as one
+/// the parent gated with `#[cfg(test)] mod name;` when the file's own inner attribute
+/// says so — the attribute lands on the module the `mod` item names either way, only
+/// spelled where the module's own file can carry it instead of where it is declared.
+/// Found by Codex review of this change (PR #143), round 33: `module_tree` read only
+/// the parent declaration's own gating and never a reached file's own inner attribute,
+/// so a file that is entirely `#![cfg(test)]` was walked as production-reachable and a
+/// `Clone` impl or a macro invocation inside it — never shipped — rejected valid code.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn crate_root_is_cfg_test_gated(contents: &str) -> Result<bool, syn::Error> {
+    let file = parse_rust(contents)?;
+    Ok(has_cfg_test(&file.attrs))
+}
+
 /// The `extern crate` declarations of `contents`, in source order.
 ///
 /// The identifier is `syn`'s spelling, so `extern crate r#alloc;` reports `alloc`:
@@ -2158,6 +2178,31 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
             self.found = true;
         }
 
+        // Round 33: `const _: () = make_clone!();` is legal Rust whose macro sits in
+        // *expression* position, and this module's own doc reasoned that shape needs
+        // no case here because "the reference does not let an expression position
+        // expand to an item" — true of substituting the invocation itself for an item,
+        // but not of what the invocation can expand *into*: a block is a legal
+        // expression, and Rust's block grammar admits item statements inside one
+        // (`non_local_definitions`, the same construct round 15 already found reaching
+        // an `impl` through a function body), so an arbitrary macro can expand to `{
+        // impl Clone for Recovery { .. }; }` and still type as `()`. `visit_expr_macro`
+        // is the last of the four positions a macro invocation can occupy — item,
+        // statement, type and now expression — that this module cannot expand, but
+        // unlike the other three this position is where `waymaker-flash` itself
+        // already calls `assert!`, `matches!`, `panic!`, `unreachable!` and `write!`
+        // throughout its production code, so flagging every expression-position
+        // invocation would reject the very file this rule exists to protect. Every one
+        // of those is a compiler-builtin or standard-library macro with a fixed,
+        // fully-specified expansion that never emits a freestanding item — a promise a
+        // third-party or local `macro_rules!` invocation cannot make — so only a
+        // macro that is not one of them fails closed.
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if !is_known_safe_expression_macro(&node.mac.path) {
+                self.found = true;
+            }
+        }
+
         // Round 31: every attribute the traversal above still reaches — because
         // nothing upstream of it has already excluded the item, member, field,
         // variant or foreign item it sits on — might be an attribute macro this
@@ -2281,6 +2326,59 @@ fn is_known_safe_attribute_path(path: &syn::Path) -> bool {
     KNOWN_TOOLS.contains(&first_name.as_str())
 }
 
+/// Whether `path` names one of the compiler-builtin or standard-library macros usable
+/// in expression position whose expansion is fixed and fully specified by the
+/// reference — never a third-party or local `macro_rules!` invocation, which this
+/// module cannot expand and which round 33 found could expand to a block containing a
+/// freestanding item.
+///
+/// Matched as a single, unqualified identifier rather than resolved through an alias
+/// table: every name here is a language or standard-library macro a workspace has no
+/// ordinary reason to re-export under another name, and a path of more than one
+/// segment (`core::assert!` written out, say) is not how any of them are invoked in
+/// practice — read conservatively, so a genuinely unusual spelling fails closed rather
+/// than being resolved away.
+fn is_known_safe_expression_macro(path: &syn::Path) -> bool {
+    const KNOWN_MACROS: &[&str] = &[
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "cfg",
+        "column",
+        "compile_error",
+        "concat",
+        "dbg",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "env",
+        "eprint",
+        "eprintln",
+        "file",
+        "format",
+        "format_args",
+        "include",
+        "include_bytes",
+        "include_str",
+        "line",
+        "matches",
+        "module_path",
+        "option_env",
+        "panic",
+        "print",
+        "println",
+        "stringify",
+        "todo",
+        "unimplemented",
+        "unreachable",
+        "vec",
+        "write",
+        "writeln",
+    ];
+    path.get_ident()
+        .is_some_and(|ident| KNOWN_MACROS.contains(&ident_name(ident).as_str()))
+}
+
 /// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition, including one
 /// reached only by expanding a `#[cfg_attr(.., cfg(..))]` however many levels deep.
 ///
@@ -2373,14 +2471,47 @@ fn collect_derive_names_from_meta(
     }
 }
 
-/// Pushes every name each path in `paths` could resolve to onto `derives`.
+/// Pushes every name each path in `paths` could resolve to onto `derives` — a name this
+/// module recognizes as one of Rust's own derivable traits pushed as itself, and
+/// anything else pushed as [`UNRESOLVED_DERIVE`].
+///
+/// Found by Codex review of this change (PR #143), round 33: `#[derive(MakeClone)]`,
+/// where `MakeClone` is a procedural derive macro, is legal Rust whose expansion this
+/// module cannot see — a derive macro is not bound to generate an implementation only
+/// for the trait its own name suggests, so `MakeClone` could just as well expand to
+/// `impl Clone for Recovery` beside whatever else it derives. Recording the resolved
+/// name literally let it through as an ordinary, harmless-looking derive that simply is
+/// not `"Clone"`, the same bypass `UNRESOLVED_DERIVE` exists to close for an alias this
+/// scan gave up chasing rather than one it chased all the way to a name it cannot
+/// expand. `DERIVABLE_BUILTIN_TRAITS` is every trait `derive` can name without a
+/// third-party macro; anything else fails closed the same way.
 fn push_resolved_names(
     paths: &syn::punctuated::Punctuated<syn::Path, syn::Token![,]>,
     aliases: &[UseAlias],
     derives: &mut Vec<String>,
 ) {
+    const DERIVABLE_BUILTIN_TRAITS: &[&str] = &[
+        "Clone",
+        "Copy",
+        "Debug",
+        "Default",
+        "Eq",
+        "Hash",
+        "Ord",
+        "PartialEq",
+        "PartialOrd",
+    ];
     for path in paths {
-        derives.extend(every_resolution(path, aliases));
+        for name in every_resolution(path, aliases) {
+            if name == UNRESOLVED_DERIVE
+                || name == LOCAL_SHADOWED_TYPE
+                || DERIVABLE_BUILTIN_TRAITS.contains(&name.as_str())
+            {
+                derives.push(name);
+            } else {
+                derives.push(UNRESOLVED_DERIVE.to_owned());
+            }
+        }
     }
 }
 

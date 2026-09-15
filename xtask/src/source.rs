@@ -9004,21 +9004,35 @@ fn module_tree(
         if !visited.insert((path.clone(), test_gated)) {
             continue;
         }
-        if test_gated {
-            test_reachable.insert(path.clone());
-        } else {
-            production_reachable.insert(path.clone());
-        }
         let Some(contents) = sources
             .iter()
             .find(|source| source.path.replace('\\', "/") == path)
             .map(|source| source.contents.as_str())
         else {
+            if test_gated {
+                test_reachable.insert(path.clone());
+            } else {
+                production_reachable.insert(path.clone());
+            }
             continue;
         };
+        // Codex review of this change (PR #143): an unconditional `mod child;` whose
+        // resolved file opens with its own `#![cfg(test)]` inner attribute is exactly
+        // as test-only as one the parent gated with `#[cfg(test)] mod child;` — the
+        // attribute is on the module the `mod` item names either way, only spelled
+        // where the module's own file can carry it instead. Reading only the parent's
+        // declaration classified such a file as production-reachable, so a `Clone`
+        // impl or a macro invocation that exists only under `#[cfg(test)]` rejected
+        // valid shipped code the same way any other false positive here would.
+        let file_gated = test_gated || crate::parse::crate_root_is_cfg_test_gated(contents)?;
+        if file_gated {
+            test_reachable.insert(path.clone());
+        } else {
+            production_reachable.insert(path.clone());
+        }
         for child in crate::parse::child_modules(&path, contents)? {
             for resolved in resolve_child(sources, &path, &child)? {
-                stack.push((resolved, test_gated || child.test_gated));
+                stack.push((resolved, file_gated || child.test_gated));
             }
         }
     }
@@ -13349,6 +13363,146 @@ mod tests {
             "{}",
             violations[0].detail
         );
+    }
+
+    #[test]
+    fn a_file_that_is_entirely_cfg_test_gated_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 33: an unconditional
+        // `mod clone_impl;` whose resolved file begins with its own `#![cfg(test)]`
+        // inner attribute is exactly as test-only as one the parent gated with
+        // `#[cfg(test)] mod clone_impl;` — the attribute lands on the module the `mod`
+        // item names either way, only spelled where the module's own file can carry it
+        // instead of where it is declared. `module_tree` read only the parent
+        // declaration's own gating, so a `Clone` impl that exists only under this
+        // file-level `#![cfg(test)]` was walked as production-reachable and rejected
+        // code that never ships.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(test)]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_unrecognized_derive_macro_on_the_pinned_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 33: `#[derive(
+        // MakeClone)] pub struct Recovery;`, where `MakeClone` is a procedural derive
+        // macro, is legal Rust whose expansion this module cannot see — a derive macro
+        // is not bound to generate an implementation only for the trait its own name
+        // suggests, so `MakeClone` could just as well expand to `impl Clone for
+        // Recovery` beside whatever else it derives. Recording the resolved name
+        // literally let it through as an ordinary, harmless-looking derive that simply
+        // is not `"Clone"`.
+        let sources = recovery_source_with_struct(concat!(
+            "#[derive(MakeClone, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn every_builtin_derivable_trait_but_clone_is_still_accepted() {
+        // The negative case: every one of Rust's own derivable traits other than
+        // `Clone` must still pass cleanly, or round 33's fix would reject the vast
+        // majority of real structs in this workspace over derives that were never in
+        // question.
+        let sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_expression_position_macro_in_a_consts_initializer_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 33: `const _: () =
+        // make_clone!();` is legal Rust whose macro sits in *expression* position — a
+        // block is a legal expression and Rust's block grammar admits item statements
+        // inside one, so the macro could expand to `{ impl Clone for Recovery { .. };
+        // }` and still type as `()`. `declares_item_macro` flagged an item-,
+        // statement- and type-position macro invocation, but never this fourth one.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "const _: () = make_clone!();\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn known_safe_expression_macros_are_not_reported_as_unexpandable() {
+        // The negative case: `waymaker-flash` itself calls `assert!`, `matches!` and
+        // `write!` in expression position throughout its production code — a bare
+        // `mac!(..);` at *statement* position is `Stmt::Macro` regardless of the
+        // macro's name (unconditionally unexpandable since round 11, and unrelated to
+        // this fix), so every macro here is wrapped in a `let` binding, a `const`
+        // initializer or a tail position instead, matching how the real file uses
+        // them. Round 33's `Expr::Macro` fix must not flag any of these, only ones it
+        // cannot vouch for.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "const _: () = assert!(1 == 1);\n",
+                "fn helper(\n",
+                "    f: &mut core::fmt::Formatter<'_>,\n",
+                "    a: u8,\n",
+                "    b: u8,\n",
+                ") -> core::fmt::Result {\n",
+                "    let _ = assert_eq!(a, a);\n",
+                "    let _ = debug_assert!(a == a);\n",
+                "    let _ = matches!(a, 0);\n",
+                "    if a == b {\n",
+                "        let _: () = panic!(\"x\");\n",
+                "    }\n",
+                "    if a == b {\n",
+                "        let _: () = unreachable!();\n",
+                "    }\n",
+                "    write!(f, \"{a}\")\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
