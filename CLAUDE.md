@@ -1306,9 +1306,11 @@ Stated so that nobody mistakes silence for coverage:
   level inside the shadowing one inherited a shadow real Rust never gives it, hiding a real
   alias the pre-#181 code had resolved correctly. The block-local-item half of #181 is now
   closed too, by issue
-  [#193](https://github.com/madmax983/waymaker/issues/193). A `struct`, `enum` or `union` a
-  block declares directly now shadows a same-named sibling module or alias too, not only a
-  generic type parameter. It lives in its own `block_shadow` list rather than the generic
+  [#193](https://github.com/madmax983/waymaker/issues/193). A `struct`, `enum`, `union` or
+  `trait` a block declares directly now shadows a same-named sibling module or alias too,
+  not only a generic type parameter — a trait is on that list because it occupies the same
+  namespace the other three do, which a fourth Codex round found `block_item_shadow_names`
+  missing after the first three landed (see the Status section's own paragraph on #193). It lives in its own `block_shadow` list rather than the generic
   parameter's `shadow`, because the two reset at different points — confirmed against
   `rustc`, not assumed: `E0401`'s "nested items are independent... for name resolution" is
   about a generic parameter, and does not make a nested `fn` or `impl` blind to its
@@ -5788,3 +5790,15 @@ since before #181. All three are one class of gap — each declaration needs pai
 with the depth it was made at, compared across kinds — filed as issue
 [#205](https://github.com/madmax983/waymaker/issues/205) rather than fixed here,
 per this project's own two-or-three-round review guidance.
+
+A fourth round found a real gap in `block_item_shadow_names` itself, separate from
+the three above and fixed here: it matched `Item::Struct`, `Item::Enum` and
+`Item::Union` and fell through `_ => None` on `Item::Trait`, so a block-local
+`trait Alias {}` never entered `block_shadow` at all. A trait name occupies the
+same namespace a struct, enum or union does — real Rust resolves `dyn Alias` or
+`Alias::CONST` to a block-local trait declaration the identical way it resolves
+`Alias { .. }` to a block-local struct — so a trait shadowing a module-level
+`use Disallowed as Alias;` was invisible to `resolved_path_uses` and `name_uses`,
+which stepped past the local trait and reported the module's own alias instead.
+`block_item_shadow_names` now matches `Item::Trait` too, verified red against the
+unpatched match arm before landing.

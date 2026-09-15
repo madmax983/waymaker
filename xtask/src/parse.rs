@@ -719,9 +719,13 @@ fn generic_type_param_names(generics: &syn::Generics) -> Vec<String> {
         .collect()
 }
 
-/// The `struct`, `enum` and `union` names `block` declares directly in its own
-/// statements. Each one shadows a same-named sibling module or `use` alias (issue
-/// #193).
+/// The `struct`, `enum`, `union` and `trait` names `block` declares directly in its
+/// own statements. Each one shadows a same-named sibling module or `use` alias
+/// (issue #193). A `trait` is on this list for the same reason it is a
+/// [`LOCAL_SHADOWED_TYPE`] shadow: it occupies the same namespace a struct, enum or
+/// union does, so a block-local `trait Alias {}` shadows a module-level `use X as
+/// Alias;` in `dyn Alias` or `Alias::CONST` exactly the way a block-local struct
+/// already shadows one in `Alias { .. }` (Codex review of PR #203, round 4).
 ///
 /// The shadow holds for the rest of this block, and for anything nested inside it —
 /// a nested `fn` or `impl` included. That is unlike a generic type parameter.
@@ -753,6 +757,7 @@ fn block_item_shadow_names(block: &syn::Block) -> Vec<String> {
                 syn::Item::Struct(item) => Some(ident_name(&item.ident)),
                 syn::Item::Enum(item) => Some(ident_name(&item.ident)),
                 syn::Item::Union(item) => Some(ident_name(&item.ident)),
+                syn::Item::Trait(item) => Some(ident_name(&item.ident)),
                 _ => None,
             }
         })
@@ -855,7 +860,7 @@ fn reset_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> V
 /// is visible only after its own definition.
 ///
 /// A sixth override, `visit_block`, feeds a *separate* `self.block_shadow` field —
-/// a block's own `struct`, `enum` and `union` declarations (issue #193), via
+/// a block's own `struct`, `enum`, `union` and `trait` declarations (issue #193), via
 /// [`extend_block_shadow`]. It is not part of this macro's own reset: unlike a
 /// generic type parameter, a block-local item still shadows inside a nested `fn` or
 /// `impl` in the same block, so `block_shadow` is untouched by every method this
@@ -929,7 +934,7 @@ pub fn generic_assoc_type_bindings_naming(
         block_items: Vec<&'ast syn::Item>,
         // Every generic type-parameter name currently shadowed (issue #181).
         shadow: Vec<String>,
-        // Every block-local `struct`/`enum`/`union` name currently shadowed
+        // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
         // (issue #193). A separate list from `shadow`: it resets only at a
         // `mod` boundary, not at a nested `fn`/`impl`/`trait` — see
         // `block_item_shadow_names`.
@@ -1305,7 +1310,7 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
         stack: Vec<&'ast [syn::Item]>,
         // Every generic type-parameter name currently shadowed (issue #181).
         shadow: Vec<String>,
-        // Every block-local `struct`/`enum`/`union` name currently shadowed
+        // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
         // (issue #193). Kept apart from `shadow`: the two reset at
         // different points — see `block_item_shadow_names`.
         block_shadow: Vec<String>,
@@ -1353,7 +1358,7 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
         }
 
         fn visit_block(&mut self, node: &'ast syn::Block) {
-            // A block's own `struct`/`enum`/`union` shadows a same-named
+            // A block's own `struct`/`enum`/`union`/`trait` shadows a same-named
             // module or alias for this block and everything nested inside
             // it (issue #193).
             let added = extend_block_shadow(&mut self.block_shadow, node);
@@ -5441,7 +5446,7 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
         // Every generic type-parameter name currently shadowed (issue #181),
         // same shape as `PathVisitor`'s own.
         shadow: Vec<String>,
-        // Every block-local `struct`/`enum`/`union` name currently shadowed
+        // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
         // (issue #193), same shape as `PathVisitor`'s own.
         block_shadow: Vec<String>,
         idents: Vec<String>,
@@ -5492,7 +5497,7 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
         }
 
         fn visit_block(&mut self, node: &'ast syn::Block) {
-            // Issue #193: a block's own `struct`/`enum`/`union` shadows a
+            // Issue #193: a block's own `struct`/`enum`/`union`/`trait` shadows a
             // same-named module or alias for this block and everything
             // nested inside it.
             let added = extend_block_shadow(&mut self.block_shadow, node);
@@ -15357,6 +15362,28 @@ mod block_local_item_shadow_tests {
         let counts =
             struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_trait_shadows_a_same_named_sibling_alias() {
+        // Codex review of this change (PR #203): `Alias` occupies the same
+        // namespace a struct, enum or union does, so a block-local
+        // `trait Alias {}` shadows a module-level `use Disallowed as
+        // Alias;` for `dyn Alias` exactly the way a block-local struct
+        // already shadows one for `Alias { .. }` — `block_item_shadow_names`
+        // had matched only `Item::Struct`/`Item::Enum`/`Item::Union` and
+        // fell through to `_ => None` on `Item::Trait`.
+        let code = "use Disallowed as Alias;\nfn f() {\n    trait Alias {}\n    fn accepts(_: \
+             &dyn Alias) {}\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Alias"]),
+            "a block-local trait did not shadow the module-level alias: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed alias resolved through the block-local trait anyway: {paths:?}"
+        );
     }
 }
 
