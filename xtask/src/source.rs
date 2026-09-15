@@ -21606,6 +21606,46 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_a_struct_pattern_destructuring_let_is_reported() {
+        // Codex's finding: `let S { x } = S { x: 0 }; x` names an irrefutable struct
+        // destructure — MSRV-legal, unwarned Rust, and no rarer a shape than the tuple
+        // pattern beside it — which `destructured_binding`'s own match fell through to `_
+        // => Vec::new()` for, exactly the way an unhandled `Pat::Tuple` once did: the whole
+        // statement went uncounted by every term that requires this function to answer at
+        // least one name, and the block it sat in read as unresolved. `destructured_binding`
+        // now matches each field pattern to its initializer by name (`Member`'s own
+        // `PartialEq`) rather than by position, since a struct's fields carry no positional
+        // order a pattern must respect the way a tuple's elements do. Verified against real
+        // rustc, warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ struct S {{ x: u8 }} let S {{ x }} = S {{ x: {n}u8 \
+                 }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_struct_pattern_destructuring_let(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_bound_by_their_own_selected_arm_is_reported() {
         // Codex's finding: `const P0: u8 = match 0u8 { x @ 0 => x, _ => 100 };` returns a
         // value bound by its own selected arm's pattern. `match_arm_matches_constant`

@@ -2890,6 +2890,43 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
                 .flat_map(|(inner_pat, inner_expr)| destructured_binding(inner_pat, inner_expr))
                 .collect()
         }
+        // Codex's finding: `let S { x } = S { x: 0 }; x` names an irrefutable struct
+        // destructure — MSRV-legal, unwarned Rust, and no rarer a shape than the tuple
+        // pattern right above it — which fell through to `_ => Vec::new()` exactly the way
+        // an unhandled `Pat::Tuple` once did: not merely leaving `x` unresolved, but
+        // dropping the whole statement from every counting term that requires
+        // `destructured_binding` to answer at least one name, so the block refused outright
+        // rather than only the one name this scan cannot fold. Each field pattern is
+        // matched to its initializer by *name* (`Member`'s own `PartialEq`), not by
+        // position — a struct's fields have no positional order a pattern is bound to
+        // respect, unlike a tuple's — and a field the pattern does not name is never
+        // looked up at all, the identical "only what is asked for" scope a tuple's own
+        // element-wise zip already keeps. A pattern field with no matching value at all —
+        // one supplied only through the expression's own `..base` update syntax, which this
+        // scan does not evaluate — recurses into nothing and contributes no binding,
+        // declining rather than guessing the value functional-update syntax would have
+        // supplied. No check compares the two sides' own struct *path*: a `let` pattern is
+        // irrefutable by construction, so an initializer that did not name the
+        // identical type would already be a type error `rustc` refused to compile, the
+        // identical standing the tuple case above already has for its own arity check alone.
+        syn::Pat::Struct(pat_struct) => {
+            let syn::Expr::Struct(expr_struct) = strip_parens(expr) else {
+                return Vec::new();
+            };
+            pat_struct
+                .fields
+                .iter()
+                .flat_map(|field_pat| {
+                    expr_struct
+                        .fields
+                        .iter()
+                        .find(|field_value| field_value.member == field_pat.member)
+                        .map_or_else(Vec::new, |field_value| {
+                            destructured_binding(&field_pat.pat, &field_value.expr)
+                        })
+                })
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
