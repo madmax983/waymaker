@@ -45,23 +45,31 @@
 //! * **unsealed** is here too, since issue
 //!   [#24](https://github.com/madmax983/waymaker/issues/24). §09's frame ends with a commit
 //!   seal one program unit wide, written only after a payload barrier, so a frame body with
-//!   no valid seal over it is a frame whose writer never reached §07 step 3. It stops the
-//!   scan at its own first byte with [`Ending::Unsealed`], which is what lets a caller tell
-//!   "the power went during an append" from "this bank is damaged" — the distinction this
-//!   module was written without, and the one [`Ending`] said it would grow a variant for.
+//!   no valid seal over it is a frame whose writer never reached §07 step 3. For an
+//!   outcome — `EffectCompleted`, `EffectFailed` or `TimerFired`, the only three kinds
+//!   `frame::redeliverable_kind` admits — if every byte between the frame's own length and
+//!   the end of its reserved slot is erased, nothing else was ever written there — no writer
+//!   starts a record before the one ahead of it has sealed — so the frame is ignored and the
+//!   scan carries on past it: issue [#95](https://github.com/madmax983/waymaker/issues/95).
+//!   Every other kind never reaches that check at all, whatever its slot holds. Otherwise —
+//!   an unsealed frame of any other kind, or an outcome whose slot is not fully erased — it
+//!   stops the scan at its own first byte with [`Ending::Unsealed`], which is what lets a
+//!   caller tell "the power went during an append" from "this bank is damaged" — the
+//!   distinction this module was written without, and the one [`Ending`] said it would grow
+//!   a variant for.
 //!
 //! # The append offset
 //!
 //! Issue #23 asks for the append point as a by-product of the scan, and the by-product is
 //! deliberately hard to get at: only [`Ending::Clean`] carries one. Every other ending
-//! stopped at *programmed* bytes, and this is not conservatism. On NOR a programmed bit
-//! cannot be returned to one without erasing the block, so a writer that appended at a
-//! damaged or unsealed frame would produce a frame that fails its own header checksum on
-//! every boot, for ever. Appending *past* it is worse: the next boot's scan stops in the
-//! same place again and never reaches what was written, so the records are lost while the
-//! device reports success. Since issue #24 a caller can tell the two apart —
-//! [`Ending::Unsealed`] is an interrupted append and [`Ending::Damaged`] is media to
-//! suspect — and neither of them is a place to write.
+//! stopped at *programmed* bytes that were never safely ignorable, and this is not
+//! conservatism. On NOR a programmed bit cannot be returned to one without erasing the
+//! block, so a writer that appended at damaged or genuinely unsealed media would produce a
+//! frame that fails its own header checksum on every boot, for ever. Appending *past* it is
+//! worse: the next boot's scan stops in the same place again and never reaches what was
+//! written, so the records are lost while the device reports success. Since issue #24 a
+//! caller can tell the two apart — [`Ending::Unsealed`] is an interrupted append and
+//! [`Ending::Damaged`] is media to suspect — and neither is a place to write.
 //!
 //! So the invariant is: **whenever an append offset comes back, every byte from it to the
 //! end of the region is erased, and the absolute offset it names is one this device can
@@ -432,17 +440,23 @@ pub enum Ending {
         /// The offset the scan gave up at, relative to [`JournalRegion::base`].
         at: u32,
     },
-    /// The scan met a frame body with no commit seal over it, at `at`.
+    /// The scan met a frame body with no commit seal over it, and could not tell an
+    /// interrupted append from damage, at `at`.
     ///
     /// §09's first stop condition. The prefix before it is final and complete, so a caller
     /// may replay it — that is what separates this from [`Incomplete`](Self::Incomplete),
     /// where the prefix may be short. Nothing may be appended: `at` is the first byte of a
     /// frame whose cells a program cycle has already cleared.
     ///
-    /// This is what a power loss during §07's steps 1 to 3 leaves behind, and it is the
-    /// only ending that says so. A record that reaches it was never acknowledged, was never
-    /// dispatched — §07 dispatches at step 4, after the commit barrier — and is therefore
-    /// history the device is right to have no trace of.
+    /// An unsealed *outcome* — `EffectCompleted`, `EffectFailed` or `TimerFired`, the only
+    /// three kinds `frame::redeliverable_kind` admits — whose own reserved slot is otherwise
+    /// erased is *not* this shape — issue
+    /// [#95](https://github.com/madmax983/waymaker/issues/95): it is ignored, and the scan
+    /// reports [`Clean`](Self::Clean) past it, because nothing else was ever written there.
+    /// Every other kind never reaches that check at all, whatever its slot holds, and always
+    /// ends here. For an outcome, this ending is what is left once the erased case is ruled
+    /// out: a byte in the slot that is neither erased nor a real seal, which is a tear
+    /// inside the seal itself, or media this module has no way to trust.
     Unsealed {
         /// The first byte of the unsealed frame, relative to [`JournalRegion::base`].
         at: u32,
@@ -612,6 +626,18 @@ struct Staged {
     seal_at: usize,
     /// Bytes the offset advances by, which is the whole record.
     stride: u32,
+    /// The frame's own declared length, before padding. What a writer actually programmed
+    /// for this record ends here; from here to `seal_at` is padding, erased on any device
+    /// this recovery was validated against — see [`Recovery::past_the_seal_slot`].
+    frame_len: u32,
+}
+
+/// What [`Recovery::sealed`] found: a whole seal, or a torn one and whether its own record
+/// kind is one `past_the_seal_slot` may still ignore. See [`frame::redeliverable_kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seal {
+    Whole,
+    Torn { redeliverable: bool },
 }
 
 impl<'storage, S> Recovery<'storage, S, Catalogued> {
@@ -656,18 +682,24 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
         self.region
     }
 
-    /// The byte at which the committed prefix ends, relative to the region's base.
+    /// The scan's current physical position, relative to the region's base — not, on its
+    /// own, a promise that every byte behind it is committed history.
     ///
     /// # Postconditions
     ///
     /// Zero before the first step; after a step that yielded a record, past that record and
     /// its padding; after a step that failed, still at the *start* of the frame that failed
-    /// — §14's "frame ignored; previous history prefix wins" is exactly that offset. Always
+    /// — §14's "frame ignored; previous history prefix wins" is exactly that offset. After a
+    /// step that ignored a torn but redeliverable outcome — issue #95, `EffectCompleted`,
+    /// `EffectFailed` or `TimerFired` with an erased `[frame_len, next)` suffix — *past*
+    /// that record's own slot, exactly as if it had yielded one, even though the ignored
+    /// frame itself never became committed history: the offset is the position the scan
+    /// resumed from, not a claim about what lies between it and the record before. Always
     /// a whole number of the region's program units, and never greater than
     /// [`JournalRegion::bytes`].
     ///
-    /// This is where history *ended*. It is not where the next record may be written unless
-    /// [`append_offset`](Self::append_offset) says so.
+    /// This is where the scan *stopped*. It is not where the next record may be written
+    /// unless [`append_offset`](Self::append_offset) says so.
     #[must_use]
     pub const fn offset(&self) -> u32 {
         self.offset
@@ -747,49 +779,60 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
     where
         S: StableStorage,
     {
-        // Split in two so that every mutable use of the page is behind us before the record
-        // borrows it: `stage` fills the page, and nothing below writes to it.
-        let staged = match self.stage(&mut *page)? {
-            Ok(staged) => staged,
-            Err(error) => return Some(Err(error)),
-        };
-        let frozen: &'page [u8] = &*page;
-        let Some(bytes) = frozen.get(..staged.need) else {
-            // Unreachable: `stage` refused a `need` the page could not hold. Spelled as a
-            // refusal rather than an `unwrap` because the workspace denies both, and a
-            // reader walking bytes off a damaged device is the last place to make an
-            // exception.
-            self.ending = Some(Ending::Incomplete { at: self.offset });
-            return Some(Err(RecoveryError::PageTooSmall {
-                needed: staged.need,
-            }));
-        };
-        match frame::decode_with::<C>(bytes) {
-            Ok(frame) => {
-                // §09's first stop condition, before the record kind: what an uncommitted
-                // frame *says* is not a question worth asking. `stage` read the whole
-                // record, so the seal is already in the page.
-                let Some(seal) = bytes.get(staged.seal_at..) else {
-                    // Unreachable: `stage` staged `need > seal_at` bytes.
-                    self.ending = Some(Ending::Incomplete { at: self.offset });
-                    return Some(Err(RecoveryError::PageTooSmall {
-                        needed: staged.need,
-                    }));
-                };
-                if !frame::commit_seal_holds(frame.frame_crc, seal) {
-                    self.ending = Some(Ending::Unsealed { at: self.offset });
-                    return Some(Err(RecoveryError::Decode(DecodeError::Unsealed)));
+        // A loop rather than a single attempt: an unsealed frame whose own reserved slot is
+        // clean is ignored — see `past_the_seal_slot` — and scanning has to carry on from
+        // past it rather than stop, exactly as it would past a yielded record. Every branch
+        // either returns or strictly advances `self.offset` by `stride > 0` before looping,
+        // so this always terminates over a region of finite length.
+        loop {
+            // Split in two so that every mutable use of the page is behind us before the
+            // record borrows it: `stage` fills the page, and nothing below writes to it.
+            let staged = match self.stage(&mut *page)? {
+                Ok(staged) => staged,
+                Err(error) => return Some(Err(error)),
+            };
+
+            // A first, short-lived look: whether the frame decodes and whether its seal
+            // holds, borrowed for this check alone rather than for `'page`. Both branches
+            // below need the page back — to look past the seal, or to decode it again for a
+            // borrow that lasts — and a borrow tied to `'page` cannot be given back inside
+            // this function once taken. Kept in its own method rather than inlined so this
+            // function's one call to `frame::decode_with::<C>` stays the one the
+            // `RECOVERY_ROUTING_STEPS` pin reads; the record-borrowing decode below is the
+            // other one, and the two never run in the same body.
+            let sealed = match self.sealed(page, staged) {
+                Ok(sealed) => sealed,
+                Err(error) => return Some(Err(error)),
+            };
+            if let Seal::Torn { redeliverable } = sealed {
+                match self.past_the_seal_slot(page, staged, redeliverable) {
+                    Ok(()) => continue,
+                    Err(error) => return Some(Err(error)),
                 }
-                match frame.decoded {
+            }
+
+            // Decoded once already, to decide `sealed`; decoded again here so the record
+            // this yields borrows `page` for `'page` rather than for the peek above.
+            let frozen: &'page [u8] = &*page;
+            let Some(bytes) = frozen.get(..staged.need) else {
+                // Unreachable: the peek above already read this many bytes.
+                self.ending = Some(Ending::Incomplete { at: self.offset });
+                return Some(Err(RecoveryError::PageTooSmall {
+                    needed: staged.need,
+                }));
+            };
+            return match frame::decode_with::<C>(bytes) {
+                Ok(frame) => match frame.decoded {
                     Decoded::Record(record) => {
-                        // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves and a
-                        // scan over a finite region is finite. Checked rather than saturating,
-                        // because this is the one arithmetic here whose degenerate answer is an
-                        // *affirmative* one: an offset that saturated would make `remaining` zero,
-                        // and the next step would report a clean end at `u32::MAX` — "safe to
-                        // append", at an offset outside the device. `stride <= remaining` is
-                        // checked before the read, so the `else` is unreachable and is spelled as
-                        // the refusal it would have to be.
+                        // `stride >= FRAME_OVERHEAD_BYTES > 0`, so the offset always moves
+                        // and a scan over a finite region is finite. Checked rather than
+                        // saturating, because this is the one arithmetic here whose
+                        // degenerate answer is an *affirmative* one: an offset that
+                        // saturated would make `remaining` zero, and the next step would
+                        // report a clean end at `u32::MAX` — "safe to append", at an offset
+                        // outside the device. `stride <= remaining` is checked before the
+                        // read, so the `else` is unreachable and is spelled as the refusal
+                        // it would have to be.
                         let Some(next) = self.offset.checked_add(staged.stride) else {
                             self.ending = Some(Ending::Incomplete { at: self.offset });
                             return Some(Err(RecoveryError::Decode(
@@ -801,20 +844,152 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
                     }
                     Decoded::UnknownKind(_) => {
                         // §09 makes skipping a property of the format version, and
-                        // `permits_unknown_record_skip` answers `false` for every one of the 256
-                        // a version byte can hold. There is deliberately no second arm: a branch
-                        // no test can reach is a branch whose first execution is recovery after
-                        // a power loss on somebody's device.
+                        // `permits_unknown_record_skip` answers `false` for every one of
+                        // the 256 a version byte can hold. There is deliberately no second
+                        // arm: a branch no test can reach is a branch whose first execution
+                        // is recovery after a power loss on somebody's device.
                         self.ending = Some(Ending::Damaged { at: self.offset });
                         Some(Err(RecoveryError::Decode(DecodeError::UnknownRecordKind)))
                     }
+                },
+                // Unreachable: the peek above already decoded these same bytes without
+                // error.
+                Err(error) => {
+                    self.ending = Some(Ending::Damaged { at: self.offset });
+                    Some(Err(RecoveryError::Decode(error)))
                 }
+            };
+        }
+    }
+
+    /// Whether the frame `staged` staged is sealed, decoded through a short-lived borrow of
+    /// `page` rather than through `'page`.
+    ///
+    /// This exists apart from [`next`](Self::next) only so that function keeps exactly one
+    /// call to `frame::decode_with::<C>` — the pin `RECOVERY_ROUTING_STEPS` reads — while
+    /// still being able to look past the seal, or hand the page back to
+    /// [`stage`](Self::stage) for another record, on the branch where it is not sealed. A
+    /// borrow tied to `'page` cannot be given back inside `next` once taken; one tied only
+    /// to this call can.
+    ///
+    /// # Errors
+    ///
+    /// [`RecoveryError::Decode`] when the frame itself does not decode — ends the scan as
+    /// [`Ending::Damaged`] — and [`RecoveryError::PageTooSmall`] on the same unreachable
+    /// short page [`stage`](Self::stage) already ruled out.
+    fn sealed(&mut self, page: &[u8], staged: Staged) -> Result<Seal, RecoveryError<S::Error>>
+    where
+        S: StableStorage,
+    {
+        let Some(peek) = page.get(..staged.need) else {
+            // Unreachable: `stage` refused a `need` the page could not hold. Spelled as a
+            // refusal rather than an `unwrap` because the workspace denies both, and a
+            // reader walking bytes off a damaged device is the last place to make an
+            // exception.
+            self.ending = Some(Ending::Incomplete { at: self.offset });
+            return Err(RecoveryError::PageTooSmall {
+                needed: staged.need,
+            });
+        };
+        match frame::decode_with::<C>(peek) {
+            Ok(frame) => {
+                // §09's first stop condition, before whether the seal holds: what an
+                // uncommitted frame *says* is not a question worth asking. `stage` read the
+                // whole record, so the seal is already in the page.
+                let Some(seal) = peek.get(staged.seal_at..) else {
+                    // Unreachable: `stage` staged `need > seal_at` bytes.
+                    self.ending = Some(Ending::Incomplete { at: self.offset });
+                    return Err(RecoveryError::PageTooSmall {
+                        needed: staged.need,
+                    });
+                };
+                if frame::commit_seal_holds(frame.frame_crc, seal) {
+                    return Ok(Seal::Whole);
+                }
+                // The seal does not hold, so this frame is exactly the "uncommitted frame"
+                // the comment above means — but the record's own kind, decoded from bytes
+                // that same checksum already verified, decides whether
+                // `past_the_seal_slot` may ignore it at all. See
+                // `frame::redeliverable_kind`.
+                Ok(Seal::Torn {
+                    redeliverable: frame::redeliverable_kind(&frame.decoded),
+                })
             }
             Err(error) => {
                 self.ending = Some(Ending::Damaged { at: self.offset });
-                Some(Err(RecoveryError::Decode(error)))
+                Err(RecoveryError::Decode(error))
             }
         }
+    }
+
+    /// Whether an unsealed frame may be ignored, once its own checksum has already verified
+    /// and its record kind is known to be one §10's capacity reserve prices a retry for.
+    /// `staged.frame_len` is what a writer actually programmed, before padding;
+    /// `staged.stride` is the whole slot the frame reserved: its padded body plus its commit
+    /// seal, whether or not the seal itself landed. `page` already holds the whole slot,
+    /// staged by [`stage`](Self::stage).
+    ///
+    /// `redeliverable` is [`Seal::Torn`]'s own field: `false` ends the scan as
+    /// [`Ending::Unsealed`] outright, before either byte range below is even read, exactly
+    /// as every unsealed frame did before issue #95 — see [`frame::redeliverable_kind`] for
+    /// which kinds answer `true` and why.
+    ///
+    /// No writer starts a record before the one ahead of it has sealed — see
+    /// [`crate::append`] — so between `frame_len` and `stride` is only ever padding and a
+    /// seal, on any device this recovery was validated against. If every byte there is
+    /// erased, the record is ignored exactly as an unsealed frame always was:
+    /// `self.offset` advances past the whole slot and [`Ok`] tells [`next`](Self::next) to
+    /// keep scanning from there, which is issue [#95](https://github.com/madmax983/waymaker/issues/95)'s
+    /// fix — the same run keeps its identity instead of being forced into
+    /// `continue_as_new`. Scanning onward, rather than declaring the slot's end a clean
+    /// finish outright, is what a *later* boot's own committed history needs: that history
+    /// starts exactly at this slot's end, and a scan that stopped here instead of continuing
+    /// would hide it behind a slot no later scan ever gets past either.
+    ///
+    /// The check is bounded to `[frame_len, stride)` rather than run to the end of the
+    /// region, and that is not only cheaper — it is what keeps this sound against a caller's
+    /// wrong alignment. A reader walked at a *wider* granularity than the one a journal was
+    /// written at computes a `stride` that runs past real, committed records without ever
+    /// looking at them; checking only the bytes between `frame_len` and that `stride` reads
+    /// exactly what a real writer would have left behind for *this* record, so a
+    /// miscomputed slot landing on erased media further out is not mistaken for one.
+    ///
+    /// If a byte in `[frame_len, stride)` is not erased, this module cannot tell an
+    /// interrupted append from damage — nothing legitimate should be there — and
+    /// [`Ending::Unsealed`] stands exactly as it always has: no append point.
+    fn past_the_seal_slot(
+        &mut self,
+        page: &[u8],
+        staged: Staged,
+        redeliverable: bool,
+    ) -> Result<(), RecoveryError<S::Error>>
+    where
+        S: StableStorage,
+    {
+        let at = self.offset;
+        let unsealed = || RecoveryError::Decode(DecodeError::Unsealed);
+        if !redeliverable {
+            self.ending = Some(Ending::Unsealed { at });
+            return Err(unsealed());
+        }
+        let (Some(from), Some(to)) = (
+            usize::try_from(staged.frame_len).ok(),
+            usize::try_from(staged.stride).ok(),
+        ) else {
+            self.ending = Some(Ending::Unsealed { at });
+            return Err(unsealed());
+        };
+        let clean = page.get(from..to).is_some_and(is_erased);
+        if !clean {
+            self.ending = Some(Ending::Unsealed { at });
+            return Err(unsealed());
+        }
+        let Some(past) = at.checked_add(staged.stride) else {
+            self.ending = Some(Ending::Unsealed { at });
+            return Err(unsealed());
+        };
+        self.offset = past;
+        Ok(())
     }
 
     /// Reads the next frame into `page`, or ends the scan.
@@ -952,12 +1127,13 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
         // commit seal that follows it. A record whose two parts run past the end of the
         // region could not have been written into it, so the region is shorter than the
         // record it appears to hold — a truncation and not a record.
-        let (Some(body), Some(seal)) = (
+        let (Some(body), Some(seal), Some(frame_len_bytes)) = (
             self.region
                 .align
                 .round_up(frame_len)
                 .and_then(|body| u32::try_from(body).ok()),
             u32::try_from(frame::seal_bytes(self.region.align)).ok(),
+            u32::try_from(frame_len).ok(),
         ) else {
             return Some(Err(
                 self.damaged(RecoveryError::Decode(DecodeError::LengthOutOfBounds))
@@ -991,6 +1167,7 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
             need: need_bytes,
             seal_at: usize::try_from(body).unwrap_or(usize::MAX),
             stride,
+            frame_len: frame_len_bytes,
         }))
     }
 

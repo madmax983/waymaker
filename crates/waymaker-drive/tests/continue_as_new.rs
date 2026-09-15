@@ -1,0 +1,2371 @@
+//! Issue [#110](https://github.com/madmax983/waymaker/issues/110)'s `continue_as_new` join:
+//! a [`Driver::at_bank`] performs design document §10's real swap, over real media.
+//!
+//! `crates/waymaker-drive/tests/ota.rs`'s
+//! `continue_as_new_is_refused_by_a_driver_that_cannot_name_a_bank` is the other half —
+//! [`Driver::new`], pointed at a fixed region, still refuses. This file is the driver that
+//! can.
+
+use waymaker_core::timer::TimerSpec;
+use waymaker_core::version::VersionRange;
+use waymaker_core::{ActivityKind, DecodeError, KernelError, Outcome, RecordRef, RunId};
+use waymaker_drive::{
+    Boundary, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
+};
+use waymaker_fault::Device;
+use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
+use waymaker_flash::capacity::{Bounds, CapacityError, Refusal, Reserve};
+use waymaker_flash::frame::{self, ProgramAlign};
+use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
+use waymaker_flash::recovery::{JournalRegion, RecoveryError, RegionError};
+use waymaker_flash::storage::{Geometry, StableStorage};
+
+const WORKFLOW_KIND: u16 = 0x00A1;
+const WORKFLOW_VERSION: u16 = 1;
+const INPUT_SCHEMA: u16 = 1;
+const RUN: RunId = RunId(0x0000_0000_0000_002A);
+const FIRST_INPUT: &[u8] = b"the-run-in-progress";
+const NEXT_INPUT: &[u8] = b"what-continue-as-new-asked-for";
+
+const BOUNDS: Bounds = Bounds {
+    run_input_bytes: 64,
+    effect_result_bytes: 16,
+    terminal_bytes: 16,
+};
+
+fn geometry() -> Geometry {
+    let Ok(geometry) = Geometry::new(8192, 4096, 8, 1) else {
+        unreachable!("8192/4096/8/1 is a legal geometry of two whole erase blocks")
+    };
+    geometry
+}
+
+fn layout() -> BankLayout {
+    let Ok(layout) = BankLayout::new(geometry()) else {
+        unreachable!("two erase blocks are two banks")
+    };
+    layout
+}
+
+fn align() -> ProgramAlign {
+    layout().align()
+}
+
+/// A device twice [`geometry`]'s size, at the same granularity — so a [`Reserve`] priced
+/// against it is compatible in every way a reserve's own `bounds()` could ever reveal, and
+/// differs only in the bank size baked into the reserve itself.
+fn other_geometry() -> Geometry {
+    let Ok(geometry) = Geometry::new(16384, 8192, 8, 1) else {
+        unreachable!("16384/8192/8/1 is a legal geometry of two whole erase blocks")
+    };
+    geometry
+}
+
+fn other_layout() -> BankLayout {
+    let Ok(layout) = BankLayout::new(other_geometry()) else {
+        unreachable!("two erase blocks are two banks")
+    };
+    layout
+}
+
+fn reserve() -> Reserve {
+    let Ok(reserve) = Reserve::for_layout(BOUNDS, layout()) else {
+        unreachable!("these bounds fit this layout")
+    };
+    reserve
+}
+
+fn first_header() -> BankHeader<'static> {
+    BankHeader {
+        run: RUN,
+        align: align(),
+        workflow_kind: WORKFLOW_KIND,
+        workflow_version: WORKFLOW_VERSION,
+        input_schema: INPUT_SCHEMA,
+        input: FIRST_INPUT,
+    }
+}
+
+/// A geometry like [`geometry`]'s, but with a chosen read unit. [`geometry`] always uses
+/// one, which is why the seal-alignment bug Codex found needed a fixture of its own: every
+/// other test in this file reads a bank's seal on a device where a misaligned read cannot
+/// be told apart from an aligned one.
+fn geometry_with_read_size(read_size: u32) -> Geometry {
+    let Ok(geometry) = Geometry::new(8192, 4096, 8, read_size) else {
+        unreachable!("8192/4096/8/{read_size} is a legal geometry of two whole erase blocks")
+    };
+    geometry
+}
+
+fn layout_with_read_size(read_size: u32) -> BankLayout {
+    let Ok(layout) = BankLayout::new(geometry_with_read_size(read_size)) else {
+        unreachable!("two erase blocks are two banks")
+    };
+    layout
+}
+
+fn reserve_for(layout: BankLayout) -> Reserve {
+    let Ok(reserve) = Reserve::for_layout(BOUNDS, layout) else {
+        unreachable!("these bounds fit this layout")
+    };
+    reserve
+}
+
+/// [`install`], against a caller-chosen layout rather than [`layout`]'s own.
+fn install_on(
+    device: &mut Device,
+    layout: BankLayout,
+    id: BankId,
+    generation: Generation,
+    header: &BankHeader<'_>,
+) {
+    let region = layout.bank(id);
+    let mut staging = [0_u8; 512];
+    let Ok(header_len) = bank::encode_header(header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.base(), header_frame),
+        device.barrier(),
+    ) else {
+        unreachable!("a bank header is a legal program")
+    };
+    let Ok(seal) = bank::seal_for(header_frame, generation) else {
+        unreachable!("a header frame can be sealed")
+    };
+    let mut seal_bytes = [0_u8; 64];
+    let Ok(seal_len) = bank::encode_seal(&seal, layout.align(), &mut seal_bytes) else {
+        unreachable!("a seal fits its own region")
+    };
+    let Some(sealed) = seal_bytes.get(..seal_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.seal_offset(), sealed),
+        device.barrier(),
+    ) else {
+        unreachable!("a generation seal is a legal program")
+    };
+}
+
+/// Installs a bank the way a previous life left it: header, barrier, seal, barrier.
+///
+/// Not the swap under test — this is the device's history, and a test that built its
+/// starting state with the writer it is testing would be a test of nothing. Ported from
+/// `crates/waymaker-flash/tests/swap.rs`'s helper of the same shape.
+fn install(device: &mut Device, id: BankId, generation: Generation, header: &BankHeader<'_>) {
+    let region = layout().bank(id);
+    let mut staging = [0_u8; 512];
+    let Ok(header_len) = bank::encode_header(header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.base(), header_frame),
+        device.barrier(),
+    ) else {
+        unreachable!("a bank header is a legal program")
+    };
+    let Ok(seal) = bank::seal_for(header_frame, generation) else {
+        unreachable!("a header frame can be sealed")
+    };
+    let mut seal_bytes = [0_u8; 64];
+    let Ok(seal_len) = bank::encode_seal(&seal, align(), &mut seal_bytes) else {
+        unreachable!("a seal fits its own region")
+    };
+    let Some(sealed) = seal_bytes.get(..seal_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.seal_offset(), sealed),
+        device.barrier(),
+    ) else {
+        unreachable!("a generation seal is a legal program")
+    };
+}
+
+/// Writes a bank's header and nothing else, leaving its seal region erased.
+///
+/// The shape a device left mid-swap — staged, never sealed — rather than the finished
+/// article [`install`] and [`install_on`] both write. Used to prove that an unsealed bank's
+/// header, whatever it declares, can never cost a boot anything: [`bank::sealed_generation`]
+/// already says such a bank is not a candidate at any generation, and `read_bank` has to
+/// establish that *before* it ever holds the header's own declared length against `page`.
+fn install_header_only(
+    device: &mut Device,
+    layout: BankLayout,
+    id: BankId,
+    header: &BankHeader<'_>,
+) {
+    let region = layout.bank(id);
+    let mut staging = [0_u8; 512];
+    let Ok(header_len) = bank::encode_header(header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.base(), header_frame),
+        device.barrier(),
+    ) else {
+        unreachable!("a bank header is a legal program")
+    };
+}
+
+/// A device booted from bank A, generation zero, and nothing on bank B.
+fn booted() -> Device {
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    device
+}
+
+/// The header a bank on media carries, decoded the way a cold boot has to.
+fn header_on(device: &mut Device, id: BankId) -> Option<(RunId, u16, u16, Vec<u8>)> {
+    header_on_with(device, layout(), id)
+}
+
+/// [`header_on`], against a caller-chosen layout rather than [`layout`]'s own.
+fn header_on_with(
+    device: &mut Device,
+    layout: BankLayout,
+    id: BankId,
+) -> Option<(RunId, u16, u16, Vec<u8>)> {
+    let region = layout.bank(id);
+    let read_len = region.bytes().min(512) as usize;
+    let mut page = vec![0_u8; read_len];
+    let Ok(()) = device.read(region.base(), &mut page) else {
+        unreachable!("a bank's header is inside the device")
+    };
+    let decoded = bank::decode_header(&page).ok()?;
+    Some((
+        decoded.run,
+        decoded.workflow_version,
+        decoded.input_schema,
+        decoded.input.to_vec(),
+    ))
+}
+
+/// A workflow that immediately retires itself over [`NEXT_INPUT`].
+struct ContinueOnce;
+
+impl Workflow for ContinueOnce {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Err(boundary.continue_as_new(NEXT_INPUT))
+    }
+}
+
+/// A workflow over whatever input it was built with. Used for the run `continue_as_new`
+/// installs, which this file never asks to do anything but exist.
+struct JustStarted<'a> {
+    input: &'a [u8],
+}
+
+impl Workflow for JustStarted<'_> {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: self.input,
+        }
+    }
+
+    fn run(&mut self, _boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
+/// A workflow that leaves an effect outstanding and then asks to migrate anyway.
+///
+/// §07's schedule record is already durable in bank A's journal when `continue_as_new`
+/// runs — the effect is committed, not merely asked for — so a swap that went ahead would
+/// forfeit an identity a crash never took.
+struct ScheduleThenContinue;
+
+impl Workflow for ScheduleThenContinue {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let _ = boundary.schedule(ActivityKind(1), b"an-effect-in-flight")?;
+        Err(boundary.continue_as_new(NEXT_INPUT))
+    }
+}
+
+/// Wider than [`BOUNDS`]'s `run_input_bytes`.
+const OVERSIZED_INPUT: [u8; 65] = [b'x'; 65];
+
+/// A workflow that asks `continue_as_new` for more than the run's own bound allows.
+struct ContinueWithOversizedInput;
+
+impl Workflow for ContinueWithOversizedInput {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Err(boundary.continue_as_new(&OVERSIZED_INPUT))
+    }
+}
+
+/// A workflow admitting both [`WORKFLOW_VERSION`] and its successor — an image that still
+/// replays the version the retiring bank recorded, standing in for a firmware upgrade
+/// arriving mid-run.
+struct UpgradingContinueOnce;
+
+impl Workflow for UpgradingContinueOnce {
+    fn identity(&self) -> Identity<'_> {
+        let Some(versions) = VersionRange::new(WORKFLOW_VERSION, WORKFLOW_VERSION + 1) else {
+            unreachable!("a lower bound below the current version is a legal range")
+        };
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions,
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Err(boundary.continue_as_new(NEXT_INPUT))
+    }
+}
+
+/// [`JustStarted`] over [`NEXT_INPUT`], admitting only the version after
+/// [`WORKFLOW_VERSION`] — an image that has since dropped the retired version entirely.
+struct JustStartedAfterUpgrade;
+
+impl Workflow for JustStartedAfterUpgrade {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION + 1),
+            input: NEXT_INPUT,
+        }
+    }
+
+    fn run(&mut self, _boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
+/// A workflow over [`NEXT_INPUT`] that admits only [`WORKFLOW_VERSION`] — the version an
+/// image would carry if it had never taken the upgrade [`UpgradingContinueOnce`] represents,
+/// rolled back to over a bank that upgrade's own swap already installed and stamped with
+/// `WORKFLOW_VERSION + 1`.
+struct RolledBackToFirstVersion;
+
+impl Workflow for RolledBackToFirstVersion {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: NEXT_INPUT,
+        }
+    }
+
+    fn run(&mut self, _boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
+/// A workflow over [`FIRST_INPUT`], with a version range this test picks, that waits for a
+/// persistent deadline nothing here ever reaches — so the run stays suspended, recorded but
+/// unfinished, across as many boots as a test wants to drive it through.
+struct WaitingAtVersion {
+    versions: VersionRange,
+}
+
+impl WaitingAtVersion {
+    fn new(oldest: u16, current: u16) -> Self {
+        let Some(versions) = VersionRange::new(oldest, current) else {
+            unreachable!("oldest <= current is a legal range")
+        };
+        Self { versions }
+    }
+}
+
+impl Workflow for WaitingAtVersion {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: self.versions,
+            input: FIRST_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        boundary.wait(TimerSpec::AtPersistentTime { instant: u64::MAX })?;
+        Ok(Outcome::Completed(&[]))
+    }
+}
+
+const fn scratch<'a>(page: &'a mut [u8; 512], result: &'a mut [u8; 16]) -> Scratch<'a> {
+    Scratch { page, result }
+}
+
+#[test]
+fn a_driver_at_a_bank_performs_a_real_swap_and_installs_the_next_run_in_the_other_bank() {
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    let Ok(Progress::Migrated { run }) = progress else {
+        unreachable!("a bank-pointed driver over a sealed bank performs the swap: {progress:?}")
+    };
+    assert_eq!(
+        run,
+        RunId(RUN.0 + 1),
+        "the next run id is this device's first successor"
+    );
+
+    // This driver performs all seven steps in one call, reclaim included: the retiring
+    // bank, A, is erased rather than left holding a stale sealed run.
+    assert_eq!(header_on(&mut device, BankId::A), None);
+
+    // The installed bank, B, carries the new run and the input `continue_as_new` was asked
+    // for — read back the way a cold boot has to, not assumed from the call that wrote it.
+    let (b_run, b_version, b_schema, b_input) =
+        header_on(&mut device, BankId::B).expect("the swap installed bank B");
+    assert_eq!(b_run, run);
+    assert_eq!(b_version, WORKFLOW_VERSION);
+    assert_eq!(b_schema, INPUT_SCHEMA);
+    assert_eq!(b_input, NEXT_INPUT);
+
+    // And the seal that made B authoritative names the generation after the one this
+    // device booted from — not merely *a* valid seal, which an understated generation
+    // would still decode as.
+    assert_eq!(
+        generation_on(&mut device, BankId::B),
+        Generation::FIRST.successor()
+    );
+}
+
+#[test]
+fn continue_as_new_stamps_the_new_bank_with_the_images_current_version_not_the_retired_ones() {
+    // Codex found this. `bank.workflow_version` is the *retiring* bank's own recorded
+    // version, read back from its header rather than from this image — stamping the next
+    // bank with it silently downgrades a run this same call is meant to carry forward. A v2
+    // image continuing a v1 run has to record v2, the version `begin` would also choose for
+    // a freshly erased journal, not the v1 the old header happened to carry.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut UpgradingContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::Migrated { .. })),
+        "{progress:?}"
+    );
+
+    let (_, b_version, ..) = header_on(&mut device, BankId::B).expect("the swap installed bank B");
+    assert_eq!(b_version, WORKFLOW_VERSION + 1);
+
+    // The sharper proof: an image that has since dropped v1 entirely still replays what the
+    // swap installed, which it could not if the header had been stamped with the retired
+    // v1 rather than the v2 this call was actually made under.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStartedAfterUpgrade,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
+}
+
+#[test]
+fn a_later_image_that_dropped_the_headers_own_version_still_resumes_the_runs_recorded_one() {
+    // Codex found this. `booted()`'s bank header names `WORKFLOW_VERSION` and never changes
+    // again — it is a fact about whatever wrote the swap, not about the run. A v2 image that
+    // still admits v1 boots this bank for the first time and records its *own* current
+    // version into `RunStarted`, per `begin`'s existing choice for an erased journal. Every
+    // boot after that has a real recorded version to read, and `verify_header_identity` must
+    // not go on checking the header's own stale one once it does — a v3 image that has since
+    // dropped v1 entirely, but still admits the v2 this run is actually recorded at, has to
+    // resume it rather than being refused over a field nothing here depends on any more.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    // v2, still admitting the header's own v1, boots this bank for the first time.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut WaitingAtVersion::new(WORKFLOW_VERSION, WORKFLOW_VERSION + 1),
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "{progress:?}"
+    );
+
+    // v3, admitting only the version the journal actually recorded and nothing below it.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut WaitingAtVersion::new(WORKFLOW_VERSION + 1, WORKFLOW_VERSION + 1),
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "a v3 image admitting only the journal's own recorded version must still resume \
+         this run rather than being refused over the header's stale v1: {progress:?}"
+    );
+}
+
+#[test]
+fn the_next_boot_of_the_same_layout_replays_the_bank_the_swap_installed() {
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+    let Ok(Progress::Migrated { run: next_run }) = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    ) else {
+        unreachable!("the first boot performs the swap")
+    };
+
+    // A fresh driver, built exactly as the first one was: nothing about which bank is
+    // authoritative was carried over from the first boot.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: NEXT_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
+    let _ = next_run;
+
+    // The proof that boot 2 replayed the bank the swap installed, rather than a coincidence
+    // of layout: boot 2 wrote a real `RunStarted` into bank B over `NEXT_INPUT`, so a third
+    // boot declaring a *different* input over the same layout can only be refused by reading
+    // that same record back. A stale fallback to bank A's own `RunStarted` — over
+    // `FIRST_INPUT` — would refuse this boot too, for the wrong reason, so the input below is
+    // chosen to differ from both.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted {
+            input: b"neither-run-ever-declared-this",
+        },
+        scratch(&mut page, &mut result),
+    );
+    assert_eq!(progress, Err(DriveError::NotThisWorkflow));
+}
+
+#[test]
+fn a_committed_effect_is_not_forfeited_by_a_live_continue_as_new() {
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ScheduleThenContinue,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(progress, Err(DriveError::EffectOutstanding));
+
+    // The swap never started: bank A is still the only sealed bank, carrying the run it
+    // always did, and bank B holds nothing a swap would have installed.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+    assert_eq!(header_on(&mut device, BankId::B), None);
+}
+
+#[test]
+fn continue_as_new_refuses_when_this_replay_never_consumed_committed_history() {
+    // Codex found this. A previous boot's committed schedule record — durable, and never
+    // resolved — sits unread on this replay, because `ContinueOnce`'s own logic asks for
+    // nothing before migrating. Swapping over it would reclaim the only copy of the
+    // history that proves this image diverges from whatever recorded it: exactly the
+    // nondeterminism `nothing_follows` already refuses at a normal ending, and it has to
+    // run before the swap here rather than after, since `swap_in` is what would destroy
+    // the evidence.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    // A previous boot leaves a durable, unresolved schedule record behind.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ScheduleThenContinue,
+        scratch(&mut page, &mut result),
+    );
+    assert_eq!(progress, Err(DriveError::EffectOutstanding));
+
+    // This replay's own logic never asks for it before trying to migrate.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+    assert_eq!(progress, Err(DriveError::HistoryContinues));
+
+    // Refused before anything moved: bank A is untouched and bank B still empty.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+    assert_eq!(header_on(&mut device, BankId::B), None);
+}
+
+#[test]
+fn an_oversized_next_run_input_is_refused_before_the_device_is_touched() {
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueWithOversizedInput,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(
+        progress,
+        Err(DriveError::NextRunInputTooLong {
+            bytes: OVERSIZED_INPUT.len(),
+            bound: BOUNDS.run_input_bytes,
+        })
+    );
+
+    // Refused before the device was asked for anything: bank A still boots the run it
+    // always did, and bank B was never erased.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+    assert_eq!(header_on(&mut device, BankId::B), None);
+}
+
+#[test]
+fn a_run_id_at_the_ceiling_is_refused_rather_than_reissued() {
+    let mut device = Device::new(geometry());
+    install(
+        &mut device,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            run: RunId(u64::MAX),
+            ..first_header()
+        },
+    );
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(progress, Err(DriveError::RunIdExhausted));
+    // No successor id exists to install, so nothing was written: bank B stays empty.
+    assert_eq!(header_on(&mut device, BankId::B), None);
+}
+
+#[test]
+fn a_driver_at_a_bank_with_no_sealed_bank_refuses_to_boot() {
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(progress, Err(DriveError::NoAuthoritativeBank));
+}
+
+#[test]
+fn a_driver_at_a_bank_with_both_banks_sealed_at_one_generation_refuses_ambiguously() {
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    install(
+        &mut device,
+        BankId::B,
+        Generation::FIRST,
+        &BankHeader {
+            run: RunId(0x9999_9999_9999_9999),
+            ..first_header()
+        },
+    );
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(progress, Err(DriveError::AmbiguousAuthority));
+}
+
+#[test]
+fn a_stale_bank_is_never_a_candidate_once_a_later_generation_exists() {
+    // `select`'s own rule, read through a real boot: bank B two generations behind bank A
+    // is not weighed against it at all, so a boot from a device with a very old spare bank
+    // still starts the run bank A names.
+    let mut device = Device::new(geometry());
+    install(
+        &mut device,
+        BankId::B,
+        Generation(0),
+        &BankHeader {
+            run: RunId(0x1111_1111_1111_1111),
+            input: b"stale",
+            ..first_header()
+        },
+    );
+    install(&mut device, BankId::A, Generation(9), &first_header());
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    let Ok(Progress::Migrated { run }) = progress else {
+        unreachable!("bank A, the higher generation, is what this boot starts from: {progress:?}")
+    };
+    assert_eq!(run, RunId(RUN.0 + 1));
+    // And the swap installed into B — the bank this device did *not* boot — recycling the
+    // stale bank rather than the one just replayed.
+    let (b_run, ..) = header_on(&mut device, BankId::B).expect("the swap installed bank B");
+    assert_eq!(b_run, run);
+}
+
+/// `RunId::successor()` itself, directly — the unit this crate's own `a_run_id_at_the_ceiling_is_refused_rather_than_reissued`
+/// exercises through a real boot, above.
+#[test]
+fn run_id_successor_refuses_only_at_the_ceiling() {
+    assert_eq!(RunId(u64::MAX).successor(), None);
+    assert_eq!(RunId(0).successor(), Some(RunId(1)));
+}
+
+/// Bank A's journal region, as a cold boot pointed at a fixed region would have to be
+/// handed it.
+fn first_region() -> JournalRegion {
+    let Ok(region) = JournalRegion::of(layout(), BankId::A, &first_header()) else {
+        unreachable!("bank A holds a journal behind its header")
+    };
+    region
+}
+
+/// The generation a bank's seal names, read back the way a cold boot has to: header and
+/// seal, decoded together rather than assumed from the call that wrote them.
+fn generation_on(device: &mut Device, id: BankId) -> Option<Generation> {
+    let region = layout().bank(id);
+    let mut header = [0_u8; 512];
+    let Ok(()) = device.read(region.base(), &mut header) else {
+        unreachable!("a bank's header is inside the device")
+    };
+    let mut seal = [0_u8; bank::SEAL_BYTES];
+    let Ok(()) = device.read(region.seal_offset(), &mut seal) else {
+        unreachable!("a bank's seal is inside the device")
+    };
+    bank::sealed_generation(&header, &seal)
+}
+
+#[test]
+fn a_driver_pointed_at_a_region_still_refuses_to_swap() {
+    // The other half of the join: this file's driver performs a real swap, and
+    // `Driver::new` genuinely still cannot — `ota.rs`'s
+    // `continue_as_new_is_refused_by_a_driver_that_cannot_name_a_bank` is the same claim
+    // over the reference OTA workflow. This is the same claim, minimal.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::new(first_region(), RUN, reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(progress, Err(DriveError::ContinueUnsupported));
+}
+
+/// Fails every erase aimed at one bank; every other call reaches the real device unchanged.
+///
+/// Stands in for §10 step 7's own erase failing — `Installed::reclaim`'s documented
+/// postcondition is that the new run stays authoritative either way, and this is what lets
+/// a test hold `swap_in` to that promise rather than to the media this device happens to
+/// model.
+struct EraseFails<'a> {
+    device: &'a mut Device,
+    failing: BankId,
+}
+
+impl StableStorage for EraseFails<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        let region = layout().bank(self.failing);
+        if offset >= region.base() && offset < region.base() + region.bytes() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_failed_reclaim_does_not_turn_a_successful_migration_into_a_failure() {
+    // Codex found this. `commit()` is the swap's own point of no return: once it returns,
+    // bank B is durably sealed and authoritative, and reclaiming bank A is cleanup rather
+    // than part of the migration — `Installed::reclaim`'s own documentation says the device
+    // has one authoritative bank, the new one, whether or not the erase lands. Reporting a
+    // failed reclaim as a failed `continue_as_new` would tell a caller the migration it just
+    // performed had not happened, when a fresh boot of this same layout would show that it
+    // had.
+    let mut device = booted();
+    let mut storage = EraseFails {
+        device: &mut device,
+        failing: BankId::A,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    let Ok(Progress::Migrated { run }) = progress else {
+        unreachable!(
+            "a failed reclaim of the retiring bank must not read back as a failed swap: \
+             {progress:?}"
+        )
+    };
+    assert_eq!(run, RunId(RUN.0 + 1));
+
+    // Bank A never actually erased — the injected failure is real, not merely reported —
+    // and bank B is authoritative anyway: the next boot of this layout replays it.
+    assert!(header_on(&mut device, BankId::A).is_some());
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: NEXT_INPUT },
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
+}
+
+#[test]
+fn a_seal_read_is_aligned_to_the_devices_own_read_unit_not_a_bare_constant() {
+    // Codex found this. `bank::SEAL_BYTES` is 12, which is not a multiple of every real
+    // geometry's read unit — a device reading in units of 8, for instance — and a
+    // conforming `StableStorage` refuses a read whose length is not a multiple of it,
+    // before this driver ever gets to compare generations. `waymaker_fault::Device` is
+    // exactly such a conforming adapter, so a `Driver::at_bank` boot over one with a read
+    // unit `SEAL_BYTES` does not divide is the regression: every boot used to refuse
+    // outright, over a read this driver made rather than one the device was asked to do.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            align: layout.align(),
+            ..first_header()
+        },
+    );
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
+}
+
+#[test]
+fn an_undersized_page_refuses_rather_than_reviving_a_retired_bank() {
+    // Codex found this. Bank B is authoritative — its generation is higher — but a swap
+    // once installed a longer input into it than bank A ever carried, so its header is the
+    // wider of the two. A page too small to read bank B's header back has to refuse
+    // outright rather than fall back to bank A: bank A is a real, validly sealed candidate
+    // too, just the *retired* one, and nothing below `select_bank` can tell "damaged" from
+    // "did not fit" unless `read_bank` says which.
+    let mut device = Device::new(geometry());
+    let long_input = &[b'x'; 60][..];
+    let long_header = BankHeader {
+        input: long_input,
+        ..first_header()
+    };
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &long_header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&long_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank A's header and the seal, deliberately short of bank B's header.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank B's header to overflow this page"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall { .. }))
+        ),
+        "an undersized page must refuse outright rather than silently booting bank A's \
+         retired run: {progress:?}"
+    );
+
+    // Nothing moved: bank B, the real authority, is untouched.
+    let (b_run, ..) = header_on(&mut device, BankId::B).expect("bank B is untouched");
+    assert_eq!(b_run, RUN);
+}
+
+#[test]
+fn read_bank_uses_the_whole_page_for_the_header_once_the_seal_is_a_scalar() {
+    // Codex found this on round 4. The old `read_bank` reserved `seal_len` bytes out of
+    // `page` before it ever read the header, so a page sized to hold the header — and
+    // nothing besides it, not even that bank's own seal — could still be refused. The header
+    // and the seal never need to be in `page` at the same time: the seal decodes to a
+    // scalar `Seal` with no borrow of the buffer, so once it is read the whole page is free
+    // for the header. With an 8-byte program unit and a 64-byte input, the padded header
+    // needs exactly as many bytes as `page` holds; the old reservation left 16 bytes short.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    let wide_input = [b'x'; 64];
+    let header = BankHeader {
+        align: layout.align(),
+        input: &wide_input,
+        ..first_header()
+    };
+    install_on(&mut device, layout, BankId::A, Generation::FIRST, &header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(header_needed) = bank::encode_header(&header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Exactly the padded header's own length — no room for the bank's seal at all.
+    let mut page = vec![0_u8; header_needed];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: &wide_input },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "a page sized to exactly the header's own padded length must still boot, even though \
+         it has no room left over for that bank's seal: {progress:?}"
+    );
+}
+
+#[test]
+fn an_unsealed_banks_oversized_header_never_blocks_the_smaller_sealed_authority() {
+    // Codex found this on round 4, in the fix for the previous round's truncation check: it
+    // ran before the seal was ever read, so an *unsealed* bank whose stale header declares
+    // more input than this boot's page can hold produced a hard refusal — even though an
+    // unsealed bank is never a candidate at any generation and reading its header at all
+    // should have cost this boot nothing. Bank A is small and genuinely sealed, the real
+    // authority; bank B carries an oversized header with no seal behind it at all, the shape
+    // a device left mid-swap — staged, never sealed — would have.
+    let layout = layout();
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+
+    let wide_input = [b'x'; 60];
+    let wide_header = BankHeader {
+        input: &wide_input,
+        ..first_header()
+    };
+    install_header_only(&mut device, layout, BankId::B, &wide_header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank A's own header and its seal, deliberately short of bank B's declared
+    // (and never-sealed) length.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank B's declared length to overflow this page"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "an unsealed bank's oversized header must never block booting the smaller, sealed \
+         authority: {progress:?}"
+    );
+}
+
+#[test]
+fn header_read_length_is_rounded_down_to_a_whole_read_unit() {
+    // Codex found this on round 4. Even with the seal decoded to scalar state first, a
+    // header read sized to whatever `page` happened to leave — with no rounding — can ask a
+    // conforming `StableStorage` for a length it refuses outright, even when `page` had
+    // ample room for the header several times over. 113 is not a multiple of this device's
+    // 8-byte read unit.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            align: layout.align(),
+            ..first_header()
+        },
+    );
+    let mut page = vec![0_u8; 113];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "an ample but misaligned page must still be readable, at a length the device's own \
+         read unit accepts: {progress:?}"
+    );
+}
+
+#[test]
+fn a_retired_banks_oversized_header_never_blocks_the_smaller_authoritative_bank() {
+    // Codex found this on round 5, in the very shape my round-4 fixes were both aimed at:
+    // if reclaim fails after a migration, the retired bank's header size is unrelated to the
+    // new authoritative bank's — it can be arbitrarily large (this one held a much longer
+    // input in an earlier life), while the newly authoritative bank, one generation higher,
+    // can be exactly as small as the run it now carries. A page sized for the new run's own
+    // header must still boot it, whatever the old bank's oversized header would need.
+    let mut device = Device::new(geometry());
+    let long_input = &[b'x'; 60][..];
+    let long_header = BankHeader {
+        input: long_input,
+        ..first_header()
+    };
+    // Bank A: the retired run, generation FIRST, with the wider header a longer-lived
+    // earlier run left behind.
+    install(&mut device, BankId::A, Generation::FIRST, &long_header);
+    // Bank B: the real authority, one generation higher, with a header small enough to fit
+    // the undersized page below easily.
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&long_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank B's own header and its seal, deliberately short of bank A's.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank A's declared length to overflow this page"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "the smaller, higher-generation bank must boot even though the retired bank's \
+         header does not fit the page at all: {progress:?}"
+    );
+
+    // Nothing on bank A moved: it was never touched, only ignored.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+}
+
+#[test]
+fn a_page_too_small_for_an_oversized_header_reports_the_actual_size_it_needs() {
+    // Codex found this on round 5: the reported `needed` used to be this bank's whole
+    // payload region (a few KiB) whenever its header did not fit, even if the header itself
+    // was only a handful of bytes too wide for the page -- which tells an embedded caller
+    // retrying with a bigger buffer that it needs far more room than it really does. Only
+    // bank A is installed and sealed here, so there is nothing to rescue the boot and this
+    // must be the hard refusal `read_bank`'s own `Errors` section describes.
+    let mut device = Device::new(geometry());
+    let wide_input = &[b'x'; 60][..];
+    let wide_header = BankHeader {
+        input: wide_input,
+        ..first_header()
+    };
+    install(&mut device, BankId::A, Generation::FIRST, &wide_header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(padded_len) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(encoded) = staging.get(..padded_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let Ok(actual_needed) = bank::header_len_of(encoded) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected prefix"
+        )
+    };
+    assert!(
+        actual_needed < layout().bank(BankId::A).payload_bytes() as usize,
+        "the fixture needs the header to be far smaller than the whole bank"
+    );
+
+    // A handful of bytes short of what the header actually needs -- nowhere near this
+    // bank's whole payload region.
+    let mut page = vec![0_u8; actual_needed - 4];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!("an oversized header on the only sealed bank must refuse: {progress:?}")
+    };
+    assert_eq!(
+        needed, actual_needed,
+        "the reported figure must be the header's own declared length, not this bank's \
+         whole payload region"
+    );
+}
+
+#[test]
+fn a_page_too_small_for_even_the_prefix_reports_the_prefix_size_not_the_whole_bank() {
+    // Codex found this on round 6: when even the header's own checksum-protected prefix
+    // does not fit, the old fallback reported this bank's whole payload region (a few KiB)
+    // -- but the read that got this far already knows a page merely wide enough for the
+    // *prefix*, rounded to a whole read unit, would answer this bank's real length on its
+    // very next call. Reporting the ceiling instead could make a constrained caller give up
+    // on an otherwise perfectly bootable bank.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &BankHeader {
+            align: layout.align(),
+            ..first_header()
+        },
+    );
+
+    // Enough for the seal (16 bytes at this align), rounded down to an 8-byte read unit,
+    // deliberately short of the 22-byte header prefix.
+    let mut page = vec![0_u8; 20];
+    let mut result = [0_u8; 16];
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!("a page too small for even the prefix must still refuse: {progress:?}")
+    };
+    assert_eq!(
+        needed, 24,
+        "the reported figure must be the prefix rounded to a read unit, not this bank's \
+         whole payload region"
+    );
+}
+
+#[test]
+fn the_reported_size_is_rounded_up_so_a_caller_retrying_with_it_exactly_converges() {
+    // Codex found this on round 6, in the very fix the previous round landed: an unpadded
+    // header length need not itself be a multiple of the device's read unit, so reporting it
+    // verbatim let a caller retry with exactly that many bytes and get the identical
+    // `PageTooSmall` forever -- `read_bank`'s own rounding-down of the page length shrank
+    // the caller's "exact" retry straight back below what was asked for.
+    let layout = layout_with_read_size(8);
+    let mut device = Device::new(geometry_with_read_size(8));
+    // Unpadded frame_len = HEADER_OVERHEAD_BYTES(26) + 63 = 89, not a multiple of 8.
+    let unaligned_input = [b'x'; 63];
+    let header = BankHeader {
+        align: layout.align(),
+        input: &unaligned_input,
+        ..first_header()
+    };
+    install_on(&mut device, layout, BankId::A, Generation::FIRST, &header);
+
+    let mut staging = [0_u8; 512];
+    let Ok(padded_len) = bank::encode_header(&header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(encoded) = staging.get(..padded_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let Ok(unpadded_needed) = bank::header_len_of(encoded) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected prefix"
+        )
+    };
+    assert_eq!(
+        unpadded_needed, 89,
+        "the fixture needs an unaligned unpadded header length"
+    );
+
+    let mut page = vec![0_u8; unpadded_needed];
+    let mut result = [0_u8; 16];
+    let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted {
+            input: &unaligned_input,
+        },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!(
+            "an 89-byte page must still refuse an 89-byte unpadded header on an 8-byte read \
+             unit: {progress:?}"
+        )
+    };
+    assert_eq!(
+        needed % 8,
+        0,
+        "the reported figure must itself be a whole read unit, not the raw unpadded length: \
+         {needed}"
+    );
+    assert!(
+        needed >= unpadded_needed,
+        "the reported figure must be enough to actually work: {needed}"
+    );
+
+    // Retrying with exactly `needed` bytes must now succeed rather than refuse again.
+    let mut page2 = vec![0_u8; needed];
+    let mut result2 = [0_u8; 16];
+    let progress2 = Driver::at_bank(layout, reserve_for(layout)).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted {
+            input: &unaligned_input,
+        },
+        Scratch {
+            page: &mut page2,
+            result: &mut result2,
+        },
+    );
+    assert!(
+        matches!(
+            progress2,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "retrying with exactly the reported size must converge rather than refuse again: \
+         {progress2:?}"
+    );
+}
+
+#[test]
+fn a_stale_oversized_bank_never_inflates_the_reported_size_the_real_authority_needs() {
+    // Codex found this on round 7: when *both* banks are oversized for the initial page,
+    // the old code reported whichever needed more room, even when that was the retired,
+    // lower-generation bank -- forcing a caller through an allocation the real authority
+    // never needed at all. The higher claimed generation is the one worth asking for room
+    // to validate: if it turns out genuine, the guarded Found/Oversized arm above says the
+    // lower one's own requirement never matters again.
+    let mut device = Device::new(geometry());
+    let wide_input = &[b'x'; 60][..];
+    let wide_header = BankHeader {
+        input: wide_input,
+        ..first_header()
+    };
+    // Bank A: the retired run, generation FIRST, with by far the wider header.
+    install(&mut device, BankId::A, Generation::FIRST, &wide_header);
+    // Bank B: the real authority, one generation higher, with a much smaller header.
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut staging = [0_u8; 512];
+    let Ok(wide_padded) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(wide_needed) = bank::header_len_of(&staging[..wide_padded]) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected \
+                       prefix"
+        )
+    };
+    let Ok(short_padded) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(short_needed) = bank::header_len_of(&staging[..short_padded]) else {
+        unreachable!(
+            "a header this function just encoded decodes its own checksum-protected \
+                       prefix"
+        )
+    };
+    assert!(
+        short_needed < wide_needed,
+        "the fixture needs the authority's header to need less room than the retired one's"
+    );
+
+    // Enough to read either bank's checksum-protected prefix, short of what either one
+    // actually needs in full.
+    let mut page = vec![0_u8; bank::HEADER_PREFIX_BYTES + 4];
+    assert!(
+        page.len() < short_needed,
+        "the fixture needs the page to be short of even the smaller header"
+    );
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+    let Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed })) = progress else {
+        unreachable!("both banks being oversized must still refuse: {progress:?}")
+    };
+    assert_eq!(
+        needed, short_needed,
+        "the reported figure must be the higher-generation (real authority) bank's own \
+         requirement, not the retired bank's larger one"
+    );
+
+    // Retrying with enough room for the real authority's own header must now boot it --
+    // padded, since a boot does more with `page` than validate the header alone, and
+    // `short_needed` is deliberately the smaller, *unpadded* figure `header_len_of` answers.
+    let mut page2 = vec![0_u8; short_padded];
+    let mut result2 = [0_u8; 16];
+    let progress2 = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page2,
+            result: &mut result2,
+        },
+    );
+    assert!(
+        matches!(
+            progress2,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "retrying with exactly the real authority's own requirement must boot it: {progress2:?}"
+    );
+}
+
+#[test]
+fn an_empty_banks_header_version_is_admitted_before_a_rolled_back_image_claims_it() {
+    // Codex found this on round 8: `verify_header_identity` checks kind and input only, so
+    // an older image whose admitted range does not include the header's own recorded
+    // version could still boot a bank a newer image's swap installed but never itself
+    // booted — `begin`'s erased-journal branch would then silently stamp its own, older
+    // `current()` version over a run the header says was meant for something else entirely.
+    let mut device = booted();
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut UpgradingContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(progress, Ok(Progress::Migrated { .. })),
+        "{progress:?}"
+    );
+    let (_, b_version, ..) = header_on(&mut device, BankId::B).expect("the swap installed bank B");
+    assert_eq!(b_version, WORKFLOW_VERSION + 1);
+
+    // Nothing has booted bank B yet — its journal is still empty. A rolled-back image that
+    // does not admit the version the header names must refuse rather than silently claim
+    // authorship of the run the swap already recorded.
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut RolledBackToFirstVersion,
+        scratch(&mut page, &mut result),
+    );
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Kernel(KernelError::IncompatibleWorkflow))
+        ),
+        "an image that does not admit the header's own recorded version must refuse rather \
+         than silently claim an empty journal a newer image's swap already named: {progress:?}"
+    );
+
+    // Nothing was written: the header still names the version the swap actually stamped,
+    // and the journal is still empty.
+    let (_, b_version, ..) = header_on(&mut device, BankId::B).expect("bank B is untouched");
+    assert_eq!(b_version, WORKFLOW_VERSION + 1);
+}
+
+/// [`install`], plus a real `RunStarted` record programmed into the bank's own journal.
+///
+/// So that a boot of this bank never needs to *write* its opening record — `begin`'s
+/// existing-history branch reads it back directly and never calls `open`, which is what
+/// [`Reserve::for_layout`]'s own `Reserved::over` gate is behind. A fixture built with
+/// [`install`] alone cannot isolate a bad reserve at `swap_in` from the same bad reserve
+/// refusing this bank's *own* first write instead — the two would look identical from the
+/// boot's answer alone.
+fn install_with_run_started(
+    device: &mut Device,
+    id: BankId,
+    generation: Generation,
+    header: &BankHeader<'_>,
+) {
+    install(device, id, generation, header);
+    let region = layout().bank(id);
+    let Some(offset) = header.journal_offset() else {
+        unreachable!("this header's journal offset is representable")
+    };
+    let Ok(offset) = u32::try_from(offset) else {
+        unreachable!("a bank's journal offset fits a u32")
+    };
+    let record = RecordRef::RunStarted {
+        workflow_kind: header.workflow_kind,
+        workflow_version: header.workflow_version,
+        input: header.input,
+    };
+    let mut staging = [0_u8; 128];
+    let Ok(len) = frame::encode(&record, header.align, &mut staging) else {
+        unreachable!("a RunStarted record fits its own staging buffer")
+    };
+    let Some(record_bytes) = staging.get(..len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.base() + offset, record_bytes),
+        device.barrier(),
+    ) else {
+        unreachable!("a RunStarted record is a legal program")
+    };
+}
+
+#[test]
+fn a_reserve_priced_for_another_layout_is_refused_before_the_swap_touches_anything() {
+    // Codex found this on round 8: `Reserve::for_layout(self.reserve.bounds(), bank.layout)`
+    // only proves the *bounds* fit this layout in the abstract -- it says nothing about
+    // whether `self.reserve` itself was ever priced against it. A caller who built this
+    // driver with a reserve computed for a different, larger layout passed that check every
+    // time, and the swap would go on to install a run whose very first boot then meets
+    // `Reserved::over` on the empty new journal and fails with `CapacityError::WrongDevice`
+    // -- one boot after the old run is already gone.
+    //
+    // Bank A needs its *own* history already durable — `install_with_run_started` rather
+    // than `booted`'s bare header — so this boot's mismatched reserve is tested against
+    // `swap_in`'s own check, not against `begin`'s ordinary write of this bank's first
+    // record, which goes through exactly the same `Reserved::over` gate one call earlier.
+    let mut device = Device::new(geometry());
+    install_with_run_started(&mut device, BankId::A, Generation::FIRST, &first_header());
+
+    let Ok(mismatched) = Reserve::for_layout(BOUNDS, other_layout()) else {
+        unreachable!("these bounds fit the larger layout too")
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), mismatched).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut ContinueOnce,
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Reserve(CapacityError::WrongDevice))
+        ),
+        "a reserve priced for another layout must be refused before the swap runs, not one \
+         boot later: {progress:?}"
+    );
+
+    // Nothing moved: bank A, with its pre-existing run, is still authoritative.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+}
+
+/// Fails every read of one bank's own header base offset; every other read — that same
+/// bank's own seal included — reaches the real device unchanged.
+///
+/// Stands in for a genuine device fault confined to one bank's header — an ECC failure,
+/// say — once that bank's own seal has already answered with a claimed generation. That is
+/// exactly the shape `BankRead::Oversized` already handles for a header that fails to
+/// *decode*; this is the same defect for a header that fails to *read* at all.
+struct HeaderReadFails<'a> {
+    device: &'a mut Device,
+    failing: BankId,
+}
+
+impl StableStorage for HeaderReadFails<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let region = layout().bank(self.failing);
+        if offset == region.base() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_stale_banks_unreadable_header_never_blocks_the_intact_authoritative_bank() {
+    // Codex found this on round 9, in the same shape round 5's oversized-header finding was:
+    // bank A's *seal* reads and validates fine — that is what supplies its claimed
+    // generation — but a device fault confined to its header (an ECC failure, say) makes
+    // that one read fail outright. Bank B is one generation higher and fully readable, so
+    // the boot must succeed on it exactly as if bank A's header damage did not exist,
+    // rather than aborting the whole boot over damage confined to a bank it does not need.
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut storage = HeaderReadFails {
+        device: &mut device,
+        failing: BankId::A,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: waymaker_drive::Conclusion::Completed,
+                ..
+            })
+        ),
+        "the intact, higher-generation bank must boot even though the retired bank's header \
+         cannot be read at all: {progress:?}"
+    );
+
+    // Bank A's header was never touched by the driver's own writes — only read, and that
+    // read failed — so it still reads back exactly as installed, once the injected fault is
+    // out of the way.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+}
+
+#[test]
+fn a_higher_generations_unusable_journal_layout_is_never_ignored_for_a_stale_banks_generation() {
+    // Codex found this on round 14, in the same shape rounds 9 and 10 found for a header
+    // that fails to *read* at all or that names an unsupported wire format: bank B's header
+    // and seal both check out fully, so its generation is not in question, but its header
+    // declares a program granularity this layout does not use — `JournalRegion::of` refuses
+    // it — and a page size or a healthy device fixes neither. Bank A is one generation
+    // lower and completely ordinary, so ignoring bank B here would revive a retired run.
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    let Some(mismatched_align) = ProgramAlign::new(4) else {
+        unreachable!("4 is a legal program alignment")
+    };
+    assert_ne!(
+        mismatched_align,
+        align(),
+        "the fixture needs a program alignment this layout does not use"
+    );
+    let mismatched_header = BankHeader {
+        align: mismatched_align,
+        ..first_header()
+    };
+    install(&mut device, BankId::B, later, &mismatched_header);
+
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert_eq!(
+        progress,
+        Err(DriveError::Region(RegionError::AlignDisagreesWithBank)),
+        "bank B's own unusable layout must be the answer, not a silent fallback to bank A's \
+         lower, stale generation: {progress:?}"
+    );
+
+    // Refused before anything moved: bank A is untouched and still names the retired run's
+    // own identity, never having been booted.
+    let (a_run, ..) = header_on(&mut device, BankId::A).expect("bank A is untouched");
+    assert_eq!(a_run, RUN);
+}
+
+/// Installs bank `id` with a header whose declared *wire* format version this firmware's
+/// `reads_format_version` does not admit — otherwise a completely ordinary, correctly
+/// checksummed header, exactly the shape a firmware elsewhere in the same fleet's rollout
+/// both wrote and would read back.
+///
+/// `bank::seal_for` cannot build this bank's seal — it decodes the header first, and this
+/// header is built specifically to fail that decode — so the seal's digest is computed
+/// directly here, the same arithmetic `seal_for_with` itself would reach for once past a
+/// decode this header cannot pass.
+fn install_with_unsupported_version(
+    device: &mut Device,
+    id: BankId,
+    generation: Generation,
+    header: &BankHeader<'_>,
+) {
+    let region = layout().bank(id);
+    let mut staging = [0_u8; 512];
+    let Ok(header_len) = bank::encode_header(header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Some(header_frame) = staging.get_mut(..header_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    // Byte 2 of the prefix is the format version — `verify_header_prefix_with`'s own field
+    // layout. At v1 `reads_format_version` admits one value, so the byte right after it is
+    // always outside the range; this still searches rather than assuming that stays true.
+    let Some(version_byte) = header_frame.get_mut(2) else {
+        unreachable!("the header prefix has at least 3 bytes")
+    };
+    let mut version = version_byte.wrapping_add(1);
+    while frame::reads_format_version(version) {
+        version = version.wrapping_add(1);
+    }
+    *version_byte = version;
+    // Re-seal the prefix and the header frame over the changed byte, the same way a real
+    // writer would have — `waymaker-flash`'s own
+    // `a_header_from_another_format_version_is_refused_before_its_body_is_read` does this
+    // identical reseal for the same reason.
+    let prefix_len = bank::HEADER_PREFIX_BYTES - 2;
+    let Some(prefix) = header_frame.get(..prefix_len) else {
+        unreachable!("the header is at least as long as its own prefix")
+    };
+    let prefix_resealed = Catalogued::header_check(prefix).to_le_bytes();
+    let Some(prefix_crc) = header_frame.get_mut(prefix_len..prefix_len + 2) else {
+        unreachable!("the header holds its own prefix checksum right after the prefix")
+    };
+    prefix_crc.copy_from_slice(&prefix_resealed);
+    let covered = header_len - bank::HEADER_TRAILER_BYTES;
+    let Some(sealed) = header_frame.get(..covered) else {
+        unreachable!("the header is at least as long as what its trailer covers")
+    };
+    let frame_resealed = Catalogued::frame_check(sealed).to_le_bytes();
+    let Some(trailer) = header_frame.get_mut(covered..covered + bank::HEADER_TRAILER_BYTES) else {
+        unreachable!("the header holds its own trailer right after what it covers")
+    };
+    trailer.copy_from_slice(&frame_resealed);
+
+    let (Ok(()), Ok(())) = (
+        device.program(region.base(), header_frame),
+        device.barrier(),
+    ) else {
+        unreachable!("a bank header is a legal program")
+    };
+    let Some(sealed) = header_frame.get(..covered) else {
+        unreachable!("the header is at least as long as what its trailer covers")
+    };
+    let seal = bank::Seal {
+        generation,
+        header_check: Catalogued::frame_check(sealed),
+    };
+    let mut seal_bytes = [0_u8; 64];
+    let Ok(seal_len) = bank::encode_seal(&seal, align(), &mut seal_bytes) else {
+        unreachable!("a seal fits its own region")
+    };
+    let Some(sealed) = seal_bytes.get(..seal_len) else {
+        unreachable!("the encoder wrote inside the buffer it was given")
+    };
+    let (Ok(()), Ok(())) = (
+        device.program(region.seal_offset(), sealed),
+        device.barrier(),
+    ) else {
+        unreachable!("a generation seal is a legal program")
+    };
+}
+
+#[test]
+fn a_higher_generation_banks_unsupported_format_version_is_never_ignored_for_a_stale_bank() {
+    // Codex found this on round 10. The scenario is a migration that committed a newer
+    // bank in a wire format version this firmware does not read, whose reclaim of the old
+    // bank then failed — so the retired bank is still perfectly readable, one generation
+    // lower, and firmware from before the new format existed meets both. `seal_for_with`
+    // decodes the header before it can seal it, so the higher-generation bank's own
+    // decode fails with `DecodeError::UnsupportedFormatVersion` — and that was folded into
+    // the same `BankRead::Absent` as a genuinely corrupt header, even though its seal had
+    // already validated and named a real, higher claimed generation. `resolve_bank_read`'s
+    // `(Found, Absent)` arm then picked the lower-generation, fully-readable bank with
+    // nothing to say it was ever second — silently resuming a run that was already
+    // replaced, exactly as the finding describes.
+    let mut device = Device::new(geometry());
+    // Bank A: the retired run, still perfectly readable, at the lower generation.
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    // Bank B: the real authority, one generation higher, in a format this firmware does
+    // not read.
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install_with_unsupported_version(&mut device, BankId::B, later, &first_header());
+
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Decode(
+                DecodeError::UnsupportedFormatVersion
+            )))
+        ),
+        "a stale, fully-readable bank must never be silently resumed just because the real, \
+         higher-generation authority is in a format this firmware cannot read: {progress:?}"
+    );
+}
+
+#[test]
+fn a_page_smaller_than_the_seal_itself_reports_page_too_small() {
+    // `read_bank`'s first read is a bank's own seal, and a page too short to hold even
+    // that has nothing to defer: there is no claimed generation yet to weigh against the
+    // other bank, so this is the one hard `PageTooSmall` `read_bank`'s own `Errors` section
+    // still describes as immediate.
+    let mut device = booted();
+    let mut page = [0_u8; 1];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut device,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall { .. }))
+        ),
+        "a page shorter than a bank's own seal must be refused as too small, not treated as \
+         a bigger problem: {progress:?}"
+    );
+}
+
+/// Fails every read of one bank's own seal-region offset; every other read reaches the
+/// real device unchanged.
+///
+/// Unlike a header read, a seal read that fails leaves `read_bank` with no claimed
+/// generation to weigh at all — there is nothing to defer this to, so it stays the one
+/// immediate `Err` `read_bank`'s own `Errors` section still describes.
+struct SealReadFails<'a> {
+    device: &'a mut Device,
+    failing: BankId,
+}
+
+impl StableStorage for SealReadFails<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let region = layout().bank(self.failing);
+        if offset == region.seal_offset() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn a_seal_read_error_is_reported_immediately_with_no_bank_to_defer_to() {
+    let mut device = booted();
+    let mut storage = SealReadFails {
+        device: &mut device,
+        failing: BankId::A,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Storage(
+                waymaker_fault::FaultError::PowerLoss
+            )))
+        ),
+        "a seal read failure names no claimed generation to weigh against the other bank, \
+         so it has to surface immediately: {progress:?}"
+    );
+}
+
+/// Fails every read of *both* banks' header-base offsets; seals and everything else reach
+/// the real device unchanged.
+struct BothHeaderReadsFail<'a> {
+    device: &'a mut Device,
+}
+
+impl StableStorage for BothHeaderReadsFail<'_> {
+    type Error = <Device as StableStorage>::Error;
+
+    fn geometry(&self) -> Geometry {
+        self.device.geometry()
+    }
+
+    fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let region_a = layout().bank(BankId::A);
+        let region_b = layout().bank(BankId::B);
+        if offset == region_a.base() || offset == region_b.base() {
+            return Err(waymaker_fault::FaultError::PowerLoss);
+        }
+        self.device.read(offset, dst)
+    }
+
+    fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), Self::Error> {
+        self.device.program(offset, src)
+    }
+
+    fn erase(&mut self, offset: u32, len: u32) -> Result<(), Self::Error> {
+        self.device.erase(offset, len)
+    }
+
+    fn barrier(&mut self) -> Result<(), Self::Error> {
+        self.device.barrier()
+    }
+}
+
+#[test]
+fn two_unreadable_banks_report_the_higher_generations_own_error() {
+    // Both banks' seals validate — each names a claimed generation — but neither header can
+    // be read at all. Neither bank can rescue the boot, so this is `resolve_bank_read`'s
+    // `(Unreadable, Unreadable)` arm: the higher claimed generation's own error is the
+    // honest answer, the same priority the two `Oversized` arms already give it.
+    let mut device = Device::new(geometry());
+    install(&mut device, BankId::A, Generation::FIRST, &first_header());
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut storage = BothHeaderReadsFail {
+        device: &mut device,
+    };
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        scratch(&mut page, &mut result),
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Storage(
+                waymaker_fault::FaultError::PowerLoss
+            )))
+        ),
+        "two unreadable banks must still report a device error rather than anything else: \
+         {progress:?}"
+    );
+}
+
+#[test]
+fn an_oversized_bank_and_an_unreadable_bank_prefer_the_higher_generations_own_answer() {
+    // Bank A is genuinely too large for the shared page (`Oversized`); bank B's header
+    // cannot be read at all (`Unreadable`). Bank B is one generation higher, so
+    // `resolve_bank_read`'s mixed `(Oversized, Unreadable)` arm must report bank B's own
+    // device error rather than bank A's `PageTooSmall` — a bigger page could still rescue
+    // bank A, but no page size fixes bank B's fault, and bank B's claim outranks it anyway.
+    let mut device = Device::new(geometry());
+    let wide_input = &[b'x'; 60][..];
+    let wide_header = BankHeader {
+        input: wide_input,
+        ..first_header()
+    };
+    install(&mut device, BankId::A, Generation::FIRST, &wide_header);
+    let Some(later) = Generation::FIRST.successor() else {
+        unreachable!("FIRST has a successor")
+    };
+    install(&mut device, BankId::B, later, &first_header());
+
+    let mut staging = [0_u8; 512];
+    let Ok(short_len) = bank::encode_header(&first_header(), &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    let Ok(long_len) = bank::encode_header(&wide_header, &mut staging) else {
+        unreachable!("a bank holds its own header")
+    };
+    // Room for bank B's own header and its seal, deliberately short of bank A's.
+    let mut page = vec![0_u8; short_len + bank::SEAL_BYTES + 8];
+    assert!(
+        page.len() < long_len + bank::SEAL_BYTES,
+        "the fixture needs bank A's declared length to overflow this page"
+    );
+
+    let mut storage = HeaderReadFails {
+        device: &mut device,
+        failing: BankId::B,
+    };
+    let mut result = [0_u8; 16];
+
+    let progress = Driver::at_bank(layout(), reserve()).boot(
+        &mut storage,
+        &mut waymaker_drive::demo::World::new(),
+        &mut JustStarted { input: FIRST_INPUT },
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Err(DriveError::Recovery(RecoveryError::Storage(
+                waymaker_fault::FaultError::PowerLoss
+            )))
+        ),
+        "the higher-generation bank's own device fault must be the answer, not the lower \
+         bank's page-size complaint: {progress:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Codex round 12: a near-capacity refusal is a rollover exit, not a dead end.
+// ---------------------------------------------------------------------------------------
+
+/// Small enough that one effect's own commit leaves the second with nowhere to go.
+const SMALL_INPUT: &[u8] = b"seed";
+
+/// What `continue_as_new` asks for, once the rollover exit is taken.
+const SMALL_NEXT_INPUT: &[u8] = b"next";
+
+const SMALL_BOUNDS: Bounds = Bounds {
+    run_input_bytes: 4,
+    effect_result_bytes: 4,
+    terminal_bytes: 4,
+};
+
+/// A fixed, small erase block: what varies across the search below is how many of them
+/// make up one bank, so the bank size grows in steps of one erase block rather than
+/// doubling — a `BankLayout` needs its capacity to be a whole number of erase blocks, so
+/// varying the erase size itself only ever offers a bank size search a factor of two wide.
+const SMALL_ERASE: u32 = 64;
+
+fn small_geometry(blocks_per_bank: u32) -> Geometry {
+    let Ok(geometry) = Geometry::new(SMALL_ERASE * blocks_per_bank * 2, SMALL_ERASE, 4, 1) else {
+        unreachable!("a whole number of erase blocks, split evenly into two banks")
+    };
+    geometry
+}
+
+fn small_layout(blocks_per_bank: u32) -> BankLayout {
+    let Ok(layout) = BankLayout::new(small_geometry(blocks_per_bank)) else {
+        unreachable!("an even number of erase blocks is two banks")
+    };
+    layout
+}
+
+const fn small_header(run: RunId, layout: BankLayout) -> BankHeader<'static> {
+    BankHeader {
+        run,
+        align: layout.align(),
+        workflow_kind: WORKFLOW_KIND,
+        workflow_version: WORKFLOW_VERSION,
+        input_schema: INPUT_SCHEMA,
+        input: SMALL_INPUT,
+    }
+}
+
+/// Two effects, each propagating a suspension outright — used only to search for a bank
+/// small enough that the second effect's own schedule is the one that meets §10's reserve,
+/// with the first already committed.
+///
+/// Neither activity kind is one [`waymaker_drive::demo::World`] treats specially, so both
+/// answer its four-byte default and never [`waymaker_core::activity::Performed::Exhausted`].
+struct TwoEffectsNoRollover;
+
+impl Workflow for TwoEffectsNoRollover {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: SMALL_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let _ = boundary.call(ActivityKind(6), b"one")?;
+        let _ = boundary.call(ActivityKind(7), b"two")?;
+        Ok(Outcome::Completed(b"done"))
+    }
+}
+
+/// A layout, reserve and freshly booted bank A small enough that
+/// [`TwoEffectsNoRollover`]'s second effect is the one Codex's round 12 finding is about —
+/// searched for rather than written down, so the number comes from the reserve's own
+/// arithmetic over real records, the way `crates/waymaker-drive/tests/matrix.rs`'s own
+/// `near_capacity` is.
+fn near_capacity() -> (BankLayout, Reserve) {
+    for blocks_per_bank in 1_u32..=8 {
+        let layout = small_layout(blocks_per_bank);
+        let Ok(reserve) = Reserve::for_layout(SMALL_BOUNDS, layout) else {
+            continue;
+        };
+        let mut device = Device::new(small_geometry(blocks_per_bank));
+        install_on(
+            &mut device,
+            layout,
+            BankId::A,
+            Generation::FIRST,
+            &small_header(RUN, layout),
+        );
+        let mut page = [0_u8; 512];
+        let mut result = [0_u8; 16];
+        let mut world = waymaker_drive::demo::World::new();
+        let progress = Driver::at_bank(layout, reserve).boot(
+            &mut device,
+            &mut world,
+            &mut TwoEffectsNoRollover,
+            scratch(&mut page, &mut result),
+        );
+        if progress == Err(DriveError::Capacity(Refusal::NearCapacity))
+            && world.dispatched().len() == 1
+        {
+            return (layout, reserve);
+        }
+    }
+    unreachable!("no bank in the search fills after exactly one effect")
+}
+
+/// Performs one effect, then asks for a second. Codex's round 12 finding is that a
+/// suspension is the *only* way a workflow can react to §10's reserved rollover exit — it
+/// cannot inspect [`Suspended`] to learn why it stopped — so this workflow does not
+/// propagate the second suspension with `?` the way [`TwoEffectsNoRollover`] does: it
+/// reacts to it by asking to roll the run over instead, which is `Refusal::NearCapacity`'s
+/// own documented remedy ("stop scheduling, and either end the run or `continue_as_new`").
+struct RolloverOnSuspension;
+
+impl Workflow for RolloverOnSuspension {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: SMALL_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let _ = boundary.call(ActivityKind(6), b"one")?;
+        match boundary.call(ActivityKind(7), b"two") {
+            Ok(_) => Ok(Outcome::Completed(b"unexpected room for a second effect")),
+            Err(_) => Err(boundary.continue_as_new(SMALL_NEXT_INPUT)),
+        }
+    }
+}
+
+#[test]
+fn a_near_capacity_refusal_is_still_a_live_rollover_exit_in_the_same_boot() {
+    let (layout, reserve) = near_capacity();
+    let mut device = Device::new(layout.geometry());
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &small_header(RUN, layout),
+    );
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+    let mut world = waymaker_drive::demo::World::new();
+
+    let progress = Driver::at_bank(layout, reserve).boot(
+        &mut device,
+        &mut world,
+        &mut RolloverOnSuspension,
+        scratch(&mut page, &mut result),
+    );
+
+    // Only the first effect ever ran: the second was refused before the world was asked
+    // anything, exactly as an ordinary near-capacity refusal already promised.
+    assert_eq!(world.dispatched().len(), 1);
+
+    let Ok(Progress::Migrated { run: next_run }) = progress else {
+        unreachable!(
+            "a live `continue_as_new` reacting to the reserved rollover exit must migrate \
+             rather than repeat the capacity error it was handed: {progress:?}"
+        )
+    };
+    assert_eq!(next_run, RUN.successor().expect("RUN has a successor"));
+
+    // The swap really happened: bank B is now authoritative, over the input the workflow
+    // asked `continue_as_new` for rather than the one the retired run started with.
+    let (b_run, _, _, b_input) =
+        header_on_with(&mut device, layout, BankId::B).expect("bank B is now sealed");
+    assert_eq!(b_run, next_run);
+    assert_eq!(b_input, SMALL_NEXT_INPUT);
+}

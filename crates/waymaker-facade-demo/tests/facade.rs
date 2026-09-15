@@ -7,11 +7,11 @@
 //!
 //! The ordinary path is `crates/waymaker-facade-demo/tests/ota.rs`.
 
+use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, Outcome};
 use waymaker_drive::{
-    Activities, Answered, Boundary, Clocks, DriveError, Driver, DurableIntent, Handoff, Identity,
+    Activities, Answered, Boundary, CheckedDispatch, Clocks, DriveError, Driver, Handoff, Identity,
     Performed, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::journal::{Answer, Journal as _};
@@ -57,13 +57,7 @@ fn reserve() -> Reserve {
 struct Idle;
 
 impl Activities for Idle {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
         Performed::Pending
     }
 }

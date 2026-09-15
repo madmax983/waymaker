@@ -12,11 +12,11 @@
 
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
-use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, KernelError, RecordKind, RecordRef, RunId};
+use waymaker_core::version::{GateId, VersionRange};
+use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, DOWNLOADED, Delayed, World};
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::Device;
@@ -610,14 +610,8 @@ impl Clocks for Ticking {
 }
 
 impl Activities for Ticking {
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
-        self.world.perform(intent, kind, input, out)
+    fn perform(&mut self, dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
+        self.world.perform(dispatch, out)
     }
 }
 
@@ -721,13 +715,7 @@ fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
     }
 
     impl Activities for Regressing {
-        fn perform(
-            &mut self,
-            _intent: DurableIntent,
-            _kind: ActivityKind,
-            _input: &[u8],
-            _out: &mut [u8],
-        ) -> Performed {
+        fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
             Performed::Pending
         }
     }
@@ -749,5 +737,321 @@ fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
             },
         ),
         Err(DriveError::Kernel(KernelError::ClockWentBackwards))
+    );
+}
+
+/// A workflow that asks the same deadline twice in one boot.
+///
+/// Codex's review of issue [#110](https://github.com/madmax983/waymaker/issues/110)'s pull
+/// request asked whether a real alarm firing could re-enter `Context::decide_timer` on the
+/// very `Context` its own `Stop::WaitingUntil` already halted, and hang there forever. The
+/// first answer here argued it could not, on the theory that a second ask is never how this
+/// driver is really resumed — only a fresh `Driver::boot` reads the clock again. That was
+/// wrong: `Alarm`'s own documentation is explicit that "the executor can suspend the core
+/// until the interrupt wakes it" and asks the deadline again "on the next poll", which is a
+/// real, retained task polled again by a real waker, still inside the one call to
+/// `Workflow::run` that built it — an in-boot sleep is what issue #110 is *for*. Falling
+/// through to `ReplayMachine::timer_intent` a second time for a boundary already
+/// `AwaitingFiring` does still diverge — `ReplayCursor::next_effect_id` refuses everything
+/// but `Replaying` and `Halted` — which is why `Context::decide_timer` must never take that
+/// path twice. What it does instead, now, is answer a repeated ask by calling `measure`
+/// directly over the same recorded `armed_at`, against a fresh clock reading: the same
+/// `TimerFired` transition a fresh boot's own `Rearm` path takes from the identical state,
+/// reached without asking the kernel's intent question again. This workflow is what proves
+/// it either way, depending on how far the clock the two asks share has moved.
+struct WokenTwice {
+    input: [u8; 4],
+    spec: TimerSpec,
+}
+
+impl WokenTwice {
+    const fn waiting(spec: TimerSpec) -> Self {
+        Self {
+            input: *b"seed",
+            spec,
+        }
+    }
+}
+
+impl Workflow for WokenTwice {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: 10,
+            versions: VersionRange::exact(1),
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        // The first ask arms the deadline. The second is the very same boundary, asked
+        // again in the same boot — standing in for a real executor's `TimerFuture` retained
+        // across an `Alarm::wake_after` sleep and polled again by its own real waker.
+        let _ = boundary.wait(self.spec);
+        boundary.wait(self.spec)?;
+        Ok(Outcome::Completed(b"woke"))
+    }
+}
+
+#[test]
+fn a_repeated_wait_remeasures_the_clock_rather_than_repeating_a_stale_remaining() {
+    // The clock advances a little between the two asks — enough to prove the second one
+    // read it again, not enough to have elapsed the deadline.
+    let mut device = Device::new(geometry());
+    let mut world = Ticking::new(100);
+    let mut workflow = WokenTwice::waiting(TimerSpec::AfterBoot { ticks: 1_000 });
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    // The first ask reports 900 remaining (armed at 0, read at 100). A stale repeat would
+    // report exactly that again; the fresh reading the second ask takes reports 800.
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 800),
+        "{progress:?}"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
+            .count(),
+        1,
+        "a repeated ask of the same open deadline arms nothing a second time"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_FIRED)
+            .count(),
+        0,
+        "the deadline has not elapsed, so nothing here should have fired it"
+    );
+}
+
+#[test]
+fn a_repeated_wait_that_finds_the_deadline_elapsed_resolves_rather_than_repeating_the_halt() {
+    // The clock advances far enough between the two asks that the second one finds the
+    // deadline already passed — issue #110's whole point, and Codex's round 12/13 finding:
+    // a live re-poll after a real alarm interrupt must be able to see that.
+    let mut device = Device::new(geometry());
+    let mut world = Ticking::new(600);
+    let mut workflow = WokenTwice::waiting(TimerSpec::AfterBoot { ticks: 1_000 });
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Finished {
+            conclusion: Conclusion::Completed,
+            result_len: 4,
+        }),
+        "the second, live ask must see the deadline the first one could not"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
+            .count(),
+        1,
+        "still one arming, from the first ask"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_FIRED)
+            .count(),
+        1,
+        "the second ask is what durably records the firing"
+    );
+}
+
+/// A workflow that asks for one deadline, then a different one, in the same boot.
+///
+/// Codex found this on review of issue [#110](https://github.com/madmax983/waymaker/issues/110)'s
+/// own pull request: a `select!` above this boundary can drop a still-open timer future and
+/// poll a fresh one over a different [`TimerSpec`] without ever resolving the abandoned
+/// one's committed `TimerScheduled` record — that record is durable, and nothing but its own
+/// spec can ever resolve it. `Context::deadline_remaining` used to answer such a mismatched
+/// ask with the abandoned timer's own frozen deadline anyway, which a façade would then
+/// re-arm a hardware alarm for as though it belonged to the new request — forever, since the
+/// mismatch recurs on every later ask and nothing ever refreshes it.
+struct SwitchesDeadline {
+    input: [u8; 4],
+    first: TimerSpec,
+    second: TimerSpec,
+    /// Whether `run` reached the `deadline_remaining` call at all.
+    observed: bool,
+    /// What it answered, when `observed` is `true`.
+    remaining: Option<(ClockKind, u64)>,
+}
+
+impl SwitchesDeadline {
+    const fn waiting(first: TimerSpec, second: TimerSpec) -> Self {
+        Self {
+            input: *b"seed",
+            first,
+            second,
+            observed: false,
+            remaining: None,
+        }
+    }
+}
+
+impl Workflow for SwitchesDeadline {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: 11,
+            versions: VersionRange::exact(1),
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        // Arms `first` and halts on it — a real `TimerScheduled` record, committed.
+        let _ = boundary.wait(self.first);
+        // Stands in for a fresh timer future built over a different spec after `select!`
+        // dropped the one that named `first`. The open boundary is still `first`'s.
+        let second = boundary.wait(self.second);
+        self.remaining = boundary.deadline_remaining();
+        self.observed = true;
+        second?;
+        Ok(Outcome::Completed(b"unreachable"))
+    }
+}
+
+#[test]
+fn a_wait_for_a_different_spec_than_the_one_still_open_reports_no_deadline() {
+    let mut device = Device::new(geometry());
+    let mut world = booted(0);
+    let mut workflow = SwitchesDeadline::waiting(
+        TimerSpec::AfterBoot { ticks: 1_000 },
+        TimerSpec::AfterBoot { ticks: 2_000 },
+    );
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "{progress:?}"
+    );
+    assert!(workflow.observed, "the second wait must still return");
+    assert_eq!(
+        workflow.remaining, None,
+        "a mismatched spec must not be told the abandoned timer's own deadline"
+    );
+    // Only the first ask ever reached the kernel: the mismatch is refused before `peek` and
+    // `machine.timer_intent` are asked about a second, different boundary.
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
+            .count(),
+        1
+    );
+}
+
+/// A workflow that abandons an open deadline for a gate rather than for a different spec.
+///
+/// Codex found this on review of the fix above: `last_wait` was set only inside
+/// `decide_timer`, so a `select!` that drops a still-open timer future and moves on to *any
+/// other* boundary — not only a mismatched `wait` — left `last_wait` naming the abandoned
+/// spec. `deadline_remaining()` would then still answer with that timer's frozen deadline
+/// after a `gate`, `call`, `schedule`, `resolve` or `continue_as_new` halt, which have
+/// nothing to do with it — exactly the shape of bug the abandoned-timer fix was meant to
+/// close, one boundary over.
+struct AbandonsTimerForAGate {
+    input: [u8; 4],
+    spec: TimerSpec,
+    observed: bool,
+    remaining: Option<(ClockKind, u64)>,
+}
+
+impl AbandonsTimerForAGate {
+    const fn waiting(spec: TimerSpec) -> Self {
+        Self {
+            input: *b"seed",
+            spec,
+            observed: false,
+            remaining: None,
+        }
+    }
+}
+
+impl Workflow for AbandonsTimerForAGate {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: 12,
+            versions: VersionRange::exact(1),
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        // Arms `spec` and halts on it — a real `TimerScheduled` record, committed.
+        let _ = boundary.wait(self.spec);
+        // Stands in for a `select!` that dropped the timer future and moved on to an
+        // unrelated boundary. The open boundary is still the timer's.
+        let gated = boundary.gate(GateId(1));
+        self.remaining = boundary.deadline_remaining();
+        self.observed = true;
+        gated?;
+        Ok(Outcome::Completed(b"unreachable"))
+    }
+}
+
+#[test]
+fn a_non_wait_boundary_after_an_abandoned_timer_reports_no_deadline() {
+    let mut device = Device::new(geometry());
+    let mut world = booted(0);
+    let mut workflow = AbandonsTimerForAGate::waiting(TimerSpec::AfterBoot { ticks: 1_000 });
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "{progress:?}"
+    );
+    assert!(workflow.observed, "the gate call must still return");
+    assert_eq!(
+        workflow.remaining, None,
+        "a non-wait boundary must not be told an abandoned timer's own deadline"
     );
 }

@@ -1211,6 +1211,13 @@ impl SizeReport {
     /// rows from this sum — dropping rows here would also stop gating a real per-feature
     /// configuration's RAM, which is the ceiling this term exists to hold every shippable
     /// configuration to.
+    ///
+    /// This also trusts each row's own `ram` figure, past two checks (issue #172).
+    /// [`Self::shortfalls`] refuses a row whose `ram` reads smaller than its own `bss`
+    /// plus `data`. It also refuses a gated row whose `ram` reads smaller than the
+    /// baseline's. Neither check can catch a row that reports `0 B` of `ram` and `bss`
+    /// together. `0 B` is this engine's real, current figure. A report of `0` is not
+    /// proof of a lie. See CLAUDE.md's "what is not checked".
     #[must_use]
     pub fn runtime_ram_total(&self) -> Option<u64> {
         let kernel_state = self.kernel_state.as_ref()?;
@@ -1403,25 +1410,7 @@ impl SizeReport {
         }
 
         shortfalls.extend(self.gated_row_shortfalls());
-
-        for row in &self.rows {
-            if row.probe_flash == 0 {
-                shortfalls.push(BudgetShortfall::Unmeasurable {
-                    detail: format!(
-                        "`{}` attributes no byte at all to `{PROBE_PACKAGE}`, but every image the matrix links is the probe; its symbol table was not read",
-                        row.name
-                    ),
-                });
-            }
-            if row.probe_flash > row.sizes.flash {
-                shortfalls.push(BudgetShortfall::Unmeasurable {
-                    detail: format!(
-                        "`{}` attributes {} B to `{PROBE_PACKAGE}` out of an image holding {} B, which is not a reading of that image",
-                        row.name, row.probe_flash, row.sizes.flash
-                    ),
-                });
-            }
-        }
+        shortfalls.extend(self.row_reading_shortfalls());
 
         for row in self.rows.iter().filter(|row| row.gated) {
             let delta = row.sizes.saturating_delta(&baseline.sizes);
@@ -1442,6 +1431,20 @@ impl SizeReport {
                         "`{}` links {} B less flash than the baseline, which the saturating image delta reads as 0 while `probe` keeps its sign; the row cannot reconcile, so it is not a measurement",
                         row.name,
                         baseline.sizes.flash - row.sizes.flash,
+                    ),
+                });
+            }
+            // Flash's own rule, one section over (issue #172). A gated row links the
+            // baseline plus the engine. So it cannot use less ram than the baseline
+            // alone already does. This rule does not floor `ram` at a non-zero value.
+            // `0 B` is this engine's real, current figure. A row that reports it
+            // honestly must pass. This rule refuses only a drop below the baseline.
+            if row.sizes.ram < baseline.sizes.ram {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` reports {} B less ram than the baseline, which a row that links the baseline plus the engine cannot do",
+                        row.name,
+                        baseline.sizes.ram - row.sizes.ram,
                     ),
                 });
             }
@@ -1589,6 +1592,47 @@ impl SizeReport {
             }
         }
 
+        shortfalls
+    }
+
+    /// Every row's own reading of itself, gated or not.
+    ///
+    /// This process did not write the `--report` document. So this check compares a
+    /// row's own fields to each other, not to a trusted source. `probe_flash` must be a
+    /// real reading of this row's image. `ram` must hold at least `bss` plus `data`
+    /// (issue #172): `bss` and `data` are writable, non-thread-local sections, and `ram`
+    /// counts both. This cannot catch a row that reports `0 B` of `ram` and `bss`
+    /// together. `0 B` is this engine's real, current figure. A report of `0` is not a
+    /// fault. See CLAUDE.md's "what is not checked".
+    fn row_reading_shortfalls(&self) -> Vec<BudgetShortfall> {
+        let mut shortfalls = Vec::new();
+        for row in &self.rows {
+            if row.probe_flash == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` attributes no byte at all to `{PROBE_PACKAGE}`, but every image the matrix links is the probe; its symbol table was not read",
+                        row.name
+                    ),
+                });
+            }
+            if row.probe_flash > row.sizes.flash {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` attributes {} B to `{PROBE_PACKAGE}` out of an image holding {} B, which is not a reading of that image",
+                        row.name, row.probe_flash, row.sizes.flash
+                    ),
+                });
+            }
+            let held = row.sizes.bss.saturating_add(row.sizes.data);
+            if row.sizes.ram < held {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` reports {} B of ram, but {} B of bss and {} B of data; ram must hold at least both",
+                        row.name, row.sizes.ram, row.sizes.bss, row.sizes.data
+                    ),
+                });
+            }
+        }
         shortfalls
     }
 
@@ -6365,6 +6409,68 @@ mod tests {
         );
         assert!(
             rendered(&report.shortfalls()).contains("cannot reconcile"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn a_row_whose_ram_is_smaller_than_its_own_bss_and_data_is_not_a_measurement() {
+        // `ram` counts every writable, non-thread-local section. `bss` and `data` are
+        // such sections. So `ram` cannot read smaller than the two of them together.
+        // Two numbers about the same bytes disagree here. That is not a smaller image.
+        let mut row = default_row(100, 40);
+        row.sizes.ram = 8;
+        let report = SizeReport::new(
+            vec![baseline_row(), row],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("ram must hold at least"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
+    fn a_gated_row_that_reports_less_ram_than_the_baseline_is_not_a_measurement() {
+        // Flash's own rule, one section over (issue #172). A gated row links the
+        // baseline plus the engine. It cannot use less ram than the baseline alone.
+        let ram_baseline = Row::new(
+            BASELINE_ROW,
+            &[PROBE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                bss: 40,
+                ram: 40,
+                ..baseline_sizes()
+            },
+            BASELINE_PROBE_FLASH,
+            false,
+        );
+        let base = baseline_sizes();
+        let forged = Row::new(
+            DEFAULT_ROW,
+            &[PROBE_FEATURE, ENGINE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                text: base.text + 100,
+                flash: base.flash + 100,
+                bss: 0,
+                ram: 0,
+                ..base
+            },
+            BASELINE_PROBE_FLASH,
+            true,
+        );
+        let report = SizeReport::new(
+            vec![ram_baseline, forged],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("less ram than the baseline"),
             "{:?}",
             report.shortfalls()
         );
