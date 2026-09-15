@@ -4261,17 +4261,24 @@ pub const EFFECT_ALLOWED_ATTRIBUTES: &[&str] = &[
     "allow", "cfg", "deny", "doc", "forbid", "ignore", "must_use", "test", "warn",
 ];
 
-/// `#[derive(..)]` names `effect.rs` may carry: the compiler's own derives.
+/// `#[derive(..)]` names `effect.rs` may carry: the compiler's own derives that add no
+/// constructor.
 ///
-/// Each expands to a trait `impl` for the deriving type alone and can add no method, no
-/// construction and no field rewrite. A custom derive is an unexamined external expansion,
-/// the shape issue [#92](https://github.com/madmax983/waymaker/issues/92)'s macro-invocation
-/// round closed for a bang macro and this round closes for a derive.
+/// Each of these expands to a trait `impl` for the deriving type alone and can add no
+/// method, no construction and no field rewrite. `Default` is deliberately absent even
+/// though the compiler interprets it directly with no macro behind it: unlike every derive
+/// on this list, it *does* construct a new value, so `#[derive(Default)]` on a proof type
+/// would be a second, public constructor — `CheckedDispatch::default()` — invisible to
+/// `EFFECT_NO_SELF_LITERAL` and `CHECKED_DISPATCH_CONSTRUCTION` alike, neither of which
+/// looks for a construction site the compiler generates rather than one written in source.
+/// A custom derive is a second, unexamined kind of gap — an external expansion, the shape
+/// issue [#92](https://github.com/madmax983/waymaker/issues/92)'s macro-invocation round
+/// closed for a bang macro and this round closes for a derive — and this list closes both
+/// by naming only derives that are neither.
 pub const EFFECT_ALLOWED_DERIVES: &[&str] = &[
     "Clone",
     "Copy",
     "Debug",
-    "Default",
     "Eq",
     "Hash",
     "Ord",
@@ -13020,15 +13027,36 @@ mod deferred_answer_pins {
     fn the_effect_protocol_std_derives_are_not_reported() {
         // The positive half: the file's own real derives — `Clone, Copy, Debug`, and so on
         // on `EffectId`, `ActivityKind`, etc. — must stay legal, or the allowlist is too
-        // narrow for the file it is pinned against.
+        // narrow for the file it is pinned against. `Default` is not among them: it is the
+        // one derive on the compiler's own list that constructs, so it is refused rather
+        // than allowed — `a_derive_default_on_a_proof_type_is_reported`, below, is its own
+        // negative half.
         let source = tests_support::clean_effect_module()
-            + "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Ord, PartialOrd)]\n\
+            + "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]\n\
                struct Extra;\n";
         let details = effect_details(&source);
         assert!(
             !details
                 .iter()
                 .any(|detail| detail.contains("attribute or derive")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_derive_default_on_a_proof_type_is_reported() {
+        // Codex's review of issue #92's merge (round 4 of the macro/derive family): `Default`
+        // used to sit on `EFFECT_ALLOWED_DERIVES` beside `Clone` and `Debug`, but unlike every
+        // other entry it *constructs* — `#[derive(Default)]` on `CheckedDispatch` or
+        // `DurableIntent` would generate `CheckedDispatch::default()`, a second public
+        // constructor neither `EFFECT_NO_SELF_LITERAL` nor `CHECKED_DISPATCH_CONSTRUCTION`
+        // looks for, since both scan for a construction site written in source rather than one
+        // the compiler generates. The ban is file-wide rather than scoped to the three proof
+        // types, matching every other refusal in this family.
+        let source = tests_support::clean_effect_module() + "#[derive(Default)]\nstruct Extra;\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("Default")),
             "{details:?}"
         );
     }
