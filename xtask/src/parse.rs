@@ -695,125 +695,6 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
     Ok(visitor.found)
 }
 
-/// Every name in `names` that a generic parameter's own trait bound binds an associated
-/// type to, anywhere `contents` declares one, outside `#[cfg(test)]`.
-///
-/// `T: Alias<Dispatch = CheckedDispatch<'a>>` writes the guarded name directly in the
-/// bound. A construction site spelled `T::Dispatch { .. }` never spells `CheckedDispatch`
-/// — [`struct_literal_counts`] compares a literal's last path segment, and `Dispatch` is
-/// not `CheckedDispatch` — so the binding is invisible to every construction pin built on
-/// it (issue #184). This needs no type inference: the bound's value is the guarded name in
-/// the source text, or a `use`/`type` alias of it, resolved the same way
-/// [`struct_literal_counts`] resolves a struct literal's own path — a plain `type Hidden =
-/// CheckedDispatch;` beside the bound is not enough to hide it. So a matching binding is
-/// reported on its own, the same way [`qself_type_alias_names`] refuses an unresolvable
-/// `type` alias on its own — a caller refuses the file outright rather than trying to
-/// prove the binding reaches a construction site.
-///
-/// # Errors
-///
-/// Returns [`syn::Error`] when `contents` does not parse as Rust.
-pub fn generic_assoc_type_bindings_naming(
-    contents: &str,
-    names: &[&str],
-) -> Result<Vec<String>, syn::Error> {
-    struct AssocBindings<'a, 'ast> {
-        names: &'a [&'a str],
-        found: Vec<String>,
-        // Mirrors `struct_literal_counts`'s own `Literals`: the module stack an alias may
-        // resolve through, and the block-local `use`/`type` aliases visible at the current
-        // point — a binding's value is exactly as aliasable as a struct literal's path.
-        stack: Vec<&'ast [syn::Item]>,
-        block_items: Vec<&'ast syn::Item>,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
-        fn visit_item(&mut self, node: &'ast syn::Item) {
-            if has_cfg_test(item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_item(self, node);
-        }
-
-        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if has_cfg_test(impl_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, node);
-        }
-
-        fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
-            if has_cfg_test(trait_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_trait_item(self, node);
-        }
-
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            let pushed = node.content.is_some();
-            if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(items);
-            }
-            let enclosing_block_items = core::mem::take(&mut self.block_items);
-            syn::visit::visit_item_mod(self, node);
-            self.block_items = enclosing_block_items;
-            if pushed {
-                self.stack.pop();
-            }
-        }
-
-        fn visit_block(&mut self, node: &'ast syn::Block) {
-            let own_items: Vec<&'ast syn::Item> = node
-                .stmts
-                .iter()
-                .filter_map(|stmt| match stmt {
-                    syn::Stmt::Item(item) => Some(item),
-                    _ => None,
-                })
-                .collect();
-            let pushed = own_items.len();
-            self.block_items.extend(own_items);
-            syn::visit::visit_block(self, node);
-            self.block_items.truncate(self.block_items.len() - pushed);
-        }
-
-        // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
-        // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
-        // shape `Iterator<Item = u8>`'s syntax can take.
-        fn visit_assoc_type(&mut self, node: &'ast syn::AssocType) {
-            if let Some(path) = type_alias_path(&node.ty) {
-                let local = (path.leading_colon.is_none() && path.segments.len() == 1)
-                    .then(|| path.segments.first())
-                    .flatten()
-                    .map(|segment| ident_name(&segment.ident))
-                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
-                let resolved = match local {
-                    Some((segments, true)) => segments,
-                    Some((segments, false)) => resolve_segments_from(segments, &self.stack),
-                    None => resolve_segments(path, &self.stack),
-                };
-                if let Some(name) = resolved
-                    .last()
-                    .filter(|last| self.names.contains(&last.as_str()))
-                {
-                    self.found.push(name.clone());
-                }
-            }
-            syn::visit::visit_assoc_type(self, node);
-        }
-    }
-
-    let file = parse_rust(contents)?;
-    let mut visitor = AssocBindings {
-        names,
-        found: Vec::new(),
-        stack: vec![&file.items],
-        block_items: Vec::new(),
-    };
-    visitor.visit_file(&file);
-    Ok(visitor.found)
-}
-
 /// The `use` and `type` aliases `block` declares directly in its own statements — not in a
 /// nested block, which gets its own scope when [`struct_literal_counts`]'s visitor reaches it.
 /// Chases `name` through the `use`/`type` aliases declared directly in `items` — the
@@ -1025,6 +906,137 @@ macro_rules! shadow_generic_params {
             self.shadow = outer;
         }
     };
+}
+
+/// Every name in `names` that a generic parameter's own trait bound binds an associated
+/// type to, anywhere `contents` declares one, outside `#[cfg(test)]`.
+///
+/// `T: Alias<Dispatch = CheckedDispatch<'a>>` writes the guarded name directly in the
+/// bound. A construction site spelled `T::Dispatch { .. }` never spells `CheckedDispatch`
+/// — [`struct_literal_counts`] compares a literal's last path segment, and `Dispatch` is
+/// not `CheckedDispatch` — so the binding is invisible to every construction pin built on
+/// it (issue #184). This needs no type inference: the bound's value is the guarded name in
+/// the source text, or a `use`/`type` alias of it, resolved the same way
+/// [`struct_literal_counts`] resolves a struct literal's own path — a plain `type Hidden =
+/// CheckedDispatch;` beside the bound is not enough to hide it. So a matching binding is
+/// reported on its own, the same way [`qself_type_alias_names`] refuses an unresolvable
+/// `type` alias on its own — a caller refuses the file outright rather than trying to
+/// prove the binding reaches a construction site.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn generic_assoc_type_bindings_naming(
+    contents: &str,
+    names: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    struct AssocBindings<'a, 'ast> {
+        names: &'a [&'a str],
+        found: Vec<String>,
+        // Mirrors `struct_literal_counts`'s own `Literals`: the module stack an alias may
+        // resolve through, and the block-local `use`/`type` aliases visible at the current
+        // point — a binding's value is exactly as aliasable as a struct literal's path.
+        stack: Vec<&'ast [syn::Item]>,
+        block_items: Vec<&'ast syn::Item>,
+        // Generic type-parameter names in scope at the current point (issue #181): a bound
+        // living on the same item that declares the parameter it names must not have that
+        // name resolved through a same-named module or alias instead.
+        shadow: Vec<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+            if has_cfg_test(trait_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, node);
+        }
+
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            let pushed = node.content.is_some();
+            if let Some((_, items)) = node.content.as_ref() {
+                self.stack.push(items);
+            }
+            let enclosing_block_items = core::mem::take(&mut self.block_items);
+            // A module sees none of an enclosing item's generics either (issue #181).
+            let outer_shadow = core::mem::take(&mut self.shadow);
+            syn::visit::visit_item_mod(self, node);
+            self.shadow = outer_shadow;
+            self.block_items = enclosing_block_items;
+            if pushed {
+                self.stack.pop();
+            }
+        }
+
+        shadow_generic_params!();
+
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            let own_items: Vec<&'ast syn::Item> = node
+                .stmts
+                .iter()
+                .filter_map(|stmt| match stmt {
+                    syn::Stmt::Item(item) => Some(item),
+                    _ => None,
+                })
+                .collect();
+            let pushed = own_items.len();
+            self.block_items.extend(own_items);
+            syn::visit::visit_block(self, node);
+            self.block_items.truncate(self.block_items.len() - pushed);
+        }
+
+        // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
+        // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
+        // shape `Iterator<Item = u8>`'s syntax can take.
+        fn visit_assoc_type(&mut self, node: &'ast syn::AssocType) {
+            if let Some(path) = type_alias_path(&node.ty) {
+                let local = (path.leading_colon.is_none() && path.segments.len() == 1)
+                    .then(|| path.segments.first())
+                    .flatten()
+                    .map(|segment| ident_name(&segment.ident))
+                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
+                let resolved = match local {
+                    Some((segments, true)) => segments,
+                    Some((segments, false)) => {
+                        resolve_segments_from(segments, &self.stack, &self.shadow)
+                    }
+                    None => resolve_segments(path, &self.stack, &self.shadow),
+                };
+                if let Some(name) = resolved
+                    .last()
+                    .filter(|last| self.names.contains(&last.as_str()))
+                {
+                    self.found.push(name.clone());
+                }
+            }
+            syn::visit::visit_assoc_type(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = AssocBindings {
+        names,
+        found: Vec::new(),
+        stack: vec![&file.items],
+        block_items: Vec::new(),
+        shadow: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
 }
 
 /// Every item anywhere in `items`, at any nesting depth, `mod` blocks
