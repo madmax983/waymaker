@@ -3003,6 +3003,33 @@ fn block_ignored_let_count(block: &syn::Block) -> usize {
         .count()
 }
 
+/// The count of every `let PATTERN = EXPR else { DIVERGE };` statement declared *directly*
+/// in `block` — counted here regardless of whether [`resolve_let_else_binding`] can actually
+/// judge the pattern, the same way [`block_while_statement_count`] and
+/// [`block_if_statement_count`] count every loop and conditional statement structurally
+/// before either scan attempts to fold it. A block genuinely holding one this scan cannot
+/// resolve still refuses — through `resolve_let_else_binding`'s own `None`, propagated by
+/// `resolve_block_sequential`'s `?` — but it refuses *there*, on what the pattern and its
+/// scrutinee actually are, rather than here, on the mere shape of the statement.
+fn block_let_else_statement_count(block: &syn::Block) -> usize {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| {
+            let syn::Stmt::Local(local) = stmt else {
+                return false;
+            };
+            if has_cfg_test(&local.attrs) {
+                return false;
+            }
+            let Some(init) = local.init.as_ref() else {
+                return false;
+            };
+            init.diverge.is_some()
+        })
+        .count()
+}
+
 /// The plain, non-assigning operator `assign_op` desugars to (`AddAssign` to `+`, and so on)
 /// — one of the ten compound-assignment [`syn::BinOp`] variants, spelled as the source text
 /// [`apply_compound_assignment`] parses back into a real [`syn::BinOp`] to build a synthetic
@@ -4051,6 +4078,86 @@ fn resolve_sequential_let(
     }
 }
 
+/// A `let PATTERN = EXPR else { DIVERGE };` statement whose pattern provably matches —
+/// resolved and bound into `resolved`/`local_types` exactly as [`resolve_sequential_let`]
+/// binds an ordinary `let`, since a let-else's own bindings are visible in the *enclosing*
+/// scope from this point on, not confined to a nested branch the way an `if let`'s are.
+///
+/// Codex's finding: `let x @ 0..=254 = 0u8 else { loop {} }; x` names a refutable pattern
+/// this scan could already check — [`match_arm_matches_constant`] is exactly what an `if
+/// let`/`while let` condition already resolves through — but `resolve_block_sequential`
+/// unconditionally skipped every `let`-`else` statement (`init.diverge.is_some()`), leaving
+/// `x` unbound even when the pattern is provably satisfied and the diverging `else` provably
+/// never runs.
+///
+/// A pattern that provably does *not* match is refused (`None`) rather than skipped: the
+/// diverging `else` branch would run in that case, and this scan has no way to represent
+/// control leaving the block here — continuing as though the statements after it still
+/// executed normally would be a wrong answer, not merely an unresolved one. A pattern this
+/// scan cannot judge either way is refused for the identical reason `resolve_sequential_let`
+/// refuses an initializer it cannot fold: an unresolved name, never a guessed value.
+///
+/// Every name [`pattern_bindings`] finds is bound to the identical scrutinee value — the
+/// same simplification [`evaluate_if_let`]'s own `bound` map already makes, sound for the
+/// single-name-or-uniform-range shape a let-else's pattern practically has here and not
+/// attempting to destructure a compound one further.
+fn resolve_let_else_binding(
+    local: &syn::Local,
+    init: &syn::LocalInit,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+    shadow_snapshot: &mut ShadowSnapshot,
+) -> Option<()> {
+    let scoped_resolve_value = |path: &syn::Path| {
+        path.get_ident()
+            .map(ident_name)
+            .and_then(|candidate| resolved.get(&candidate).copied())
+            .or_else(|| (resolve.value)(path))
+    };
+    let scoped_resolve_unsigned = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.unsigned)(path),
+            |candidate| {
+                local_types
+                    .get(&candidate)
+                    .is_some_and(|name| is_unsigned_type_name(name))
+            },
+        )
+    };
+    let scoped_resolve_width = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.width)(path),
+            |candidate| local_types.get(&candidate).map(String::as_str),
+        )
+    };
+    let scoped_resolve = Resolve {
+        value: &scoped_resolve_value,
+        unsigned: &scoped_resolve_unsigned,
+        width: &scoped_resolve_width,
+    };
+    let scrutinee = literal_or_const_value(&init.expr, &scoped_resolve)?;
+    if !match_arm_matches_constant(&local.pat, scrutinee, &scoped_resolve)? {
+        return None;
+    }
+    let declared_type = expr_declared_width(&init.expr, &scoped_resolve);
+    for ident in pattern_bindings(&local.pat, &scoped_resolve) {
+        let name = ident_name(ident);
+        shadow_snapshot.entry(name.clone()).or_insert_with(|| {
+            (
+                resolved.get(&name).copied(),
+                local_types.get(&name).cloned(),
+            )
+        });
+        resolved.insert(name.clone(), scrutinee);
+        local_types.remove(&name);
+        if let Some(ty) = &declared_type {
+            local_types.insert(name, ty.clone());
+        }
+    }
+    Some(())
+}
+
 /// A bound on how many times [`evaluate_while_loop`] will run one loop's body before
 /// refusing rather than resolving. A source loop with no discoverable termination is a
 /// hazard this scan must never inherit — an unbounded interpreter here would make a single
@@ -4443,6 +4550,14 @@ fn resolve_block_sequential(
                     continue;
                 };
                 if init.diverge.is_some() {
+                    resolve_let_else_binding(
+                        local,
+                        init,
+                        resolve,
+                        local_types,
+                        resolved,
+                        shadow_snapshot,
+                    )?;
                     continue;
                 }
                 resolve_sequential_let(
@@ -4621,7 +4736,11 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // `block_nested_block_statement_count` is the identical gap one syntax over: a bare
     // `{ .. }` statement binds no name at the outer scope either, and was counted by neither
     // side of this sum until now. `block_if_statement_count` is the same gap a third time: an
-    // `if`/`else` statement binds no name at the outer scope either.
+    // `if`/`else` statement binds no name at the outer scope either. `block_let_else_statement_count`
+    // is `block_ignored_let_count`'s own twin for a `let`-`else`: it is a name-binding
+    // statement, but one this sum counts structurally rather than through
+    // `block_let_statement_count`, since a let-else needs its pattern actually checked
+    // against its scrutinee before anyone can say whether it bound a name at all.
     if rest.len()
         != const_item_count
             + block_let_statement_count(block)
@@ -4629,6 +4748,7 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
             + block_while_statement_count(block)
             + block_nested_block_statement_count(block)
             + block_if_statement_count(block)
+            + block_let_else_statement_count(block)
             + ignored_lets
     {
         return None;

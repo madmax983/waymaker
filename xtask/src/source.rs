@@ -22209,6 +22209,45 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_a_successful_let_else_binding_is_reported() {
+        // Codex's finding: `let x @ 0..=254 = n else { loop {} }; x` names a `let`-`else`
+        // whose refutable pattern provably matches every `n` this test builds it with — but
+        // `resolve_block_sequential` unconditionally skipped any `Stmt::Local` with
+        // `init.diverge.is_some()`, leaving `x` unbound and the whole block unresolved
+        // regardless of whether the pattern matched. `resolve_let_else_binding` now checks
+        // the pattern against its scrutinee the same way an `if let`/`while let` condition
+        // already is, and binds the name(s) it finds into the *enclosing* scope — a
+        // let-else's own binding is visible from that point on in the surrounding block, not
+        // confined to a nested branch. Verified against real rustc, warning-free: `x` is `n`
+        // for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let x @ 0..=254 = {n}u8 else {{ loop {{}} }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_successful_let_else_binding(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_with_an_if_let_bound_then_branch_is_reported() {
         // Codex's finding: `if let x @ 0 = 0u8 { x } else { 100 }` selects the `then`
         // branch, whose own body reads `x` — a name only the condition's own `Expr::Let`
