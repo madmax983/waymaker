@@ -929,14 +929,24 @@ enum LiteralFound<'ast> {
 /// Leaving `scope` at the use site let that inner shadow win regardless of where the alias
 /// chasing it was actually declared, hiding a real construction behind an unrelated,
 /// same-named local alias (Codex review, PR #183). Once resolution has stepped into a
-/// sibling module by name, it leaves the lexical ancestor stack behind exactly as
-/// [`resolve_segments`] does: `self::` still resolves inside that module, but `super::` and
-/// further fallthrough do not, because a module reached by name has no ancestor this
-/// per-file scan can identify past the point it was entered from.
+/// module by name, `self::` still resolves inside it, and — unlike [`resolve_segments`],
+/// whose per-file stack has no ancestor left to offer once it descends this way — `super::`
+/// does too: the module's own declaring parent is a real frame already on `stack`, walked to
+/// once by [`nearest_module_at_or_below`] the moment the module is entered and remembered as
+/// `entered_parent` for as long as any entered module is still on top of it (Codex review,
+/// PR #183, round 2 — a `super::` inside a module reached this way had dead-ended exactly the
+/// way [`resolve_segments`]'s own residual limit does, losing a real alias target one module
+/// short).
+///
 /// One loop iteration of [`resolve_segments_through_blocks`] once resolution has stepped
-/// into a module by name (`entered`) — mirrors [`resolve_segments`]'s own `entered` handling,
-/// with no fallthrough, because a module reached by name has no ancestor this per-file scan
-/// can identify.
+/// into one or more modules by name (`entered`, innermost last): looks the next segment up
+/// against the innermost entered module's own aliases and inline sibling modules, and
+/// descends further by *pushing* onto `entered` rather than replacing it, so a later
+/// `super::` can pop back out one module at a time rather than only ever having one level to
+/// fall from. Leading `self`/`super` segments are not this function's to consume —
+/// [`consume_entered_prefix`] does that before this function is called, popping `entered`
+/// (and handing `scope` back for lexical resolution once it empties) so this function only
+/// ever sees a name it still has to look up.
 ///
 /// `Ok(true)` substituted an alias or descended further, and the caller's loop should
 /// continue; `Ok(false)` found neither, and the caller's loop should stop; `Err(segments)` is
@@ -945,9 +955,8 @@ fn step_entered_scope<'ast>(
     items: &'ast [syn::Item],
     segments: &mut Vec<String>,
     descended_prefix: &mut Vec<String>,
-    entered: &mut Option<&'ast [syn::Item]>,
+    entered: &mut Vec<&'ast [syn::Item]>,
 ) -> Result<bool, Vec<String>> {
-    consume_self_prefix(segments);
     let Some(first) = segments.first().cloned() else {
         return Ok(false);
     };
@@ -971,11 +980,44 @@ fn step_entered_scope<'ast>(
             .find(|(name, _)| *name == first)
         {
             descended_prefix.push(segments.remove(0));
-            *entered = Some(module_items);
+            entered.push(module_items);
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Consumes leading `self`/`super` segments while resolution is inside one or more modules
+/// entered by name (`entered`, innermost last). `self` leaves `entered` where it is; `super`
+/// pops the innermost entered module — landing on the module that named it, if another
+/// entered module is still underneath, or on `entered_parent` — the lexical scope the
+/// *outermost* entered module was reached from — the moment `entered` empties, handing `scope`
+/// back so [`consume_scope_prefix_through_blocks`] can take over from there (Codex review, PR
+/// #183, round 2: a module reached by name used to have no ancestor at all past the point it
+/// was entered from, so `super::` inside it silently dead-ended rather than resolving one
+/// module out).
+fn consume_entered_prefix(
+    segments: &mut Vec<String>,
+    entered: &mut Vec<&[syn::Item]>,
+    entered_parent: usize,
+    scope: &mut usize,
+) {
+    loop {
+        match segments.first().map(String::as_str) {
+            Some("self") => {
+                segments.remove(0);
+            }
+            Some("super") if !entered.is_empty() => {
+                segments.remove(0);
+                entered.pop();
+                if entered.is_empty() {
+                    *scope = entered_parent;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
 }
 
 fn resolve_segments_through_blocks(path: &syn::Path, stack: &[LiteralScope<'_>]) -> Vec<String> {
@@ -988,7 +1030,11 @@ fn resolve_segments_through_blocks(path: &syn::Path, stack: &[LiteralScope<'_>])
         return segments;
     }
     let mut scope = stack.len().saturating_sub(1);
-    let mut entered: Option<&[syn::Item]> = None;
+    let mut entered: Vec<&[syn::Item]> = Vec::new();
+    // Meaningful only once `entered` is non-empty: the lexical scope the *outermost* entered
+    // module was reached from, so `super::` inside it can resume lookup there once `entered`
+    // empties rather than dead-ending (Codex review, PR #183, round 2).
+    let mut entered_parent = 0_usize;
     let mut descended_prefix: Vec<String> = Vec::new();
     // `stack[0]` is always the file's own module (`struct_literal_counts` never builds this
     // stack any other way), so `item_count`/`total_alias_count` over it already bounds any
@@ -1018,12 +1064,19 @@ fn resolve_segments_through_blocks(path: &syn::Path, stack: &[LiteralScope<'_>])
         .sum();
     let bound = module_bound + block_bound + 1;
     for _ in 0..=bound {
-        if let Some(items) = entered {
-            match step_entered_scope(items, &mut segments, &mut descended_prefix, &mut entered) {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(resolved) => return resolved,
+        if !entered.is_empty() {
+            consume_entered_prefix(&mut segments, &mut entered, entered_parent, &mut scope);
+            if let Some(&items) = entered.last() {
+                match step_entered_scope(items, &mut segments, &mut descended_prefix, &mut entered)
+                {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(resolved) => return resolved,
+                }
             }
+            // `entered` emptied: a `super::` walked all the way back out to `entered_parent`,
+            // which `scope` now names. Fall through to the lexical lookup below for this same
+            // iteration, so the segment after the last `super::` is looked up immediately.
         }
 
         consume_scope_prefix_through_blocks(&mut segments, &mut scope, stack);
@@ -1070,13 +1123,19 @@ fn resolve_segments_through_blocks(path: &syn::Path, stack: &[LiteralScope<'_>])
             }
             LiteralFound::Module(items) => {
                 descended_prefix.push(segments.remove(0));
-                entered = Some(items);
+                // `entered` is always empty here — this arm is only reached from the lexical
+                // lookup above, which only runs once `entered` is empty — so this is always
+                // the *outermost* module this call enters, and `at` is where it was found.
+                entered_parent = nearest_module_at_or_below(stack, at);
+                entered.push(items);
             }
         }
     }
-    match entered {
-        Some(_) => consume_self_prefix(&mut segments),
-        None => consume_scope_prefix_through_blocks(&mut segments, &mut scope, stack),
+    if !entered.is_empty() {
+        consume_entered_prefix(&mut segments, &mut entered, entered_parent, &mut scope);
+    }
+    if entered.is_empty() {
+        consume_scope_prefix_through_blocks(&mut segments, &mut scope, stack);
     }
     // Nothing resolved past the last module entered by name: give the names descent
     // consumed back, so the answer is the path as written rather than a name silently
@@ -3071,6 +3130,32 @@ mod raw_identifier_tests {
              fn f() {\n\
              \x20   mod aliases {\n\
              \x20       pub type Ready = super::Sealable;\n\
+             \x20   }\n\
+             \x20   let _ = aliases::Ready {};\n\
+             }",
+            "Sealable",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_super_reference_inside_an_entered_module_resumes_at_its_declaring_parent() {
+        // Codex review, PR #183, round 2 (P1): the test above already covers `super::` naming
+        // the guarded type directly, but a chain needs a second hop to expose this gap — its
+        // `super::Sealable` resolves to `"Sealable"` as the trailing segment whether or not
+        // `super` itself is understood, since only the last segment is compared. Here
+        // `super::Guard` names a top-level alias of its own, so following it needs `super` to
+        // land back on the module `aliases` was declared in (this file's root) rather than
+        // dead-ending, which a module entered by name used to do unconditionally. Before this
+        // fix the result stopped at `"Guard"`, one hop short of `"Sealable"`.
+        let counts = struct_literal_counts(
+            "struct Sealable;\n\
+             type Guard = Sealable;\n\
+             fn f() {\n\
+             \x20   mod aliases {\n\
+             \x20       pub type Ready = super::Guard;\n\
              \x20   }\n\
              \x20   let _ = aliases::Ready {};\n\
              }",

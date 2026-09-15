@@ -3729,6 +3729,28 @@ construction pin miss a barrier-capable state built this way. `block_own_modules
 `LiteralScope::Block` now carries a block's own inline modules alongside its aliases, and
 every module lookup — at a `Module` frame or a `Block` one — reads them the same way. No new
 ADR here either.
+A fifth gap was Codex's very next round, on that fourth gap's own fix: a module entered by
+name — whether a block-declared one, as above, or issue #169's original sibling-in-an-
+enclosing-module case — had no ancestor at all past the point it was entered from, so
+`self::` resolved inside it but `super::` silently dead-ended, exactly the residual limit
+[what is not checked](#what-is-not-checked) already states for `resolve_segments`, the
+plain, non-block-aware resolver this one is modelled on. For `resolve_segments_through_blocks`
+that limit was never necessary: unlike the plain resolver's per-file item list, this one's
+`stack` already holds every lexical ancestor down to the file's own root, so the module's
+real declaring parent is a frame already on it. `entered` is now a stack of every module
+entered by name, innermost last, rather than one slot that a further descent silently
+overwrote; `entered_parent` is the lexical frame the *outermost* one was reached from,
+found once by `nearest_module_at_or_below` the moment it is entered; and
+`consume_entered_prefix` — `consume_scope_prefix_through_blocks`'s twin for this mode — lets
+`self::` stay put and `super::` pop one entered module at a time, handing `scope` back to
+ordinary lexical resolution the moment the stack empties. `fn f() { mod aliases { pub type
+Ready = super::Guard; } aliases::Ready { .. } }`, with a top-level `type Guard = Sealable;`,
+used to resolve `Ready` as `Guard` rather than `Sealable`, one hop short: `super` gave up
+before reaching `Guard`'s own declaration, so its alias was never followed. The fourth gap's
+own regression test named `Sealable` directly as `super::`'s target, so its last segment
+read right whether or not `super` itself resolved — only a *second* alias hop exposes the
+difference, which is why that round's test passed on the very code this one catches. No new
+ADR here either: this is `struct_literal_counts`'s own correctness, not a new decision.
 `Effect::redelivering` threads the same binding through with no kernel-boundary change:
 `decide` already checks the workflow's current request against history with
 `ReplayMachine::intent` before the redelivery row is reached, so the request `redelivering`
