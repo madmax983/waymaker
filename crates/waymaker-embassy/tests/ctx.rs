@@ -456,7 +456,7 @@ fn an_unserviceable_kind_stops_a_timer_future_built_after_it_from_reaching_the_j
     assert_eq!(stalled, Poll::Pending, "the activity stalls unserviceable");
 
     let spec = TimerSpec::AfterBoot { ticks: 25 };
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
 
     assert_eq!(waited, Poll::Pending);
     assert_eq!(
