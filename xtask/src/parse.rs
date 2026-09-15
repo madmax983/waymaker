@@ -953,6 +953,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // decision recorded inside `<div>...</div>` is still visible to a reader, unlike a
     // comment, and dropping it would fail a build over content that renders fine.
     let mut in_html_comment = false;
+    let mut in_cdata = false; // Codex, round 57: carried the same way, see `OpenConstructState`.
     // The non-rendering elements (`<script>`, `<style>`, `<title>`, `<template>` or `<iframe>`)
     // currently open, innermost last — a stack rather than one tag, named rather than a
     // bare flag (Codex, pull request #138, round 30) so a matching close is required: a
@@ -1095,7 +1096,10 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
             Event::Html(html) => {
                 let spans = visible_html_ranges(
                     &html,
-                    &mut in_html_comment,
+                    &mut OpenConstructState {
+                        in_html_comment: &mut in_html_comment,
+                        in_cdata: &mut in_cdata,
+                    },
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
@@ -1585,12 +1589,92 @@ fn attribute_value<'a>(span: &'a str, attribute: &str) -> Option<&'a str> {
     None
 }
 
+/// HTML5's fixed list of "foreign content breakout" element names (WHATWG §13.2.6.5,
+/// the "Any other start tag" case of the "in foreign content" insertion mode) —
+/// reaching one of these as a start tag while genuinely inside foreign content pops
+/// back out to ordinary HTML rules rather than opening a foreign-namespace child
+/// (Codex, pull request #138, round 57, "Exit foreign mode on HTML breakout tags").
+/// `font` is deliberately absent: WHATWG lists it separately, breaking out only when
+/// it carries a `color`, `face` or `size` attribute, checked by
+/// [`is_foreign_breakout_tag`] rather than by name alone.
+const HTML_FOREIGN_BREAKOUT_TAGS: &[&str] = &[
+    "b",
+    "big",
+    "blockquote",
+    "body",
+    "br",
+    "center",
+    "code",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "embed",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "hr",
+    "i",
+    "img",
+    "li",
+    "listing",
+    "menu",
+    "meta",
+    "nobr",
+    "ol",
+    "p",
+    "pre",
+    "ruby",
+    "s",
+    "small",
+    "span",
+    "strong",
+    "strike",
+    "sub",
+    "sup",
+    "table",
+    "tt",
+    "u",
+    "ul",
+    "var",
+];
+
+/// Whether opening the element named `name` — with markup `span` — while genuinely
+/// inside foreign content breaks back out to ordinary HTML parsing: [`name`] is one of
+/// [`HTML_FOREIGN_BREAKOUT_TAGS`], or it is `font` carrying a `color`, `face` or
+/// `size` attribute, the one name WHATWG lists as breaking out conditionally rather
+/// than unconditionally.
+fn is_foreign_breakout_tag(span: &str, name: &str) -> bool {
+    HTML_FOREIGN_BREAKOUT_TAGS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        || (name.eq_ignore_ascii_case("font")
+            && ["color", "face", "size"]
+                .iter()
+                .any(|attribute| attribute_value(span, attribute).is_some()))
+}
+
 /// Updates `foreign_content` — the currently open foreign-content roots and HTML
 /// integration points, innermost last — from one already-consumed tag's own markup
 /// (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
 /// foreign content"; carried across lines round 50, "Carry foreign-content depth
 /// across raw HTML lines"; widened to a real stack round 51, "Exit foreign mode at
-/// HTML integration points").
+/// HTML integration points"; round 57, "Exit foreign mode on HTML breakout tags").
+///
+/// A start tag named in [`HTML_FOREIGN_BREAKOUT_TAGS`] (or `font` per
+/// [`is_foreign_breakout_tag`]), reached while [`honors_self_closing_now`] is true —
+/// genuinely inside a foreign-content root rather than at an HTML integration point —
+/// pops every consecutive root frame off the top of the stack and reprocesses as
+/// ordinary HTML, per WHATWG's "in foreign content" insertion mode. Reaching this
+/// before the self-closing check matters: `<svg><p><script /></svg>` breaks out at
+/// `p` regardless of any self-closing slash a breakout tag itself might carry, and
+/// once broken out, a later self-closing tag like `<script />` is read under
+/// ordinary HTML rules rather than foreign-content ones.
 ///
 /// HTML5 acknowledges the self-closing flag on *any* start tag while the innermost open
 /// frame [`honors_self_closing_now`] — a root's own descendants, but not an integration
@@ -1616,6 +1700,15 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
         if foreign_content
             .last()
             .is_some_and(|frame| frame.name.eq_ignore_ascii_case(name))
+        {
+            foreign_content.pop();
+        }
+        return;
+    }
+    if honors_self_closing_now(foreign_content) && is_foreign_breakout_tag(span, name) {
+        while foreign_content
+            .last()
+            .is_some_and(|frame| frame.honors_self_closing)
         {
             foreign_content.pop();
         }
@@ -2062,6 +2155,13 @@ enum HidingMarker {
     /// start (= the opening delimiter's own end), the payload's end (= the closing
     /// delimiter's own start), and the closing delimiter's end, in that order.
     Cdata(usize, usize, usize, usize),
+    /// A CDATA section whose opener was found on this line but whose closing `]]>`
+    /// was not (Codex, pull request #138, round 57, "Carry foreign CDATA across
+    /// lines") — carries the opening delimiter's start and the payload's start, so
+    /// the caller can emit the rest of the line as visible text and carry the open
+    /// state into the next line's scan, the same way an unterminated comment
+    /// already does via `in_html_comment`.
+    CdataOpen(usize, usize),
 }
 
 /// The byte range of the next HTML tag — opening or closing, any name — at or after
@@ -2287,22 +2387,40 @@ fn next_hiding_marker(
     // `!`), so `find_any_tag` below always finds a competing `Markup` candidate at
     // this exact same `start` too — one that (correctly, outside foreign content)
     // treats it as a bogus comment ending at the first `>`, which would also
-    // swallow the CDATA payload itself as invisible markup. Only recognized inside
-    // foreign content, where CDATA is real, and only when this line supplies the
-    // closing `]]>` too — an unclosed one falls through to the same bogus-comment
-    // handling every other unresolved `<!...>` construct gets, rather than adding a
-    // second cross-line carry mechanism for what should be a rare construct here.
-    if !foreign_content.is_empty()
+    // swallow the CDATA payload itself as invisible markup.
+    //
+    // Only recognized while the innermost open frame genuinely honors foreign
+    // parsing rules (Codex, round 57, "Restrict CDATA to active foreign
+    // namespaces") — `honors_self_closing_now`, the same test the self-closing
+    // exemption already uses, rather than a bare "some foreign frame is open":
+    // `<svg><foreignObject><![CDATA[...]]></foreignObject></svg>` has switched
+    // back to ordinary HTML parsing inside the integration point, where
+    // `<![CDATA[` is once again a bogus comment whose payload a browser never
+    // renders, even though `foreign_content` is still non-empty there.
+    //
+    // If this line does not also supply the closing `]]>`, a `CdataOpen`
+    // candidate carries the open state across lines (round 57, "Carry foreign
+    // CDATA across lines") the same way an HTML comment already does — falling
+    // through to the bogus-comment/`PendingTag` path instead, as an earlier
+    // version of this fix did, read every payload line up to the next unrelated
+    // `>` as markup, discarding real visible text a multi-line CDATA section
+    // legitimately spans.
+    if honors_self_closing_now(foreign_content)
         && let Some(start) = find_cdata_opener(line, from)
     {
         let payload_start = start + "<![CDATA[".len();
-        if let Some(offset) = line.get(payload_start..).and_then(|rest| rest.find("]]>")) {
-            let payload_end = payload_start + offset;
-            let close_end = payload_end + "]]>".len();
-            candidates.push((
-                start,
-                HidingMarker::Cdata(start, payload_start, payload_end, close_end),
-            ));
+        match line.get(payload_start..).and_then(|rest| rest.find("]]>")) {
+            Some(offset) => {
+                let payload_end = payload_start + offset;
+                let close_end = payload_end + "]]>".len();
+                candidates.push((
+                    start,
+                    HidingMarker::Cdata(start, payload_start, payload_end, close_end),
+                ));
+            }
+            None => {
+                candidates.push((start, HidingMarker::CdataOpen(start, payload_start)));
+            }
         }
     }
     if let Some((start, end)) = find_any_tag(line, from) {
@@ -2467,29 +2585,29 @@ fn next_non_rendering_marker(
                 // A genuine nested child, opened after `top` and closed properly —
                 // not relevant to `top`'s own state.
                 descendants.pop();
-            } else if !descendants.contains(&name)
-                && ancestors.last().is_some_and(|open| *open == name)
-            {
+            } else if !descendants.contains(&name) && ancestors.contains(&name) {
                 // Matches neither `top` nor anything this walk watched open inside
-                // it, but does match the nearest element genuinely known to be open
-                // *outside* it — a real ancestor's own close. A real HTML5 parser
-                // pops its whole stack of open elements up through a matching
-                // ancestor's end tag, force-closing every descendant still open
-                // beneath it — including `top`, however deeply hidden — so `<div><span
-                // hidden>ignored</div>All 6 recovery invariants` closes `span` the
-                // moment `</div>` is reached, not never: `top` never gets an end tag
-                // of its own to wait for, and the suffix after `</div>` is real,
-                // visible prose a reader sees. Popped here rather than left for the
-                // caller, since only this walk knows which name actually matched.
-                ancestors.pop();
+                // it, but does match *some* element genuinely known to be open
+                // *outside* it — not necessarily the nearest one, since a real
+                // HTML5 parser searches its whole stack of open elements for a
+                // matching end tag, not only its topmost entry (Codex, pull
+                // request #138, round 57, "Unwind all elements through a matching
+                // ancestor"): `<div><section><span hidden>ignored</div>All 6
+                // recovery invariants` has `section` nested between `div` and the
+                // hidden `span`, so checking only `ancestors.last()` (`section`)
+                // never matched `</div>` at all, leaving `span` latched open
+                // through end of document. A real parser pops everything nested
+                // inside a closing ancestor's end tag, however many layers deep,
+                // which is why every entry through the match — not just the
+                // matched one — is popped here, and `top` closes along with them.
+                while ancestors.pop().as_deref() != Some(name.as_str()) {}
                 return Some(NonRenderingAdvance::Close(end));
             }
             // Otherwise `name` matches nothing this scanner has positive evidence
             // is genuinely open — an out-of-order close inside a genuine nested
-            // child, an ancestor further out than the nearest one, or a wholly
-            // unmatched stray tag — and is left inert, the same as HTML5's own
-            // tokenizer does for an end tag with no matching open element anywhere
-            // on the stack.
+            // child, or a wholly unmatched stray tag — and is left inert, the same
+            // as HTML5's own tokenizer does for an end tag with no matching open
+            // element anywhere on the stack.
         } else if implicitly_closed_by(top, &name) {
             return Some(NonRenderingAdvance::Close(start));
         } else if matches!(
@@ -2528,6 +2646,18 @@ fn next_non_rendering_marker(
 struct NestedHtmlContext<'a> {
     foreign_content: &'a mut Vec<ForeignFrame>,
     ancestors: &'a mut Vec<String>,
+}
+
+/// `in_html_comment` and `in_cdata` bundled into one parameter, only to keep
+/// [`visible_html_ranges`] (and [`hide_non_rendering_in_html_line`]) under clippy's
+/// parameter-count limit (Codex, pull request #138, round 57) — the two are
+/// otherwise independent, mutually-exclusive mid-construct flags, each carried
+/// across `Event::Html` lines the same way: an unterminated HTML comment or an
+/// unterminated foreign-content CDATA section leaves the rest of that line's text
+/// visible and resumes the search for its own close at the start of the next line.
+struct OpenConstructState<'a> {
+    in_html_comment: &'a mut bool,
+    in_cdata: &'a mut bool,
 }
 
 /// Advances past one close, one nested open, or one nested comment, relative to the
@@ -2779,13 +2909,25 @@ fn resolve_pending_tag(
             open_non_rendering.pop();
         }
         let reopens_top = matches_open_top && !implicit_close;
-        if matches!(
+        let is_fixed_name = matches!(
             name.as_str(),
             "script" | "style" | "title" | "template" | "iframe"
-        ) || reopens_top
-        {
+        );
+        // The ambient foreign-content self-closing exemption, applied here too and
+        // not only in the single-line paths (`next_hiding_marker`'s `Tag` handling,
+        // `next_non_rendering_marker`'s `Open` handling) that already carry it
+        // (Codex, pull request #138, round 57, "Honor multiline self-closing
+        // scripts in SVG"): `<svg>\n<script\n />\n<text>All 6 recovery
+        // invariants</text>\n</svg>` has SVG honoring the trailing slash on a
+        // *fixed* non-rendering name the same way it would any other descendant,
+        // so `<script>` has no body and needs no matching close — pushing it here
+        // regardless waited forever for a `</script>` this document never writes,
+        // hiding everything after it to end of document.
+        let self_closing_in_foreign_content =
+            ends_with_self_closing_slash(&full_text) && honors_self_closing_now(foreign_content);
+        if (is_fixed_name || reopens_top) && !self_closing_in_foreign_content {
             open_non_rendering.push(name);
-        } else if !is_void_element(&name) {
+        } else if !is_fixed_name && !reopens_top && !is_void_element(&name) {
             // Self-closing foreign content checked here too, not only in
             // `find_any_hidden_opening_tag`'s own same-line search (Codex, round 46,
             // "Skip multiline self-closing foreign hidden tags"): `<svg\n hidden />`
@@ -2840,9 +2982,32 @@ fn push_remaining_or_pending_tag(
     spans.push(VisibleHtmlSpan::Text(cursor..line.len()));
 }
 
+/// Consumes CDATA payload text a foreign-content section left open at the end of an
+/// earlier line (Codex, pull request #138, round 57, "Carry foreign CDATA across
+/// lines"): either this line supplies the closing `]]>`, ending the section and
+/// returning the cursor just past it, or the whole line is payload and nothing
+/// remains open for a caller to resume past. Extracted from `visible_html_ranges`
+/// itself only to stay under clippy's line limit, the same reason `push_list_item_marker`
+/// and `push_remaining_or_pending_tag` were pulled out at round 56.
+fn advance_past_cdata(
+    line: &str,
+    cursor: usize,
+    in_cdata: &mut bool,
+    spans: &mut Vec<VisibleHtmlSpan>,
+) -> Option<usize> {
+    if let Some(offset) = line.get(cursor..).and_then(|rest| rest.find("]]>")) {
+        let payload_end = cursor + offset;
+        spans.push(VisibleHtmlSpan::Text(cursor..payload_end));
+        *in_cdata = false;
+        return Some(payload_end + "]]>".len());
+    }
+    spans.push(VisibleHtmlSpan::Text(cursor..line.len()));
+    None
+}
+
 fn visible_html_ranges(
     line: &str,
-    in_html_comment: &mut bool,
+    open_construct: &mut OpenConstructState<'_>,
     open_non_rendering: &mut Vec<String>,
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
@@ -2889,22 +3054,35 @@ fn visible_html_ranges(
         // flag, since the two never hold at once — resolving it first is what lets a
         // `</template>` written *inside* such a comment be skipped rather than read as
         // the tracked element's real close.
-        if *in_html_comment {
+        if *open_construct.in_html_comment {
             match find_comment_close(line, cursor) {
                 Some(end) => {
                     cursor = end;
-                    *in_html_comment = false;
+                    *open_construct.in_html_comment = false;
                     continue;
                 }
                 None => break,
             }
+        }
+        // A CDATA section left open by an earlier line carries the same way an
+        // unterminated comment does (Codex, pull request #138, round 57, "Carry
+        // foreign CDATA across lines"): the payload up to `]]>` — or the rest of
+        // the line, if it is not here either — is visible text, never markup.
+        if *open_construct.in_cdata {
+            if let Some(next) =
+                advance_past_cdata(line, cursor, open_construct.in_cdata, &mut spans)
+            {
+                cursor = next;
+                continue;
+            }
+            break;
         }
         if !open_non_rendering.is_empty() {
             match advance_past_non_rendering(
                 line,
                 cursor,
                 open_non_rendering,
-                in_html_comment,
+                open_construct.in_html_comment,
                 pending_tag,
                 pending_raw_text_close,
                 &mut NestedHtmlContext {
@@ -2919,47 +3097,88 @@ fn visible_html_ranges(
                 None => break,
             }
         }
-        match next_hiding_marker(line, cursor, foreign_content) {
-            None => {
-                push_remaining_or_pending_tag(line, cursor, pending_tag, &mut spans);
-                break;
-            }
-            Some(HidingMarker::Comment(start)) => {
-                spans.push(VisibleHtmlSpan::Text(cursor..start));
-                let Some(end) = find_comment_close(line, start) else {
-                    *in_html_comment = true;
-                    break;
-                };
-                cursor = end;
-            }
-            Some(HidingMarker::Tag(start, end, tag)) => {
-                spans.push(VisibleHtmlSpan::Text(cursor..start));
-                open_non_rendering.push(tag.to_owned());
-                cursor = end;
-            }
-            Some(HidingMarker::Hidden(start, end, name)) => {
-                spans.push(VisibleHtmlSpan::Text(cursor..start));
-                open_non_rendering.push(name);
-                cursor = end;
-            }
-            Some(HidingMarker::Markup(start, end)) => {
-                spans.push(VisibleHtmlSpan::Text(cursor..start));
-                let span = &line[start..end];
-                if is_html_block_tag(span) || is_line_break_tag(span) {
-                    spans.push(VisibleHtmlSpan::Break);
-                }
-                track_foreign_content_depth(span, foreign_content);
-                track_ordinary_ancestor(span, ancestors);
-                cursor = end;
-            }
-            Some(HidingMarker::Cdata(open_start, payload_start, payload_end, close_end)) => {
-                spans.push(VisibleHtmlSpan::Text(cursor..open_start));
-                spans.push(VisibleHtmlSpan::Text(payload_start..payload_end));
-                cursor = close_end;
-            }
+        match advance_via_hiding_marker(
+            line,
+            cursor,
+            open_non_rendering,
+            open_construct,
+            pending_tag,
+            &mut NestedHtmlContext {
+                foreign_content,
+                ancestors,
+            },
+            &mut spans,
+        ) {
+            Some(next) => cursor = next,
+            None => break,
         }
     }
     spans
+}
+
+/// Applies whatever [`next_hiding_marker`] finds at or after `cursor`, returning the
+/// cursor to resume `visible_html_ranges`'s own loop from, or `None` when nothing
+/// more can be resolved on this line — an unterminated comment or an unclosed CDATA
+/// section carries its open state across the line break instead, through
+/// `open_construct`, and a marker of `None` itself means there was nothing left to
+/// find at all. Extracted from `visible_html_ranges` only to stay under clippy's
+/// line limit, the same reason [`advance_past_cdata`] was; bundled onto
+/// [`OpenConstructState`] and [`NestedHtmlContext`], the same reason those two exist,
+/// to stay under its parameter-count limit as well.
+fn advance_via_hiding_marker(
+    line: &str,
+    cursor: usize,
+    open_non_rendering: &mut Vec<String>,
+    open_construct: &mut OpenConstructState<'_>,
+    pending_tag: &mut Option<PendingTag>,
+    nested: &mut NestedHtmlContext<'_>,
+    spans: &mut Vec<VisibleHtmlSpan>,
+) -> Option<usize> {
+    match next_hiding_marker(line, cursor, nested.foreign_content) {
+        None => {
+            push_remaining_or_pending_tag(line, cursor, pending_tag, spans);
+            None
+        }
+        Some(HidingMarker::Comment(start)) => {
+            spans.push(VisibleHtmlSpan::Text(cursor..start));
+            let Some(end) = find_comment_close(line, start) else {
+                *open_construct.in_html_comment = true;
+                return None;
+            };
+            Some(end)
+        }
+        Some(HidingMarker::Tag(start, end, tag)) => {
+            spans.push(VisibleHtmlSpan::Text(cursor..start));
+            open_non_rendering.push(tag.to_owned());
+            Some(end)
+        }
+        Some(HidingMarker::Hidden(start, end, name)) => {
+            spans.push(VisibleHtmlSpan::Text(cursor..start));
+            open_non_rendering.push(name);
+            Some(end)
+        }
+        Some(HidingMarker::Markup(start, end)) => {
+            spans.push(VisibleHtmlSpan::Text(cursor..start));
+            let span = &line[start..end];
+            if is_html_block_tag(span) || is_line_break_tag(span) {
+                spans.push(VisibleHtmlSpan::Break);
+            }
+            track_foreign_content_depth(span, nested.foreign_content);
+            track_ordinary_ancestor(span, nested.ancestors);
+            Some(end)
+        }
+        Some(HidingMarker::Cdata(open_start, payload_start, payload_end, close_end)) => {
+            spans.push(VisibleHtmlSpan::Text(cursor..open_start));
+            spans.push(VisibleHtmlSpan::Text(payload_start..payload_end));
+            Some(close_end)
+        }
+        Some(HidingMarker::CdataOpen(open_start, payload_start)) => {
+            spans.push(VisibleHtmlSpan::Text(cursor..open_start));
+            spans.push(VisibleHtmlSpan::Text(payload_start..line.len()));
+            *open_construct.in_cdata = true;
+            None
+        }
+    }
 }
 
 /// One visible byte range of an `Event::Html` line, or a forced line break a stripped
@@ -5380,6 +5599,49 @@ fn numeric_character_reference_at(after_amp: &str) -> Option<(char, usize)> {
     Some((character, consumed))
 }
 
+/// Hides every `<!--` ... `-->` span inside one `Tag::HtmlBlock` spanning `start` to
+/// `block_end`, into `hidden`. Extracted from [`visible_source`] only to stay under
+/// clippy's line limit, the same reason [`hide_non_rendering_in_html_line`] and
+/// [`hide_non_rendering_in_inline_html`] were.
+///
+/// A comment nested inside a block that opens with a real tag —
+/// `<div>\n<!-- [x](y) -->\n</div>` — is still a comment, and the whole block does
+/// not start with `<!--` for that reason (Codex, pull request #138, round 13). One
+/// `HtmlBlock` event covers the whole block, real tags and nested comments alike, so
+/// each `<!--` ... `-->` span inside it is hidden on its own rather than requiring
+/// the block to be nothing but a comment.
+///
+/// The close is searched for from the opener to the end of the whole document, not
+/// only to the end of this block (Codex, round 14): an unterminated `<!--` is not
+/// rendered, so everything after it is as hidden as a matched comment's body,
+/// matching the fail-closed behaviour `without_html_comments` already had for this
+/// case. HTML comments do not nest, so the first `-->` found always closes the
+/// `<!--` before it.
+///
+/// Found through `find_comment_opener`, not a raw substring search (Codex, pull
+/// request #138, round 40, finding 2): a real, complete tag inside the block whose
+/// own quoted attribute merely spells `<!--` — `<div title="<!--">note</div>` — is
+/// text a browser renders as an attribute value, not a comment, and a raw search
+/// would hide everything from there to end of document over a decoy that was never
+/// a real opener. Bounded to `block_end` the same way the old search was, by
+/// slicing the search text there.
+fn hide_html_block_comments(
+    contents: &str,
+    start: usize,
+    block_end: usize,
+    hidden: &mut Vec<(usize, usize)>,
+) {
+    let mut cursor = start;
+    while let Some(open) = find_comment_opener(&contents[..block_end], cursor) {
+        let end = find_comment_close(contents, open).unwrap_or(contents.len());
+        hidden.push((open, end));
+        if end >= block_end {
+            break;
+        }
+        cursor = end;
+    }
+}
+
 /// `contents` with every fenced code block, blockquote and HTML comment removed,
 /// keeping the exact source bytes of everything else — link syntax, code span
 /// backticks, real (non-comment) HTML, and all.
@@ -5438,6 +5700,7 @@ pub fn visible_source(contents: &str) -> String {
     // and `foreign_content` are (Codex, pull request #138, round 56, "Ignore closes
     // that do not match a real ancestor").
     let mut ancestors: Vec<String> = Vec::new();
+    let mut in_cdata = false; // Codex, round 57: carried the same way, see `OpenConstructState`.
     // A comment nested inside an open `<template>`, kept apart from the block-comment
     // search below: that is a document-wide search over already-*closed* blocks, not a
     // state a currently open nesting element carries across lines.
@@ -5482,39 +5745,7 @@ pub fn visible_source(contents: &str) -> String {
             }
             Event::End(TagEnd::HtmlBlock) => {
                 if let Some(start) = html_block_start.take() {
-                    // A comment nested inside a block that opens with a real tag —
-                    // `<div>\n<!-- [x](y) -->\n</div>` — is still a comment, and the
-                    // whole block does not start with `<!--` for that reason (Codex,
-                    // pull request #138, round 13). One `HtmlBlock` event covers the
-                    // whole block, real tags and nested comments alike, so each
-                    // `<!--` ... `-->` span inside it is hidden on its own rather than
-                    // requiring the block to be nothing but a comment.
-                    //
-                    // The close is searched for from the opener to the end of the whole
-                    // document, not only to the end of this block (Codex, round 14): an
-                    // unterminated `<!--` is not rendered, so everything after it is as
-                    // hidden as a matched comment's body, matching the fail-closed
-                    // behaviour `without_html_comments` already had for this case. HTML
-                    // comments do not nest, so the first `-->` found always closes the
-                    // `<!--` before it.
-                    //
-                    // Found through `find_comment_opener`, not a raw substring search
-                    // (Codex, pull request #138, round 40, finding 2): a real, complete
-                    // tag inside the block whose own quoted attribute merely spells
-                    // `<!--` — `<div title="<!--">note</div>` — is text a browser
-                    // renders as an attribute value, not a comment, and a raw search
-                    // would hide everything from there to end of document over a
-                    // decoy that was never a real opener. Bounded to `range.end` the
-                    // same way the old search was, by slicing the search text there.
-                    let mut cursor = start;
-                    while let Some(open) = find_comment_opener(&contents[..range.end], cursor) {
-                        let end = find_comment_close(contents, open).unwrap_or(contents.len());
-                        hidden.push((open, end));
-                        if end >= range.end {
-                            break;
-                        }
-                        cursor = end;
-                    }
+                    hide_html_block_comments(contents, start, range.end, &mut hidden);
                 }
             }
             // Inline HTML has no enclosing tag, so a self-contained inline comment,
@@ -5536,6 +5767,7 @@ pub fn visible_source(contents: &str) -> String {
                     &mut in_template_comment,
                     &mut foreign_content,
                     &mut ancestors,
+                    &mut in_cdata,
                     &mut hidden,
                 );
             }
@@ -5642,6 +5874,7 @@ fn hide_non_rendering_in_html_line(
     in_template_comment: &mut bool,
     foreign_content: &mut Vec<ForeignFrame>,
     ancestors: &mut Vec<String>,
+    in_cdata: &mut bool,
     hidden: &mut Vec<(usize, usize)>,
 ) {
     let mut cursor = if let Some(pending) = pending_raw_text_close.take() {
@@ -5670,6 +5903,20 @@ fn hide_non_rendering_in_html_line(
         hidden.push((start, line_start + cursor));
     }
     loop {
+        // A CDATA section left open by an earlier line (Codex, pull request #138,
+        // round 57, "Carry foreign CDATA across lines") is opaque character data,
+        // never real markup — consumed rather than scanned, so a stray construct
+        // inside its payload is never misread as a real comment or tag.
+        if *in_cdata {
+            match html.get(cursor..).and_then(|rest| rest.find("]]>")) {
+                Some(offset) => {
+                    cursor += offset + "]]>".len();
+                    *in_cdata = false;
+                    continue;
+                }
+                None => break,
+            }
+        }
         if !open_non_rendering.is_empty() {
             match advance_past_non_rendering(
                 html,
@@ -5729,6 +5976,10 @@ fn hide_non_rendering_in_html_line(
             Some(HidingMarker::Cdata(_, _, _, close_end)) => {
                 cursor = close_end;
             }
+            Some(HidingMarker::CdataOpen(..)) => {
+                *in_cdata = true;
+                break;
+            }
         }
     }
 }
@@ -5785,6 +6036,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // is reused for the state transition alone: called with `hidden: true`, it never
     // writes anywhere; called for the state transition alone.
     let mut in_html_comment = false;
+    let mut in_cdata = false; // Codex, round 57: carried the same way, see `OpenConstructState`.
     // The non-rendering elements (`<script>`, `<style>`, `<title>`, `<template>` or `<iframe>`)
     // currently open at block level, innermost last, if any (Codex, pull request #138,
     // round 30): `<div>\n<script>\n\n- Status: accepted\n\n</script>\n</div>` outlives
@@ -5828,7 +6080,10 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             Event::Html(html) => {
                 visible_html_ranges(
                     &html,
-                    &mut in_html_comment,
+                    &mut OpenConstructState {
+                        in_html_comment: &mut in_html_comment,
+                        in_cdata: &mut in_cdata,
+                    },
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
@@ -5984,29 +6239,46 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
             // 49): unlike `<br>` and a spanning comment, which are real, rendered
             // breaks nothing can undo, a non-rendering element's own opening says
             // nothing about completeness on its own.
-            Event::InlineHtml(html) => {
-                let opened = track_non_rendering_html(
+            Event::InlineHtml(html)
+                if advance_list_item_inline_html(
                     &html,
+                    collecting,
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
-                );
-                if opened {
-                    hidden_markup_seen = true;
-                }
-                if collecting
-                    && if html.starts_with("<!--") {
-                        html.contains('\n')
-                    } else {
-                        is_line_break_tag(&html)
-                    }
-                {
-                    collecting = false;
-                }
+                    &mut hidden_markup_seen,
+                ) =>
+            {
+                collecting = false;
             }
             _ => {}
         }
     }
     None
+}
+
+/// Applies one `Event::InlineHtml` construct to a list item [`unordered_list_item_value`]
+/// is collecting, returning whether it disqualifies the item (a spanning comment or a
+/// tag that itself renders as a line break, exactly as that function's own
+/// `Event::InlineHtml` handling already documented). Extracted only to stay under
+/// clippy's line limit, the same reason `hide_html_block_comments` was pulled out of
+/// `visible_source`.
+fn advance_list_item_inline_html(
+    html: &str,
+    collecting: bool,
+    open_non_rendering_tag: &mut Vec<String>,
+    foreign_content: &mut Vec<ForeignFrame>,
+    hidden_markup_seen: &mut bool,
+) -> bool {
+    let opened = track_non_rendering_html(html, open_non_rendering_tag, foreign_content);
+    if opened {
+        *hidden_markup_seen = true;
+    }
+    collecting
+        && if html.starts_with("<!--") {
+            html.contains('\n')
+        } else {
+            is_line_break_tag(html)
+        }
 }
 
 /// Every real, visible Markdown heading in `contents`, rendered `"#".repeat(level) + "
@@ -6038,6 +6310,7 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
     let mut in_fence = false;
     let mut blockquote_depth: u32 = 0;
     let mut in_html_comment = false;
+    let mut in_cdata = false; // Codex, round 57: carried the same way, see `OpenConstructState`.
     let mut open_non_rendering_tag: Vec<String> = Vec::new();
     // A tag whose own closing `>` had not yet appeared when its line ran out
     // (Codex, pull request #138, round 41, finding 1), carried across `Event::Html`
@@ -6069,7 +6342,10 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
             Event::Html(html) => {
                 visible_html_ranges(
                     &html,
-                    &mut in_html_comment,
+                    &mut OpenConstructState {
+                        in_html_comment: &mut in_html_comment,
+                        in_cdata: &mut in_cdata,
+                    },
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
@@ -6147,6 +6423,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // it by real HTML rules until an actual `-->` appears. `visible_html_ranges` is
     // called for the state transition alone; nothing between cells is ever read.
     let mut in_html_comment = false;
+    let mut in_cdata = false; // Codex, round 57: carried the same way, see `OpenConstructState`.
     // The non-rendering elements (`<script>`, `<style>`, `<title>`, `<template>` or `<iframe>`)
     // currently open inside a cell, innermost last, if any (Codex, pull request #138,
     // round 30): this parser is independent of `markdown_prose`'s own non-rendering
@@ -6184,7 +6461,10 @@ pub fn table_rows(contents: &str) -> Vec<String> {
             Event::Html(html) => {
                 visible_html_ranges(
                     &html,
-                    &mut in_html_comment,
+                    &mut OpenConstructState {
+                        in_html_comment: &mut in_html_comment,
+                        in_cdata: &mut in_cdata,
+                    },
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,

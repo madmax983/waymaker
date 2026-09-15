@@ -7246,6 +7246,175 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_inside_a_multiline_cdata_payload_still_counts() {
+        // Codex, pull request #138, round 57, finding "Carry foreign CDATA across
+        // lines": a multi-line `<![CDATA[...]]>` section inside foreign content
+        // that does not close on its own opening line used to be silently dropped
+        // as a hiding candidate rather than carried across the line break, falling
+        // through instead to the generic incomplete-tag machinery built for an
+        // ordinary tag whose own `>` is on a later line. That machinery swallows
+        // every line up to the next unquoted `>` as though it were all one tag's
+        // own markup — here, the real closing `]]>`'s own `>`, the first one the
+        // payload contains — so the whole CDATA payload, id and headline included,
+        // was hidden as inert tag syntax instead of kept as the real, visible
+        // character data a browser renders it as.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg><![CDATA[\n{} {}\n]]></svg>\n</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_breakout_script_still_counts_as_hidden() {
+        // Codex, pull request #138, round 57, finding "Exit foreign mode on HTML
+        // breakout tags": `<p>` is one of HTML5's fixed foreign-content breakout
+        // elements, so opening it while genuinely inside an `<svg>` (not at an
+        // HTML integration point) pops back out to ordinary HTML parsing before
+        // the `<p>` itself is processed. `<script />` that follows is then read
+        // under ordinary rules, where a self-closing slash on a non-void,
+        // non-foreign element is ignored rather than honored — a real, raw-text
+        // `<script>` whose body a browser never renders, not a bodyless one the
+        // way `<script />` reads directly inside `<svg>`. `track_foreign_content_depth`
+        // used to recognize only foreign-content roots and HTML integration points
+        // as namespace changes, so the still-open `<svg>` frame kept exempting the
+        // self-closing slash, and the id and headline that follow read as
+        // ordinary, visible text a self-closing `<script>` never opened at all.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><p><script />{} {}</script></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_div_closing_through_a_hidden_span_still_counts() {
+        // Codex, pull request #138, round 57, finding "Unwind all elements
+        // through a matching ancestor": a real HTML5 parser searches its whole
+        // stack of open elements for a matching end tag, not only its topmost
+        // entry, so `<div><section><span hidden>ignored</div>` closes `span`,
+        // `section` and `div` all at once when `</div>` is reached — even though
+        // `section` sits between `div` and the hidden `span` on the stack.
+        // Checking only `ancestors.last()` (`section`) never matched `</div>` at
+        // all, leaving the hidden `span` latched open through end of document
+        // and hiding the id and headline that follow it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><section><span hidden>ignored</div>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_cdata_at_an_html_integration_point_stays_hidden() {
+        // Codex, pull request #138, round 57, finding "Restrict CDATA to active
+        // foreign namespaces": `<foreignObject>` switches parsing of its own
+        // descendants back to ordinary HTML rules even while the enclosing
+        // `<svg>` is still open, so `<![CDATA[...]]>` reached inside one is once
+        // again a bogus comment ending at its own first `>` — the `]]>`'s own —
+        // rather than real character data, even though `foreign_content` is
+        // still non-empty there. Gating CDATA recognition on a bare "some
+        // foreign frame is open" check read this construct as real CDATA
+        // anyway, and its payload — genuinely inert bogus-comment text no
+        // reader ever sees — satisfied the check. Wrapped in a block-level
+        // `<div>` on its own line, the same as round 56's own CDATA test, so the
+        // whole construct is a genuine CommonMark HTML block reaching this
+        // module's block-level `Event::Html` scan — where `next_hiding_marker`'s
+        // CDATA eligibility check actually runs — rather than `Event::InlineHtml`,
+        // which has no CDATA-specific handling of its own to exercise at all.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg><foreignObject><![CDATA[{} {}]]></foreignObject></svg>\n</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_multiline_self_closing_script_in_svg_still_counts() {
+        // Codex, pull request #138, round 57, finding "Honor multiline
+        // self-closing scripts in SVG": SVG honors a self-closing slash on a
+        // *fixed* non-rendering name like `<script>` the same way it would any
+        // other descendant, so a `<script\n />` whose own `/` lands on a later
+        // line still has no body and needs no matching close.
+        // `resolve_pending_tag`'s cross-line path pushed a fixed name onto the
+        // hidden-element stack unconditionally, regardless of where it landed
+        // relative to open foreign content, waiting forever for a `</script>`
+        // this document never writes and hiding everything after it —
+        // including the id and headline that follow inside a plain `<text>` —
+        // clear through to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg>\n<script\n />\n<text>{} {}</text>\n</svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_an_escaped_or_encoded_comment_marker_still_counts() {
         // Codex, pull request #138, round 22: `\<!--` and `&lt;!--` both decode to text
         // containing `<!--`, but a real, unescaped one is always recognized by
