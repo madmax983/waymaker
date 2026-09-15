@@ -1915,6 +1915,17 @@ pub fn check_storage_contract(sources: &[crate::size::LayerSource]) -> Vec<Viola
 /// The file whose public surface [`RECOVERY_SURFACE`] pins.
 pub const RECOVERY_SURFACE_PATH: &str = "waymaker-flash/src/recovery.rs";
 
+/// The crate root [`check_recovery_is_not_clone`] walks its module tree from.
+///
+/// Codex review of this change (PR #143), round 38: a `Clone` implementation may be
+/// declared anywhere in `waymaker-flash`, not only somewhere [`RECOVERY_SURFACE_PATH`]'s
+/// own `mod` declarations reach — `impl Clone for crate::recovery::Recovery<'_, S> { .. }`
+/// written in `append.rs`, say, which `lib.rs` reaches directly and `recovery.rs` never
+/// does. Walking from the crate root instead reaches every production file the crate
+/// actually ships, `recovery.rs`'s own descendants included, so a handwritten impl has
+/// nowhere left in the crate to hide.
+const RECOVERY_ADAPTER_ROOT_PATH: &str = "waymaker-flash/src/lib.rs";
+
 /// Every public function the storage-backed recovery of issue #23 is allowed to have.
 ///
 /// Design document §02 decision 2 — "a cursor advances through history in workflow order;
@@ -1971,13 +1982,29 @@ pub const RECOVERY_SURFACE: &[&str] = &[
     "with_integrity",
 ];
 
-/// Rule: the recovery reader's public surface is exactly the one that was reviewed.
+/// The struct the second half of [`check_recovery_surface`] pins, in
+/// [`RECOVERY_SURFACE_PATH`].
+const RECOVERY_TYPE: &str = "Recovery";
+
+/// Rule: the recovery reader's public surface is exactly the one that was reviewed, and
+/// `Recovery` cannot be duplicated.
 ///
-/// The same shape as [`check_replay_cursor_surface`], for the reader that walks a journal on
-/// media rather than one in RAM.
+/// The surface half is the same shape as [`check_replay_cursor_surface`], for the reader
+/// that walks a journal on media rather than one in RAM.
+///
+/// The second half is issue [#77](https://github.com/madmax983/waymaker/issues/77).
+/// [`waymaker_flash::append::Journal::after`] takes a `Recovery` by value so that one scan
+/// cannot hand out two writers at one offset. A derived `Clone` undid that:
+/// `Journal::after(recovery.clone())` is one scan and two writers, not two scans. This
+/// fires on that derive and on a handwritten `impl Clone for Recovery`, because both give
+/// the mutation back without touching `Journal::after` at all.
+///
+/// What it cannot see: a `Recovery` rebuilt from its own public `region`, `offset` and
+/// `ending` readings, by a struct literal written inside this same file. That needs no
+/// `Clone` anywhere, and CLAUDE.md's "What is not checked" names the limit.
 #[must_use]
 pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
-    check_pinned_surface(
+    let mut violations = check_pinned_surface(
         "recovery-surface",
         "waymaker-flash",
         RECOVERY_SURFACE_PATH,
@@ -1986,7 +2013,277 @@ pub fn check_recovery_surface(sources: &[crate::size::LayerSource]) -> Vec<Viola
         "the reader's public API is where design document \u{a7}02 decision 2 and the rule \
          that an append offset is only ever erased media are both enforced, so a seek or a \
          second way to an offset cannot be added without a reviewer writing it down",
-    )
+    );
+    violations.extend(check_recovery_is_not_clone(sources));
+    violations
+}
+
+/// The second half of [`check_recovery_surface`], over one file's parsed syntax.
+///
+/// Split out for the reason [`check_append_typestate`] is: a surface pin is a set
+/// comparison and this is a shape, and a reader chasing one does not have to read the
+/// other.
+///
+/// Fails closed five ways, each reported rather than read as a pass: the module tree
+/// rooted at `recovery.rs` cannot be walked (an unparseable file, or an out-of-line `mod`
+/// this scan cannot resolve to exactly one scanned file); a file that tree reaches, in
+/// production, invokes a macro this scan cannot expand; the root file parses but declares
+/// no `Recovery` struct at all, which is a rename this pin must not read as "no `Clone`
+/// found"; or `Recovery` is `Clone`, by a derive in the root file or by a handwritten
+/// `impl` anywhere the tree reaches.
+fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
+    const RULE: &str = "recovery-surface";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let Some(source) = find_source(sources, RECOVERY_SURFACE_PATH) else {
+        // `check_pinned_surface`, called just above, already reports a missing module.
+        return Vec::new();
+    };
+    // Codex review of this change (PR #143), round 38: a handwritten `impl Clone for
+    // Recovery` need not live anywhere `recovery.rs`'s own `mod` declarations reach — it
+    // can sit in any production source of `waymaker-flash`, reached from `lib.rs` by a
+    // path that never passes through `recovery.rs` at all (`append.rs`, say). The walk
+    // therefore starts at the crate root rather than at `recovery.rs`, so every file the
+    // crate actually ships is read, not only `recovery.rs`'s own descendants.
+    let Some(crate_root) = find_source(sources, RECOVERY_ADAPTER_ROOT_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{RECOVERY_ADAPTER_ROOT_PATH} is missing, so whether any source of \
+                 `{ADAPTER}` implements `Clone` for `{RECOVERY_TYPE}` cannot be checked"
+            ),
+        )];
+    };
+    // Codex review of this change (PR #143), round 12: an out-of-line `mod clone_impl;`
+    // in a reached file has no content in that file's own text at all — its body lives
+    // in a sibling file this function never looked at — and that sibling can write
+    // `impl Clone for super::Recovery` or invoke a macro that does, with neither caught
+    // by anything below that reads only a file's own contents. `module_tree` is the walk
+    // `integrity-check`'s table scan already uses for the identical shape of problem (a
+    // `mod` this scan cannot resolve to exactly one scanned file), so this reuses it
+    // rather than re-deriving the same fail-closed resolution a second time.
+    let (production_reachable, _test_only) = match module_tree(sources, crate_root) {
+        Ok(reachable) => reachable,
+        Err(error) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_ADAPTER_ROOT_PATH}'s module tree {error}, so whether it \
+                     reaches a `Clone` impl for `{RECOVERY_TYPE}` cannot be checked"
+                ),
+            )];
+        }
+    };
+    // Round 29: the one file whose *top-level* scope is where `Recovery` is actually
+    // declared — everywhere else in the reachable tree, a same-named struct, enum or
+    // union is a different declaration, and `recovery_reachable_file_is_clone_free`
+    // needs to know which case it is in to tell the two apart.
+    let root_path = source.path.replace('\\', "/");
+    for path in &production_reachable {
+        // `find_source` matches by suffix; `module_tree` already resolved this path to
+        // exactly one of `sources`, so an exact match is what is wanted here.
+        let Some(reached) = sources
+            .iter()
+            .find(|candidate| candidate.path.replace('\\', "/") == *path)
+        else {
+            continue;
+        };
+        let is_pinned_type_file = *path == root_path;
+        if let Some(violation) =
+            recovery_reachable_file_is_clone_free(path, &reached.contents, is_pinned_type_file)
+        {
+            return vec![violation];
+        }
+    }
+    let derived = match crate::parse::struct_derives(&source.contents, RECOVERY_TYPE) {
+        Ok(Some(derived)) => derived,
+        Ok(None) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_SURFACE_PATH} declares no `{RECOVERY_TYPE}` struct: a rename \
+                     or a re-export under that name leaves this pin checking nothing"
+                ),
+            )];
+        }
+        Err(error) => {
+            return vec![Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{RECOVERY_SURFACE_PATH} does not parse, so whether `{RECOVERY_TYPE}` is \
+                     `Clone` cannot be checked: {error}"
+                ),
+            )];
+        }
+    };
+    if derived
+        .iter()
+        .any(|name| name == crate::parse::UNRESOLVED_DERIVE)
+    {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{RECOVERY_SURFACE_PATH} derives something through a `super`-qualified \
+                 alias, or an alias pile this scan gave up chasing, so whether \
+                 `{RECOVERY_TYPE}` is `Clone` cannot be ruled out"
+            ),
+        )];
+    }
+    // A handwritten `impl Clone`, anywhere the module tree reaches, is already handled
+    // by the loop above — this is only the derive half.
+    if !derived.iter().any(|name| name == "Clone") {
+        return Vec::new();
+    }
+    vec![Violation::new(
+        RULE,
+        ADAPTER,
+        format!(
+            "`{RECOVERY_TYPE}` is `Clone`: `Journal::after` takes it by value so one scan \
+             cannot hand out two writers, and a clone hands out two writers from one scan \
+             anyway (issue #77)"
+        ),
+    )]
+}
+
+/// A violation over `contents`, one file [`check_recovery_is_not_clone`]'s module-tree
+/// walk reached at `path` — a macro this scan cannot expand, or a handwritten `impl
+/// Clone` for [`RECOVERY_TYPE`] — or [`None`] if neither is there.
+///
+/// Split out of [`check_recovery_is_not_clone`] to keep the per-file checks readable on
+/// their own; every reachable file, root included, is checked the same way.
+///
+/// `is_pinned_type_file` is `true` only when `path` is the one file whose top-level
+/// scope is where [`RECOVERY_TYPE`] is actually declared — passed through to
+/// [`crate::parse::trait_implementors_for_pinned_type`] so a same-named struct, enum or
+/// union declared anywhere else the tree reaches is read as the unrelated local
+/// declaration it is, rather than folded into the same match the pinned type's own
+/// `Clone` impl would be (round 29 of Codex review on this change, PR #143).
+fn recovery_reachable_file_is_clone_free(
+    path: &str,
+    contents: &str,
+    is_pinned_type_file: bool,
+) -> Option<Violation> {
+    const RULE: &str = "recovery-surface";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::declares_item_macro(contents) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} invokes a macro this scan cannot expand, so whether it \
+                     generates a `Clone` impl for `{RECOVERY_TYPE}` cannot be ruled out"
+                ),
+            ));
+        }
+        Err(error) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} does not parse, so whether it invokes a macro that could \
+                     generate `Clone` for `{RECOVERY_TYPE}` cannot be checked: {error}"
+                ),
+            ));
+        }
+    }
+    // Every file the tree reaches is read for a handwritten `impl`, the root included:
+    // `trait_implementors_for_pinned_type` resolves both the trait name and the
+    // self-type through every alias it can chase — including a local `type` alias on
+    // the self-type side, since round 13 found both a trait alias (`use Clone as C; use
+    // self::C as Klon; impl Klon for ..`) and a type alias (`type R = super::Recovery;
+    // impl Clone for R`) that a single-hop, unaliased read of either side would miss —
+    // so `impl Clone for super::Recovery` in a child module, however it spells either
+    // name, is caught here the same way `impl Clone for Recovery` in the root file is.
+    // `is_pinned_type_file` is what keeps a same-named local declaration elsewhere in
+    // the tree from being read as that same match (round 29).
+    let handwritten = match crate::parse::trait_implementors_for_pinned_type(
+        contents,
+        "Clone",
+        RECOVERY_TYPE,
+        is_pinned_type_file,
+    ) {
+        Ok(implementors) => implementors,
+        Err(error) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} does not parse, so its `Clone` implementors cannot be \
+                     checked: {error}"
+                ),
+            ));
+        }
+    };
+    if handwritten
+        .iter()
+        .any(|implementor| implementor == crate::parse::UNRESOLVED_DERIVE)
+    {
+        return Some(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{path} implements a trait, or names a self-type, through an alias this \
+                 scan could not fully resolve, so whether it implements `Clone` for \
+                 `{RECOVERY_TYPE}` cannot be ruled out"
+            ),
+        ));
+    }
+    if handwritten
+        .iter()
+        .any(|implementor| implementor == RECOVERY_TYPE)
+    {
+        return Some(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{path} implements `Clone` for `{RECOVERY_TYPE}`: `Journal::after` takes \
+                 it by value so one scan cannot hand out two writers, and a clone hands \
+                 out two writers from one scan anyway (issue #77)"
+            ),
+        ));
+    }
+    // Round 40 of Codex review on this change (PR #143): a procedural derive macro
+    // named on *any* struct, enum or union this file declares — not only `Recovery`
+    // itself — can expand to `impl Clone for Recovery` regardless of what it is
+    // ostensibly deriving for, since a derive macro receives the whole item and emits
+    // whatever tokens it likes. `struct_derives`, below, only ever asks this question
+    // of `Recovery`'s own declaration in the one file that pins it; this asks it of
+    // every other declaration this file reaches.
+    match crate::parse::unresolved_derive_elsewhere(contents) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} derives something, on a type other than `{RECOVERY_TYPE}`, \
+                     through a name this scan could not resolve to one of Rust's own \
+                     derivable traits — a procedural derive macro is not confined to \
+                     the type it is attached to, so whether it generates a `Clone` impl \
+                     for `{RECOVERY_TYPE}` cannot be ruled out"
+                ),
+            ));
+        }
+        Err(error) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} does not parse, so whether it derives something that could \
+                     generate `Clone` for `{RECOVERY_TYPE}` cannot be checked: {error}"
+                ),
+            ));
+        }
+    }
+    None
 }
 
 /// The file whose public surface [`check_rig_oracle`] pins: the rig's oracle.
@@ -9024,49 +9321,65 @@ impl From<syn::Error> for ModuleTreeError {
     }
 }
 
-/// The scanned file `child` — declared in `parent_path` — resolves to (issue #59).
+/// The scanned files `child` — declared in `parent_path` — resolves to (issue #59).
 ///
 /// A `#[path]` attribute names exactly the file `rustc` reads: no natural-directory
 /// fallback is offered, because a fallback would scan a file the compiler never reads.
 /// A plain `mod name;` probes `name.rs` then `name/mod.rs`, in `rustc`'s order.
 ///
-/// Both directions fail closed. A declaration with no matching scanned file is a module
-/// the walk cannot see, and a checksum that cannot see a file approves it unseen; a
-/// declaration matching two files is a tree `rustc` itself rejects, and silently taking
-/// the first would scan a tree the compiler never builds.
+/// `child.candidates` is grouped rather than flat (see [`crate::parse::ChildModule`]'s
+/// own doc, and round 17 of Codex review on this change, PR #143): each group is
+/// resolved independently, to at most one scanned file, and every group's resolution is
+/// returned rather than requiring exactly one across the whole thing — a natural file
+/// and a `cfg_attr` target can legally coexist for two different builds, and that is not
+/// the ambiguity a plain `mod name;` matching both `name.rs` and `name/mod.rs` is.
+///
+/// Both directions still fail closed. A `mod` with no matching scanned file in any
+/// group is a module the walk cannot see, and a checksum that cannot see a file approves
+/// it unseen; a single group matching two files is a tree `rustc` itself rejects for
+/// *that* group, and silently taking the first would scan a tree the compiler never
+/// builds.
 ///
 /// # Errors
 ///
-/// Returns [`ModuleTreeError::Missing`] when no candidate is among `sources`, and
-/// [`ModuleTreeError::Ambiguous`] when more than one is.
+/// Returns [`ModuleTreeError::Missing`] when no group has a candidate among `sources`,
+/// and [`ModuleTreeError::Ambiguous`] when some one group has more than one.
 fn resolve_child(
     sources: &[crate::size::LayerSource],
     parent_path: &str,
     child: &crate::parse::ChildModule,
-) -> Result<String, ModuleTreeError> {
-    let present: Vec<&str> = child
-        .candidates
-        .iter()
-        .map(String::as_str)
-        .filter(|candidate| {
-            sources
-                .iter()
-                .any(|source| source.path.replace('\\', "/") == *candidate)
-        })
-        .collect();
-    match present.as_slice() {
-        [single] => Ok((*single).to_owned()),
-        [] => Err(ModuleTreeError::Missing {
-            parent: parent_path.to_owned(),
-            module: child.name.clone(),
-            candidates: child.candidates.clone(),
-        }),
-        _ => Err(ModuleTreeError::Ambiguous {
-            parent: parent_path.to_owned(),
-            module: child.name.clone(),
-            candidates: present.iter().map(ToString::to_string).collect(),
-        }),
+) -> Result<Vec<String>, ModuleTreeError> {
+    let mut resolved = Vec::new();
+    for group in &child.candidates {
+        let present: Vec<&str> = group
+            .iter()
+            .map(String::as_str)
+            .filter(|candidate| {
+                sources
+                    .iter()
+                    .any(|source| source.path.replace('\\', "/") == *candidate)
+            })
+            .collect();
+        match present.as_slice() {
+            [] => {}
+            [single] => resolved.push((*single).to_owned()),
+            _ => {
+                return Err(ModuleTreeError::Ambiguous {
+                    parent: parent_path.to_owned(),
+                    module: child.name.clone(),
+                    candidates: present.iter().map(ToString::to_string).collect(),
+                });
+            }
+        }
     }
+    if resolved.is_empty() {
+        return Err(ModuleTreeError::Missing {
+            parent: parent_path.to_owned(),
+            module: child.name.clone(),
+            candidates: child.candidates.iter().flatten().cloned().collect(),
+        });
+    }
+    Ok(resolved)
 }
 
 /// The module tree rooted at `root`: every file it reaches at production gating through
@@ -9102,21 +9415,36 @@ fn module_tree(
         if !visited.insert((path.clone(), test_gated)) {
             continue;
         }
-        if test_gated {
-            test_reachable.insert(path.clone());
-        } else {
-            production_reachable.insert(path.clone());
-        }
         let Some(contents) = sources
             .iter()
             .find(|source| source.path.replace('\\', "/") == path)
             .map(|source| source.contents.as_str())
         else {
+            if test_gated {
+                test_reachable.insert(path.clone());
+            } else {
+                production_reachable.insert(path.clone());
+            }
             continue;
         };
+        // Codex review of this change (PR #143): an unconditional `mod child;` whose
+        // resolved file opens with its own `#![cfg(test)]` inner attribute is exactly
+        // as test-only as one the parent gated with `#[cfg(test)] mod child;` — the
+        // attribute is on the module the `mod` item names either way, only spelled
+        // where the module's own file can carry it instead. Reading only the parent's
+        // declaration classified such a file as production-reachable, so a `Clone`
+        // impl or a macro invocation that exists only under `#[cfg(test)]` rejected
+        // valid shipped code the same way any other false positive here would.
+        let file_gated = test_gated || crate::parse::crate_root_is_cfg_test_gated(contents)?;
+        if file_gated {
+            test_reachable.insert(path.clone());
+        } else {
+            production_reachable.insert(path.clone());
+        }
         for child in crate::parse::child_modules(&path, contents)? {
-            let resolved = resolve_child(sources, &path, &child)?;
-            stack.push((resolved, test_gated || child.test_gated));
+            for resolved in resolve_child(sources, &path, &child)? {
+                stack.push((resolved, file_gated || child.test_gated));
+            }
         }
     }
     let test_only: BTreeSet<String> = test_reachable
@@ -10686,11 +11014,26 @@ mod tests {
     }
 
     fn recovery_source(extra: &str) -> Vec<crate::size::LayerSource> {
-        vec![crate::size::LayerSource {
+        vec![
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: format!("{}{extra}", tests_support::clean_recovery_surface()),
+            },
+        ]
+    }
+
+    /// The crate root [`recovery_source`] and [`recovery_source_with_struct`] need beside
+    /// their single `recovery.rs` fixture, now that `check_recovery_is_not_clone` walks
+    /// the module tree from [`RECOVERY_ADAPTER_ROOT_PATH`] rather than from `recovery.rs`
+    /// itself (round 38).
+    fn flash_lib_source() -> crate::size::LayerSource {
+        crate::size::LayerSource {
             crate_name: "waymaker-flash".to_owned(),
-            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
-            contents: format!("{}{extra}", tests_support::clean_recovery_surface()),
-        }]
+            path: format!("crates/{RECOVERY_ADAPTER_ROOT_PATH}"),
+            contents: tests_support::clean_flash_lib(),
+        }
     }
 
     #[test]
@@ -10729,17 +11072,4108 @@ mod tests {
         // renamed or rewritten and the pin has stopped checking anything.
         let thinned =
             tests_support::clean_recovery_surface().replace("pub fn append_offset() {}\n", "");
-        let violations = check_recovery_surface(&[crate::size::LayerSource {
-            crate_name: "waymaker-flash".to_owned(),
-            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
-            contents: thinned,
-        }]);
+        let violations = check_recovery_surface(&[
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: thinned,
+            },
+        ]);
         assert_eq!(violations.len(), 1);
         assert!(
             violations[0].detail.contains("append_offset"),
             "{}",
             violations[0].detail
         );
+    }
+
+    /// [`tests_support::clean_recovery_surface`] with its `Recovery` struct's own line
+    /// replaced by `struct_decl`, as one [`crate::size::LayerSource`].
+    ///
+    /// A second `pub struct Recovery` appended beside the clean one, the way
+    /// [`recovery_source`] would append it, is not a file `waymaker-flash` could ship —
+    /// two declarations of one name — so the Clone-shape tests below replace the
+    /// declaration in place instead, the way
+    /// [`a_recovery_function_that_disappeared_is_reported_too`] already replaces the
+    /// clean fixture's `append_offset` line.
+    fn recovery_source_with_struct(struct_decl: &str) -> Vec<crate::size::LayerSource> {
+        let contents = tests_support::clean_recovery_surface().replace(
+            "#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n",
+            struct_decl,
+        );
+        vec![
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_recovery_that_is_not_clone_is_accepted() {
+        // The shape issue #77's fix leaves behind: `Recovery` still derives `Debug`,
+        // `PartialEq` and `Eq`, and none of those is `Clone`.
+        assert!(check_recovery_surface(&recovery_source("")).is_empty());
+    }
+
+    #[test]
+    fn a_recovery_that_derives_clone_is_rejected() {
+        // Issue #77: `Journal::after` takes a `Recovery` by value so one scan cannot hand
+        // out two writers, and a derived `Clone` let a caller do exactly that with
+        // `Journal::after(recovery.clone())` — one scan, two writers.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Clone, Debug)]\npub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule, "recovery-surface");
+        assert_eq!(violations[0].subject, "waymaker-flash");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_inside_a_cfg_attr_is_still_rejected() {
+        // A `Clone` that only applies under one build is still a `Clone` under that
+        // build. `missing-docs` already treats a `cfg_attr` wrapper as the same
+        // regression as a bare one; this pin has to as well.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Debug, PartialEq, Eq)]\n\
+             #[cfg_attr(not(feature = \"nope\"), derive(Clone))]\n\
+             pub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_an_aliased_name_is_still_rejected() {
+        // `Clone` renamed on the way in is still `Clone`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "use core::clone::Clone as Klon;\n#[derive(Klon, Debug)]\npub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_through_nested_cfg_attr_is_still_rejected() {
+        // `cfg_attr(a, cfg_attr(b, derive(Clone)))` is valid Rust, and rustc derives
+        // `Clone` from it exactly as from a bare `#[derive(Clone)]` once both conditions
+        // hold. Found by Codex review of this change (PR #143): the first version of
+        // this check only unwrapped one level of `cfg_attr` and missed a second.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Debug, PartialEq, Eq)]\n\
+             #[cfg_attr(all(), cfg_attr(all(), derive(Clone)))]\n\
+             pub struct Recovery;\n",
+        ));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_derive_behind_a_cfg_attr_that_only_activates_under_test_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 46: when `Recovery` has
+        // `#[cfg_attr(test, derive(Clone))]`, `collect_derive_names_from_meta` used to
+        // recurse into every injected attribute regardless of the `cfg_attr`'s own
+        // condition, so a `Clone` that rustc only ever injects under `cfg(test)` — never
+        // in a build that ships — was recorded exactly as an unconditional
+        // `#[derive(Clone)]` would be, and `recovery-surface` rejected a crate whose
+        // production build never carries the derive at all. This is the derive-list
+        // twin of round 45's `meta_is_unresolved_attribute_macro` fix.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Debug, PartialEq, Eq)]\n\
+             #[cfg_attr(test, derive(Clone))]\n\
+             pub struct Recovery;\n",
+        ));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_recovery_with_a_handwritten_clone_impl_is_rejected() {
+        // A reviewer told to remove the derive can still write the same defect by hand.
+        // `clone` also lands as a new name on the surface pin — unlike a derive, a
+        // handwritten `impl` is a method the surface half can see too — so both halves
+        // fire, and both name `recovery-surface`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "pub struct Recovery;\nimpl Clone for Recovery {\n    fn clone(&self) -> Self { \
+             Recovery }\n}\n",
+        ));
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.rule == "recovery-surface")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Clone")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clone_on_an_unrelated_struct_does_not_trip_the_recovery_pin() {
+        // The check is about `Recovery`, not about whether the file mentions `Clone` at
+        // all — a decoy in the same file must not report on a struct that is not the one
+        // `Journal::after` is written against.
+        let violations = check_recovery_surface(&recovery_source(
+            "#[derive(Clone)]\npub struct NotRecovery;\n",
+        ));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_recovery_renamed_and_reexported_fails_closed_rather_than_reading_as_clean() {
+        // No `syn::Item::Struct` here is named `Recovery` at all — it was renamed to
+        // `Scan` and re-exported under the old name. `struct_derives` must report that as
+        // "checking nothing" rather than as "no `Clone` found", or a `Clone` `Scan`
+        // behind this exact rename would read as a clean pass.
+        let renamed = recovery_source_with_struct(
+            "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Scan;\npub use self::Scan as \
+             Recovery;\n",
+        );
+        let violations = check_recovery_surface(&renamed);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_decoy_named_recovery_does_not_save_a_renamed_clone_from_failing_closed() {
+        // Found by Codex review of this change (PR #143): the first version of this
+        // check recursed into every nested `mod` looking for a struct named `Recovery`,
+        // so an unrelated, private `struct Recovery` tucked inside an inner module
+        // satisfied "declared" — and, deriving nothing, answered "not `Clone`" — while
+        // the real exported type, renamed to `Scan` and `Clone`, went unexamined. Only a
+        // struct at this file's top level may answer for `Recovery`.
+        let renamed_with_decoy = recovery_source_with_struct(
+            "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Scan;\npub use self::Scan as \
+             Recovery;\nmod hidden {\n    struct Recovery;\n}\n",
+        );
+        let violations = check_recovery_surface(&renamed_with_decoy);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_gated_recovery_decoy_does_not_save_a_renamed_clone_from_failing_closed() {
+        // Found by Codex review of this change (PR #143): `#[cfg(any())] struct Recovery;`
+        // never compiles — `any()` with no arguments is always false — but this module
+        // does not evaluate `cfg`, so the first version of this check read it as a real,
+        // non-`Clone` declaration and never looked at the `Clone` `Scan` exported under
+        // the same name beside it. Only an unconditional declaration may answer for
+        // `Recovery`, so this must fail closed exactly as an outright rename does.
+        let cfg_gated_decoy = recovery_source_with_struct(
+            "#[cfg(any())]\npub struct Recovery;\n#[derive(Clone, Debug, PartialEq, Eq)]\npub \
+             struct Scan;\npub use self::Scan as Recovery;\n",
+        );
+        let violations = check_recovery_surface(&cfg_gated_decoy);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_shadowed_derive_alias_from_a_nested_module_does_not_hide_clone() {
+        // Found by Codex review of this change (PR #143): `collect_item_aliases` walks
+        // the whole file and does not track which module an alias belongs to, so
+        // `resolve_segments` returns whichever alias of one local name it meets first in
+        // file order. A `mod earlier { use Debug as Klon; }` appearing before the
+        // top-level `use core::clone::Clone as Klon;` used to resolve `#[derive(Klon)]`
+        // to `Debug` instead of `Clone` — and a nested module's `use` cannot really reach
+        // a struct outside it, so only top-level aliases may answer for a top-level
+        // struct's derive.
+        let shadowed = recovery_source_with_struct(concat!(
+            "mod earlier {\n",
+            "    use core::default::Default as Klon;\n",
+            "}\n",
+            "use core::clone::Clone as Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&shadowed);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_hidden_behind_a_nested_cfg_attr_cfg_decoy_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `#[cfg_attr(all(), cfg(any()))]`
+        // is valid Rust that removes the item exactly as a bare `#[cfg(any())]` would, but
+        // the first version of `has_any_cfg` only read an item's own attribute paths and
+        // never unwrapped a `cfg_attr` to find a `cfg` nested inside it.
+        let cfg_attr_gated_decoy = recovery_source_with_struct(
+            "#[cfg_attr(all(), cfg(any()))]\npub struct Recovery;\n#[derive(Clone, Debug, \
+             PartialEq, Eq)]\npub struct Scan;\npub use self::Scan as Recovery;\n",
+        );
+        let violations = check_recovery_surface(&cfg_attr_gated_decoy);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares no `Recovery` struct")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_chained_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `use core::clone::Clone as C;
+        // use self::C as Klon;` is a two-hop rename, and the first version of this check
+        // only substituted one hop, reporting the derive as `C` instead of `Clone`.
+        let chained = recovery_source_with_struct(concat!(
+            "use core::clone::Clone as C;\n",
+            "use self::C as Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&chained);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_cfg_gated_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): the first version of this check
+        // excluded a `cfg`-gated `use` from the alias table entirely, on the same
+        // reasoning that excludes a `cfg`-gated *struct declaration* — but the two need
+        // opposite conservatism. `#[cfg(all())] use core::clone::Clone as Klon;` still
+        // means `#[derive(Klon)]` is `Clone` whenever that condition holds, so excluding
+        // the alias was the false negative: it left `Klon` unresolved and the derive
+        // unreported.
+        let cfg_gated_alias = recovery_source_with_struct(concat!(
+            "#[cfg(all())]\n",
+            "use core::clone::Clone as Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&cfg_gated_alias);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_raw_identifier_derive_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `r#Clone` is a raw-identifier
+        // spelling of the same `Clone` derive macro, but the first version of this check
+        // kept the `r#` prefix when collecting a path's segments, so the string comparison
+        // against the plain "Clone" missed it.
+        let raw_derive =
+            recovery_source_with_struct("#[derive(r#Clone, Debug)]\npub struct Recovery;\n");
+        let violations = check_recovery_surface(&raw_derive);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_raw_identifier_derive_attribute_is_still_rejected() {
+        // Found while merging main's raw-identifier fix (issue #90, PR #148): that fix
+        // patched `path_attr_value`'s own `#[path]` check to strip a raw marker before
+        // comparing, but `attr_introduces_cfg`, `meta_introduces_cfg`, and
+        // `collect_derive_names_from_meta` — all written for this change — still used
+        // `syn::Path::is_ident` directly, which keeps the raw marker. `#[r#derive(Clone)]`
+        // is legal Rust naming the same `derive` macro a plain `#[derive(Clone)]` would,
+        // and the unpatched check would have read it as an attribute named something
+        // other than `"derive"` and skipped it.
+        let raw_attribute_name =
+            recovery_source_with_struct("#[r#derive(Clone, Debug)]\npub struct Recovery;\n");
+        let violations = check_recovery_surface(&raw_attribute_name);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_hidden_behind_a_duplicate_conditional_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): mutually exclusive `cfg`s can
+        // validly bind one local name to two different targets —
+        // `#[cfg(any())] use core::fmt::Debug as Klon;` never applies and
+        // `#[cfg(all())] use core::clone::Clone as Klon;` always does — and the first
+        // version of this check resolved only whichever `Klon` was declared first in the
+        // file, which happened to be the inactive `Debug` one, missing the real `Clone`.
+        let duplicate_conditional_alias = recovery_source_with_struct(concat!(
+            "#[cfg(any())]\n",
+            "use core::fmt::Debug as Klon;\n",
+            "#[cfg(all())]\n",
+            "use core::clone::Clone as Klon;\n",
+            "#[derive(Klon)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&duplicate_conditional_alias);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_raw_aliased_name_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): the alias's own local name can
+        // be a raw identifier too — `use core::clone::Clone as r#Klon;` binds the same
+        // name a plain `Klon` would — and the first version of this check normalised the
+        // derive path's segments but not the alias table's, so `r#Klon` never matched the
+        // plain `Klon` a `#[derive(Klon)]` looked up.
+        let raw_aliased = recovery_source_with_struct(concat!(
+            "use core::clone::Clone as r#Klon;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&raw_aliased);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_self_qualified_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143): `#[derive(self::C)]` is a
+        // qualified derive path, and the first version of this check only looked for an
+        // alias named the *first* segment of a path — here, the module qualifier `self`,
+        // which is never itself a registered alias — rather than stripping `self::` first
+        // and looking up `C`.
+        let self_qualified = recovery_source_with_struct(concat!(
+            "use core::clone::Clone as C;\n",
+            "#[derive(self::C, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&self_qualified);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_derived_under_a_super_qualified_alias_is_still_rejected() {
+        // Found by Codex review of this change (PR #143), round 8: `super::C` names
+        // whatever `C` binds to in the *parent* module — here, a
+        // `pub use core::clone::Clone as C;` this file never sees, since every function
+        // in `parse.rs` reads one file's `contents` alone. The first version of this
+        // check had no local alias named `super` to fail the lookup against, so
+        // `super::C` fell through to its own last segment, the harmless-looking name
+        // `"C"` — never equal to `"Clone"`, so the derive went unreported. This scan
+        // cannot read the parent file to resolve `C` for real, so the fix is the other
+        // half of failing closed: a `super`-qualified path reports as unresolved rather
+        // than as a plain name that merely fails to match.
+        let super_qualified =
+            recovery_source_with_struct("#[derive(super::C, Debug)]\npub struct Recovery;\n");
+        let violations = check_recovery_surface(&super_qualified);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_dropped_past_the_alias_candidate_cap_is_still_rejected() {
+        // Found by Codex review of this change (PR #143), round 8: 64 inactive
+        // `#[cfg(any())] use core::fmt::Debug as Klon;` aliases followed by one active
+        // `use core::clone::Clone as Klon;` are all legal candidates for `Klon`, and the
+        // first version of the cap that bounds how many this scan will chase dropped
+        // whichever candidate crossed the 64th slot — here, the one real `Clone` — and
+        // reported the derive path's own still-aliased name (`"Klon"`) in its place,
+        // which never equals `"Clone"` either. The fix reports a dropped candidate as
+        // unresolved rather than as that harmless-looking leftover name.
+        let mut source = String::new();
+        for _ in 0..64 {
+            source.push_str("#[cfg(any())]\nuse core::fmt::Debug as Klon;\n");
+        }
+        source.push_str("use core::clone::Clone as Klon;\n");
+        source.push_str("#[derive(Klon)]\npub struct Recovery;\n");
+        let capped = recovery_source_with_struct(&source);
+        let violations = check_recovery_surface(&capped);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_module_scope_macro_invocation_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 9: an item-level macro
+        // invocation in this file — defined here or, as the finding's example has it, in
+        // a sibling file like `lib.rs` and only invoked here — could expand to anything
+        // at all, including a `#[derive(Clone)]` or a handwritten `impl Clone`, and
+        // neither `struct_derives` nor `trait_implementors` can expand a macro to see
+        // what it generates. Mirrors `ctx-facade`'s ban on a declared `macro_rules!`,
+        // generalized to any invocation rather than only a local definition.
+        let macro_invocation = recovery_source_with_struct(concat!(
+            "generate_clone_impl!(Recovery);\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&macro_invocation);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_invocation_nested_in_a_module_is_also_rejected() {
+        // Found by Codex review of this change (PR #143), round 10: the first version of
+        // the macro-invocation check read only the file's top-level items, on the same
+        // reasoning `struct_derives` uses for a struct declaration — but a macro
+        // invocation is not scoped the way a declaration is.
+        // `generate_clone_impl!(super::Recovery)` written inside a nested `mod hidden`
+        // still expands to `impl Clone for Recovery`, naming the outer type through a
+        // path rather than declaring a second one, so it is exactly as dangerous as a
+        // top-level invocation and has to be read the same way.
+        let nested_macro_invocation = recovery_source_with_struct(concat!(
+            "mod hidden {\n",
+            "    generate_clone_impl!(super::Recovery);\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&nested_macro_invocation);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_statement_inside_a_method_body_is_also_rejected() {
+        // Found by Codex review of this change (PR #143), round 11: a bare
+        // `path!(..);` standing alone as its own statement in a function or method
+        // body is the other position Rust's reference grants item expansion, and the
+        // nested-module recursion the round 10 fix added reads `syn::Item` alone, which
+        // never reaches inside a function body at all. `generate_clone_impl!(Recovery);`
+        // written this way can expand to a non-local `impl Clone for Recovery`, naming
+        // the outer type exactly as the round 10 example did.
+        let macro_statement = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated() {\n",
+            "        generate_clone_impl!(Recovery);\n",
+            "    }\n",
+            "}\n",
+        ));
+        let violations = check_recovery_surface(&macro_statement);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_expression_position_macro_does_not_trip_the_recovery_pin() {
+        // The other half of the round 11 fix: a macro used where Rust's reference
+        // requires an expression — a `const` initializer, a condition, a `let` binding,
+        // a tail expression — can never expand to an item, so flagging it would reject
+        // ordinary code `recovery.rs` already has (its own `const _: () =
+        // assert!(..);` compile-time checks, for one). This is the false-positive check
+        // the fix for round 11 has to pass, not a bypass anyone reported.
+        let expression_macro = recovery_source_with_struct(concat!(
+            "const _: () = assert!(1 == 1);\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated() -> bool {\n",
+            "        matches!(1, 1)\n",
+            "    }\n",
+            "}\n",
+        ));
+        let violations = check_recovery_surface(&expression_macro);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_handwritten_clone_in_an_out_of_line_submodule_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 12: an out-of-line
+        // `mod clone_impl;` has no content in `recovery.rs`'s own text at all — its body
+        // lives in a sibling file this check never read before — and that sibling can
+        // write `impl Clone for super::Recovery` with nothing in `recovery.rs` itself to
+        // catch it. `trait_implementors` already resolves an implementor by its type's
+        // last path segment, so once the module tree is walked to find this file at
+        // all, the existing check needs no change to read it correctly.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_invocation_in_an_out_of_line_submodule_is_rejected() {
+        // The macro-invocation half of the same finding: a `mod clone_impl;` file could
+        // just as easily invoke a macro that expands to `impl Clone for super::Recovery`
+        // rather than writing the `impl` by hand, and `declares_item_macro` needs the
+        // same module-tree walk to ever see that file's contents at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "generate_clone_impl!(super::Recovery);\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_for_a_local_type_alias_of_recovery_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 13: a child module can
+        // write `type R = super::Recovery; impl Clone for R { .. }`, and the first
+        // version of the handwritten-impl scan read the self-type's own last path
+        // segment with no alias resolution at all, so it recorded `R` — never equal to
+        // `Recovery` — and missed the impl entirely.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type R = super::Recovery;\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_through_a_chained_trait_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 13: a child module can
+        // write `use core::clone::Clone as C; use self::C as Klon; impl Klon for
+        // super::Recovery { .. }`, and the first version of the handwritten-impl scan
+        // resolved the trait path only once (`resolve_segments`, not the multi-hop
+        // `every_resolution` the derive scan already uses), so it followed `Klon` to
+        // `self::C` and stopped there — never reaching `Clone` — and missed the impl.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use core::clone::Clone as C;\n",
+                "use self::C as Klon;\n",
+                "impl Klon for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_path_module_declared_inside_a_method_body_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 14: `child_modules`
+        // used to document walking into a function body as a residual limit —
+        // "legal Rust but vanishingly rare" — and this is the example that made it
+        // worth closing: `#[path = "recovery/clone_impl.rs"] mod clone_impl;` written
+        // as a local item inside an ordinary method reaches the same file a
+        // module-scope declaration would, and the old scan's blind spot there let the
+        // whole module-tree walk (round 12's fix) miss it entirely.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated_method() {\n",
+            "        #[path = \"recovery/clone_impl.rs\"]\n",
+            "        mod clone_impl;\n",
+            "    }\n",
+            "}\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_parenthesized_self_type_is_still_matched() {
+        // Found by Codex review of this change (PR #143), round 14:
+        // `#[allow(unused_parens)] impl Clone for (Recovery) { .. }` is legal Rust, but
+        // `syn` parses a parenthesized type as `Type::Paren` rather than `Type::Path`,
+        // and the first version of this scan matched `Type::Path` alone, silently
+        // skipping the impl.
+        let parenthesized = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[allow(unused_parens)]\n",
+            "impl Clone for (Recovery) {\n",
+            "    fn clone(&self) -> Self {\n",
+            "        Recovery\n",
+            "    }\n",
+            "}\n",
+        ));
+        // `clone` also lands as a new name on the surface pin, the same way
+        // `a_recovery_with_a_handwritten_clone_impl_is_rejected` above already
+        // documents for the unparenthesized shape.
+        let violations = check_recovery_surface(&parenthesized);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("Clone")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_impl_declared_as_a_local_item_inside_a_function_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 15: a reached child
+        // file can declare an `impl` as a local item inside an ordinary function —
+        // `#[allow(non_local_definitions)] fn install() { impl Clone for
+        // super::Recovery { .. } }` — and Rust's own `non_local_definitions` lint
+        // documents that such an `impl` is never actually scoped to the function,
+        // however it looks written down. The old recursion over a reached file's
+        // items read only `syn::Item::Impl` and `syn::Item::Mod`, never descending
+        // into a function body at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "fn install() {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_path_module_declared_inside_a_nested_control_flow_block_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 15: a `mod` can sit
+        // one control-flow block deeper than a method's own body —
+        // `if true { #[path = "..."] mod clone_impl; }` — which the round 14 fix's
+        // function-body descent, reading only the body's own immediate statements,
+        // still could not see.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    fn unrelated_method() {\n",
+            "        if true {\n",
+            "            #[path = \"recovery/clone_impl.rs\"]\n",
+            "            mod clone_impl;\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_cfg_attr_nested_path_module_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 16: this scan does
+        // not evaluate a `cfg`'s condition, so a `#[cfg_attr(all(), path =
+        // "recovery/clone_impl.rs")] mod child;` is a build under which `rustc`
+        // really does load `clone_impl.rs` — and the old scan, reading only a direct
+        // `#[path]`, saw no unconditional attribute and fell back to the natural
+        // directory pair alone, never scanning the file the `cfg_attr` names.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[cfg_attr(all(), path = \"recovery/clone_impl.rs\")]\n",
+            "mod child;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_for_a_parenthesized_type_alias_of_recovery_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 16: a child module
+        // can write `#[allow(unused_parens)] type R = (super::Recovery); impl Clone
+        // for R { .. }` — legal Rust whose alias target is `Type::Paren` rather than
+        // `Type::Path`, on the *alias declaration* side of the same parenthesizing
+        // round 14 had already closed on the self-type side. The old scan silently
+        // omitted `R` from the alias table, so the implementation scan recorded only
+        // the never-matching name `R`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(unused_parens)]\n",
+                "type R = (super::Recovery);\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_expanded_self_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 16: a child module
+        // can write `impl Clone for identity_ty!(super::Recovery)`, using a type
+        // macro this scan cannot expand — `declares_item_macro` now flags a
+        // type-position macro invocation anywhere in the file, failing the whole
+        // file closed the same way an item- or statement-position one already does.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for identity_ty!(super::Recovery) {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_for_a_type_alias_declared_inside_a_function_body_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 17: a reached child
+        // file can write `fn install() { type R = super::Recovery; impl Clone for R
+        // { .. } }` — a local type alias declared in the same function body as the
+        // impl that names it. `collect_trait_implementors` has descended into a
+        // function body since round 15 and found the `impl` there, but
+        // `collect_type_aliases` read only `Item::Mod`, so `R` resolved to nothing
+        // and the impl went unmatched even though the alias sits in the very body
+        // the impl scan already reaches.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "fn install() {\n",
+                "    type R = super::Recovery;\n",
+                "    impl Clone for R {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_const_initializer_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 17: a reached child
+        // file can write `const _: () = { impl Clone for super::Recovery { .. } };`
+        // — a non-local `impl` inside a `const` initializer's own block, applying
+        // globally the same way one inside a function body does — and neither the
+        // handwritten-impl scan nor the macro scan read `Item::Const` at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "const _: () = {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "};\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_natural_file_and_a_cfg_attr_target_coexisting_is_not_ambiguous() {
+        // Found by Codex review of this change (PR #143), round 17: round 16's fix
+        // put a `cfg_attr`-nested `path` target into the same flat candidate list as
+        // the natural `name.rs`/`name/mod.rs` pair, so a real, legal layout — both
+        // files present, for two different builds — made `resolve_child`'s
+        // exact-one resolver misreport the workspace as `Ambiguous` even when
+        // neither file is `Clone`. Each is now its own resolution group, and a
+        // group resolving is not the ambiguity a single group matching two files
+        // (`rustc`'s own refusal) is.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[cfg_attr(feature = \"alt\", path = \"recovery/alt.rs\")]\n",
+            "mod child;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/child.rs".to_owned(),
+            contents: "// the natural file: no Clone impl here.\n".to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/alt.rs".to_owned(),
+            contents: "// the cfg_attr target: no Clone impl here either.\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_in_either_branch_of_a_coexisting_cfg_attr_target_is_rejected() {
+        // The other half of the same fix: whichever of the two coexisting files
+        // carries the `Clone` impl, the scan has to catch it, because the branch
+        // this build does not take may be the one a different build does.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[cfg_attr(feature = \"alt\", path = \"recovery/alt.rs\")]\n",
+            "mod child;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/child.rs".to_owned(),
+            contents: "// the natural file: no Clone impl here.\n".to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/alt.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_path_module_declared_inside_a_const_initializer_block_is_also_reached() {
+        // Found by Codex review of this change (PR #143), round 18: a `mod` can sit
+        // inside a `const`/`static` initializer's own block — `const _: () = {
+        // #[path = "..."] mod clone_impl; };` — which `collect_child_modules` could
+        // not see at all: it read only `Item::Mod`, `Item::Fn`, `Item::Impl` and
+        // `Item::Trait`, so the child file was never even reached, and neither a
+        // handwritten impl nor a macro inside it could be checked.
+        let mut sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "const _: () = {\n",
+            "    #[path = \"recovery/clone_impl.rs\"]\n",
+            "    mod clone_impl;\n",
+            "};\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_enum_discriminant_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 18: a non-local
+        // `impl` can sit inside an enum variant's discriminant expression — legal
+        // Rust exactly the way one inside a `const` initializer's own block already
+        // was (round 17) — and the shared `nested_body_items` helper read only
+        // `Item::Const`/`Item::Static` at the time, not `Item::Enum`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "enum E {\n",
+                "    A = {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        1\n",
+                "    },\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_type_alias_array_length_block_is_rejected() {
+        // The other block-bearing shape round 18 found: an array type's length can
+        // be a block, and a type alias's own type is exactly where one can be
+        // buried.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type T = [(); {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    1\n",
+                "}];\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_struct_field_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 19: after enum
+        // discriminants and type aliases gained the same block-bearing traversal, a
+        // struct's own field types were still unvisited — and a field's type can carry
+        // an array-length block exactly the way a type alias's own type can.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Holder {\n",
+                "    field: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }],\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_alias_in_an_unrelated_nested_module_does_not_leak_into_a_different_scope() {
+        // Found by Codex review of this change (PR #143), round 20: `trait_implementors`
+        // built one alias table for the whole file by recursing through every inline
+        // module and accumulating everything into one shared `Vec`, so an unrelated
+        // nested module's own `use core::clone::Clone as Marker;` — which real Rust
+        // scopes strictly to that `mod { .. }` block, never letting it leak to a
+        // sibling scope or its parent — resolved an unrelated, identically-named alias
+        // used by a completely different `impl` elsewhere in the file. This is a false
+        // *positive*: `Recovery` here implements only a local, harmless marker trait,
+        // never `Clone`, and must not be rejected.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use self::Harmless as Marker;\n",
+            "mod hidden {\n",
+            "    #[allow(unused_imports)]\n",
+            "    use core::clone::Clone as Marker;\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "impl Marker for Recovery {}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_enum_variant_field_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 20: after struct field
+        // types gained their own traversal, an enum variant's own *fields* — not only
+        // its discriminant — were still unvisited, and a field's type can carry an
+        // array-length block exactly the way a struct field's or a type alias's own
+        // type can.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "enum E {\n",
+                "    V([(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }]),\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_through_a_block_local_use_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 21: `type` aliases
+        // declared inside a function body have been chased at any nesting depth
+        // `nested_body_items` covers since round 17, but the parallel `use`-alias loop
+        // only ever read a scope's own direct items, never descending into a body — so
+        // a reached child file's `fn install() { use core::clone::Clone as C; impl C
+        // for super::Recovery { .. } }`, legal Rust exactly like round 17's local type
+        // alias, resolved `C` to nothing and the impl went unmatched.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "fn install() {\n",
+                "    use core::clone::Clone as C;\n",
+                "    impl C for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_function_signature_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 21: every prior round
+        // that walked a function or method descended only into its body, never its
+        // signature — but a parameter type (or a return type) can carry a buried block
+        // exactly the way a type alias's, a struct field's, or an enum variant field's
+        // own type already could.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "fn hidden(_: [(); {\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}]) {\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_alias_in_an_unrelated_function_body_does_not_leak_into_a_different_scope() {
+        // Found by Codex review of this change (PR #143), round 22: round 21's own fix
+        // for a block-local `use` alias recursed into every function body in a scope
+        // and accumulated all of their aliases into one shared table, reintroducing
+        // round 20's false positive one level down — an unrelated function's own local
+        // `use core::clone::Clone as C;` could resolve an unrelated `impl C for
+        // Recovery` at the module's own top level. `Recovery` here implements only a
+        // local, harmless marker trait, never `Clone`, and must not be rejected.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use self::Harmless as C;\n",
+            "#[allow(dead_code)]\n",
+            "fn unrelated() {\n",
+            "    #[allow(unused_imports)]\n",
+            "    use core::clone::Clone as C;\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "impl C for Recovery {}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_where_clause_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 22: every prior round
+        // that walked a function or method signature descended only into its
+        // parameter and return types, never its generics — but a `where` clause
+        // predicate's bounded type can carry a buried block exactly the way a
+        // parameter type already could.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Wrapper<const N: usize>;\n",
+                "trait Trait {}\n",
+                "impl Trait for Wrapper<0> {}\n",
+                "fn hidden<T>()\n",
+                "where\n",
+                "    Wrapper<{\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }>: Trait,\n",
+                "{\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_union_field_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 22: a `union`'s own
+        // field types can each carry a buried block exactly the way a struct's or an
+        // enum variant's field types already could, and neither scanner read
+        // `Item::Union` at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "union U {\n",
+                "    field: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }],\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_for_a_projected_associated_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 23: `impl Clone for
+        // <() as Alias>::Target` is legal Rust whose self-type is a projected
+        // associated type — `syn` stores the qualified self and the trait separately
+        // from `path`, which here is only `Target`, and rustc normalizes the
+        // projection to `Recovery` once `Alias for ()` binds it. Resolving `path`
+        // alone through the alias table would miss it, and this scan cannot evaluate
+        // a trait binding to learn what the projection resolves to — it must fail
+        // closed rather than silently comparing the unqualified associated type name.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Alias {\n",
+                "    type Target;\n",
+                "}\n",
+                "impl Alias for () {\n",
+                "    type Target = super::Recovery;\n",
+                "}\n",
+                "impl Clone for <() as Alias>::Target {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_alias_inside_a_nested_control_flow_block_does_not_leak_to_its_enclosing_function_body() {
+        // Found by Codex review of this change (PR #143), round 23: round 22's own
+        // fix stopped a body's own local aliases from being shared across *sibling
+        // items*, but it still computed those local aliases by flattening every item
+        // reachable through control flow, however deeply nested, into one list before
+        // building the extension — so `use self::Harmless as C;` at module scope,
+        // followed by `fn install() { if false { use core::clone::Clone as C; } impl C
+        // for Recovery {} }`, resolved the harmless `impl C for Recovery` through the
+        // inner `use`, even though that `use` is scoped only to the `if false { .. }`
+        // block it is declared in — not to the function body around it, and not to
+        // the `impl`'s own statement beside it. `Recovery` here implements only a
+        // local, harmless marker trait, never `Clone`, and must not be rejected.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use self::Harmless as C;\n",
+            "#[allow(non_local_definitions, dead_code)]\n",
+            "fn install() {\n",
+            "    if false {\n",
+            "        #[allow(unused_imports)]\n",
+            "        use core::clone::Clone as C;\n",
+            "    }\n",
+            "    impl C for Recovery {}\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_associated_types_own_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 23: an associated
+        // type's own type can bury a block exactly the way a type alias's, a struct
+        // field's, an enum variant field's, or a union field's type already could —
+        // `impl T for X { type A = [(); { impl Clone for Recovery { .. }; 0 }]; }` —
+        // and the fallback for an `impl` block's own members dropped `ImplItem::Type`
+        // on the floor instead of walking it, in both the handwritten-implementation
+        // scan and the module-tree scan that discovers a reached file at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Trait {\n",
+                "    type A;\n",
+                "}\n",
+                "impl Trait for () {\n",
+                "    type A = [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }];\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_struct_generics_default_array_length_block_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 24: `struct
+        // Holder<T = Wrapper<{ impl Clone for Recovery { .. }; 0 }>>(T);` buries a
+        // non-local `impl` inside a struct's own generics — a type parameter's
+        // default — exactly the way a struct's field types already could, and this
+        // walk read only the fields, never `struct_item.generics`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Wrapper<const N: usize>;\n",
+                "struct Holder<T = Wrapper<{\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}>>(T);\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_through_a_projected_type_alias_target_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 24: `type R = <() as
+        // Alias>::Target;`, after a reached file binds `Target` to `Recovery`, is
+        // legal Rust whose target is a projected associated type — the same shape
+        // round 23 closed for a self-type written directly as `<() as Alias>::Target`,
+        // one hop earlier, in the alias `impl Clone for R` is chased through. Reading
+        // the projection's `path` alone resolved `R` to the unqualified name `Target`
+        // instead of failing closed, so the implementation went unmatched.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Alias {\n",
+                "    type Target;\n",
+                "}\n",
+                "impl Alias for () {\n",
+                "    type Target = super::Recovery;\n",
+                "}\n",
+                "type R = <() as Alias>::Target;\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_block_local_alias_shadows_an_ambient_one_of_the_same_name() {
+        // Found by Codex review of this change (PR #143), round 24: module scope
+        // imports `use core::clone::Clone as C;`, and a function body imports a
+        // harmless local trait under the same local name — `use self::Harmless as
+        // C;` — before `impl C for Recovery {}`. Real Rust resolves the impl to the
+        // block-local `Harmless`, shadowing the ambient `Clone` binding for the rest
+        // of the block, but `extend_with_local_scope` used to append rather than
+        // shadow, so `every_resolution` still found the ambient `Clone` candidate
+        // alongside the local one and rejected a `Recovery` that never implements it.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "trait Harmless {}\n",
+            "use core::clone::Clone as C;\n",
+            "#[allow(non_local_definitions, dead_code)]\n",
+            "fn install() {\n",
+            "    #[allow(unused_imports)]\n",
+            "    use self::Harmless as C;\n",
+            "    impl C for Recovery {}\n",
+            "}\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_conditionally_shadowed_ambient_alias_is_still_used_when_the_shadow_never_ships() {
+        // Found by Codex review of this change (PR #143), round 25: round 24's own fix
+        // dropped an ambient alias whenever *any* local declaration of the same name
+        // existed, including one behind `#[cfg(any())]`, which never compiles. Module
+        // scope imports `use core::clone::Clone as C;`, and a function body's
+        // `#[cfg(any())] use self::Harmless as C;` never actually shadows it in the
+        // only configuration that ships, so `impl C for Recovery` still resolves
+        // through the ambient `Clone` and must be rejected.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Harmless {}\n",
+                "use core::clone::Clone as C;\n",
+                "#[allow(non_local_definitions, dead_code)]\n",
+                "fn install() {\n",
+                "    #[cfg(any())]\n",
+                "    #[allow(unused_imports)]\n",
+                "    use self::Harmless as C;\n",
+                "    impl C for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_crate_qualified_trait_path_is_not_silently_stripped_to_a_local_name() {
+        // Found by Codex review of this change (PR #143), round 25: `impl crate::C for
+        // Recovery` can name a crate-root `use core::clone::Clone as C;` this per-file
+        // scan never reads — every function here parses one file's own contents alone,
+        // and `crate::` means the *crate root's* scope, not this file's own, unlike
+        // `self::` which correctly does mean this file's own scope. Treating `crate`
+        // as a qualifier to strip the same way `self` is resolved `crate::C` to the
+        // bare name `C` instead of failing closed the way a `super`-qualified path
+        // already does, whether or not a crate-root `C` actually exists.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl crate::CloneAlias for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_associated_consts_own_declared_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 25: `const N: [(); {
+        // impl Clone for Recovery { .. }; 0 }] = [];` buries a non-local `impl` inside
+        // an associated const's own *declared type* exactly the way its initializer
+        // already could, and this arm walked only `constant.expr`, never
+        // `constant.ty`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Marker;\n",
+                "impl Marker {\n",
+                "    const N: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }] = [];\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_impl_headers_own_trait_path_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 25: `impl Marker<{
+        // impl Clone for Recovery { .. }; 0 }> for Holder {}` is legal Rust with
+        // `non_local_definitions` allowed; the inner implementation applies globally.
+        // The outer impl's own trait path can bury a block through a const generic
+        // argument exactly the way its own generic declarations already could, and
+        // this arm walked neither the trait path nor the self type.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Holder;\n",
+                "trait Marker<const N: usize> {}\n",
+                "#[allow(non_local_definitions)]\n",
+                "impl Marker<{\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}> for Holder {}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_foreign_functions_own_signature_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 26: `extern "C" { fn
+        // hidden(_: [(); { impl Clone for super::Recovery { .. }; 0 }]); }` is legal
+        // Rust, and `Item::ForeignMod` reached this scan's fallback arm entirely — a
+        // foreign function's own signature was never walked at all, so an `impl`
+        // buried in one of its parameter types went unmatched.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "extern \"C\" {\n",
+                "    fn hidden(_: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }]);\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_foreign_statics_own_declared_type_is_rejected() {
+        // The other half of round 26's foreign-item finding: a foreign `static`'s own
+        // declared type can bury a block exactly the way a foreign function's
+        // signature can, and it reached the same unwalked fallback arm.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "extern \"C\" {\n",
+                "    static HIDDEN: [(); {\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }];\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_traits_own_associated_type_declaration_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 26: `trait Outer {
+        // type A<T> where T: Marker<{ impl Clone for super::Recovery { .. }; 0 }>; }`
+        // is a GAT-shaped associated type *declaration* in a trait, as opposed to an
+        // impl's associated type, which round 23 already covers. `TraitItem::Type`
+        // fell through this scan's wildcard arm, so its own generics (whose `where`
+        // clause bounds can bury a block), its own trait bounds, and its default type
+        // were never visited.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Marker<const N: usize> {}\n",
+                "trait Outer {\n",
+                "    type A<T> where T: Marker<{\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }>;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_clone_impl_inside_a_traits_own_supertrait_bound_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 26: `trait Outer:
+        // Marker<{ impl Clone for super::Recovery { .. }; 0 }> {}` — a trait's own
+        // supertrait bound list was never walked in this scan's `Item::Trait` arm,
+        // only its generics and selected members, so a supertrait bound's own const
+        // generic argument could bury an impl invisibly.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Marker<const N: usize> {}\n",
+                "trait Outer: Marker<{\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    0\n",
+                "}> {\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_enum_field_is_not_read_as_reachable_in_production() {
+        // Found by Codex review of this change (PR #143), round 26: an individual
+        // enum field's own `#[cfg(test)]` was not propagated by
+        // `enum_variant_bodies` — only the variant-level gate was used for every
+        // field's own type, unlike `struct_field_bodies`/`union_field_bodies`, which
+        // each already gate a field by its own attribute on top of the enclosing
+        // item's. A `mod` hidden inside a test-only field's own type — here, one that
+        // itself implements `Clone` for `Recovery` — used to be read as reachable in
+        // production (because the ungated *variant* was the only gate consulted),
+        // wrongly flagging a construct that only ever compiles under `#[cfg(test)]`.
+        let contents = tests_support::clean_recovery_surface().replace(
+            "#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n",
+            concat!(
+                "mod clone_impl;\n",
+                "#[derive(Debug, PartialEq, Eq)]\n",
+                "pub struct Recovery;\n",
+            ),
+        );
+        let mut sources = vec![
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents,
+            },
+        ];
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "enum E {\n",
+                "    V(\n",
+                "        #[cfg(test)]\n",
+                "        [(); {\n",
+                "            mod nested_only_under_test;\n",
+                "            0\n",
+                "        }],\n",
+                "    ),\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl/nested_only_under_test.rs"
+                .to_owned(),
+            contents: concat!(
+                "impl Clone for super::super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_clone_impl_inside_an_associated_types_own_generic_bound_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 27: a generic
+        // associated-type *implementation*'s own type-parameter bound can bury a
+        // block through a const generic argument — `impl T for X { type A<U:
+        // Marker<{ impl Clone for Recovery { .. }; 0 }>> = (); }` is legal Rust —
+        // and `impl_member_scope_roots`'s `ImplItem::Type` arm walked only
+        // `assoc_type.ty`, never `assoc_type.generics`, the same gap round 24 closed
+        // for an item's own generics and round 26 for a trait's own associated type
+        // declaration.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Marker<const N: usize> {}\n",
+                "trait T { type A<U>; }\n",
+                "struct Holder;\n",
+                "impl T for Holder {\n",
+                "    type A<U: Marker<{\n",
+                "        impl Clone for super::Recovery {\n",
+                "            fn clone(&self) -> Self {\n",
+                "                super::Recovery\n",
+                "            }\n",
+                "        }\n",
+                "        0\n",
+                "    }>> = ();\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_in_a_cfg_test_gated_impl_member_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 27:
+        // `declares_item_macro`'s visitor checked `#[cfg(test)]` only on the
+        // enclosing `syn::Item`, so `#[cfg(test)] fn helper() { generate_clone!(); }`
+        // inside an otherwise-production `impl` block was still reached by the
+        // default descent into the member — the visitor had no override for
+        // `visit_impl_item`/`visit_trait_item` to stop at a test-gated *member* the
+        // way it already stops at a test-gated item. A macro that only ever compiles
+        // under `#[cfg(test)]` was therefore read as reachable in production and
+        // failed the whole file closed over code that ships with nothing generated
+        // at all.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "impl Recovery {\n",
+            "    #[cfg(test)]\n",
+            "    #[allow(dead_code)]\n",
+            "    fn helper() {\n",
+            "        generate_clone!();\n",
+            "    }\n",
+            "}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_reached_through_a_sibling_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 28: `mod traits {
+        // pub use core::clone::Clone as C; } impl traits::C for super::Recovery {
+        // .. }` is legal Rust, and the qualified trait path `traits::C` had no alias
+        // to resolve against — `every_resolution` only ever looked up a single
+        // segment as a candidate, so `traits` fell through to the "no matching
+        // alias, take the last segment" branch and reported the bare, still-aliased
+        // name `C` rather than `Clone`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub use core::clone::Clone as C;\n",
+                "}\n",
+                "impl traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_in_a_cfg_test_gated_field_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 28: the same gap as
+        // round 27's, one subitem further — `#[cfg(test)] field:
+        // generate_type_round28!()` on a production struct's field carries its own
+        // gate that `declares_item_macro`'s visitor walked straight past, since
+        // `syn::visit::Visit` dispatches a field through `visit_field` rather than
+        // through `visit_item`, `visit_impl_item` or `visit_trait_item`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[allow(dead_code)]\n",
+            "struct HasTestOnlyField {\n",
+            "    #[cfg(test)]\n",
+            "    field: generate_type_round28!(),\n",
+            "}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_through_a_generic_type_alias_argument_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 28: `type
+        // Identity<T> = T; type R = Identity<super::Recovery>; impl Clone for R {
+        // .. }` is legal Rust whose target names a real generic alias with an
+        // argument substituted in, but `direct_scope_aliases`'s `Item::Type` arm
+        // read only the target path's segment identifiers, discarding
+        // `<super::Recovery>` — so `R` resolved to `Identity`'s own declared target,
+        // `T`, rather than to the type actually substituted in, and the alias was
+        // silently accepted as not `Clone` instead of failing closed.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type Identity<T> = T;\n",
+                "type R = Identity<super::Recovery>;\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_derive_reached_through_a_sibling_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 29: `struct_derives`
+        // collected its aliases with a hand-rolled loop over `Item::Use` alone, so
+        // `mod traits { pub use core::clone::Clone as C; } #[derive(traits::C)]` had
+        // no alias for the qualified name `traits::C` to resolve against at all — the
+        // derive-side counterpart of round 28's finding for a handwritten `impl`,
+        // which read `module_scope_aliases` (and so `direct_scope_module_aliases`)
+        // from the start.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "mod traits {\n",
+            "    pub use core::clone::Clone as C;\n",
+            "}\n",
+            "#[derive(traits::C, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_derive_reached_through_a_local_type_alias_argument_is_rejected() {
+        // The other half of the same finding: `struct_derives`'s hand-rolled loop
+        // read no `type` alias at all, so a plain-path `type Klon = core::clone::
+        // Clone; #[derive(Klon)]` — which `direct_scope_aliases` has resolved for
+        // every other caller since round 13 — bypassed the derive scan entirely too.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "type Klon = core::clone::Clone;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_unrelated_recovery_struct_in_an_inline_module_is_not_the_pinned_type() {
+        // Found by Codex review of this change (PR #143), round 29: a nested inline
+        // module is free to declare its own, wholly unrelated `struct Recovery` and
+        // hand it a `Clone` impl — real Rust name resolution has the unqualified
+        // `Recovery` written there mean the module's own local declaration, not the
+        // pinned type declared at its enclosing file's own top level. The scan used
+        // to read both as the same bare name and reject a file that never gave two
+        // writers to anything.
+        //
+        // The inline module is nested inside a *child* file rather than inside
+        // `recovery.rs` itself so this test exercises only the finding at hand:
+        // writing a second, unrelated `Clone::clone` directly into `recovery.rs`'s
+        // own text — however deeply nested — trips `recovery-surface`'s *other*
+        // half, the method-surface pin over that one file's own public functions,
+        // which is unrelated to issue #77 and is not this test's concern.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod unrelated;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/unrelated.rs".to_owned(),
+            contents: concat!(
+                "mod nested {\n",
+                "    pub struct Recovery;\n",
+                "\n",
+                "    impl Clone for Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_unrelated_recovery_struct_in_a_child_file_is_not_the_pinned_type() {
+        // The same finding, one file over: a production-reachable child file — from
+        // the whole tree's point of view, exactly as nested as an inline module would
+        // be — can declare its own local `struct Recovery` too, with nothing to do
+        // with the one `recovery.rs` itself declares.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod unrelated;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/unrelated.rs".to_owned(),
+            contents: concat!(
+                "pub struct Recovery;\n",
+                "\n",
+                "impl Clone for Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_reached_through_an_out_of_line_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 29: `mod traits;`,
+        // with its content in a sibling file this per-file scan never opens, had no
+        // alias for a qualified `traits::C` to resolve against at all — round 28
+        // closed this same gap for an *inline* `mod traits { .. }`, whose content is
+        // right here in the same file to read, but an out-of-line module's content
+        // lives somewhere this scan cannot see, so the honest answer is the same
+        // fail-closed one a `super`-qualified path already gets rather than a guess.
+        // Without it, `traits::C` fell through to "no matching alias, take the last
+        // segment" and reported the bare, still-aliased `C` — which matches neither
+        // `Clone` nor the unresolved sentinel, so the whole self-type check (and with
+        // it, the impl's own `super::Recovery` self-type, which the pre-existing
+        // `super`-qualified guard would otherwise catch on its own) was skipped
+        // entirely, and a real `Clone` impl for the pinned type went unnoticed.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits;\n",
+                "impl traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl/traits.rs".to_owned(),
+            contents: "pub use core::clone::Clone as C;\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_derive_reached_through_a_glob_imported_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 30: `mod traits { pub
+        // use core::clone::Clone as C; } use traits::*; #[derive(C)] struct Recovery;`
+        // is legal Rust, and `collect_tree_aliases` deliberately drops `UseTree::Glob`
+        // — this scan does not perform name resolution, so it has no way to know what
+        // a glob import actually brings into scope. Without a fail-closed answer, `C`
+        // fell through to "no matching alias, take the last segment" and reported the
+        // bare, harmless-looking name `C` rather than `Clone`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "mod traits {\n",
+            "    pub use core::clone::Clone as C;\n",
+            "}\n",
+            "use traits::*;\n",
+            "#[derive(C, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone")
+                || violations[0].detail.contains("could not fully resolve"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_handwritten_clone_reached_through_a_glob_imported_alias_is_rejected() {
+        // The handwritten-impl half of the same finding, in a production-reachable
+        // child file: `use traits::*;` brings `C` into scope with nothing this scan
+        // can see, so `impl C for Recovery` must fail closed the same way a
+        // `super`-qualified path does rather than silently comparing the bare `C`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub use core::clone::Clone as C;\n",
+                "}\n",
+                "use traits::*;\n",
+                "impl C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_block_local_recovery_struct_shadows_the_pinned_type() {
+        // Found by Codex review of this change (PR #143), round 30: a function is just
+        // as free to declare its own local `struct Recovery` as an inline module is
+        // (round 29's finding) — `fn install() { struct Recovery; impl Clone for
+        // Recovery { .. } }` is legal Rust whose unqualified `Recovery` means the
+        // block-local declaration, but `extend_with_local_scope` only ever collected
+        // `use` and `type` aliases, so the local declaration never earned the shadow
+        // marker round 29 registers for the identical shape at module scope, and this
+        // was rejected as though it implemented `Clone` for the pinned type.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod unrelated;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/unrelated.rs".to_owned(),
+            contents: concat!(
+                "fn install() {\n",
+                "    struct Recovery;\n",
+                "\n",
+                "    impl Clone for Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_derive_reached_through_a_doubly_nested_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 31: `mod traits { pub
+        // mod nested { pub use core::clone::Clone as C; } } #[derive(traits::nested::C)]
+        // pub struct Recovery;` is legal Rust, and round 28's `direct_scope_module_aliases`
+        // only ever read a directly nested module's own *direct* aliases — never a
+        // module nested inside that one — so `traits::nested::C` had nothing to
+        // resolve against and fell through to the bare, harmless-looking name `C`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "mod traits {\n",
+            "    pub mod nested {\n",
+            "        pub use core::clone::Clone as C;\n",
+            "    }\n",
+            "}\n",
+            "#[derive(traits::nested::C, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_handwritten_clone_reached_through_a_doubly_nested_modules_qualified_alias_is_rejected() {
+        // The handwritten-impl half of the same finding.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub mod nested {\n",
+                "        pub use core::clone::Clone as C;\n",
+                "    }\n",
+                "}\n",
+                "impl traits::nested::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_chained_export_inside_a_nested_module_resolves_to_its_own_real_target() {
+        // Found by Codex review of this change (PR #143), round 37: `mod traits { pub
+        // use core::clone::Clone as C; pub use self::C as D; } impl traits::D for
+        // Recovery { .. }` is legal Rust — `self::C` names `C` in `traits`' own scope,
+        // exactly the chained re-export `every_resolution`'s own doc comment already
+        // describes resolving within a *single* file's alias table. But
+        // `direct_scope_module_aliases` copied `D`'s target, `self::C`, onto the
+        // qualified alias `traits::D` unresolved, so the next hop looked `self::C` up
+        // in the *outer* file's own alias table — which has only the qualified
+        // `traits::C`, never the bare `C` `traits`'s own scope would resolve it
+        // through — and fell through to the harmless-looking last segment, `C`,
+        // instead of chasing the second hop to `Clone`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub use core::clone::Clone as C;\n",
+                "    pub use self::C as D;\n",
+                "}\n",
+                "impl traits::D for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_reached_file_carrying_an_attribute_macro_this_scan_cannot_expand_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 31: `declares_item_macro`
+        // flagged an item-, statement- or type-position macro *invocation*, but never
+        // asked whether an item carried an attribute macro at all. Unlike a derive, an
+        // attribute macro may rewrite the item it decorates or splice an unrelated item
+        // in beside it — `#[a_transform] struct Anything;` could expand to anything,
+        // `impl Clone for Recovery` included, and nothing here could say otherwise.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[a_transform]\n", "struct Anything;\n",).to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_attribute_macro_reached_only_through_a_cfg_attr_is_rejected() {
+        // The `cfg_attr` half of the same finding: `#[cfg_attr(unix, a_transform)]` is
+        // legal Rust whose second argument is an attribute macro this scan cannot expand,
+        // exactly as a bare `#[a_transform]` is — `meta_is_unresolved_attribute_macro`
+        // has to look past the `cfg_attr` wrapper the same way this scan already does to
+        // find a derive or a `cfg` hidden the same way.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[cfg_attr(unix, a_transform)]\n", "struct Anything;\n",).to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_cfg_attr_macro_that_only_activates_under_test_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 45: the last test's own
+        // fix read every injected attribute of a `cfg_attr` without asking whether its
+        // condition could hold in a production build at all. `#[cfg_attr(test, a_transform)]`
+        // on an otherwise ordinary production item only ever injects `a_transform` under
+        // `cfg(test)` — rustc removes the whole attribute in every other build, so a
+        // production build never sees it — but `meta_is_unresolved_attribute_macro`
+        // walked into it exactly as it would a condition that might hold in production
+        // and rejected valid, test-only instrumentation. `Cfg::requires_test` is what
+        // `has_cfg_test` already proves a `cfg(test)` condition guarantees, reused here
+        // to skip an injected attribute that can never activate outside `test`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[cfg_attr(test, a_transform)]\n", "struct Anything;\n",).to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn ordinary_builtin_attributes_are_not_reported_as_macros() {
+        // The negative case: a file that carries only the builtin attributes this
+        // workspace actually uses must not be rejected by round 31's fix, or every
+        // reached file in the real crate would fail closed over its own doc comments,
+        // `#[derive(..)]`, `#[must_use]`, `#[repr(..)]` and the rest.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "//! Module doc.\n",
+                "#[derive(Debug)]\n",
+                "#[repr(transparent)]\n",
+                "#[must_use]\n",
+                "#[non_exhaustive]\n",
+                "pub struct Anything(u8);\n",
+                "#[cfg_attr(test, allow(dead_code))]\n",
+                "#[inline]\n",
+                "fn helper() {}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_cfg_test_gated_macro_statement_inside_a_production_function_is_not_reported() {
+        // Found by Codex review of this change (PR #143), round 32: `fn helper() {
+        // #[cfg(test)] generate_clone!(); }` is legal Rust whose macro statement never
+        // exists in a shipped build, but `visit_stmt_macro` read only the fact that a
+        // `StmtMacro` node was reached, never its own `attrs`, so a test-only macro
+        // statement inside an otherwise-production function failed the whole file
+        // closed over code that ships with nothing generated at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "fn helper() {\n",
+                "    #[cfg(test)]\n",
+                "    generate_clone!();\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_macro_statement_reachable_in_production_is_still_rejected() {
+        // The positive twin: a macro statement with no `#[cfg(test)]` at all, or one
+        // gated by a condition other than exactly `test`, still ships and still fails
+        // the file closed — round 32's fix only excuses the exact `#[cfg(test)]` shape,
+        // matching how every other gate in this visitor already reads `has_cfg_test`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("fn helper() {\n", "    generate_clone!();\n", "}\n",).to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_reachable_only_through_two_correlated_enclosing_cfg_conditions_is_not_reported() {
+        // Found by Codex review of this change (PR #143), round 46:
+        // `#[cfg(any(test, feature = "x"))] mod parent { #[cfg(not(feature = "x"))] fn
+        // helper() { evil!(); } }` can never include `helper` in a non-test build — the
+        // two conditions correlate through the shared flag exactly the way `has_cfg_test`
+        // itself closed for several attributes on *one* item in round 43 — but neither
+        // `parent`'s own condition (satisfiable under `feature = "x"` with no test) nor
+        // `helper`'s own condition (satisfiable under `!x` the same way) requires `test`
+        // in isolation, so a visitor that checked each item's own attributes against a
+        // separate boolean, discarding what its enclosing item's own `cfg` had already
+        // narrowed down, reached `evil!()` and rejected a macro invocation that never
+        // ships. `MacroVisitor::enclosing_cfg` threads the accumulated formula down
+        // through every level instead.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[cfg(any(test, feature = \"x\"))]\n",
+                "mod parent {\n",
+                "    #[cfg(not(feature = \"x\"))]\n",
+                "    fn helper() {\n",
+                "        evil!();\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_macro_reachable_through_two_enclosing_cfg_conditions_that_do_not_correlate_is_still_rejected()
+     {
+        // The positive twin: `parent`'s condition is satisfiable under `feature = "x"`
+        // with no test, and `helper`'s own condition, `feature = "y"`, is satisfiable
+        // under `y` regardless of `x` — the two share no flag, so the combination is
+        // still reachable without `test` (`x && y`) and the macro still ships.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[cfg(any(test, feature = \"x\"))]\n",
+                "mod parent {\n",
+                "    #[cfg(feature = \"y\")]\n",
+                "    fn helper() {\n",
+                "        evil!();\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_matches_macro_over_a_qualified_variant_pattern_is_not_reported() {
+        // Found on this pull request's own merge with `main`: `frame.rs`'s
+        // `redeliverable_kind` calls `matches!(decoded, RecordRef::EffectCompleted { .. }
+        // | RecordRef::EffectFailed { .. } | RecordRef::TimerFired { .. })`, real,
+        // shipping production code — but `matches!`'s second argument is a *pattern*,
+        // and `token_stream_hides_a_possible_item` read the brace after each variant
+        // name as though it might open a block, exactly as it would for `assert!({
+        // .. })`. A pattern's own `{ .. }` can only ever hold the rest-pattern, never a
+        // statement, so a brace immediately qualified by `path::` and containing
+        // nothing but `..` no longer counts as hiding an item on its own.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "enum Outcome {\n",
+                "    Completed { value: u8 },\n",
+                "    Failed { reason: u8 },\n",
+                "}\n",
+                "fn redeliverable(outcome: &Outcome) -> bool {\n",
+                "    matches!(\n",
+                "        outcome,\n",
+                "        Outcome::Completed { .. } | Outcome::Failed { .. }\n",
+                "    )\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_matches_macro_over_an_unqualified_variant_pattern_is_still_rejected() {
+        // The residual limit `is_opaque_variant_pattern_brace`'s own doc states: a brace
+        // not immediately qualified by `path::` — here a bare `Outcome { .. }`, no `::`
+        // before the type name at all — still fails closed exactly as before. Closing
+        // only the qualified shape a real, shipping pattern needs is deliberate, not an
+        // oversight left for a future round to widen without noticing this one already
+        // considered it.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "struct Outcome {\n",
+                "    value: u8,\n",
+                "}\n",
+                "fn redeliverable(outcome: &Outcome) -> bool {\n",
+                "    matches!(outcome, Outcome { .. })\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_crate_qualified_alias_reached_through_a_nested_module_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 32: fresh evidence
+        // beyond round 25's bare `crate::C` case is a longer `crate::traits::C`, where
+        // the crate root declares `mod traits { pub use core::clone::Clone as C; }` —
+        // legal Rust that rustc resolves to `Clone` two segments down. Round 25's fix
+        // only closed the bare, two-segment `crate::NAME` shape, reasoning that a
+        // longer path was another module's own real declaration rather than an alias
+        // lookup this scan could fail closed on without rejecting
+        // `waymaker-embassy/src/wiring.rs`'s own ordinary `use crate::...;` imports —
+        // but that reasoning rested on this scan being shared with
+        // `future_trait_implementors`'s own scan of every file the crate has, which
+        // ended when that scan moved to its own `resolve_segments`. `every_resolution`
+        // now fails closed on every `crate`-qualified path, not only the bare one.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl crate::traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_entirely_cfg_test_gated_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 33: an unconditional
+        // `mod clone_impl;` whose resolved file begins with its own `#![cfg(test)]`
+        // inner attribute is exactly as test-only as one the parent gated with
+        // `#[cfg(test)] mod clone_impl;` — the attribute lands on the module the `mod`
+        // item names either way, only spelled where the module's own file can carry it
+        // instead of where it is declared. `module_tree` read only the parent
+        // declaration's own gating, so a `Clone` impl that exists only under this
+        // file-level `#![cfg(test)]` was walked as production-reachable and rejected
+        // code that never ships.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(test)]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_unrecognized_derive_macro_on_the_pinned_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 33: `#[derive(
+        // MakeClone)] pub struct Recovery;`, where `MakeClone` is a procedural derive
+        // macro, is legal Rust whose expansion this module cannot see — a derive macro
+        // is not bound to generate an implementation only for the trait its own name
+        // suggests, so `MakeClone` could just as well expand to `impl Clone for
+        // Recovery` beside whatever else it derives. Recording the resolved name
+        // literally let it through as an ordinary, harmless-looking derive that simply
+        // is not `"Clone"`.
+        let sources = recovery_source_with_struct(concat!(
+            "#[derive(MakeClone, Debug)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn every_builtin_derivable_trait_but_clone_is_still_accepted() {
+        // The negative case: every one of Rust's own derivable traits other than
+        // `Clone` must still pass cleanly, or round 33's fix would reject the vast
+        // majority of real structs in this workspace over derives that were never in
+        // question.
+        let sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]\n",
+            "pub struct Recovery;\n",
+        ));
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_expression_position_macro_in_a_consts_initializer_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 33: `const _: () =
+        // make_clone!();` is legal Rust whose macro sits in *expression* position — a
+        // block is a legal expression and Rust's block grammar admits item statements
+        // inside one, so the macro could expand to `{ impl Clone for Recovery { .. };
+        // }` and still type as `()`. `declares_item_macro` flagged an item-,
+        // statement- and type-position macro invocation, but never this fourth one.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "const _: () = make_clone!();\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn known_safe_expression_macros_are_not_reported_as_unexpandable() {
+        // The negative case: `waymaker-flash` itself calls `assert!`, `matches!` and
+        // `write!` in expression position throughout its production code — a bare
+        // `mac!(..);` at *statement* position is `Stmt::Macro` regardless of the
+        // macro's name (unconditionally unexpandable since round 11, and unrelated to
+        // this fix), so every macro here is wrapped in a `let` binding, a `const`
+        // initializer or a tail position instead, matching how the real file uses
+        // them. Round 33's `Expr::Macro` fix must not flag any of these, only ones it
+        // cannot vouch for.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "const _: () = assert!(1 == 1);\n",
+                "fn helper(\n",
+                "    f: &mut core::fmt::Formatter<'_>,\n",
+                "    a: u8,\n",
+                "    b: u8,\n",
+                ") -> core::fmt::Result {\n",
+                "    let _ = assert_eq!(a, a);\n",
+                "    let _ = debug_assert!(a == a);\n",
+                "    let _ = matches!(a, 0);\n",
+                "    if a == b {\n",
+                "        let _: () = panic!(\"x\");\n",
+                "    }\n",
+                "    if a == b {\n",
+                "        let _: () = unreachable!();\n",
+                "    }\n",
+                "    write!(f, \"{a}\")\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_brace_group_hidden_inside_a_known_safe_macros_own_arguments_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 35: naming a safe
+        // macro is not the same as vouching for its own arguments. `syn` never parses
+        // a macro invocation's tokens into structured syntax — they are an opaque
+        // token stream — so `#[allow(non_local_definitions)] const _: () =
+        // assert!({ impl Clone for super::Recovery { .. } true });` puts a real,
+        // globally-applying `impl` inside `assert!`'s own condition, and round 33's
+        // fix, having recognized `assert!` as safe, never looked inside its arguments
+        // at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "const _: () = assert!({\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    true\n",
+                "});\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_locally_imported_macro_wearing_a_whitelisted_name_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 36: `use
+        // crate::make_clone as assert; const _: () = assert!();` is legal Rust whose
+        // `assert!` invocation is not `core::assert!` at all — a local `use` rebinds
+        // the name in the macro namespace the same way it would in the value or type
+        // namespace — but `is_known_safe_expression_macro` matched the spelled name
+        // alone, so a locally-imported macro wearing a whitelisted name walked past
+        // the one check built to catch an unexpandable macro. The macro's own
+        // definition lives outside this file (the shape a real `use` names), so this
+        // case is isolated from `declares_item_macro`'s separate, unconditional
+        // `Item::Macro` ban on a *declaration* in the same file — only the `use` and
+        // the invocation are here, exercising the shadow check alone.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use crate::round36_make_clone as assert;\n",
+                "const _: () = assert!();\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_test_gated_expression_position_macro_used_as_a_tail_expression_is_accepted() {
+        // Found by Codex review of this change (PR #143), round 36: a macro used as a
+        // *tail* expression still carries its own attributes on the `ExprMacro` node —
+        // `fn helper() { #[cfg(test)] make_clone!() }` is legal Rust whose macro is
+        // removed from every non-test build exactly like a gated statement already is
+        // — but `visit_expr_macro` read only the macro's path, never its own
+        // attributes, so this test-gated invocation failed the whole file closed over
+        // a macro that never ships.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "fn helper() {\n",
+                "    #[cfg(test)]\n",
+                "    make_clone!()\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_file_gated_with_a_compound_any_test_cfg_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 35: `#![cfg(any(test))]`
+        // is exactly as test-only as the bare `#![cfg(test)]` round 33 already
+        // recognized — `any(..)` with a single branch that is itself test-only can only
+        // be satisfied under test — but `has_cfg_test`'s old `parse_args::<syn::Ident>()`
+        // parse failed on anything but a bare identifier and silently answered `false`,
+        // so this spelling was still walked as production-reachable.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(any(test))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_file_gated_with_a_compound_all_test_cfg_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 35, the other half of
+        // the same finding: `#![cfg(all(test, debug_assertions))]` can never hold
+        // without `test`, whatever its other conjunct asks for, so it is exactly as
+        // test-only as the bare form too.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(all(test, debug_assertions))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_file_gated_with_an_equivalent_cfg_attr_spelling_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 37: `#![cfg_attr(
+        // not(test), cfg(test))]` is exactly as test-only as a bare `#![cfg(test)]` —
+        // rustc replaces the whole attribute with `cfg(test)` in every build where
+        // `not(test)` holds (every non-test one, where the injected `cfg(test)` then
+        // excludes the file) and removes it entirely in every build where `not(test)`
+        // does not hold (every test one, where the file stays present) — but
+        // `has_cfg_test`'s old outer filter read only an attribute whose own path was
+        // `cfg`, so this `cfg_attr`-spelled equivalent never reached the predicate at
+        // all and the file was walked as production-reachable.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg_attr(not(test), cfg(test))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_cfg_attr_whose_condition_can_hold_without_test_is_still_production_reachable() {
+        // The negative case: `#![cfg_attr(feature = "x", cfg(test))]` only excludes the
+        // file when `feature = "x"` is enabled — with that feature off, the attribute
+        // vanishes entirely and the file stays present regardless of `test` — so it
+        // must not be read as test-only. `meta_holds_without_test` cannot prove
+        // `feature = "x"` is guaranteed true whenever `test` is false, and must not:
+        // a build with neither `test` nor the feature enabled leaves the file in a
+        // shipped image.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg_attr(feature = \"x\", cfg(test))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_file_gated_with_an_any_cfg_satisfiable_without_test_is_still_production_reachable() {
+        // The negative case: `#![cfg(any(test, feature = "x"))]` is satisfiable under
+        // `feature = "x"` alone, with no test anywhere, so it must stay
+        // production-reachable — round 35's widening recognizes only a predicate that
+        // is *guaranteed* false whenever `test` is, and treating this one as test-only
+        // would hide production-reachable code from every rule that reads
+        // `has_cfg_test`'s answer as "unreachable in a shipped build".
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(any(test, feature = \"x\"))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn two_cfg_attributes_neither_alone_test_only_can_still_combine_to_be() {
+        // Found by Codex review of this change (PR #143), round 43: `has_cfg_test`
+        // combined several attributes' own answers with `.any()`, which finds a
+        // *single* attribute that alone proves the item test-only but is blind to a
+        // combination of several that individually could still admit a non-test
+        // build. `#![cfg(any(test, feature = "x"))]` alone is satisfiable under
+        // `feature = "x"` with no test anywhere (the test right above this one), and
+        // `#![cfg(not(feature = "x"))]` alone is satisfiable under `!x` the same way
+        // — but the two together, exactly as conjunctive as `all(..)`'s own
+        // arguments, admit only `test && !x`, which requires `test`. `.any()` over
+        // the two individually-false answers stayed false, and this harmless
+        // test-only `Clone` implementation was rejected as production-reachable.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(any(test, feature = \"x\"))]\n",
+                "#![cfg(not(feature = \"x\"))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_in_a_sibling_file_of_recovery_rs_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 38: a `Clone`
+        // implementation may be declared anywhere in `waymaker-flash`, not only
+        // somewhere `recovery.rs`'s own `mod` declarations reach —
+        // `impl Clone for crate::recovery::Recovery { .. }` in `append.rs`, say,
+        // which the crate root reaches directly and `recovery.rs` never does at
+        // all. `check_recovery_is_not_clone` now walks the module tree from
+        // `RECOVERY_ADAPTER_ROOT_PATH` rather than from `recovery.rs`, so a sibling
+        // the crate root reaches through its own `pub mod` declaration is read too.
+        let sources = vec![
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_ADAPTER_ROOT_PATH}"),
+                contents: "pub mod append;\npub mod recovery;\n".to_owned(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: tests_support::clean_recovery_surface(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/append.rs".to_owned(),
+                contents: concat!(
+                    "impl Clone for crate::recovery::Recovery {\n",
+                    "    fn clone(&self) -> Self {\n",
+                    "        crate::recovery::Recovery\n",
+                    "    }\n",
+                    "}\n",
+                )
+                .to_owned(),
+            },
+        ];
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_unrelated_clone_impl_in_a_sibling_file_does_not_trip_the_recovery_pin() {
+        // The negative case round 38's widened scan needs beside it: a sibling file
+        // the crate root reaches is free to implement `Clone` for an unrelated type of
+        // its own, named the ordinary way real code in this crate names its own
+        // self-type — relatively, not through a `crate::`-qualified path, which
+        // `every_resolution` fails closed on for an unrelated reason (rounds 25 and
+        // 32) and which is not the shape this test is about.
+        let sources = vec![
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_ADAPTER_ROOT_PATH}"),
+                contents: "pub mod append;\npub mod recovery;\n".to_owned(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: tests_support::clean_recovery_surface(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/append.rs".to_owned(),
+                contents: concat!(
+                    "pub struct Sealable;\n",
+                    "impl Clone for Sealable {\n",
+                    "    fn clone(&self) -> Self {\n",
+                    "        Sealable\n",
+                    "    }\n",
+                    "}\n",
+                )
+                .to_owned(),
+            },
+        ];
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn an_expression_position_include_invocation_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 39: `include_str!`
+        // and `include_bytes!` can only ever produce a literal, but bare `include!`
+        // splices the named file's own tokens in as Rust source — a file this
+        // per-file scan never opens, the same blind spot an out-of-line `mod name;`
+        // has — so `const _: () = include!("clone.inc");`, where `clone.inc` holds
+        // `{ impl Clone for Recovery { .. }; 0 }`, walked past
+        // `is_known_safe_expression_macro`'s old whitelist unseen: the invocation's
+        // own tokens are a single string literal with no brace in them anywhere.
+        // `include` is no longer on that whitelist, so the invocation itself is
+        // enough to trip this test — no separate file is needed to demonstrate the
+        // gap this closes.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "const _: () = include!(\"clone.inc\");\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_glob_reexported_through_a_nested_module_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 39: `mod traits {
+        // mod nested { pub use core::clone::Clone as C; } pub use nested::*; } impl
+        // traits::C for Recovery { .. }` is legal Rust — `traits`' own glob
+        // re-exports `nested::C` as `traits::C` — but `direct_scope_module_aliases`
+        // built a nested module's synthetic scope only from its explicit aliases and
+        // its own nested modules' *qualified* aliases, never from a glob any of them
+        // declares, so `traits::C` had nothing registered to resolve against and
+        // fell through to the harmless-looking bare name `C`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    mod nested {\n",
+                "        pub use core::clone::Clone as C;\n",
+                "    }\n",
+                "    pub use nested::*;\n",
+                "}\n",
+                "impl traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_glob_with_no_reexport_of_the_pinned_name_is_still_accepted() {
+        // The negative case beside the last: a nested module's glob that never
+        // touches the trait being searched for must not make every qualified
+        // reference through it unresolvable — only `resolve_segment_chain`'s own
+        // "no matching alias" fallback is supposed to fail closed on a glob, and a
+        // name that *did* match an explicit alias must still resolve through it.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    mod nested {\n",
+                "        pub use core::fmt::Debug as C;\n",
+                "    }\n",
+                "    pub use nested::*;\n",
+                "}\n",
+                "impl traits::C for Sealable {\n",
+                "}\n",
+                "pub struct Sealable;\n",
+            )
+            .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_procedural_derive_imported_under_a_builtin_name_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 39: `use
+        // custom::Debug; #[derive(Debug)] struct Recovery;` is legal Rust whose
+        // `Debug` is not `core::fmt::Debug` at all — an ordinary `use` shadows the
+        // prelude name exactly as a `use .. as` rename would — and a third-party
+        // crate is free to name a procedural derive macro `Debug` on purpose, for
+        // ergonomics or as a drop-in replacement, with an expansion this scan cannot
+        // see. `every_resolution` chases the alias to `["custom", "Debug"]`, finds no
+        // further alias for `custom`, and `resolve_segment_chain`'s "no matching
+        // alias, take the last segment" fallback reports the string `"Debug"` again —
+        // indistinguishable, by name alone, from the literal, never-imported builtin.
+        // The whitelist trusted that resolved string with no way to tell the two
+        // apart.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "use custom::Debug;\n",
+            "#[derive(Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_qualified_procedural_derive_named_like_a_builtin_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 44, the same finding
+        // one segment earlier: `#[derive(custom::Debug)]` is legal Rust whose `Debug`
+        // is a procedural derive macro exported by `custom`, not `core::fmt::Debug` —
+        // no `use` ever imports it, so `locally_rebound` (which asks only whether the
+        // path's own *first segment* was ever handed to a local alias) reads `false`,
+        // and round 39's fix, which exists to catch exactly this shape when the path
+        // arrives through an alias, never applied. Before round 43 widened
+        // `resolve_segment_chain`'s own fallback, `custom::Debug` matched no alias at
+        // all and fell through to trusting its last segment, `"Debug"`, the identical
+        // harmless-looking string a real builtin resolves to — so `push_resolved_names`
+        // could not tell "the literal, qualified path to a procedural macro that
+        // happens to be named `Debug`" from "the real builtin". Round 43's fix already
+        // closes it from underneath: an unaliased, qualified path unresolved on its own
+        // first hop now resolves to `UNRESOLVED_DERIVE` rather than its last segment, so
+        // `push_resolved_names` sees `UNRESOLVED_DERIVE` directly and never reaches the
+        // builtin-name check at all.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "#[derive(custom::Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn an_unaliased_builtin_derive_is_still_accepted() {
+        // The negative case beside the last: an ordinary, never-rebound derive of
+        // one of the eight safe builtins must still be accepted, or every clean
+        // `#[derive(Debug, PartialEq, Eq)]` in this crate would start failing.
+        assert!(
+            check_recovery_surface(&recovery_source_with_struct(
+                "#[derive(Debug, PartialEq, Eq, Default, Hash, Ord, PartialOrd, Copy)]\n\
+                 pub struct Recovery;\n",
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_procedural_derive_on_an_unrelated_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 40: a procedural
+        // derive macro is not obliged to emit an implementation only for the trait
+        // its own name suggests, or only for the type it is attached to —
+        // `#[derive(Evil)] struct Helper;` anywhere in a production-reachable file
+        // can expand to `impl Clone for Recovery` exactly as freely as a derive
+        // placed directly on `Recovery` itself. `struct_derives` only ever
+        // validates `Recovery`'s own derive list; `Helper`'s was invisible to
+        // every check here.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "#[derive(Evil)]\npub struct Helper;\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_procedural_derive_named_clone_on_an_unrelated_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 45: `use evil::Clone;
+        // #[derive(Clone)] struct Helper;` is round 39's exact bypass — an explicitly
+        // imported procedural derive macro sharing a name with a real builtin — with
+        // `Clone` itself as the shadowed name rather than `Debug`. `push_resolved_names`
+        // carved `Clone` out of the `!locally_rebound` guard unconditionally, reasoning
+        // that resolving *to* `Clone` through an alias was the intended detection round
+        // 13's own `Klon` test relies on — but that let a `Clone`-named import through
+        // regardless of whether it was ever rebound, so a real, unrelated procedural
+        // macro that only *shares the name* `Clone` (and could just as well expand to
+        // `impl Clone for Recovery`) was trusted as the literal builtin. `Clone` needs no
+        // exemption of its own: it is already the first entry of `DERIVABLE_BUILTIN_TRAITS`,
+        // so the same `!locally_rebound` guard the other eight names already have covers
+        // it once the separate exemption is removed.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use evil::Clone;\n",
+                "#[derive(Clone)]\n",
+                "pub struct Helper;\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_procedural_derive_on_an_unrelated_struct_in_a_nested_module_is_rejected() {
+        // The same finding one module deeper: a nested inline module's own struct
+        // is exactly as reachable a target for an unrecognized derive as one at
+        // the file's top level.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod nested {\n",
+                "    #[derive(Evil)]\n",
+                "    pub struct Helper;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn an_unrelated_structs_ordinary_derive_does_not_trip_the_recovery_pin() {
+        // The negative case beside the last two: an unrelated struct deriving one
+        // of the ordinary safe builtins, unaliased, must not be flagged — every
+        // production struct in this crate that is not `Recovery` still derives
+        // `Debug`, `PartialEq`, and the like.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[derive(Debug, PartialEq, Eq)]\n", "pub struct Helper;\n",)
+                .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_nested_macro_hidden_in_a_trusted_macros_own_arguments_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 40: `assert!(evil!())`
+        // carries no brace group anywhere in `assert!`'s own tokens — only `evil`,
+        // `!` and an empty `(..)` group — but `evil!` is an ordinary, unrecognized
+        // macro whose own (unexpandable) expansion could be `{ impl Clone for
+        // Recovery { .. } true }`. The brace scan alone missed a hidden macro
+        // invocation one level short of the brace it would have produced.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "const _: () = assert!(evil!());\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_locally_declared_trait_of_the_same_name_is_not_the_real_one() {
+        // Found by Codex review of this change (PR #143), round 41: `trait Clone {
+        // fn conjure() -> Self; } impl Clone for Recovery { .. }` is legal Rust whose
+        // `Clone` is a local, unrelated trait — Rust resolves the unqualified name to
+        // the nearest declaration in scope, and a trait declared right here shadows
+        // `core::clone::Clone` for this whole scope exactly as a local struct already
+        // shadows an imported type (round 29). Nothing registered a trait
+        // declaration's own name as a local shadow, so this legal, harmless code was
+        // rejected as though it implemented the real `Clone`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Clone {\n",
+                "    fn conjure() -> Self;\n",
+                "}\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn conjure() -> Self {\n",
+                "        unimplemented!()\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_locally_declared_trait_does_not_hide_a_real_qualified_clone_impl() {
+        // The negative case beside the last: a local `trait Clone` must shadow only
+        // an *unqualified* reference to the name, not a fully qualified one — Rust's
+        // own name resolution bypasses local shadowing entirely once a path is
+        // qualified, and this scan must agree.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Clone {\n",
+                "    fn conjure() -> Self;\n",
+                "}\n",
+                "impl core::clone::Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_locally_declared_trait_in_the_pinned_file_itself_is_not_the_real_one() {
+        // Found by Codex review of this change (PR #143), round 43: the last two
+        // tests put the local `trait Clone` and its impl in a *sibling* file, where
+        // `is_pinned_type_file` is `false` and every local shadow — round 41's
+        // trait shadow included — is registered normally. Declared in the *pinned*
+        // file itself (`recovery.rs`), the identical code was rejected instead:
+        // `trait_implementors_for_pinned_type` skipped *every* top-level shadow
+        // there, not only `Recovery`'s own, to keep the pinned type's own
+        // declaration from shadowing itself — but that also dropped the local
+        // `Clone` trait's shadow, so the bare `Clone` in `impl Clone for Recovery`
+        // resolved past it to the real `core::clone::Clone` and rejected code that
+        // implements only the unrelated local trait declared two lines above it.
+        let sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "trait Clone {\n",
+            "    fn conjure() -> Self;\n",
+            "}\n",
+            "impl Clone for Recovery {\n",
+            "    fn conjure() -> Self {\n",
+            "        unimplemented!()\n",
+            "    }\n",
+            "}\n",
+        ));
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_procedural_derive_on_a_block_local_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 42: a production
+        // function containing `#[derive(Evil)] struct Helper;` reached neither
+        // `declares_item_macro`'s trust of the outer `derive` attribute nor
+        // `unresolved_derive_elsewhere`'s own module-scoped walk, which that
+        // function's own doc comment already named as a residual — a procedural
+        // derive on a block-local item can emit a non-local `impl Clone for
+        // crate::recovery::Recovery` exactly as freely as one on a struct declared
+        // at module scope (round 40).
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub fn install() {\n",
+                "    #[derive(Evil)]\n",
+                "    struct Helper;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_procedural_derive_on_a_struct_nested_two_blocks_deep_is_rejected() {
+        // The same finding at the depth `collect_trait_implementors_in_block`
+        // already walks a handwritten `impl` through: a block nested inside a
+        // function's own `if` statement is still reachable, one level of
+        // `direct_child_blocks_of_block` recursion further than the function's own
+        // top-level block.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub fn install(flag: bool) {\n",
+                "    if flag {\n",
+                "        #[derive(Evil)]\n",
+                "        struct Helper;\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_block_local_structs_ordinary_derive_does_not_trip_the_recovery_pin() {
+        // The negative case beside the last two: a block-local struct deriving one
+        // of the ordinary safe builtins, unaliased, must not be flagged.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub fn install() {\n",
+                "    #[derive(Debug, PartialEq, Eq)]\n",
+                "    struct Helper;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn an_absolute_path_aliased_to_a_trait_in_the_same_file_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 34: `impl ::dep::C for
+        // Recovery { .. }` is legal Rust — an absolute path reaches the extern prelude,
+        // and `extern crate self as dep;` can make it name this very crate under
+        // another name — but `every_resolution` took the leading `::` as a signal to
+        // trust the last segment (`C`) as a plain, unaliased name, never consulting
+        // this file's own alias table even when that table has `C` bound to `Clone`
+        // right here. `every_resolution` now fails closed on every absolute path. The
+        // impl lives in a child file so it cannot also trip the unrelated
+        // `RECOVERY_SURFACE` function-surface pin, which reads `recovery.rs` itself.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use core::clone::Clone as C;\n",
+                "impl ::dep::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_qualified_trait_path_unresolved_in_its_own_file_is_not_trusted_by_its_last_segment() {
+        // Found by Codex review of this change (PR #143), round 43, fresh beyond the
+        // absolute-path case round 34 closed above: `extern crate self as dep; pub
+        // use core::clone::Clone as C;` at the crate root, reached from a sibling
+        // file with `impl dep::C for crate::recovery::Recovery { .. }`, makes
+        // `dep::C` name `Clone` — but the sibling's own alias table has no `dep` at
+        // all (that declaration lives in a file this per-file scan never opens
+        // while scanning the sibling), so `dep::C` matched no alias on either the
+        // qualified or the plain lookup and fell through to trusting its own last
+        // segment, `C`, the identical harmless-looking miss a leading `::` already
+        // produced before round 34. `resolve_segment_chain` now fails closed on any
+        // qualified (multi-segment) path that matches no alias on its very first
+        // hop — the path exactly as the source wrote it, before any local alias
+        // this scan can see has had a chance to explain it — rather than only on
+        // `crate::`, `super::` and an absolute `::` prefix. The impl lives in a
+        // child file so it cannot also trip the unrelated `RECOVERY_SURFACE`
+        // function-surface pin, which reads `recovery.rs` itself.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl dep::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_chained_alias_still_resolves_through_a_qualified_use_target_after_one_hop() {
+        // The negative case beside the last: round 43's new first-hop-only rule must
+        // not stop an ordinary aliased derive from resolving. `use core::clone::Clone
+        // as C; impl C for Recovery { .. }` chases one alias hop to the fully
+        // written target `core::clone::Clone` — a real path this scan *did* see,
+        // via a local `use` — and that hop must still trust its own last segment,
+        // `Clone`, or every aliased `impl` this file's whole design exists to catch
+        // would stop resolving at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use core::clone::Clone as C;\n",
+                "impl C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_generic_alias_substituted_with_the_pinned_type_in_a_self_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 34: `type
+        // Identity<T> = T; impl Clone for Identity<Recovery> { .. }` is legal Rust that
+        // implements `Clone` for `Recovery` itself, because substituting `Recovery` for
+        // `T` makes `Identity<Recovery>` the type `Recovery`. The self-type scan reads
+        // only the segment identifier (`Identity`), discarding the generic argument
+        // that decides what the alias actually resolves to, so it followed `Identity`
+        // to its declared target `T` and reported an implementor named `T` — never
+        // `Recovery`. `every_resolution` now fails closed whenever a segment that
+        // carries a generic argument is also a locally aliased name, since resolving
+        // through the alias would mean substituting that argument, which this module
+        // does not do.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type Identity<T> = T;\n",
+                "impl Clone for Identity<super::Recovery> {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn an_unaliased_generic_self_type_on_an_unrelated_struct_is_still_accepted() {
+        // The negative case: an ordinary generic type that is not the pinned struct and
+        // is not aliased to anything must still pass, or round 34's fix would reject
+        // any generic `Clone` impl in the file rather than only the ones that resolve
+        // through an alias.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub struct Wrapper<T> {\n",
+                "    value: T,\n",
+                "}\n",
+                "impl<T: Clone> Clone for Wrapper<T> {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        Wrapper { value: self.value.clone() }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]
@@ -10757,11 +15191,18 @@ mod tests {
 
     #[test]
     fn a_windows_path_separator_still_finds_the_recovery_module() {
-        let violations = check_recovery_surface(&[crate::size::LayerSource {
-            crate_name: "waymaker-flash".to_owned(),
-            path: RECOVERY_SURFACE_PATH.replace('/', "\\"),
-            contents: tests_support::clean_recovery_surface(),
-        }]);
+        let violations = check_recovery_surface(&[
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: RECOVERY_ADAPTER_ROOT_PATH.replace('/', "\\"),
+                contents: tests_support::clean_flash_lib(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: RECOVERY_SURFACE_PATH.replace('/', "\\"),
+                contents: tests_support::clean_recovery_surface(),
+            },
+        ]);
         assert!(violations.is_empty(), "{violations:?}");
     }
 
@@ -16902,10 +21343,31 @@ mod tests {
         surface("A storage module.", STORAGE_CONTRACT_SURFACE)
     }
 
-    /// A recovery module declaring exactly [`RECOVERY_SURFACE`] and nothing else.
+    /// A recovery module declaring exactly [`RECOVERY_SURFACE`], and a `Recovery` struct
+    /// that derives neither `Clone`.
+    ///
+    /// The struct is part of "clean" now that issue #77's fix pins its derives too: a
+    /// fixture with no `Recovery` struct at all is not a recovery module the fix would
+    /// leave behind, it is the rename the pin has to fail closed on — see
+    /// `check_recovery_is_not_clone`.
     #[must_use]
     pub fn clean_recovery_surface() -> String {
-        surface("A recovery module.", RECOVERY_SURFACE)
+        let mut source = surface("A recovery module.", RECOVERY_SURFACE);
+        source.push_str("#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n");
+        source
+    }
+
+    /// A crate root for `waymaker-flash` declaring `recovery` as its only child module.
+    ///
+    /// Round 38 of Codex review on this change (PR #143) moved
+    /// `check_recovery_is_not_clone`'s module-tree walk from `recovery.rs` to the crate
+    /// root, so a fixture naming only `recovery.rs` now needs this beside it for the walk
+    /// to reach `recovery.rs` at all — otherwise `RECOVERY_ADAPTER_ROOT_PATH` is missing
+    /// from the fixture's own sources and the rule fails closed on that, rather than on
+    /// whatever the fixture meant to exercise.
+    #[must_use]
+    pub fn clean_flash_lib() -> String {
+        String::from("//! Two-bank NOR flash adapter for Waymaker.\npub mod recovery;\n")
     }
 
     /// A `waymaker-rig` oracle whose public surface is exactly the pin.
@@ -17228,6 +21690,8 @@ mod tests {
                 );
             }
         }
+        // Issue #77's half: a `Recovery` struct that is not `Clone`.
+        source.push_str("#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n");
         source
     }
 
