@@ -22821,6 +22821,80 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_cmp_orderings_explicit_discriminant_is_reported() {
+        // Codex's finding: `core::cmp::Ordering` is declared `Less = -1, Equal = 0, Greater
+        // = 1` — real, explicit discriminants — but `well_known_std_enum_variant` used to
+        // number every entry by plain declaration-order position, giving `Less` the value
+        // `0` rather than `-1`. `if (core::cmp::Ordering::Less as i8) < 0 { n } else { 10 *
+        // n + 100 }` is `n` in real Rust (`-1 < 0` is `true`) but read as `10 * n + 100`
+        // here (`0 < 0` is `false`), turning a dense `0..14` sequence into a sparse one and
+        // letting the outer table pass `integrity-check` undetected. Every entry in the
+        // table now names its own explicit discriminant rather than a derived position.
+        // Verified against real rustc, warning-free: the guard is `n` for every `n` in
+        // `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = if (core::cmp::Ordering::Less as i8) < 0 {{ {n}u8 }} \
+                 else {{ 10 * {n}u8 + 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_orderings_explicit_discriminant(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_reference_pattern_destructuring_let_is_reported() {
+        // Codex's finding: `let &x = &n; x` names an irrefutable reference destructure —
+        // after struct-pattern support was added, this fell through to `_ => Vec::new()`
+        // for the identical reason both earlier shapes did: the whole statement went
+        // uncounted by every term that requires `destructured_binding` to answer at least
+        // one name. `destructured_binding` now recurses into a `Pat::Reference` paired with
+        // a real, syntactic `Expr::Reference` initializer, the identical way it already
+        // recurses into a tuple or struct pattern. Verified against real rustc,
+        // warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(constants, "    const P{n}: u8 = {{ let &x = &{n}u8; x }};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_reference_pattern_destructuring_let(nibble: u32) \
+             -> u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_a_power_of_two_strided_pattern_is_reported() {
         // Codex's finding: `match n { 0 => 9, 4 => 3, 8 => 27, 12 => 1, _ => 0 }` — a stride
         // of four — spans thirteen raw slots for four values, over

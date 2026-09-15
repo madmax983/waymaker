@@ -2927,6 +2927,22 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
                 })
                 .collect()
         }
+        // Codex's finding: `let &x = &n; x` names an irrefutable reference destructure —
+        // after struct patterns were added, this fell through to `_ => Vec::new()` for the
+        // identical reason both earlier shapes did: the whole statement went uncounted by
+        // every term that requires this function to answer at least one name. Recognised
+        // only when the initializer is itself a real, syntactic `&EXPR` (or `&mut EXPR`) —
+        // `strip_parens`, the same normalisation every other case here already applies —
+        // since a value that merely *happens* to be a reference at some other type this
+        // scan does not track (a function call returning one, say) gives no expression to
+        // recurse into at all. `&&x` over `&&n` recurses through this arm twice, one layer
+        // at a time, the identical way a nested tuple or struct pattern already does.
+        syn::Pat::Reference(pat_ref) => {
+            let syn::Expr::Reference(expr_ref) = strip_parens(expr) else {
+                return Vec::new();
+            };
+            destructured_binding(&pat_ref.pat, &expr_ref.expr)
+        }
         _ => Vec::new(),
     }
 }
@@ -3955,14 +3971,13 @@ fn well_known_bound_segments(segments: &[String]) -> Option<(&str, &str)> {
     }
 }
 
-/// The fieldless variant *ordinal* of a small, closed set of `core`/`std` enums this scan can
-/// never add to `qualified` at all — [`collect_dependency_qualified_constants`] walks a
-/// crate's own source tree, and there is no source tree here to walk: `core` and `std` are
-/// the toolchain, not a workspace crate `sources` could ever list. Each entry mirrors that
-/// enum's own real declaration order — zero for the first variant, one more for each after
-/// it — the identical rule [`item_enum_variant_constants`] already applies to a workspace
-/// enum one dependency edge away, so a match naming these variants is exactly as
-/// dense-detectable as one naming `waymaker_core::transition::Divergence`'s already is.
+/// The fieldless variant's *real discriminant* for a small, closed set of `core`/`std` enums
+/// this scan can never add to `qualified` at all — [`collect_dependency_qualified_constants`]
+/// walks a crate's own source tree, and there is no source tree here to walk: `core` and
+/// `std` are the toolchain, not a workspace crate `sources` could ever list. Each entry names
+/// the value `rustc` really assigns that variant, not merely one this scan invents for its
+/// own bookkeeping — a distinction three of the four entries happen not to need (see below)
+/// but one of them does, sharply.
 ///
 /// Codex's finding: `core::sync::atomic::Ordering`'s five variants — a real, reachable enum
 /// with no dependency edge this scan could ever walk source for — resolved to nothing, so a
@@ -3976,17 +3991,51 @@ fn well_known_bound_segments(segments: &[String]) -> Option<(&str, &str)> {
 /// Codex's next-round finding: `core::num::FpCategory`'s five variants named the identical
 /// gap one enum over, resolved to nothing for the identical reason. Added rather than
 /// generalised, for the identical reason the first three entries were.
+///
+/// Codex's next-round finding: `core::cmp::Ordering` is declared `Less = -1, Equal = 0,
+/// Greater = 1` — real, explicit discriminants, not the plain declaration-order numbering
+/// [`item_enum_variant_constants`] gives an *unspecified* one, which is all the version of
+/// this table keyed on position alone ever assumed. `Ordering::Less as i8 < 0` is `true` in
+/// real Rust and was `false` here (`0 < 0`), which is wrong in a way a match-pattern
+/// resolution alone would never surface: this path is the *general* qualified-constant
+/// fallback, reached from an ordinary expression exactly as readily as from a match arm, so
+/// the wrong number reaches arithmetic and comparisons too, not only density detection. Every
+/// entry now names its own explicit value rather than a position `ENUMS` derives for it — the
+/// other three enums verified by disassembling an `as`-cast of each of their own variants,
+/// confirming declaration order really does agree with their own real discriminants, so only
+/// this one entry's numbers needed to change.
 fn well_known_std_enum_variant(segments: &[String]) -> Option<i128> {
-    const ENUMS: &[(&[&str], &[&str])] = &[
+    #[allow(
+        clippy::type_complexity,
+        reason = "one table, local to this function, of an enum's own path segments beside \
+                  its own (variant name, discriminant) pairs — a type alias would name the \
+                  shape once more than the table itself already does"
+    )]
+    const ENUMS: &[(&[&str], &[(&str, i128)])] = &[
         (
             &["sync", "atomic", "Ordering"],
-            &["Relaxed", "Release", "Acquire", "AcqRel", "SeqCst"],
+            &[
+                ("Relaxed", 0),
+                ("Release", 1),
+                ("Acquire", 2),
+                ("AcqRel", 3),
+                ("SeqCst", 4),
+            ],
         ),
-        (&["cmp", "Ordering"], &["Less", "Equal", "Greater"]),
-        (&["task", "Poll"], &["Ready", "Pending"]),
+        (
+            &["cmp", "Ordering"],
+            &[("Less", -1), ("Equal", 0), ("Greater", 1)],
+        ),
+        (&["task", "Poll"], &[("Ready", 0), ("Pending", 1)]),
         (
             &["num", "FpCategory"],
-            &["Nan", "Infinite", "Zero", "Subnormal", "Normal"],
+            &[
+                ("Nan", 0),
+                ("Infinite", 1),
+                ("Zero", 2),
+                ("Subnormal", 3),
+                ("Normal", 4),
+            ],
         ),
     ];
     let (root, rest) = segments.split_first()?;
@@ -3995,12 +4044,16 @@ fn well_known_std_enum_variant(segments: &[String]) -> Option<i128> {
     }
     let (variant, enum_path) = rest.split_last()?;
     let enum_path: Vec<&str> = enum_path.iter().map(String::as_str).collect();
-    let index = ENUMS.iter().find_map(|&(path, variants)| {
+    ENUMS.iter().find_map(|&(path, variants)| {
         (path == enum_path.as_slice())
-            .then(|| variants.iter().position(|name| *name == variant.as_str()))
+            .then(|| {
+                variants
+                    .iter()
+                    .find(|(name, _)| *name == variant.as_str())
+                    .map(|&(_, value)| value)
+            })
             .flatten()
-    })?;
-    i128::try_from(index).ok()
+    })
 }
 
 /// `expr`'s own integer literal, if it is one carrying an explicit suffix (`255u8`, never
