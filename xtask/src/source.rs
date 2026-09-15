@@ -13370,6 +13370,31 @@ mod tests {
     }
 
     #[test]
+    fn a_cfg_attr_macro_that_only_activates_under_test_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 45: the last test's own
+        // fix read every injected attribute of a `cfg_attr` without asking whether its
+        // condition could hold in a production build at all. `#[cfg_attr(test, a_transform)]`
+        // on an otherwise ordinary production item only ever injects `a_transform` under
+        // `cfg(test)` — rustc removes the whole attribute in every other build, so a
+        // production build never sees it — but `meta_is_unresolved_attribute_macro`
+        // walked into it exactly as it would a condition that might hold in production
+        // and rejected valid, test-only instrumentation. `Cfg::requires_test` is what
+        // `has_cfg_test` already proves a `cfg(test)` condition guarantees, reused here
+        // to skip an injected attribute that can never activate outside `test`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[cfg_attr(test, a_transform)]\n", "struct Anything;\n",).to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
     fn ordinary_builtin_attributes_are_not_reported_as_macros() {
         // The negative case: a file that carries only the builtin attributes this
         // workspace actually uses must not be rejected by round 31's fix, or every
@@ -14185,6 +14210,40 @@ mod tests {
             crate_name: "waymaker-flash".to_owned(),
             path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
             contents: "#[derive(Evil)]\npub struct Helper;\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_procedural_derive_named_clone_on_an_unrelated_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 45: `use evil::Clone;
+        // #[derive(Clone)] struct Helper;` is round 39's exact bypass — an explicitly
+        // imported procedural derive macro sharing a name with a real builtin — with
+        // `Clone` itself as the shadowed name rather than `Debug`. `push_resolved_names`
+        // carved `Clone` out of the `!locally_rebound` guard unconditionally, reasoning
+        // that resolving *to* `Clone` through an alias was the intended detection round
+        // 13's own `Klon` test relies on — but that let a `Clone`-named import through
+        // regardless of whether it was ever rebound, so a real, unrelated procedural
+        // macro that only *shares the name* `Clone` (and could just as well expand to
+        // `impl Clone for Recovery`) was trusted as the literal builtin. `Clone` needs no
+        // exemption of its own: it is already the first entry of `DERIVABLE_BUILTIN_TRAITS`,
+        // so the same `!locally_rebound` guard the other eight names already have covers
+        // it once the separate exemption is removed.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use evil::Clone;\n",
+                "#[derive(Clone)]\n",
+                "pub struct Helper;\n",
+            )
+            .to_owned(),
         });
         let violations = check_recovery_surface(&sources);
         assert_eq!(violations.len(), 1, "{violations:?}");

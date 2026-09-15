@@ -2809,6 +2809,22 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
 /// `true`, matching [`attr_introduces_cfg`]'s own rule for the identical shape of
 /// unreadable content: a `cfg_attr` this scan cannot read is not evidence that everything
 /// it names is safe.
+///
+/// Round 45 of Codex review on this change (PR #143) found the reverse gap: this
+/// recursion read every injected attribute of a `cfg_attr` without ever asking whether
+/// the `cfg_attr`'s own *condition* could hold in a production build at all.
+/// `#[cfg_attr(test, Evil)]` on an otherwise ordinary production item only ever injects
+/// `Evil` under `cfg(test)` — rustc removes the whole attribute in every other build —
+/// so a production build never sees it, yet this function walked into it exactly as it
+/// would a condition that might hold in production and reported the item as macro-
+/// generated. [`Cfg::requires_test`] is the same predicate [`has_cfg_test`] builds every
+/// attribute's formula with, over the condition [`parse_cfg_meta`] parses from `metas`'
+/// own first entry: a condition it proves can never hold outside `test` makes the whole
+/// `cfg_attr` contribute nothing to a production build, so its injected attributes are
+/// skipped rather than read. A condition this scan cannot *prove* test-only — `feature =
+/// ".."`, or anything unrecognized — still reads its injected attributes exactly as
+/// before, matching the fail-closed default every other use of `Cfg::requires_test`
+/// keeps.
 fn meta_is_unresolved_attribute_macro(meta: &syn::Meta) -> bool {
     if path_is_ident(meta.path(), "cfg_attr") {
         let syn::Meta::List(list) = meta else {
@@ -2819,6 +2835,12 @@ fn meta_is_unresolved_attribute_macro(meta: &syn::Meta) -> bool {
         ) else {
             return true;
         };
+        if metas
+            .first()
+            .is_some_and(|condition| parse_cfg_meta(condition).requires_test())
+        {
+            return false;
+        }
         return metas.iter().skip(1).any(meta_is_unresolved_attribute_macro);
     }
     !is_known_safe_attribute_path(meta.path())
@@ -3178,11 +3200,24 @@ fn collect_derive_names_from_meta(
 /// segment happens to spell, `"Debug"` included if the imported item shares the name.
 /// The whitelist then read the resolved string alone and trusted it as the concrete
 /// builtin, with no way to tell "the literal, never-rebound identifier `Debug`" from
-/// "a fallback guess that happens to read `Debug`". `Clone` is exempt from the new
-/// check: resolving *to* `Clone` through an alias is the intended detection round 13's
-/// own `Klon` test already relies on, so distrusting it here would reopen that gap
-/// rather than close this one — the risk is specific to the eight names this scan
-/// otherwise discards as harmless.
+/// "a fallback guess that happens to read `Debug`".
+///
+/// Round 45 of Codex review on this change (PR #143) found that `Clone` had been
+/// carved out of this same check with an unconditional `name == "Clone"` exemption,
+/// reasoning that resolving *to* `Clone` through an alias is the intended detection
+/// round 13's own `Klon` test relies on — but `use evil::Clone; #[derive(Clone)] struct
+/// Helper;` is exactly round 39's bypass with `Clone` as the shadowed name instead of
+/// `Debug`: an explicitly imported procedural derive macro can share the name `Clone`
+/// on purpose, and the unconditional exemption trusted it regardless of
+/// `locally_rebound`. `Clone` is already the first entry of `DERIVABLE_BUILTIN_TRAITS`,
+/// so the separate exemption is redundant rather than load-bearing once removed: the
+/// existing `!locally_rebound` guard on the whitelist clause covers the un-rebound case
+/// on its own, and round 13's own `Klon` alias case — `locally_rebound` is `true`
+/// there — now reports `UNRESOLVED_DERIVE` instead of the literal name `Clone`, which
+/// still names the pinned type's own violation (the fail-closed message names `Clone`
+/// by text) and still flags an unrelated struct's derive through the same alias as
+/// worth a human's review, exactly as an unrelated struct's `MakeClone` or aliased
+/// `Debug` already does.
 fn push_resolved_names(
     paths: &syn::punctuated::Punctuated<syn::Path, syn::Token![,]>,
     aliases: &[UseAlias],
@@ -3210,7 +3245,6 @@ fn push_resolved_names(
         for name in every_resolution(path, aliases) {
             let trusted = name == UNRESOLVED_DERIVE
                 || name == LOCAL_SHADOWED_TYPE
-                || name == "Clone"
                 || (!locally_rebound && DERIVABLE_BUILTIN_TRAITS.contains(&name.as_str()));
             if trusted {
                 derives.push(name);

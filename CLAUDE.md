@@ -4383,6 +4383,39 @@ trustable string at all. Verified by neutralizing round 43's fix alone and confi
 the new regression test fails against the unpatched fallback, then passes once restored
 — no code change beyond the test.
 
+Round 45 found two more on the same commit, both genuine code changes this time. The
+first is `push_resolved_names`'s own `Clone` exemption: `use evil::Clone; #[derive(Clone)]
+struct Helper;` is round 39's exact bypass — an explicitly imported procedural derive
+macro sharing a name with a real builtin — with `Clone` itself as the shadowed name
+rather than `Debug`. The unconditional `name == "Clone"` clause trusted a resolution
+of `Clone` regardless of `locally_rebound`, reasoning that resolving *to* `Clone`
+through an alias was the intended detection round 13's own `Klon` test relies on — but
+that reasoning proves too much: it also trusts a `Clone`-named import that was never
+`core::clone::Clone` at all. `Clone` needs no exemption of its own — it is already the
+first entry of `DERIVABLE_BUILTIN_TRAITS` — so removing the separate clause folds it
+into the same `!locally_rebound` guard the other eight names already have. Round 13's
+own `Klon` case (`locally_rebound` is `true` there) now reports `UNRESOLVED_DERIVE`
+instead of the literal name `Clone`, which still names the pinned type's own violation
+— the fail-closed message names `Clone` by text too — and still flags an unrelated
+struct's derive through the same alias as worth a human's review. The second is the
+reverse gap in `meta_is_unresolved_attribute_macro`: it read every injected attribute of
+a `cfg_attr` without asking whether the `cfg_attr`'s own condition could hold in a
+production build at all, so `#[cfg_attr(test, Evil)]` on an otherwise ordinary
+production item — which only ever injects `Evil` under `cfg(test)`, with rustc removing
+the whole attribute in every other build — was read as though the injected attribute
+might apply in production and rejected valid, test-only instrumentation. `Cfg::
+requires_test`, the same predicate round 43's `has_cfg_test` fix built, now decides
+whether the `cfg_attr`'s own condition is provably test-only before recursing into what
+it injects; a condition this scan cannot prove test-only still reads its injected
+attributes exactly as before. Verified against real compilation throughout: the `Clone`
+exemption with a standalone two-crate example — a `#[proc_macro_derive(Clone)]` that
+emits a hardcoded `impl Clone for Recovery`, imported as `use evil::Clone;` and invoked
+on an unrelated `Helper` — compiled cleanly, and conflicted (`E0119`) against an
+explicit second `impl Clone for Recovery`, confirming the injected impl is real; the
+`cfg_attr` fix by injecting `#[cfg_attr(test, round45_a_transform)]` into
+`waymaker-flash` itself, confirmed caught by `check-layering` before the fix and cleared
+by it after, reverted cleanly.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of
