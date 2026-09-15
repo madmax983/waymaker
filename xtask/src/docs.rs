@@ -8534,6 +8534,82 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_a_misnested_formatting_element_stays_hidden() {
+        // Codex, pull request #138, round 73, finding "Preserve hidden formatting
+        // after adoption-agency closes": a *formatting* element's own end tag
+        // does not simply close it when something opened after it is still
+        // open — HTML5's adoption agency algorithm runs instead. `<b
+        // hidden><div>ignored</b>decision-id headline</div>` has the misnested
+        // `</b>` produce `<b hidden></b><div>ignored<b hidden>decision-id
+        // headline</b></div>` in a real browser: the id and headline are
+        // reparented into a *cloned* `<b hidden>`, still inside the still-open
+        // `div`, and stay exactly as hidden as before the stray `</b>`.
+        // Treating any closing tag matching `top` as an unconditional close
+        // ended suppression at the misnested `</b>` instead, exposing them.
+        // `b` is never one of CommonMark's own fixed HTML-block tag names, so
+        // no formatting element can ever reach `next_non_rendering_marker`'s
+        // block-level walk as `top` at all — this construct, and the fix, are
+        // `track_non_rendering_html`'s own self-contained `Event::InlineHtml`
+        // twin, the same as the sibling test just below.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><div>ignored</b>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_misnested_element_still_closes_on_its_own_end_tag() {
+        // The other half of round 73's fix: adoption agency is special to HTML5's
+        // fixed set of formatting elements, not a general rule for any misnested
+        // close. `<span hidden><section>ignored</span>decision-id
+        // headline</section>` has an ordinary `<span>` — not a formatting
+        // element — closed while a `<section>` opened after it is still open,
+        // and a real browser runs the plain "any other end tag" algorithm
+        // there: the stack search finds `span`, and popping it takes the
+        // intervening `section` down with it, ending the hidden region at the
+        // explicit `</span>` exactly as an unconditional close already modeled.
+        // `span`, like `b`, is not one of CommonMark's own fixed HTML-block tag
+        // names, so this reaches `track_non_rendering_html`'s self-contained
+        // `Event::InlineHtml` construct the same way the misnested-formatting
+        // case above does — confirmed by mutating `is_formatting_element` to
+        // always answer `true`, which turns this test red too, proving the gate
+        // is doing real work here rather than "some descendant is still open"
+        // alone deciding it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span hidden><section>ignored</span>{} {}</section>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
     {
         // Codex, pull request #138, round 69, finding "Match integration points to

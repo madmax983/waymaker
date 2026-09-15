@@ -2515,6 +2515,25 @@ fn is_void_element(name: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
+/// The HTML5 formatting elements: the fixed set whose own end tag runs the
+/// "adoption agency algorithm" rather than an ordinary close, when the element is
+/// misnested with something opened after it still on the stack (Codex, pull
+/// request #138, round 73, "Preserve hidden formatting after adoption-agency
+/// closes"). No other element gets this treatment — an ordinary misnested `<div>`
+/// or `<span>` just runs HTML5's plain "any other end tag" algorithm, which this
+/// scanner's own `descendants`/`ancestors` truncate-through-match logic already
+/// models correctly.
+const FORMATTING_ELEMENTS: &[&str] = &[
+    "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u",
+];
+
+/// Whether `name` is one of [`FORMATTING_ELEMENTS`], case-insensitively.
+fn is_formatting_element(name: &str) -> bool {
+    FORMATTING_ELEMENTS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
 /// Whether `name` is one of the two HTML5 foreign-content namespace roots — SVG and
 /// `MathML` — the only place ordinary HTML still honors a trailing `/` in
 /// `<tag ... />` as bodyless, XML-style self-closing syntax (Codex, pull request
@@ -3407,8 +3426,20 @@ fn track_non_rendering_html(
                 if !self_closing_in_foreign_content {
                     stack.push(tag.to_owned());
                 }
-            } else if closes_non_rendering_element(html, &top) {
+            } else if closes_non_rendering_element(html, &top)
+                && (descendants.is_empty() || !is_formatting_element(&top))
+            {
                 stack.pop();
+            } else if closes_non_rendering_element(html, &top) {
+                // A *formatting* element's own end tag does not close it while
+                // something opened after it is still open (Codex, pull request
+                // #138, round 73, "Preserve hidden formatting after
+                // adoption-agency closes"), met here for a self-contained
+                // inline construct — see `next_non_rendering_marker`'s own twin
+                // fix for the reasoning. Left as a no-op: `top` stays on
+                // `stack`, and this construct's own markup is still consumed by
+                // the caller (the final `true` below), the same as any other
+                // closing tag that matches nothing this scan may act on.
             } else if let Some(next_tag) = opens_any_tag(html) {
                 if implicitly_closed_by(&top, &next_tag) {
                     // Codex, pull request #138, round 48, "Honor implicit closes
@@ -4107,6 +4138,24 @@ fn next_non_rendering_marker(
                 // already calls this on its own closing tag — the safe no-op this
                 // is when `top` never pushed one, so the frame it did push does
                 // not otherwise outlive the element that opened it.
+                //
+                // Never a *formatting* element's own misnested close here (Codex,
+                // pull request #138, round 73, "Preserve hidden formatting after
+                // adoption-agency closes"): `top` reaches this walk only by being
+                // one of the fixed non-rendering elements, or an arbitrary
+                // `hidden`-suppressed element recognized while `stack` was
+                // otherwise empty — either way, the line that opened it had to be
+                // one `pulldown-cmark` itself classifies as an HTML *block*
+                // (CommonMark's fixed "type 6" tag-name list), and no formatting
+                // element (`is_formatting_element`'s own fixed list — `b`, `em`,
+                // `i`, and the rest) is ever on it. A nested `<b hidden>` reached
+                // *while already scanning* a block-level `top` is tracked here
+                // only as an ordinary `descendants` entry, exactly like any other
+                // nested tag with no `hidden` of its own — this walk never
+                // promotes it to a `top` in its own right, so it is `track_non_rendering_html`'s
+                // self-contained-`Event::InlineHtml` twin, not this function,
+                // that ever meets a formatting element as `top` and needs the
+                // adoption-agency exception; see that function's own fix.
                 track_foreign_content_depth(span, foreign_content);
                 return Some(NonRenderingAdvance::Close(end));
             }
