@@ -5209,14 +5209,73 @@ fn try_alias_candidates<'a>(
     false
 }
 
+/// The `use`/`type` alias and `mod` declarations of `first` in `block_items`
+/// that are actually live from the construction site this search started
+/// from — searched innermost to outermost (`block_items`' own append order
+/// is outer-to-inner, so this reads it in reverse) and stopping at, and
+/// including, the first declaration that is *unconditional*: no
+/// `#[cfg(..)]` of its own at all.
+///
+/// An unconditional declaration shadows everything further out completely
+/// in real Rust, confirmed against real `rustc`: a module-scope alias, or
+/// an outer block's own alias, of the same name is never reachable once an
+/// unconditional inner one exists, whatever it resolves to — the outer one
+/// is not merely a second live branch under some `cfg` this scanner cannot
+/// evaluate, it is dead code no build ever reaches. So once the walk finds
+/// one, everything past it is excluded, and the caller is told module
+/// scope is shadowed too, via the second element (issue #197, Codex review
+/// of the PR: two findings, block-vs-module and block-vs-block, both from
+/// applying no shadowing rule at all — every block-local match, and module
+/// scope beside them, was tried as though all of them could be
+/// simultaneously live the way two `cfg`-gated declarations can).
+///
+/// A declaration that is itself conditional does not stop the walk: it is
+/// included, and the search continues outward, because a `cfg`-gated inner
+/// declaration does not rule out whatever is further out any more than two
+/// `cfg`-gated declarations of one name already fail to rule each other
+/// out. The second element is `true` — module scope stays live — exactly
+/// when the walk exhausts `block_items` without ever finding an
+/// unconditional declaration.
+fn live_block_declarations<'a>(
+    block_items: &[&'a syn::Item],
+    first: &str,
+) -> (Vec<&'a syn::Item>, bool) {
+    let mut live = Vec::new();
+    for item in block_items.iter().rev() {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        let names_first = match item {
+            syn::Item::Mod(module) => ident_name(&module.ident) == first,
+            _ => own_aliases(core::iter::once(*item))
+                .iter()
+                .any(|alias| alias.local == first),
+        };
+        if !names_first {
+            continue;
+        }
+        live.push(*item);
+        if !has_any_cfg(item_attrs(item)) {
+            return (live, false);
+        }
+    }
+    (live, true)
+}
+
 /// [`segments_could_reach_target`]'s block-local module search — split out to
-/// stay under this file's own line-count lint. `None` when no block-local
-/// module is named `first`, so the caller can tell "nothing claimed this
-/// name" apart from "something claimed it and none of the branches reached
-/// `target`" — the same distinction [`try_alias_candidates`]'s own empty
-/// candidate list already lets a caller read from `resolved_elsewhere`.
+/// stay under this file's own line-count lint. `None` when no live
+/// declaration in `live_items` is a module named `first`, so the caller can
+/// tell "nothing claimed this name" apart from "something claimed it and
+/// none of the branches reached `target`" — the same distinction
+/// [`try_alias_candidates`]'s own empty candidate list already lets a
+/// caller read from `resolved_elsewhere`. `block_items` — the full,
+/// unrestricted list — is threaded through to the recursive call
+/// unchanged: [`live_block_declarations`]'s own shadowing answer is about
+/// `first` alone, and a further hop resolves its own, different name
+/// against the whole scope again.
 #[allow(clippy::too_many_arguments)]
 fn try_block_module_candidates<'a>(
+    live_items: &[&'a syn::Item],
     block_items: &[&'a syn::Item],
     first: &str,
     remaining: &[String],
@@ -5227,7 +5286,7 @@ fn try_block_module_candidates<'a>(
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
 ) -> Option<bool> {
-    let block_modules: Vec<&'a [syn::Item]> = own_modules(block_items.iter().copied())
+    let block_modules: Vec<&'a [syn::Item]> = own_modules(live_items.iter().copied())
         .into_iter()
         .filter(|(name, _)| name == first)
         .map(|(_, module_items)| module_items)
@@ -5254,8 +5313,10 @@ fn try_block_module_candidates<'a>(
 
 /// [`segments_could_reach_target`]'s own block-local search — split out to
 /// stay under this file's own line-count lint. Tries a block-local alias
-/// named `first`, then — since neither rules the other out under an
-/// unevaluated `cfg` — a block-local `mod` of the same name.
+/// named `first` among `live_items`, then — since neither rules the other
+/// out under an unevaluated `cfg` — a block-local `mod` of the same name
+/// among `live_items` too. `live_items` is [`live_block_declarations`]'s
+/// own shadowing-aware subset, never the full `block_items` list.
 ///
 /// `Some(true)` once either reaches `target`; `Some(false)` when at least
 /// one candidate of either kind exists but none reaches it, so the caller
@@ -5265,6 +5326,7 @@ fn try_block_module_candidates<'a>(
 /// [`segments_could_reach_target`]'s own docs.
 #[allow(clippy::too_many_arguments)]
 fn try_block_local_candidates<'a>(
+    live_items: &[&'a syn::Item],
     block_items: &[&'a syn::Item],
     first: &str,
     rest: &[String],
@@ -5277,7 +5339,7 @@ fn try_block_local_candidates<'a>(
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
 ) -> Option<bool> {
-    let block_candidates: Vec<UseAlias> = own_aliases(block_items.iter().copied())
+    let block_candidates: Vec<UseAlias> = own_aliases(live_items.iter().copied())
         .into_iter()
         .filter(|candidate| candidate.local == first)
         .collect();
@@ -5306,6 +5368,7 @@ fn try_block_local_candidates<'a>(
     // tried). A one-segment path names an item, not a module to step into.
     if !rest.is_empty() {
         if let Some(reached) = try_block_module_candidates(
+            live_items,
             block_items,
             first,
             rest,
@@ -5401,16 +5464,55 @@ fn segments_could_reach_target<'a>(
     // one contiguous scope to key a cache entry on, and it is small — one
     // construction site's own enclosing blocks. Not shadow-gated — see this
     // function's own docs.
+    // Module scope, and an outer block, are shadowed the moment an
+    // unconditional block-local declaration of `first` exists anywhere in
+    // `block_items` — see `live_block_declarations`'s own docs.
+    let mut module_scope_shadowed = false;
     if block_applies {
-        match try_block_local_candidates(
-            block_items,
+        let (live_items, module_scope_live) = live_block_declarations(block_items, &first);
+        if !live_items.is_empty() {
+            module_scope_shadowed = !module_scope_live;
+            match try_block_local_candidates(
+                &live_items,
+                block_items,
+                &first,
+                rest,
+                stack,
+                scope,
+                entered,
+                innermost_scope,
+                block_eligible,
+                target,
+                budget,
+                cache,
+            ) {
+                Some(true) => return true,
+                Some(false) => resolved_elsewhere = true,
+                None => {}
+            }
+        }
+    }
+
+    if shadowed {
+        return segments.last().is_some_and(|last| last.as_str() == target);
+    }
+
+    // An unconditional block-local declaration of `first` shadows module
+    // scope completely — see `live_block_declarations`'s own docs — so
+    // neither a module-scope alias nor a same-named module is a live
+    // possibility here at all, and `resolved_elsewhere` is already `true`
+    // from the block-local search that found it.
+    if !module_scope_shadowed {
+        match try_module_scope_candidates(
+            items,
             &first,
             rest,
+            &segments,
             stack,
             scope,
             entered,
+            block_items,
             innermost_scope,
-            block_eligible,
             target,
             budget,
             cache,
@@ -5421,19 +5523,38 @@ fn segments_could_reach_target<'a>(
         }
     }
 
-    if shadowed {
-        return segments.last().is_some_and(|last| last.as_str() == target);
-    }
+    !resolved_elsewhere && segments.last().is_some_and(|last| last.as_str() == target)
+}
 
-    // A module-scope alias's own target is never `block_eligible` — see this
-    // function's own docs.
+/// [`segments_could_reach_target`]'s own module-scope search — split out to
+/// stay under this file's own line-count lint. A module-scope alias's own
+/// target is never `block_eligible` — see [`segments_could_reach_target`]'s
+/// own docs — and a hop tries every sibling module of `first`'s name too,
+/// not ruled out by an alias that did not pan out, or by another same-named
+/// module that did not either. Same `Some`/`None` shape as
+/// [`try_block_local_candidates`].
+#[allow(clippy::too_many_arguments)]
+fn try_module_scope_candidates<'a>(
+    items: &'a [syn::Item],
+    first: &str,
+    rest: &[String],
+    segments: &[String],
+    stack: &[&'a [syn::Item]],
+    scope: usize,
+    entered: Option<&'a [syn::Item]>,
+    block_items: &[&'a syn::Item],
+    innermost_scope: usize,
+    target: &str,
+    budget: &mut usize,
+    cache: &mut AliasLookupCache<'a>,
+) -> Option<bool> {
     let module_alias_candidates: Vec<UseAlias> = cache
         .aliases_of(items)
         .iter()
         .filter(|candidate| candidate.local == first)
         .cloned()
         .collect();
-    resolved_elsewhere |= !module_alias_candidates.is_empty();
+    let mut claimed = !module_alias_candidates.is_empty();
     if try_alias_candidates(
         module_alias_candidates,
         rest,
@@ -5447,12 +5568,8 @@ fn segments_could_reach_target<'a>(
         budget,
         cache,
     ) {
-        return true;
+        return Some(true);
     }
-
-    // No alias reached `target` — every sibling module of the same name is still a
-    // live possibility, not ruled out by an alias that did not pan out, or by
-    // another same-named module that did not either.
     if segments.len() > 1 {
         let remaining: Vec<String> = segments.get(1..).unwrap_or_default().to_vec();
         let modules: Vec<&'a [syn::Item]> = cache
@@ -5461,7 +5578,7 @@ fn segments_could_reach_target<'a>(
             .filter(|(name, _)| *name == first)
             .map(|(_, module_items)| *module_items)
             .collect();
-        resolved_elsewhere |= !modules.is_empty();
+        claimed |= !modules.is_empty();
         for module_items in modules {
             if segments_could_reach_target(
                 remaining.clone(),
@@ -5476,12 +5593,11 @@ fn segments_could_reach_target<'a>(
                 budget,
                 cache,
             ) {
-                return true;
+                return Some(true);
             }
         }
     }
-
-    !resolved_elsewhere && segments.last().is_some_and(|last| last.as_str() == target)
+    claimed.then_some(false)
 }
 
 /// Something [`struct_literal_counts`] can count literals inside of, with the
@@ -15581,6 +15697,97 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_block_local_alias_shadows_a_module_scope_one() {
+        // Codex review of PR #204: an unconditional block-local alias
+        // completely shadows a module-scope one of the same name in real
+        // Rust — confirmed against real `rustc`, which even warns the
+        // module-scope alias and the type it names are unused — but the
+        // search still tried module scope as an *additional* branch after
+        // the block-local candidate did not reach `target`, as though the
+        // two could be simultaneously live the way two `cfg`-gated
+        // declarations can.
+        let counts = struct_literal_counts(
+            "type Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_conditional_block_local_alias_still_lets_module_scope_through() {
+        // The control for the test above: once the block-local declaration
+        // is itself `cfg`-gated, it no longer unconditionally shadows
+        // anything, so the module-scope alias stays a live possibility —
+        // this is the ordinary live/live ambiguity every other test in
+        // this module already covers, held here as one more check that the
+        // new shadowing rule does not swallow it.
+        let counts = struct_literal_counts(
+            "type Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_inner_block_alias_shadows_an_outer_block_one() {
+        // Codex review of PR #204: `block_items` is flattened across
+        // enclosing blocks, and the same shadowing rule applies one level
+        // over — an unconditional declaration in the *innermost* block
+        // shadows one from an outer block exactly as it shadows module
+        // scope, confirmed against real `rustc` the same way.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
+             \x20   {\n\
+             \x20       type Unchecked = Decoy;\n\
+             \x20       let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_conditional_inner_block_alias_still_lets_the_outer_one_through() {
+        // The control for the test above: a `cfg`-gated inner declaration
+        // does not unconditionally shadow the outer one, so both stay live.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
+             \x20   {\n\
+             \x20       #[cfg(feature = \"a\")]\n\
+             \x20       type Unchecked = Decoy;\n\
+             \x20       let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 }
 

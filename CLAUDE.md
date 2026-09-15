@@ -5824,5 +5824,33 @@ block-local alias branch does not pan out — mirroring the outer scope's own
 alias-then-module order, and unable to rule either out under an unevaluated `cfg` any more
 than two aliases can rule each other out. `a_block_local_module_is_searched_for_a_qualified_path_head`
 and its control, `a_block_local_module_does_not_count_an_unrelated_name`, are the
-regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+regression.
+
+A further round found a ninth and a tenth together, and both are the same shape:
+real Rust shadowing this backstop had never modelled at all, rather than a further
+ambiguity to branch over. An *unconditional* (no `#[cfg]`) block-local `type`/`use`
+declaration of a name completely shadows any same-named declaration further out — a
+module-scope alias of the same name, or an outer block's own alias of the same name —
+confirmed against real `rustc`: the shadowed declaration and its target type are both
+"never used"/"never constructed" in the compiler's own diagnostics, and neither
+`resolve_local_alias_chain`'s block-local search nor the backstop's own module-scope
+section had ever asked whether a closer, unconditional declaration made the farther one
+dead code. `live_block_declarations` is the fix, shared by both directions: it walks
+`block_items` in reverse — innermost first, the order real Rust shadowing resolves in —
+skipping any `#[cfg(test)]` item (test code is not shipped code, `own_aliases`'s own
+reason), and stops at, and includes, the first *unconditional* (`!has_any_cfg`) match; an
+unconditional match means every declaration further out is dead and reports so, and
+running out with none found means module scope is still a live candidate exactly as
+before. `try_block_local_candidates` and `try_block_module_candidates` now search only
+the live slice this returns rather than the whole of `block_items`, and
+`segments_could_reach_target` wraps its own module-scope alias-and-descent section behind
+the "module scope still live" flag this walk reports, skipping it outright once a
+block-local declaration has shadowed it — two mutually exclusive `#[cfg]`-gated
+declarations of one name still count as separate live branches, exactly as an ambiguous
+alias or module already does, because neither one alone is unconditional.
+`an_unconditional_block_local_alias_shadows_a_module_scope_one` and its control,
+`a_conditional_block_local_alias_still_lets_module_scope_through`, are the ninth's
+regression; `an_unconditional_inner_block_alias_shadows_an_outer_block_one` and its
+control, `a_conditional_inner_block_alias_still_lets_the_outer_one_through`, are the
+tenth's. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
 rule id.
