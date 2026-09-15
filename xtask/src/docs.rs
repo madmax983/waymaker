@@ -5140,6 +5140,34 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_inside_an_iframe_element_does_not_settle_anything() {
+        // Codex, pull request #138, round 52, "Suppress iframe fallback content":
+        // `<iframe>` is a raw-text element like `<script>`/`<style>`, not a nesting one
+        // like `<template>` — a browser that supports iframes never renders its body as
+        // page prose, that body being legacy fallback content for one that cannot embed
+        // the frame at all — but it was missing from the fixed non-rendering element
+        // list entirely, so a marker hidden inside `<iframe>...</iframe>` read as
+        // ordinary visible documentation evidence.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-an-iframe.md".to_owned(),
+            contents: format!(
+                "{}\n<iframe>\n{DEFERRED_QUESTION_MARKER} {}\n</iframe>\n",
+                clean_adr("hidden in an iframe"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside an <iframe> element settled something: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_inside_a_script_nested_in_a_div_does_not_settle_anything() {
         // Codex, pull request #138, round 29: `<div>\n<script>\n...\n</script>\n</div>`
         // is one `HtmlBlock` whose nested `<script>` opens on its own `Event::Html` line
@@ -8705,6 +8733,31 @@ mod tests {
                 "| <a href = \"{}\">recovery proof</a> |",
                 clause.discharged_by
             ),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_raw_html_link_with_a_named_slash_reference_still_counts() {
+        // Codex, pull request #138, round 52, "Decode the full HTML named-reference
+        // set": `decode_character_references` recognized only the five XML entities and
+        // a numeric reference, so a destination that spelled a slash as the standard
+        // named reference `&sol;` — which a browser resolves to `/` exactly the way it
+        // resolves the numeric `&#47;` round 44 already covers — was left undecoded and
+        // never matched the real repository path.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let encoded = clause.discharged_by.replace('/', "&sol;");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href=\"{encoded}\">recovery proof</a> |"),
         );
         let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
         assert!(
