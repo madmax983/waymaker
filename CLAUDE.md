@@ -4110,6 +4110,42 @@ reverted. The tail-expression case reused the same cross-file macro, this time g
 and to a real impl under `cargo test`, with `check-layering` confirmed to report nothing
 for either configuration.
 
+Round 37 found two more, one in each half of round 36's own review. The first is round
+32's own qualified-alias reach one hop further: `direct_scope_module_aliases` copied a
+nested module's own alias *target* straight onto the qualified entry it registers for
+the outer scope, which is right for an ordinary re-export and wrong for a chained one —
+`mod traits { pub use core::clone::Clone as C; pub use self::C as D; } impl traits::D
+for Recovery { .. }` names `self::C`, which is `C` in `traits`' own scope, exactly the
+chained re-export `every_resolution`'s own doc comment already describes resolving
+within a single file's alias table — but the qualified alias `traits::D` carried
+`self::C` unresolved out to the *outer* scope, whose own table has only the qualified
+`traits::C`, never the bare `C` `traits` would resolve it through, so the second hop
+fell through to the harmless-looking last segment, `C`. The fix factors
+`every_resolution`'s own hop-chasing BFS out of its path-specific pre-checks into a new
+`resolve_segment_chain`, taking an already-extracted segment list rather than a
+`syn::Path`, and `direct_scope_module_aliases` now runs a nested module's own alias
+target through it — against that same nested scope, before qualifying — rather than
+handing an unresolved reference to a table with no way to finish resolving it. The
+second is `has_cfg_test`'s own outer filter one spelling further: `#![cfg_attr(not(test),
+cfg(test))]` is exactly as test-only as a bare `#![cfg(test)]`, because rustc's rewrite
+of a `cfg_attr` leaves nothing else it could mean — `cfg(test)` in every build where
+`not(test)` holds (every non-test one, excluding the file) and no attribute at all in
+every build where it does not (every test one, where the guarded `cfg(test)` would have
+excluded nothing anyway) — but `has_cfg_test` read only an attribute whose own path was
+`cfg`, so a `cfg_attr`-spelled equivalent never reached the predicate at all. A new
+`attribute_requires_test` reads the whole attribute, `cfg_attr` included, recursing into
+its own injected items; a new `meta_holds_without_test` is `meta_requires_test`'s dual —
+guaranteed *true* whenever `test` is false, needed because a `cfg_attr`'s own condition
+has to be shown to hold in exactly the builds its guarded `cfg` would have excluded, and
+the two functions call each other for `not(..)`, the connective whose truth table is the
+other's. Both were verified against real compilation: the chained export was injected as
+a real, doubly-nested re-export chain in `waymaker-flash`'s own `recovery` module,
+confirmed to compile (visibility warnings only) and confirmed caught by `check-layering`
+before reverting; and the `cfg_attr` compound was injected the same way round 35's own
+compounds were, confirmed by a duplicate-impl conflict to produce a real `Clone` impl
+only under `cargo test`, and confirmed cleared by `check-layering` in both
+configurations.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

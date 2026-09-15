@@ -58,8 +58,9 @@ fn path_is_ident(path: &syn::Path, name: &str) -> bool {
     path.get_ident().is_some_and(|ident| ident_is(ident, name))
 }
 
-/// Whether `attrs` carries a `#[cfg(..)]` that is guaranteed false whenever `test` is —
-/// the bare `#[cfg(test)]`, or a compound predicate built from it.
+/// Whether `attrs` carries a `#[cfg(..)]` or `#[cfg_attr(.., cfg(..))]` that is
+/// guaranteed false whenever `test` is — the bare `#[cfg(test)]`, a compound `cfg`
+/// predicate built from it, or an equivalent spelled through `cfg_attr`.
 ///
 /// The textual `without_test_modules` blanked on the substring `#[cfg(test)]` alone, and
 /// this function used to match only that exact shape — `path_is_ident(attr.path(),
@@ -72,33 +73,77 @@ fn path_is_ident(path: &syn::Path, name: &str) -> bool {
 /// never hold without it, whatever else it also asks for, and an `any(..)` every one of
 /// whose branches is itself guaranteed test-only can only be satisfied under test — so a
 /// reached file gated with either spelling was still walked as production-reachable.
-/// [`meta_requires_test`] is the recursive predicate; `#[cfg(any(test, other))]` is
+/// [`attribute_requires_test`] is the recursive predicate; `#[cfg(any(test, other))]` is
 /// deliberately *not* recognized, and must not be, because it is satisfiable under
 /// `other` alone — treating it as test-only would hide production-reachable code from
 /// every rule that reads this function's answer as "unreachable in a shipped build".
+///
+/// Round 36 widened it once more: `#![cfg_attr(not(test), cfg(test))]` is exactly as
+/// test-only as a bare `#![cfg(test)]`, because rustc's own rewrite of a `cfg_attr`
+/// leaves nothing else it could mean — expanding to `cfg(test)` in exactly the builds
+/// where `not(test)` holds (every non-test one) and to no attribute at all in every
+/// build where it does not (every test one, where the guarded `cfg(test)` would have
+/// held anyway) — but this function's own outer filter read only an attribute whose
+/// *path* was `cfg`, so a `cfg_attr`-spelled equivalent never reached the predicate at
+/// all. [`attribute_requires_test`] now reads the attribute's own path instead of
+/// requiring the caller to have already stripped it.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        path_is_ident(attr.path(), "cfg")
-            && attr
-                .parse_args::<syn::Meta>()
-                .is_ok_and(|meta| meta_requires_test(&meta))
-    })
+    attrs.iter().any(|attr| attribute_requires_test(&attr.meta))
 }
 
-/// [`has_cfg_test`]'s recursive half, over one `cfg` predicate rather than a whole
-/// attribute list.
+/// [`has_cfg_test`]'s recursive half, over one attribute's parsed [`syn::Meta`] — its
+/// own path included, so a `#[cfg(..)]` and a `#[cfg_attr(.., ..)]` are told apart here
+/// rather than by the caller.
+///
+/// A `cfg(..)` predicate is handed to [`meta_requires_test`], the same recursive
+/// predicate a `cfg_attr`'s own condition is evaluated against — the two questions are
+/// dual, not the same, which is what [`meta_holds_without_test`] answers instead.
+///
+/// A `cfg_attr(condition, injected..)` requires `test` exactly when its own expansion
+/// does: rustc replaces the whole attribute with every `injected` item when `condition`
+/// holds, and removes it entirely otherwise — so the item's presence, considering only
+/// this one attribute, is `!condition || (every injected item's own presence)`. That is
+/// false whenever `test` is false exactly when both `condition` is *guaranteed true*
+/// whenever `test` is false (so the `!condition` branch is not what lets it through) and
+/// at least one `injected` item is itself [`attribute_requires_test`] (so the branch
+/// that does run still requires it) — the same "any disjunct must hold" shape
+/// [`meta_requires_test`]'s own `any(..)` arm already uses, because `!condition ||
+/// injected` is exactly that shape with two disjuncts. Recursing into each `injected`
+/// item through this same function rather than assuming it is a bare `cfg(..)` is what
+/// lets `cfg_attr(.., cfg_attr(.., cfg(test)))` chain arbitrarily deep, the same reach
+/// [`attr_introduces_cfg`]/[`meta_introduces_cfg`] already give a *reached* `cfg`.
+fn attribute_requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::List(list) if path_is_ident(&list.path, "cfg") => list
+            .parse_args::<syn::Meta>()
+            .is_ok_and(|inner| meta_requires_test(&inner)),
+        syn::Meta::List(list) if path_is_ident(&list.path, "cfg_attr") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|metas| {
+                metas.first().is_some_and(meta_holds_without_test)
+                    && metas.iter().skip(1).any(attribute_requires_test)
+            }),
+        _ => false,
+    }
+}
+
+/// [`attribute_requires_test`]'s half over one already-unwrapped `cfg` predicate — the
+/// argument of a `cfg(..)`, or one operand of an `all(..)`/`any(..)`/`not(..)` — rather
+/// than over a whole attribute.
 ///
 /// A bare `test` is the base case. `all(..)` is true only when every one of its
 /// conjuncts is, so naming a predicate this function already recognizes as test-only
 /// anywhere in the list makes the whole `all(..)` test-only too, whatever the other
 /// conjuncts are. `any(..)` is true when at least one of its disjuncts is, so it is
 /// test-only only when *every* disjunct is — one branch this function cannot vouch for
-/// (a bare `feature = ".."`, a `not(..)`, or anything else) is a branch that can fire
-/// without `test`, and an empty `any()` is never true at all so it is not test-only
-/// either. Anything else — `not(..)` included, since a `not` making its argument require
-/// `test` does not make the negation require it — is read as unable to prove, matching
-/// this scan's own rule that guessing is how a broken input talks a check out of
-/// testing it.
+/// (a bare `feature = ".."`, or anything [`meta_holds_without_test`] cannot prove either)
+/// is a branch that can fire without `test`, and an empty `any()` is never true at all
+/// so it is not test-only either. `not(..)` is test-only exactly when its own argument
+/// is guaranteed to *hold* whenever `test` is false — see [`meta_holds_without_test`],
+/// its dual — and an unrecognized shape is read as unable to prove, matching this scan's
+/// own rule that guessing is how a broken input talks a check out of testing it.
 fn meta_requires_test(meta: &syn::Meta) -> bool {
     match meta {
         syn::Meta::Path(path) => path_is_ident(path, "test"),
@@ -112,6 +157,41 @@ fn meta_requires_test(meta: &syn::Meta) -> bool {
                 syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
             )
             .is_ok_and(|metas| !metas.is_empty() && metas.iter().all(meta_requires_test)),
+        syn::Meta::List(list) if path_is_ident(&list.path, "not") => list
+            .parse_args::<syn::Meta>()
+            .is_ok_and(|inner| meta_holds_without_test(&inner)),
+        _ => false,
+    }
+}
+
+/// [`meta_requires_test`]'s dual: whether `meta` is guaranteed **true** whenever `test`
+/// is false, over the same predicate grammar.
+///
+/// No bare identifier or key-value pair is ever recognized here, `test` itself
+/// included — `test` is false exactly when `test` is false, never guaranteed *true*
+/// then, and nothing else (`debug_assertions`, `feature = ".."`) is a fact this scan can
+/// assume about an unrelated flag. `not(P)` holds whenever `test` is false exactly when
+/// `P` is guaranteed false whenever `test` is false, which is [`meta_requires_test`]
+/// applied to `P` — the two functions call each other rather than duplicating one
+/// another's cases. `all(..)` holds whenever `test` is false only if *every* conjunct
+/// does, and `any(..)` only needs *one* disjunct that does, matching each connective's
+/// own truth table rather than [`meta_requires_test`]'s (which asks the opposite
+/// question of the opposite condition).
+fn meta_holds_without_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::List(list) if path_is_ident(&list.path, "not") => list
+            .parse_args::<syn::Meta>()
+            .is_ok_and(|inner| meta_requires_test(&inner)),
+        syn::Meta::List(list) if path_is_ident(&list.path, "all") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|metas| !metas.is_empty() && metas.iter().all(meta_holds_without_test)),
+        syn::Meta::List(list) if path_is_ident(&list.path, "any") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|metas| metas.iter().any(meta_holds_without_test)),
         _ => false,
     }
 }
@@ -997,8 +1077,6 @@ const GLOB_IMPORT_MARKER: &str = "*";
 /// harmless-looking name `C` exactly the way a bare `crate::C` used to — every
 /// `crate`-qualified path fails closed now, regardless of length.
 fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
-    const MAX_CANDIDATES: usize = 64;
-
     if path.leading_colon.is_some() {
         // Round 34: an absolute path (`::dep::C`) reaches the extern prelude — which,
         // through `extern crate self as dep;`, can be this very crate under another
@@ -1043,6 +1121,29 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
+    resolve_segment_chain(segments, aliases)
+}
+
+/// [`every_resolution`]'s own hop-chasing BFS, factored out over an already-extracted
+/// segment list rather than a [`syn::Path`] — everything past `every_resolution`'s own
+/// path-shaped pre-checks (a leading `::`, a generic argument on an aliased segment),
+/// which have no equivalent once a target is already a plain `Vec<String>`.
+///
+/// [`direct_scope_module_aliases`] is the other caller, and the reason this split
+/// exists: round 37 of Codex review on this change (PR #143) found that a *chained*
+/// export inside a nested module — `mod traits { pub use core::clone::Clone as C; pub
+/// use self::C as D; }` — registered `traits::D`'s synthetic alias with the target
+/// `self::C` copied verbatim, never resolved against `traits`' own scope where `C` is
+/// declared. The next hop then looked `self::C` up in the *outer* file's alias table,
+/// which only has `traits::C` — the qualified name — not the bare `C` `traits`'s own
+/// scope would resolve it through, so the lookup fell through to the harmless-looking
+/// last segment, `C`, instead of chasing the second hop to `Clone`. Calling this same
+/// function against the nested module's *own* alias list, exactly as `every_resolution`
+/// already would if `self::C` had been written where `every_resolution` could see it, is
+/// what closes it — the same resolution a real compiler performs, run once more before
+/// the qualifying prefix is added, rather than a second, narrower implementation of it.
+fn resolve_segment_chain(segments: Vec<String>, aliases: &[UseAlias]) -> Vec<String> {
+    const MAX_CANDIDATES: usize = 64;
 
     let mut frontier = vec![segments];
     let mut finished: Vec<String> = Vec::new();
@@ -1505,15 +1606,27 @@ fn direct_scope_module_aliases<'a>(
         };
         let name = ident_name(&module.ident);
         let nested_items: Vec<&syn::Item> = nested.iter().collect();
-        let qualified = direct_scope_aliases(nested_items.iter().copied())
+        let scope: Vec<UseAlias> = direct_scope_aliases(nested_items.iter().copied())
             .into_iter()
-            .chain(direct_scope_module_aliases(nested_items.iter().copied()));
-        for alias in qualified {
-            aliases.push(UseAlias {
-                local: format!("{name}::{}", alias.local),
-                target: alias.target,
-                absolute: alias.absolute,
-            });
+            .chain(direct_scope_module_aliases(nested_items.iter().copied()))
+            .collect();
+        // Round 37: `alias.target` used to be copied straight onto the qualified
+        // entry, which is right for an ordinary re-export (`pub use core::clone::Clone
+        // as C;`, target `["core", "clone", "Clone"]`, nothing further to chase) and
+        // wrong for a *chained* one (`pub use self::C as D;`, target `["self", "C"]`)
+        // — `self::C` names `C` in *this* nested module's own scope, which `scope`
+        // already holds, but was never resolved against it before being prefixed and
+        // handed to the outer caller. `resolve_segment_chain` is `every_resolution`'s
+        // own hop-chasing, run here against `scope` before qualifying rather than
+        // left for a second hop the outer alias table has no way to complete.
+        for alias in &scope {
+            for resolved in resolve_segment_chain(alias.target.clone(), &scope) {
+                aliases.push(UseAlias {
+                    local: format!("{name}::{}", alias.local),
+                    target: vec![resolved],
+                    absolute: false,
+                });
+            }
         }
     }
     aliases

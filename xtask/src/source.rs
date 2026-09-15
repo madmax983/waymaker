@@ -13189,6 +13189,49 @@ mod tests {
     }
 
     #[test]
+    fn a_chained_export_inside_a_nested_module_resolves_to_its_own_real_target() {
+        // Found by Codex review of this change (PR #143), round 37: `mod traits { pub
+        // use core::clone::Clone as C; pub use self::C as D; } impl traits::D for
+        // Recovery { .. }` is legal Rust — `self::C` names `C` in `traits`' own scope,
+        // exactly the chained re-export `every_resolution`'s own doc comment already
+        // describes resolving within a *single* file's alias table. But
+        // `direct_scope_module_aliases` copied `D`'s target, `self::C`, onto the
+        // qualified alias `traits::D` unresolved, so the next hop looked `self::C` up
+        // in the *outer* file's own alias table — which has only the qualified
+        // `traits::C`, never the bare `C` `traits`'s own scope would resolve it
+        // through — and fell through to the harmless-looking last segment, `C`,
+        // instead of chasing the second hop to `Clone`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub use core::clone::Clone as C;\n",
+                "    pub use self::C as D;\n",
+                "}\n",
+                "impl traits::D for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_reached_file_carrying_an_attribute_macro_this_scan_cannot_expand_is_rejected() {
         // Found by Codex review of this change (PR #143), round 31: `declares_item_macro`
         // flagged an item-, statement- or type-position macro *invocation*, but never
@@ -13666,6 +13709,70 @@ mod tests {
         });
         let violations = check_recovery_surface(&sources);
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_file_gated_with_an_equivalent_cfg_attr_spelling_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 37: `#![cfg_attr(
+        // not(test), cfg(test))]` is exactly as test-only as a bare `#![cfg(test)]` —
+        // rustc replaces the whole attribute with `cfg(test)` in every build where
+        // `not(test)` holds (every non-test one, where the injected `cfg(test)` then
+        // excludes the file) and removes it entirely in every build where `not(test)`
+        // does not hold (every test one, where the file stays present) — but
+        // `has_cfg_test`'s old outer filter read only an attribute whose own path was
+        // `cfg`, so this `cfg_attr`-spelled equivalent never reached the predicate at
+        // all and the file was walked as production-reachable.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg_attr(not(test), cfg(test))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_cfg_attr_whose_condition_can_hold_without_test_is_still_production_reachable() {
+        // The negative case: `#![cfg_attr(feature = "x", cfg(test))]` only excludes the
+        // file when `feature = "x"` is enabled — with that feature off, the attribute
+        // vanishes entirely and the file stays present regardless of `test` — so it
+        // must not be read as test-only. `meta_holds_without_test` cannot prove
+        // `feature = "x"` is guaranteed true whenever `test` is false, and must not:
+        // a build with neither `test` nor the feature enabled leaves the file in a
+        // shipped image.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg_attr(feature = \"x\", cfg(test))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
     }
 
     #[test]
