@@ -1885,7 +1885,18 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
                 ordinary_descendants: Vec::new(),
             });
         }
-    } else if is_html_integration_point(span, name) {
+    } else if !foreign_content.is_empty() && is_html_integration_point(span, name) {
+        // An HTML integration point is only ever real while it is genuinely being
+        // inserted into the SVG or MathML namespace (Codex, round 68, "Require a
+        // foreign namespace before opening integration frames") — `is_html_integration_point`
+        // matches on the tag's own name and attributes alone, blind to whether any
+        // foreign root is open at all. `<mtext><mglyph><script
+        // />decision-id headline</script></mglyph></mtext>` with no enclosing
+        // `<math>` has `mtext` as nothing more than an unrecognized ordinary HTML
+        // element — self-closing never honored, `<script />` opening for real and
+        // hiding its own body — but opening an integration-point frame for it
+        // regardless let the following `mglyph` exception wrongly re-enter
+        // "MathML" that was never really open, treating `<script />` as bodyless.
         if !self_closes_immediately {
             foreign_content.push(ForeignFrame {
                 name: name.to_ascii_lowercase(),
@@ -1900,7 +1911,23 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
         // content" rules — recorded on the innermost frame alone (Codex, round 61),
         // so a later `mglyph`/`malignmark` can tell it is no longer a direct child.
         if let Some(top) = foreign_content.last_mut() {
-            top.ordinary_descendants.push(name.to_ascii_lowercase());
+            let lower = name.to_ascii_lowercase();
+            // Applies its own implicit closes to the frame's own descendant stack
+            // first (Codex, round 68, "Drop implicitly closed integration-point
+            // descendants"), the same discipline round 66 gave the plain
+            // `ancestors`/`descendants` stacks: `<mtext><p><div></div><mglyph>...`
+            // has `div` implicitly close the open `p`, so a browser recovers with
+            // `mglyph` once again a direct child of `mtext` — but appending `div`
+            // without first popping the stale `p` left `ordinary_descendants`
+            // nonempty, wrongly failing the `mglyph` exception's direct-child check.
+            while top
+                .ordinary_descendants
+                .last()
+                .is_some_and(|open| implicitly_closed_by(open, &lower))
+            {
+                top.ordinary_descendants.pop();
+            }
+            top.ordinary_descendants.push(lower);
         }
     }
 }
@@ -2219,11 +2246,15 @@ fn track_non_rendering_html(
                     // (Codex, round 66, "Apply implicit closes to tracked hidden
                     // descendants"), met here for a self-contained inline construct —
                     // see `next_non_rendering_marker`'s own twin fix for the reasoning.
-                    while descendants
-                        .last()
-                        .is_some_and(|open| implicitly_closed_by(open, &next_tag))
+                    // Searched and truncated through the whole stack, not only its
+                    // top (Codex, round 68, "Truncate through implicitly closed
+                    // hidden descendants") — see that fix's own twin for the
+                    // reasoning.
+                    if let Some(pos) = descendants
+                        .iter()
+                        .rposition(|open| implicitly_closed_by(open, &next_tag))
                     {
-                        descendants.pop();
+                        descendants.truncate(pos);
                     }
                     descendants.push(next_tag);
                 }
@@ -2969,11 +3000,19 @@ fn next_non_rendering_marker(
             // away with it — leaving the following `</div>` to match nothing here
             // and fall through to `ancestors`, where the outer element happened to
             // share its name.
-            while descendants
-                .last()
-                .is_some_and(|open| implicitly_closed_by(open, &name))
+            //
+            // Searched and truncated through the whole stack, not only its top
+            // (Codex, round 68, "Truncate through implicitly closed hidden
+            // descendants"): the same "any other end tag"-shaped gap round 67 found
+            // in `track_ordinary_ancestor` — `<p><span><div>` has `div` implicitly
+            // close `p` two levels down, taking the intervening `span` with it, but
+            // checking only `descendants.last()` (`span`) never found the `p` at
+            // all, leaving both stale for a later stray close to wrongly match.
+            if let Some(pos) = descendants
+                .iter()
+                .rposition(|open| implicitly_closed_by(open, &name))
             {
-                descendants.pop();
+                descendants.truncate(pos);
             }
             descendants.push(name);
         }

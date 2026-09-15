@@ -7888,6 +7888,149 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_a_script_inside_a_bare_mtext_with_no_math_ancestor_stays_hidden() {
+        // Codex, pull request #138, round 68, finding "Require a foreign namespace
+        // before opening integration frames": `is_html_integration_point` matches
+        // on a tag's own name and attributes alone, blind to whether any foreign
+        // root is open at all — but an HTML integration point is only ever real
+        // while it is genuinely being inserted into the SVG or MathML namespace.
+        // `text <mtext><mglyph><script />decision-id headline</script></mglyph>
+        // </mtext>` has no enclosing `<math>` at all, so `mtext` is nothing more
+        // than an unrecognized ordinary HTML element to a real browser — but
+        // opening an integration-point frame for it regardless let the following
+        // `mglyph` exception wrongly re-enter "MathML" that was never really open,
+        // treating `<script />` as bodyless and exposing the id and headline that
+        // follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <mtext><mglyph><script />{} {}</script></mglyph></mtext>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_after_a_div_implicitly_closes_a_paragraph_inside_mtext_still_counts()
+     {
+        // Codex, pull request #138, round 68, finding "Drop implicitly closed
+        // integration-point descendants": pushing an ordinary tag onto a frame's
+        // own `ordinary_descendants` never first checked whether it implicitly
+        // closes the descendant already on top — the round-66 fix for the plain
+        // `ancestors`/`descendants` stacks, never extended to this one.
+        // `<math><mtext><p><div></div><mglyph><script /></mglyph>decision-id
+        // headline</mtext></math>` has the `<div>` implicitly close the open `<p>`
+        // — HTML5's "close a p element" rule — so a browser recovers and `mglyph`
+        // is once again a genuine *direct* child of `mtext`, reopening real MathML
+        // parsing for its bodyless `<script />`. Appending `div` without first
+        // popping the stale `p` left `ordinary_descendants` nonempty, wrongly
+        // failing `mglyph`'s direct-child check and reading the script as a real,
+        // unclosed HTML one that hides the id and headline that follow instead of
+        // leaving them visible.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><p><div></div><mglyph><script /></mglyph>{} {}</mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_a_section_after_a_div_implicitly_closes_a_paragraph_two_descendants_deep_stays_hidden()
+     {
+        // Codex, pull request #138, round 68, finding "Truncate through implicitly
+        // closed hidden descendants": the round-66 implicit-close-before-push fix
+        // for the descendant stack only ever checked `descendants.last()`, not the
+        // whole stack — the same "any other end tag"-shaped gap round 67 found and
+        // fixed for `track_ordinary_ancestor`, still open here.
+        // `<div><section hidden><p><span><div></p></div>decision-id
+        // headline</section></div>` has the inner `<div>` implicitly close the
+        // `<p>` two levels down, taking the intervening `<span>` with it — but
+        // checking only the top never found the `<p>`, leaving both stale. The
+        // stray `</p>` that follows then matched that stale `p` and cleared the
+        // entire descendant stack, so the real closing `</div>` matched nothing
+        // and fell through to `ancestors`, where the *outer* `div` happened to
+        // share its name, prematurely ending the hidden `section` and exposing
+        // the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><section hidden><p><span><div></p></div>{} {}</section></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_an_inline_section_after_a_div_implicitly_closes_a_paragraph_two_descendants_deep_stays_hidden()
+     {
+        // Codex, pull request #138, round 68, finding "Truncate through implicitly
+        // closed hidden descendants", met here for `track_non_rendering_html`'s
+        // own self-contained-`Event::InlineHtml` twin of the fix above. `text
+        // <div><span hidden><p><em><div></p></div>decision-id
+        // headline</span></div>` has the same construct as the block-level test,
+        // reached through a paragraph's inline HTML events instead of one raw
+        // HTML line: the inner `<div>` implicitly closes the `<p>` two levels
+        // down, taking the intervening `<em>` with it — but checking only the top
+        // left both stale here too, so the stray `</p>` that follows cleared the
+        // entire descendant stack and the real closing `</div>` fell through to
+        // `ancestors`, where the *outer* `div` happened to share its name,
+        // force-closing the hidden `span` early.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <div><span hidden><p><em><div></p></div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_hidden_in_a_span_after_a_div_implicitly_closes_a_sibling_paragraph_stays_hidden()
     {
         // Codex, pull request #138, round 62, finding "Remove implicitly closed
