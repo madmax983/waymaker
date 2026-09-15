@@ -73,6 +73,13 @@ stopping offset and the same verdict. Fixing one without the other is exactly th
 test exists to catch, and it did: the first attempt at this change fixed only `Recovery`, and
 `a_recovery_reads_what_a_scan_reads` failed within the hour.
 
+**Only an outcome may be ignored this way.** `frame::redeliverable_kind` reads the record the
+same, already-verified decode produced and answers `true` for exactly `EffectCompleted`,
+`EffectFailed` and `TimerFired` — the three kinds whose retry §10's capacity reserve prices,
+below. Every other kind — `RunStarted`, a schedule, a version marker, a terminal record —
+still ends the scan as `Ending::Unsealed` when its seal does not hold, exactly as it always
+did before this issue. See [Consequences](#consequences) for why the scope stops there.
+
 **`Recovery::next`'s one call to the codec stays one call.** `RECOVERY_ROUTING_STEPS` pins
 `next` to exactly one call to `frame::decode_with::<C>`, so that a recovery always verifies
 with the check its caller chose. Answering "is this frame sealed" needs a decode, and
@@ -94,38 +101,66 @@ stands, unchanged, for that case. `waymaker-drive`'s and `waymaker-rig`'s row-5 
 both outcomes and require each to occur, rather than asserting only the refusal ADR 0027
 recorded.
 
-**The fix is generic over the record kind.** `Recovery` and `Scan` decode bytes, not kinds, so
-the same rule applies to a schedule record, a timer record or a version marker left unsealed
-the same way. None of them costs anything by being ignored: an unsealed schedule record's
-effect was never dispatched — §07 dispatches after the commit barrier, at step 4 — so losing
-it is what §14 already asked for, now without losing the bank to get there.
+**The fix is scoped to outcomes, not generic over the record kind.** The first version of
+this ADR let `Recovery` and `Scan` ignore an unsealed frame of *any* kind, on the reasoning
+that they decode bytes, not kinds, and that losing an unsealed schedule, marker or terminal
+record costs nothing because nothing downstream depended on it yet. That reasoning is right
+for a schedule, a marker and a terminal record's own *replay effect* — but it is silent about
+*capacity*, and capacity is exactly where it broke, twice, on this same pull request's own
+review. `frame::redeliverable_kind` now answers `true` for exactly three kinds —
+`EffectCompleted`, `EffectFailed`, `TimerFired` — and `false` for everything else
+(`RunStarted`, a schedule, a version marker, a terminal record), which reverts every other
+kind to the pre-issue-#95 refusal: an unsealed one of those still ends the scan as
+`Ending::Unsealed`, no append point, exactly as it always did. `Recovery::sealed` decodes the
+frame once (the same decode the seal check already needed) and hands `past_the_seal_slot` a
+`Seal::Torn { redeliverable }` rather than a bare `bool`; `Scan::next` gates its own `clean`
+check on the same function, since it already holds the decoded frame in scope. Neither reader
+gained a second call to `frame::decode_with` — the kind was already being computed and
+discarded.
 
-**The capacity reserve had to widen for it.** A completion record is the one kind where
-"ignored and redelivered" is not free: the effect was already dispatched, so a torn,
-ignored attempt costs `outcome_bytes` of media the bank cannot get back, and dispatch
-happens on `Ending::Clean` — before capacity is ever checked — so the activity is
-redelivered whether or not there is still room to record its outcome. A schedule admitted at
+**Why capacity is the line, and why it falls in different places for different kinds.** An
+outcome is the one case where the *effect already ran* — §07 dispatches at step 4, before the
+outcome frame is even staged at step 5 — so losing the record and keeping the bank is a pure
+win: the alternative was `continue_as_new`, and this ADR's whole point is that redelivering in
+place is strictly better than that. Losing a *schedule* is free by the same argument row 5
+already makes: an unsealed schedule's effect was never dispatched, so there is nothing to
+protect. But the outcome's redelivery is not free to the *bank*: recovery ignoring a torn
+outcome attempt still costs `outcome_bytes` of media that cannot be reclaimed, and — this is
+where the first version of this ADR stopped looking — dispatch happens on `Ending::Clean`,
+*before* capacity is ever checked, so the activity gets redelivered whether or not there is
+still room to record its result. §10's reserve prices exactly this: `redelivery_slack`, below.
+A torn *terminal* record redelivering in place is a *second*, independent instance of the
+same shape, and it is worse in one respect — the terminal is the run's only exit, so failing
+to ever record it strands the run for good, not merely refuses one more effect. Codex found
+both, in two separate review rounds of the same mechanism, and the second finding is what
+settled the scope: rather than widen the reserve a second time for a kind (and prove it sound
+for every kind after that — `RunStarted`'s own retry safety turns out to depend on the
+*relative* sizes of `run_input_bytes` against everything else in `Bounds`, which no single
+constant term fixes in general), the fix is scoped to the one kind whose retry-safety has an
+actual, checked, static reservation behind it.
+
+**The capacity reserve widens for the outcome, and only the outcome.** A schedule admitted at
 §10's reserve boundary used to leave room for exactly one outcome and the terminal record;
 after one torn-and-ignored attempt that is down to the terminal record alone, and the retry
-that has to record the *real* outcome refuses with `Refusal::NearCapacity` — on every later
-boot, forever, after the activity has already run again. Codex found this on review of the
-fix above: it is a real regression this ADR's own first version introduced, because before
-it, any torn outcome refused the whole bank *before* redelivering, and never reached this
-state. `Reserve::exit_bytes_after`'s `EffectScheduled`/`TimerScheduled` arm and
-`Reserve::for_layout`'s floor both now add one more `outcome_bytes` —
-`redelivery_slack` — so one wasted attempt is always affordable. A second tear on the retry
-itself is outside what this covers, the same standing this codebase gives its other
-single-crash guarantees rather than an unbounded one.
+that has to record the *real* outcome would refuse with `Refusal::NearCapacity` — on every
+later boot, forever, after the activity has already run again. `Reserve::exit_bytes_after`'s
+`EffectScheduled`/`TimerScheduled` arm and `Reserve::for_layout`'s floor both now add one more
+`outcome_bytes` — `redelivery_slack` — so one wasted attempt is always affordable. A second
+tear on the retry itself is outside what this covers, the same standing this codebase gives
+its other single-crash guarantees rather than an unbounded one.
 `a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry` drives the exact
 shape: a schedule at the boundary, a torn outcome attempt, a fresh recovery, and a retry that
-now fits — verified to fail without `redelivery_slack` before it existed.
+now fits — verified to fail without `redelivery_slack` before it existed. No such term exists
+for any other kind, which is exactly why no other kind is in `redeliverable_kind`'s set.
 
-**Numbers.** `cargo xtask size`: the `default` row moves from 12820 B to 12920 B of the 13312 B
-gate ADR 0036 set — 92 B for the recovery fix's two new methods and the loop, and 8 B more for
-`redelivery_slack` — no raise asked for and 392 B left. `cargo xtask profile`: zero heap
-blocks on all four workloads, unchanged. Runtime RAM and kernel state are unmoved —
-`Recovery`'s own fields did not change, only a local, frame-only struct (`Staged`) gained one
-field and two private methods joined it, and `Reserve` gained no field at all.
+**Numbers.** `cargo xtask size`: the `default` row moves from 12820 B to 12964 B of the 13312 B
+gate ADR 0036 set — 92 B for the recovery fix's two new methods and the loop, 8 B for
+`redelivery_slack`, and 44 B for `redeliverable_kind` and the two call sites that read it — no
+raise asked for and 348 B left. `cargo xtask profile`: zero heap blocks on all four workloads,
+unchanged. Runtime RAM and kernel state are unmoved — `Recovery`'s own fields did not change,
+only a local, frame-only struct (`Staged`) gained one field, two private methods joined it,
+`sealed`'s own return type widened from a `bool` to a two-variant `Seal`, and `Reserve`
+gained no field at all.
 
 **`waymaker-rig`'s own row classification needed a signal of its own.** The rig judges only
 what a board could: it has no access to which byte of a program call a crash landed on, so it
@@ -137,8 +172,12 @@ media a board has. `waymaker_rig::matrix::Row`'s own vocabulary, and the model's
 counts, did not move: `waymaker-drive`'s classification already used the injected operation
 and its progress, not `Ending`, so it was never resting on the ambiguity this issue removes.
 The rig's own resume-sweep census (`a_reset_at_any_point_of_a_resume_leaves_a_part_the_rig_judges_healthy`)
-grew, from 46 797 to 48 534 cuts and 15 990 to 16 536 inside a mark, because crash points that
-used to fail `rig.verify` before a resume was ever attempted are now healthy, resumable parts.
+moved twice: first from 46 797 to 48 534 cuts and 15 990 to 16 536 inside a mark, when every
+kind was redeliverable and more crash points reached a healthy, resumable part than
+`rig.verify` used to filter out before a resume was ever attempted; then back down to
+47 276 cuts and 16 133 inside a mark once the scope narrowed to outcomes, because a torn
+`RunStarted`, schedule, marker or terminal record is once again a part `rig.verify` filters
+out before resuming, exactly as it always was outside the three redeliverable kinds.
 
 **What is still owed.** `waymaker-spec`'s ghost model is untouched, on purpose: it already
 models the two-barrier write more coarsely than this, with no transition for the state a

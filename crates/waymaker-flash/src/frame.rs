@@ -497,6 +497,31 @@ pub enum Decoded<'a> {
     UnknownKind(RecordKind),
 }
 
+/// Whether issue [#95](https://github.com/madmax983/waymaker/issues/95)'s ignore-and-continue
+/// rule may apply to an unsealed frame decoded as `decoded`.
+///
+/// Scoped to the three kinds whose effect already ran, or whose deadline was already
+/// observed elapsed, by the time this write was attempted: `EffectCompleted`,
+/// `EffectFailed`, `TimerFired`. §10's capacity reserve prices exactly one wasted retry of
+/// *these* three — `Reserve::exit_bytes_after`'s `redelivery_slack`, reserved when the
+/// schedule ahead of them is admitted — so it is only these three whose retry is provably
+/// still affordable after one ignored attempt. Every other kind — `RunStarted`, a schedule,
+/// a version marker, a terminal record — has no such reservation and reverts to the
+/// pre-issue-#95 refusal: an unsealed one of those still ends the scan as `Unsealed`, no
+/// append point, exactly as it always did. Widening this set needs a matching widening of
+/// the capacity reserve first, not the other way around.
+#[must_use]
+pub(crate) const fn redeliverable_kind(decoded: &Decoded<'_>) -> bool {
+    matches!(
+        decoded,
+        Decoded::Record(
+            RecordRef::EffectCompleted { .. }
+                | RecordRef::EffectFailed { .. }
+                | RecordRef::TimerFired { .. }
+        )
+    )
+}
+
 /// One decoded frame, and how much of the input it occupied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame<'a> {
@@ -1620,11 +1645,16 @@ impl<'a, C: IntegrityCheck> Iterator for Scan<'a, C> {
                 // If a byte in `[frame.frame_len, next)` is not erased, this reader cannot
                 // tell an interrupted append from damage — nothing legitimate should be
                 // there — and `Unsealed` stands exactly as it always has.
-                let clean = self
-                    .offset
-                    .checked_add(frame.frame_len)
-                    .and_then(|padding_at| self.journal.get(padding_at..next))
-                    .is_some_and(|slot| slot.iter().all(|byte| *byte == ERASED_BYTE));
+                //
+                // `redeliverable_kind` gates the whole check on the record's own kind, not
+                // only on erasure: §10's capacity reserve only prices a wasted retry for an
+                // outcome, so only an outcome may be ignored here — see its own doc comment.
+                let clean = redeliverable_kind(&frame.decoded)
+                    && self
+                        .offset
+                        .checked_add(frame.frame_len)
+                        .and_then(|padding_at| self.journal.get(padding_at..next))
+                        .is_some_and(|slot| slot.iter().all(|byte| *byte == ERASED_BYTE));
                 if clean {
                     self.offset = next;
                     continue;

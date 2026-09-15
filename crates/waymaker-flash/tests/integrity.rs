@@ -205,6 +205,18 @@ const fn crc16_arc(bytes: &[u8]) -> u16 {
     crc
 }
 
+/// Whether issue #95's ignore-and-continue rule ever applies to a torn `record`, mirroring
+/// `frame::redeliverable_kind` (not `pub` outside the crate, so restated here rather than
+/// imported): only an outcome's own retry is priced into §10's capacity reserve.
+const fn is_redeliverable(record: &RecordRef<'_>) -> bool {
+    matches!(
+        record,
+        RecordRef::EffectCompleted { .. }
+            | RecordRef::EffectFailed { .. }
+            | RecordRef::TimerFired { .. }
+    )
+}
+
 /// The records the sweeps run over: one per [`RecordRef`] variant, plus one long enough to
 /// span several program units at every alignment.
 ///
@@ -537,12 +549,14 @@ fn a_write_torn_at_a_program_unit_boundary_is_never_read_as_a_record() {
 
                 // A record on its own, with nothing programmed after it, is never read as a
                 // record whatever the tear — but since issue #95 it is not always refused
-                // *either*: a tear at or before the frame's own padded length leaves
-                // nothing but erased media behind it, which the reader now treats as a
-                // safe place to keep writing rather than as damage.
+                // *either*: for an outcome (`EffectCompleted`/`EffectFailed`/`TimerFired`),
+                // a tear at or before the frame's own padded length leaves nothing but
+                // erased media behind it, which the reader now treats as a safe place to
+                // keep writing rather than as damage. Every other kind has no capacity
+                // reserved for a wasted retry, so it still refuses exactly as it always did.
                 let frame_len = FRAME_OVERHEAD_BYTES + payload_len(&record);
                 let padded = frame::body_len(&record, align).expect("this record encodes");
-                let recoverable = cut >= frame_len && cut <= padded;
+                let recoverable = is_redeliverable(&record) && cut >= frame_len && cut <= padded;
                 assert!(
                     !reads_as_a_record(&torn[..written], align),
                     "{record:?} at {bytes} torn after {cut} of {written} B decoded as a record"

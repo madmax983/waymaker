@@ -3587,32 +3587,46 @@ tell an interrupted append from damage, and the bank is still refused exactly as
 [ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)
 says of media nothing legitimate should be in. `waymaker-drive`'s and `waymaker-rig`'s own
 row-5 tests sweep both outcomes rather than only the one that used to hold.
-The fix is generic over the record kind rather than specific to completions, so a schedule
-or a timer record left unsealed the same way is now redeliverable too, with nothing lost:
-§02 decision 3 makes an unsealed *schedule* record one whose effect was never dispatched
-either way. `Recovery::next`'s one call to `frame::decode_with::<C>` is kept in a private
+The fix is scoped to an outcome rather than generic over every record kind — the first
+version of this issue let any unsealed frame be ignored, and Codex's review of it found the
+scope was the mistake. `frame::redeliverable_kind` answers `true` for exactly
+`EffectCompleted`, `EffectFailed` and `TimerFired`, read from the same decode `sealed` already
+needs to check the seal, so neither `Recovery` nor `Scan` pays for a second call to
+`frame::decode_with::<C>` to ask. Every other kind — `RunStarted`, a schedule, a version
+marker, a terminal record — still ends the scan as `Ending::Unsealed` when its seal does not
+hold, exactly as it always did: losing a schedule is free by row 5's own argument (an
+unsealed schedule's effect was never dispatched either way), but losing a *terminal* record
+this way is not, and neither is losing `RunStarted` in general — see the capacity paragraph
+below for why. `Recovery::next`'s one call to `frame::decode_with::<C>` is kept in a private
 `sealed` helper for the `integrity-check` routing pin's sake, and the loop this needed is
 bounded the same way every offset advance in this module already is — by `stride > 0` — so a
 chain of ignored slots from repeated crashes still terminates over a region of finite length.
-Costs 100 B of layers, 12920 B of 13312 with 392 B left and no raise asked for; runtime RAM and
-kernel state are unmoved, because nothing here grows what `Recovery` carries between calls.
-`waymaker-spec`'s ghost model is untouched: it already treats the two-barrier write as coarser
-than this — see [what is not checked](#what-is-not-checked)'s note that the model "has no
-transition for the state §07's payload barrier creates" — so this is a fact about bytes the
-model was never fine-grained enough to see change.
+Costs 100 B of layers for the recovery fix and 44 B more for `redeliverable_kind`, 12964 B of
+13312 with 348 B left and no raise asked for; runtime RAM and kernel state are unmoved,
+because nothing here grows what `Recovery` carries between calls. `waymaker-spec`'s ghost
+model is untouched: it already treats the two-barrier write as coarser than this — see
+[what is not checked](#what-is-not-checked)'s note that the model "has no transition for the
+state §07's payload barrier creates" — so this is a fact about bytes the model was never
+fine-grained enough to see change.
 
-Redelivering in place moved a cost that used to be absorbed by starting a fresh run: the
-bytes a torn, ignored attempt consumes cannot be reclaimed on NOR, and §10's capacity reserve
-priced a schedule against only the *real* outcome that would eventually land, not against one
-that might be wasted first. `Reserve::exit_bytes_after`'s `EffectScheduled`/`TimerScheduled`
-arm and `Reserve::for_layout`'s floor both now reserve one extra outcome's worth —
-`redelivery_slack` — so a single tear at the reserve boundary cannot strand the run: without
-it, dispatch happens on `Ending::Clean`, before capacity is ever checked, so the activity
-would be redelivered on every later boot while the retry that has to record its outcome
-refused with `NearCapacity` forever. One wasted attempt is tolerated, not an unbounded
-number, matching this codebase's other single-crash guarantees;
+Redelivering an outcome in place moved a cost that used to be absorbed by starting a fresh
+run: the bytes a torn, ignored attempt consumes cannot be reclaimed on NOR, and §10's capacity
+reserve priced a schedule against only the *real* outcome that would eventually land, not
+against one that might be wasted first. `Reserve::exit_bytes_after`'s
+`EffectScheduled`/`TimerScheduled` arm and `Reserve::for_layout`'s floor both now reserve one
+extra outcome's worth — `redelivery_slack` — so a single tear at the reserve boundary cannot
+strand the run: without it, dispatch happens on `Ending::Clean`, before capacity is ever
+checked, so the activity would be redelivered on every later boot while the retry that has to
+record its outcome refused with `NearCapacity` forever. One wasted attempt is tolerated, not
+an unbounded number, matching this codebase's other single-crash guarantees;
 `a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry` drives exactly that
-shape end to end. Codex found this on review of the fix above. See
+shape end to end. Codex found this on review of the fix above, and then found the same shape
+a second time against a *terminal* record: nothing prices a terminal's own retry, so treating
+it as redeliverable the same way could strand a run's only exit for ever. Widening the
+reserve a second time, for a kind whose own retry-safety turns out to depend on the relative
+sizes of a workflow's declared `Bounds` — `RunStarted`'s in particular, since
+`run_input_bytes` can dwarf everything else `Reserve::for_layout` prices — is what
+`redeliverable_kind`'s narrower scope avoids rather than chases. See
 [ADR 0049](docs/adr/0049-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
 
 Issue #99 then closes the route Codex found on issue #32's fourth review round. A

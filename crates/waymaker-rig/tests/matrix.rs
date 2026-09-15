@@ -1664,12 +1664,17 @@ fn a_reset_at_any_point_of_a_resume_leaves_a_part_the_rig_judges_healthy() {
     // 180 of the 389 images resume to a part that needs no writes, so they contribute
     // no cuts: a resume that writes nothing has no point to cut.
     //
-    // The last two moved with issue #95: a torn completion whose own reserved slot came
-    // out clean is now a healthy, resumable part rather than one `rig.verify` filtered out
-    // before a resume was ever attempted, so more images reach the injector below.
+    // The last two moved with issue #95, in both directions. A torn completion whose own
+    // reserved slot came out clean is a healthy, resumable part rather than one
+    // `rig.verify` filtered out before a resume was ever attempted, which is more images
+    // reaching the injector below — but only for an outcome
+    // (`EffectCompleted`/`EffectFailed`/`TimerFired`): §10's capacity reserve prices a
+    // wasted retry for exactly those three, found owed for every other kind on this pull
+    // request's own review, so a torn `RunStarted`, schedule, marker or terminal record
+    // still refuses the bank exactly as it always did.
     assert_eq!(
         (uninstalled, images.len(), cuts, torn_marks),
-        (47, 389, 48_534, 16_536),
+        (47, 389, 47_276, 16_133),
         "the resume sweep changed size"
     );
 }

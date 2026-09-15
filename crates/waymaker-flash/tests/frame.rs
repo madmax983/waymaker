@@ -2144,21 +2144,26 @@ fn a_scan_at_the_wrong_alignment_refuses_rather_than_reporting_a_clean_end() {
     let mut journal = [ERASED_BYTE; SCRATCH];
     let mut at = 0;
     for record in [
+        // An outcome first, not `RunStarted`: since issue #95 only an outcome
+        // (`EffectCompleted`/`EffectFailed`/`TimerFired`) is a kind `redeliverable_kind`
+        // ever lets the ignore-and-continue rule apply to, and this test means to exercise
+        // that rule's own alignment hazard rather than the plain, pre-#95 refusal a
+        // non-outcome kind still gets immediately.
+        RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"a",
+        },
         RecordRef::RunStarted {
             workflow_kind: 1,
             workflow_version: 1,
-            input: b"a",
-        },
-        RecordRef::EffectCompleted {
-            seq: EffectSeq(0),
-            result: b"b",
+            input: b"b",
         },
         RecordRef::RunCompleted { result: b"c" },
     ] {
         at += frame::encode(&record, writer, &mut journal[at..]).expect("room");
     }
 
-    // Each frame is seventeen to nineteen bytes padded out to sixty-four, so a reader
+    // Each frame is thirteen to nineteen bytes padded out to sixty-four, so a reader
     // striding by one looks for the first record's commit seal in the first bytes of that
     // record's own padding — which are erased, and no byte of a seal ever is. Since issue
     // #24 the mismatch is therefore *noticed* at the first record rather than the second:
@@ -2185,7 +2190,7 @@ fn a_scan_at_the_wrong_alignment_refuses_rather_than_reporting_a_clean_end() {
     );
     assert_eq!(
         mismatched.offset(),
-        22,
+        18,
         "the mismatch is caught inside the first record's own real padding"
     );
     assert!(mismatched.next().is_none(), "the scan is fused");

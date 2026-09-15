@@ -592,6 +592,14 @@ struct Staged {
     frame_len: u32,
 }
 
+/// What [`Recovery::sealed`] found: a whole seal, or a torn one and whether its own record
+/// kind is one `past_the_seal_slot` may still ignore. See [`frame::redeliverable_kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seal {
+    Whole,
+    Torn { redeliverable: bool },
+}
+
 impl<'storage, S> Recovery<'storage, S, Catalogued> {
     /// A recovery of `region` over `storage`, verifying with the shipped integrity check.
     ///
@@ -750,8 +758,8 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
                 Ok(sealed) => sealed,
                 Err(error) => return Some(Err(error)),
             };
-            if !sealed {
-                match self.past_the_seal_slot(page, staged) {
+            if let Seal::Torn { redeliverable } = sealed {
+                match self.past_the_seal_slot(page, staged, redeliverable) {
                     Ok(()) => continue,
                     Err(error) => return Some(Err(error)),
                 }
@@ -823,7 +831,7 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
     /// [`RecoveryError::Decode`] when the frame itself does not decode — ends the scan as
     /// [`Ending::Damaged`] — and [`RecoveryError::PageTooSmall`] on the same unreachable
     /// short page [`stage`](Self::stage) already ruled out.
-    fn sealed(&mut self, page: &[u8], staged: Staged) -> Result<bool, RecoveryError<S::Error>>
+    fn sealed(&mut self, page: &[u8], staged: Staged) -> Result<Seal, RecoveryError<S::Error>>
     where
         S: StableStorage,
     {
@@ -839,9 +847,9 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
         };
         match frame::decode_with::<C>(peek) {
             Ok(frame) => {
-                // §09's first stop condition, before the record kind: what an uncommitted
-                // frame *says* is not a question worth asking. `stage` read the whole
-                // record, so the seal is already in the page.
+                // §09's first stop condition, before whether the seal holds: what an
+                // uncommitted frame *says* is not a question worth asking. `stage` read the
+                // whole record, so the seal is already in the page.
                 let Some(seal) = peek.get(staged.seal_at..) else {
                     // Unreachable: `stage` staged `need > seal_at` bytes.
                     self.ending = Some(Ending::Incomplete { at: self.offset });
@@ -849,7 +857,17 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
                         needed: staged.need,
                     });
                 };
-                Ok(frame::commit_seal_holds(frame.frame_crc, seal))
+                if frame::commit_seal_holds(frame.frame_crc, seal) {
+                    return Ok(Seal::Whole);
+                }
+                // The seal does not hold, so this frame is exactly the "uncommitted frame"
+                // the comment above means — but the record's own kind, decoded from bytes
+                // that same checksum already verified, decides whether
+                // `past_the_seal_slot` may ignore it at all. See
+                // `frame::redeliverable_kind`.
+                Ok(Seal::Torn {
+                    redeliverable: frame::redeliverable_kind(&frame.decoded),
+                })
             }
             Err(error) => {
                 self.ending = Some(Ending::Damaged { at: self.offset });
@@ -858,11 +876,17 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
         }
     }
 
-    /// Whether an unsealed frame may be ignored, once its own checksum has already verified.
+    /// Whether an unsealed frame may be ignored, once its own checksum has already verified
+    /// and its record kind is known to be one §10's capacity reserve prices a retry for.
     /// `staged.frame_len` is what a writer actually programmed, before padding;
     /// `staged.stride` is the whole slot the frame reserved: its padded body plus its commit
     /// seal, whether or not the seal itself landed. `page` already holds the whole slot,
     /// staged by [`stage`](Self::stage).
+    ///
+    /// `redeliverable` is [`Seal::Torn`]'s own field: `false` ends the scan as
+    /// [`Ending::Unsealed`] outright, before either byte range below is even read, exactly
+    /// as every unsealed frame did before issue #95 — see [`frame::redeliverable_kind`] for
+    /// which kinds answer `true` and why.
     ///
     /// No writer starts a record before the one ahead of it has sealed — see
     /// [`crate::append`] — so between `frame_len` and `stride` is only ever padding and a
@@ -891,12 +915,17 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
         &mut self,
         page: &[u8],
         staged: Staged,
+        redeliverable: bool,
     ) -> Result<(), RecoveryError<S::Error>>
     where
         S: StableStorage,
     {
         let at = self.offset;
         let unsealed = || RecoveryError::Decode(DecodeError::Unsealed);
+        if !redeliverable {
+            self.ending = Some(Ending::Unsealed { at });
+            return Err(unsealed());
+        }
         let (Some(from), Some(to)) = (
             usize::try_from(staged.frame_len).ok(),
             usize::try_from(staged.stride).ok(),
