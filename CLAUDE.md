@@ -5719,5 +5719,23 @@ module descent to recurse rather than loop in place, the way an alias hop alread
 name can name more than one live module, "the one match" is no longer a thing a loop can just
 step into and carry on from. `segments_could_reach_target` no longer loops at all — every hop,
 alias or module, is its own recursive call now. `a_second_live_module_of_one_name_is_still_tried`
-and its control are the regression. No new ADR: nothing here moves a must-not-own cell, a
-dependency edge, or a rule id.
+and its control are the regression.
+
+The same review found two more, both in the fixes just above. First: a module-scope alias's
+own target is resolved in the scope it was declared in, never the caller's block — but a
+module-scope alias's recursive call kept the caller's own `block_eligible`, so a
+construction site's own function-local alias could answer for a name the module-scope
+alias's target never meant. `block_eligible` is now forced `false` for a module-scope
+alias's own target; a block-local alias's own target keeps it, since that one really can
+chain through a further block-local hop. Second: `self::T`/`super::T` explicitly names a
+module's own item — a generic type parameter has no `self::`/`super::` form at all — but
+`shadow` was checked after `self`/`super` had already been stripped, so an unrelated generic
+parameter could suppress a search real Rust never lets it touch. `shadow` is now checked
+once, in `path_could_reach_target`, against the path's own first segment exactly as written,
+before any prefix is consumed. `a_module_scope_alias_does_not_reach_a_later_block_local_shadow`
+and `a_self_qualified_path_reaches_a_live_live_module_ambiguity_despite_a_generic_shadow` —
+each with its own control — are the two regressions; one earlier test
+(`a_block_local_alias_still_applies_after_a_module_scope_hop`) rested on a premise real Rust
+does not allow at all — a module-scope alias's target naming an item only a later, unrelated
+function declares — and is replaced by the first of the two. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.

@@ -4988,6 +4988,15 @@ fn path_could_reach_target<'a>(
     // `scope` unmoved, so a block-local alias could be reached through a path
     // that real Rust would resolve at module scope alone).
     let block_eligible = segments.len() == 1;
+    // `shadow` is checked here, against the path's own first segment exactly as
+    // written — before any `self`/`super` consumption — matching
+    // `resolve_segments_from`'s own check, which runs before its loop ever touches
+    // a prefix. `self::T`/`super::T` explicitly names a module's own item, never a
+    // generic type parameter: a generic parameter has no `self::`/`super::` form at
+    // all, so a leading `self`/`super` can never be the shadowed name (issue #197,
+    // Codex review of the PR: checking `shadow` after stripping `self` let an
+    // unrelated generic parameter suppress an explicitly module-qualified path).
+    let shadowed = segments.first().is_some_and(|first| shadow.contains(first));
 
     let scope = stack.len().saturating_sub(1);
     let mut budget = budget;
@@ -4999,7 +5008,7 @@ fn path_could_reach_target<'a>(
         block_items,
         scope,
         block_eligible,
-        shadow,
+        shadowed,
         target,
         &mut budget,
         cache,
@@ -5047,16 +5056,21 @@ fn path_could_reach_target<'a>(
 /// could exhaust the budget on one live branch before a later, real one was tried,
 /// answering `false` for a construction that is real).
 ///
-/// `shadow` names any generic type parameters in scope — see [`resolve_segments`]'s
-/// own `shadow`. Checked once, against the path's own first segment, then cleared:
-/// [`resolve_local_alias_chain`] chases a block-local alias with no shadow check at
-/// all — a block-local declaration shadows a generic type parameter of the same name
-/// unconditionally in real Rust — and only the deterministic resolver's fallback,
-/// reached when no block-local alias exists at all, ever consults `shadow`. So
-/// `shadow` gates only the module-scope half of a hop, never `block_items` (issue
-/// #197, Codex review: an earlier version of this fix checked `shadow` before ever
-/// trying `block_items`, so a block-local alias sharing a name with an enclosing
-/// generic parameter was refused instead of searched).
+/// `shadowed` is [`path_could_reach_target`]'s own: whether the *original*
+/// construction path's own first segment, exactly as written, names a generic type
+/// parameter in scope — see [`resolve_segments`]'s own `shadow`. Checked once, before
+/// any hop, the same way `block_eligible` is: [`resolve_local_alias_chain`] chases a
+/// block-local alias with no shadow check at all — a block-local declaration shadows
+/// a generic type parameter of the same name unconditionally in real Rust — and only
+/// the deterministic resolver's fallback, reached when no block-local alias exists at
+/// all, ever consults `shadow`, against the path's own first segment before that
+/// fallback's loop ever touches a prefix. So `shadowed` gates only a hop's
+/// module-scope half, never `block_items` (issue #197, Codex review: an earlier
+/// version of this fix checked `shadow` after stripping a leading `self`/`super`, so
+/// an unrelated generic parameter could suppress an explicitly module-qualified path
+/// that real Rust never lets it touch — `self::T` and `super::T` have no generic
+/// parameter reading at all). Every recursive call below passes `false`: only the
+/// search's very first hop can be the identifier a generic parameter could shadow.
 ///
 /// A hop tries every alias candidate it finds *and* — when none of them reach
 /// `target` — every sibling module of the same name, rather than treating a matching
@@ -5069,11 +5083,66 @@ fn path_could_reach_target<'a>(
 /// two same-named live modules was ever descended into, so a construction reachable
 /// only through the second was missed too).
 ///
+/// A block-local alias's own target is resolved as `block_eligible`, since it can
+/// itself chain through further block-local hops (see above). A module-scope alias's
+/// target is resolved with `block_eligible` forced `false`: that alias's target
+/// belongs to the scope it was *declared* in, never the caller's block, so a
+/// block-local name it happens to share is not the same name at all (issue #197,
+/// Codex review of the PR: a module-scope alias's target kept the caller's own
+/// `block_eligible`, so a construction site's own function-local alias answered for a
+/// name the module-scope alias's target never meant).
+///
 /// Every hop recurses rather than looping in place, module descent included: once a
 /// name can name more than one live module, "the one match" is no longer a thing a
 /// loop can just step into and carry on from.
 ///
 /// `cache` is [`path_could_reach_target`]'s own — see there.
+///
+/// Tries every alias in `candidates`, recursing into [`segments_could_reach_target`]
+/// with `next_block_eligible` for the ones that are not absolute — shared by
+/// [`segments_could_reach_target`]'s own block-local and module-scope halves, which
+/// differ only in which candidates they gather and what `next_block_eligible` is.
+#[allow(clippy::too_many_arguments)]
+fn try_alias_candidates<'a>(
+    candidates: Vec<UseAlias>,
+    rest: &[String],
+    stack: &[&'a [syn::Item]],
+    scope: usize,
+    entered: Option<&'a [syn::Item]>,
+    block_items: &[&'a syn::Item],
+    innermost_scope: usize,
+    next_block_eligible: bool,
+    target: &str,
+    budget: &mut usize,
+    cache: &mut AliasLookupCache<'a>,
+) -> bool {
+    for alias in candidates {
+        let mut resolved = alias.target;
+        resolved.extend(rest.iter().cloned());
+        if resolved.last().is_some_and(|last| last.as_str() == target) {
+            return true;
+        }
+        if !alias.absolute
+            && segments_could_reach_target(
+                resolved,
+                stack,
+                scope,
+                entered,
+                block_items,
+                innermost_scope,
+                next_block_eligible,
+                false,
+                target,
+                budget,
+                cache,
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn segments_could_reach_target<'a>(
     mut segments: Vec<String>,
@@ -5083,7 +5152,7 @@ fn segments_could_reach_target<'a>(
     block_items: &[&'a syn::Item],
     innermost_scope: usize,
     block_eligible: bool,
-    shadow: &[String],
+    shadowed: bool,
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
@@ -5113,62 +5182,67 @@ fn segments_could_reach_target<'a>(
         return false;
     };
 
-    // Only the path's own first segment is ever a shadowed generic parameter's
-    // name — every later hop's `first` comes from an alias's own target, a real
-    // name written somewhere else in the file, never the identifier that could
-    // collide with a generic parameter here. Every recursive call below passes an
-    // empty slice, so `shadowed` is never consulted again after this hop.
-    let shadowed = shadow.contains(&first);
-    let no_shadow: &[String] = &[];
+    let rest = segments.get(1..).unwrap_or_default();
 
     // Block-local aliases are not cached: `block_items` has no one contiguous
     // scope to key a cache entry on, and it is small — one construction site's
-    // own enclosing blocks. Not shadow-gated — see this function's own docs.
-    let block_candidates: Vec<UseAlias> = if block_applies {
-        own_aliases(block_items.iter().copied())
-    } else {
-        Vec::new()
-    };
-    let module_alias_candidates: Vec<UseAlias> = if shadowed {
-        Vec::new()
-    } else {
-        cache.aliases_of(items).iter().cloned().collect()
-    };
-    let matches: Vec<UseAlias> = block_candidates
-        .into_iter()
-        .chain(module_alias_candidates)
-        .filter(|candidate| candidate.local == first)
-        .collect();
+    // own enclosing blocks. Not shadow-gated — see this function's own docs. A
+    // block-local alias's own target stays `block_eligible`, since it can chain
+    // through a further block-local hop.
+    if block_applies {
+        let block_candidates: Vec<UseAlias> = own_aliases(block_items.iter().copied())
+            .into_iter()
+            .filter(|candidate| candidate.local == first)
+            .collect();
+        if try_alias_candidates(
+            block_candidates,
+            rest,
+            stack,
+            scope,
+            entered,
+            block_items,
+            innermost_scope,
+            block_eligible,
+            target,
+            budget,
+            cache,
+        ) {
+            return true;
+        }
+    }
 
-    for alias in matches {
-        let mut resolved = alias.target;
-        resolved.extend(segments.get(1..).unwrap_or_default().iter().cloned());
-        if resolved.last().is_some_and(|last| last.as_str() == target) {
-            return true;
-        }
-        if !alias.absolute
-            && segments_could_reach_target(
-                resolved,
-                stack,
-                scope,
-                entered,
-                block_items,
-                innermost_scope,
-                block_eligible,
-                no_shadow,
-                target,
-                budget,
-                cache,
-            )
-        {
-            return true;
-        }
+    if shadowed {
+        return segments.last().is_some_and(|last| last.as_str() == target);
+    }
+
+    // A module-scope alias's own target is never `block_eligible` — see this
+    // function's own docs.
+    let module_alias_candidates: Vec<UseAlias> = cache
+        .aliases_of(items)
+        .iter()
+        .filter(|candidate| candidate.local == first)
+        .cloned()
+        .collect();
+    if try_alias_candidates(
+        module_alias_candidates,
+        rest,
+        stack,
+        scope,
+        entered,
+        block_items,
+        innermost_scope,
+        false,
+        target,
+        budget,
+        cache,
+    ) {
+        return true;
     }
 
     // No alias reached `target` — every sibling module of the same name is still a
     // live possibility, not ruled out by an alias that did not pan out, or by
     // another same-named module that did not either.
-    if segments.len() > 1 && !shadowed {
+    if segments.len() > 1 {
         let remaining: Vec<String> = segments.get(1..).unwrap_or_default().to_vec();
         let modules: Vec<&'a [syn::Item]> = cache
             .modules_of(items)
@@ -5184,8 +5258,8 @@ fn segments_could_reach_target<'a>(
                 Some(module_items),
                 block_items,
                 innermost_scope,
-                block_eligible,
-                no_shadow,
+                false,
+                false,
                 target,
                 budget,
                 cache,
@@ -14674,15 +14748,17 @@ mod cfg_alias_ambiguity_tests {
     }
 
     #[test]
-    fn a_block_local_alias_still_applies_after_a_module_scope_hop() {
-        // The mirror of the test above: a module-scope alias chained to a
-        // block-local one must still resolve — block-local aliases are not only
-        // reachable as the very first hop.
+    fn a_module_scope_alias_does_not_reach_a_later_block_local_shadow() {
+        // Codex review of PR #204: a module-scope alias's target is resolved in the
+        // scope it was *declared* in, never a caller's block. `type Bridge = A;`
+        // declared at module scope means module scope's own `A` — the real
+        // `CheckedDispatch` the search should not answer with is `forge`'s own
+        // *block-local* `A`, which real Rust never lets `Bridge` see at all.
         let counts = struct_literal_counts(
-            "#[cfg(not(feature = \"a\"))]\ntype Bridge = Decoy;\n\
+            "type A = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\ntype Bridge = Unrelated;\n\
              #[cfg(feature = \"a\")]\ntype Bridge = A;\n\
              fn forge() -> u8 {\n\
-             \x20   #[cfg(feature = \"a\")]\n\
              \x20   type A = CheckedDispatch;\n\
              \x20   let _ = Bridge { intent: 0, bytes: 0 };\n\
              \x20   0\n\
@@ -14691,7 +14767,7 @@ mod cfg_alias_ambiguity_tests {
             FnScope::None,
         )
         .expect("the fixture parses");
-        assert_eq!(counts.total, 1, "{counts:?}");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 
     #[test]
@@ -14750,6 +14826,46 @@ mod cfg_alias_ambiguity_tests {
              \x20   pub struct CheckedDispatch;\n\
              }\n\
              use inner::CheckedDispatch as T;\n\
+             fn forge<T>() -> u8 {\n\
+             \x20   let _ = T { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_self_qualified_path_reaches_a_live_live_module_ambiguity_despite_a_generic_shadow() {
+        // Codex review of PR #204: `self::T` explicitly names the enclosing
+        // module's own `T` — a generic type parameter has no `self::` form at all,
+        // so it can never be what `self::T` means. Checking `shadow` after
+        // stripping the leading `self` let the unrelated generic parameter `T`
+        // suppress this module-scope search entirely.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype T = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype T = CheckedDispatch;\n\
+             fn forge<T>() -> u8 {\n\
+             \x20   let _ = self::T { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_bare_shadowed_name_still_refuses_the_same_live_live_module_ambiguity() {
+        // The control for the test above: the same live/live module ambiguity,
+        // reached through the bare, shadowed name instead — which must still
+        // refuse module resolution, matching `resolve_segments_from`.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype T = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype T = CheckedDispatch;\n\
              fn forge<T>() -> u8 {\n\
              \x20   let _ = T { intent: 0, bytes: 0 };\n\
              \x20   0\n\
