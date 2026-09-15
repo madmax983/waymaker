@@ -649,18 +649,24 @@ impl<'storage, S, C: IntegrityCheck> Recovery<'storage, S, C> {
         self.region
     }
 
-    /// The byte at which the committed prefix ends, relative to the region's base.
+    /// The scan's current physical position, relative to the region's base — not, on its
+    /// own, a promise that every byte behind it is committed history.
     ///
     /// # Postconditions
     ///
     /// Zero before the first step; after a step that yielded a record, past that record and
     /// its padding; after a step that failed, still at the *start* of the frame that failed
-    /// — §14's "frame ignored; previous history prefix wins" is exactly that offset. Always
+    /// — §14's "frame ignored; previous history prefix wins" is exactly that offset. After a
+    /// step that ignored a torn but redeliverable outcome — issue #95, `EffectCompleted`,
+    /// `EffectFailed` or `TimerFired` with an erased `[frame_len, next)` suffix — *past*
+    /// that record's own slot, exactly as if it had yielded one, even though the ignored
+    /// frame itself never became committed history: the offset is the position the scan
+    /// resumed from, not a claim about what lies between it and the record before. Always
     /// a whole number of the region's program units, and never greater than
     /// [`JournalRegion::bytes`].
     ///
-    /// This is where history *ended*. It is not where the next record may be written unless
-    /// [`append_offset`](Self::append_offset) says so.
+    /// This is where the scan *stopped*. It is not where the next record may be written
+    /// unless [`append_offset`](Self::append_offset) says so.
     #[must_use]
     pub const fn offset(&self) -> u32 {
         self.offset

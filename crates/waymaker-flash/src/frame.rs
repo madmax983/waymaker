@@ -1527,19 +1527,25 @@ impl<'a, C: IntegrityCheck> Scan<'a, C> {
         }
     }
 
-    /// The byte at which the committed prefix ends.
+    /// The scan's current physical position — not, on its own, a promise that every byte
+    /// behind it is committed history.
     ///
     /// # Postconditions
     ///
     /// Zero before the first step; after a step that yielded a record, past that record
     /// and its padding; after a step that yielded a failure, still at the *start* of the
     /// frame that failed — §14's "frame ignored; previous history prefix wins" is exactly
-    /// that offset. Always a whole number of program units, and never greater than the
-    /// journal's length: a frame whose padding does not fit in the journal is a truncation
-    /// rather than a record, so no step can end anywhere but on a boundary.
+    /// that offset. After a step that ignored a torn but redeliverable outcome — issue #95,
+    /// `EffectCompleted`, `EffectFailed` or `TimerFired` with an erased `[frame_len, next)`
+    /// suffix — *past* that record's own slot, exactly as if it had yielded one, even though
+    /// the ignored frame itself never became committed history: the offset is the position
+    /// the scan resumed from, not a claim about what lies between it and the record before.
+    /// Always a whole number of program units, and never greater than the journal's length:
+    /// a frame whose padding does not fit in the journal is a truncation rather than a
+    /// record, so no step can end anywhere but on a boundary.
     ///
-    /// This is where history *ended*, which is not the same as where the next record may be
-    /// written unless the scan ended in erased media: see [the note on `Scan`](Self).
+    /// This is where the scan *stopped*, which is not the same as where the next record may
+    /// be written unless the scan ended in erased media: see [the note on `Scan`](Self).
     #[must_use]
     pub const fn offset(&self) -> usize {
         self.offset
