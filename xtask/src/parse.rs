@@ -4315,8 +4315,11 @@ pub fn invokes_any_macro(contents: &str) -> Result<bool, syn::Error> {
 /// Every attribute name `contents` carries, outside `#[cfg(test)]`, that is not
 /// `allowed_attributes` or a `#[derive(..)]` naming only `allowed_derives`.
 ///
-/// Each is returned as the bare name (`"forge"`) or, for a rejected derive, as
-/// `"derive(Path)"`. A procedural attribute macro or a custom derive is a macro surface neither
+/// Also every name in `allowed_derives` that a `use` in `contents` rebinds.
+///
+/// Each is returned as the bare name (`"forge"`), for a rejected derive as
+/// `"derive(Path)"`, or for a rebound name as `"Clone (rebound by a use)"`. A
+/// procedural attribute macro or a custom derive is a macro surface neither
 /// [`struct_literal_counts`]'s item walk nor [`invokes_any_macro`]'s `visit_macro` override
 /// ever sees: it is not a `syn::Macro` invocation at all, and its expansion runs in its own
 /// defining crate, invisible to a scan that only reads this file's *unexpanded* tokens
@@ -4330,6 +4333,21 @@ pub fn invokes_any_macro(contents: &str) -> Result<bool, syn::Error> {
 /// itself interprets with no macro behind it at all; a derive is checked further, since
 /// `#[derive(A, B)]` can mix an inert compiler derive with a custom one in the same
 /// attribute.
+///
+/// Issue #186 closes two more gaps a fourth review round found.
+///
+/// First: the scan read an item's own attributes and an `impl` member's, but never a
+/// *trait* member's. A trait method's own declaration — its default body included —
+/// is a `syn::TraitItem`. An attribute macro there stayed invisible.
+///
+/// Second: an allowed derive name is only a name. `#[derive(Clone)]` resolves however
+/// `Clone` names in scope at that point. `use forge::Anything as Clone;` rebinds that
+/// name, the same way it would rebind a type or a value. This scanner cannot resolve
+/// what a `use` really targets — the same limit this file's qualified
+/// associated-type-projection check already accepts — so it reports any
+/// `use` that rebinds an allowed derive's name, whatever it targets. This is the same
+/// hard refusal this function already uses for a macro or an attribute it does not
+/// recognize.
 ///
 /// # Errors
 ///
@@ -4393,6 +4411,18 @@ pub fn unaudited_attributes(
             note(attrs, self.allowed, self.derives, &mut self.found);
             syn::visit::visit_impl_item(self, node);
         }
+
+        // Issue #186, finding 1: a trait method's own declaration, default body
+        // included, is a `syn::TraitItem`, not a `syn::Item` or a `syn::ImplItem` — an
+        // attribute macro there reached neither override above.
+        fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+            let attrs = trait_item_attrs(node);
+            if has_cfg_test(attrs) {
+                return;
+            }
+            note(attrs, self.allowed, self.derives, &mut self.found);
+            syn::visit::visit_trait_item(self, node);
+        }
     }
 
     let file = parse_rust(contents)?;
@@ -4402,7 +4432,70 @@ pub fn unaudited_attributes(
         found: Vec::new(),
     };
     visitor.visit_file(&file);
-    Ok(visitor.found)
+    let mut found = visitor.found;
+    shadowed_derive_names(&file.items, allowed_derives, &mut found);
+    Ok(found)
+}
+
+/// Every name in `derives` that a `use` in `items` rebinds, outside `#[cfg(test)]`.
+///
+/// Pushed onto `found` as `"Name (rebound by a use)"`; or, for a glob import, every
+/// name in `derives` at once, as `"Name (glob import may rebind it)"`.
+///
+/// "Rebound" applies with or without a rename. Without a `use`, `Clone` in scope is
+/// the compiler's own derive. `use forge::Clone;` — no `as` — rebinds it exactly as
+/// `use forge::Anything as Clone;` would, so both are reported.
+///
+/// See [`unaudited_attributes`]'s own doc comment for why this does not resolve what
+/// a named `use` actually targets. A `type` alias is deliberately not read here the
+/// way [`own_aliases`] reads one: it occupies the type namespace, not the macro
+/// namespace a derive name is resolved in, so it cannot rebind what `#[derive(..)]`
+/// sees. Item order does not matter: real Rust resolves every item in a module
+/// together, so a `use` declared after the derive it shadows still shadows it. This
+/// recurses into a nested `mod` on the same terms `own_aliases`'s own callers do,
+/// even though `effect-protocol`'s own module ban means `effect.rs` itself never has
+/// one.
+///
+/// A glob import (`use forge::*;`) is checked with [`tree_has_glob`] instead of
+/// [`collect_tree_aliases`], which contributes no alias for one at all: this scanner
+/// cannot see what a glob exports, so it cannot rule out an item named `Clone` among
+/// them. Adversarial review of this fix's own first round found the gap: a glob is
+/// exactly the shape `trait_implementors`'s own `GLOB_IMPORT_MARKER` already fails
+/// closed over for a handwritten `impl` (issue #109), one this function had not
+/// reused (issue #186).
+fn shadowed_derive_names(items: &[syn::Item], derives: &[&str], found: &mut Vec<String>) {
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Use(use_item) => {
+                if tree_has_glob(&use_item.tree) {
+                    for derive in derives {
+                        found.push(format!("{derive} (glob import may rebind it)"));
+                    }
+                }
+                let mut aliases = Vec::new();
+                collect_tree_aliases(
+                    &use_item.tree,
+                    use_item.leading_colon.is_some(),
+                    &mut Vec::new(),
+                    &mut aliases,
+                );
+                for alias in aliases {
+                    if derives.contains(&alias.local.as_str()) {
+                        found.push(format!("{} (rebound by a use)", alias.local));
+                    }
+                }
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = module.content.as_ref() {
+                    shadowed_derive_names(nested, derives, found);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// How many `fn name` items `contents` declares, at any nesting depth.
