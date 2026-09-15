@@ -56,7 +56,7 @@ be superseded.
 | [0045](0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md) | The emulator paints the stack, and reports a high-water mark | accepted |
 | [0046](0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md) | CRC-16 folds its nibble round to a multiply, and CRC-32 stays bitwise | accepted |
 | [0047](0047-a-shape-catalogue-holds-the-suite-to-the-writers.md) | A shape catalogue holds the suite to the writers | accepted |
-| [0048](0048-an-unserviceable-kind-is-an-answer-not-a-record.md) | An unserviceable kind is an answer, not a record | accepted |
+| [0049](0049-an-unserviceable-kind-is-an-answer-not-a-record.md) | An unserviceable kind is an answer, not a record | accepted |
 
 ## Reading the numbers
 
