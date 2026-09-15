@@ -352,8 +352,10 @@ impl Refusal {
 ///   the layout's program granularity — padded and sealed, which is what a record really
 ///   occupies.
 /// * [`tail_bytes`](Self::tail_bytes) is what an outstanding effect still owes: an outcome
-///   and then a terminal record. It is the largest [`exit_bytes_after`](Self::exit_bytes_after)
-///   can answer.
+///   and then a terminal record. It is *not* the largest
+///   [`exit_bytes_after`](Self::exit_bytes_after) can answer — a schedule record's own arm
+///   adds one more worst-case outcome on top of it, issue #95's redelivery slack, so
+///   `tail_bytes` plus one outcome is the true ceiling.
 /// * A reserve exists only for a layout that can hold it. [`for_layout`](Self::for_layout)
 ///   refuses the rest, so a `Reserve` in hand is a promise that has already been checked
 ///   against a bank.
