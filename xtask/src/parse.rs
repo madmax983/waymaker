@@ -58,141 +58,224 @@ fn path_is_ident(path: &syn::Path, name: &str) -> bool {
     path.get_ident().is_some_and(|ident| ident_is(ident, name))
 }
 
-/// Whether `attrs` carries a `#[cfg(..)]` or `#[cfg_attr(.., cfg(..))]` that is
-/// guaranteed false whenever `test` is — the bare `#[cfg(test)]`, a compound `cfg`
-/// predicate built from it, or an equivalent spelled through `cfg_attr`.
+/// Whether `attrs` — the *whole* attribute list on one item — is guaranteed absent
+/// whenever `test` is false, considering every `#[cfg(..)]` and `#[cfg_attr(.., ..)]`
+/// on it *together*.
 ///
 /// The textual `without_test_modules` blanked on the substring `#[cfg(test)]` alone, and
-/// this function used to match only that exact shape — `path_is_ident(attr.path(),
-/// "cfg")` with a bare `test` identifier as its whole argument, so `#[cfg(any(test))]`
-/// and `#[cfg(all(test, feature = "x"))]` fell through `parse_args::<syn::Ident>()`
-/// unparsed and answered `false`.
+/// rounds 35 through 37 widened a single attribute's own predicate to recognize
+/// `#[cfg(any(test))]`, `#[cfg(all(test, feature = "x"))]` and a `cfg_attr`-spelled
+/// equivalent — each still a *per-attribute* recursive rule, combined across several
+/// attributes with `.any()`. Found by Codex review of this change (PR #143), round 43:
+/// that combination is sound only in the direction it was built for — a single
+/// attribute that alone proves the item test-only is enough to prove the whole item
+/// test-only too — but several `#[cfg(..)]` attributes on one item are conjunctive,
+/// exactly like `all(..)`'s own arguments, and a per-attribute rule that treats each
+/// one as an isolated question cannot see a combination that is test-only only because
+/// two attributes *correlate* through a flag neither one alone pins down.
+/// `#[cfg(any(test, feature = "x"))]` `#[cfg(not(feature = "x"))]` is exactly that: read
+/// together the two admit only `test && !x`, which requires `test`, but neither
+/// attribute alone does — `any(test, x)` is satisfiable under `x` with no `test`
+/// anywhere, and `not(x)` is satisfiable under `!x` the same way, and even a recursive
+/// rule that folded every attribute's own formula into one `all(..)` and then asked
+/// "does any conjunct alone require test" would still miss it, since neither conjunct
+/// does — only the pair does, through the shared `x`.
 ///
-/// Found by Codex review of this change (PR #143), round 35: both compounds are exactly
-/// as test-only as the bare form — an `all(..)` naming `test` among its conjuncts can
-/// never hold without it, whatever else it also asks for, and an `any(..)` every one of
-/// whose branches is itself guaranteed test-only can only be satisfied under test — so a
-/// reached file gated with either spelling was still walked as production-reachable.
-/// [`attribute_requires_test`] is the recursive predicate; `#[cfg(any(test, other))]` is
-/// deliberately *not* recognized, and must not be, because it is satisfiable under
-/// `other` alone — treating it as test-only would hide production-reachable code from
-/// every rule that reads this function's answer as "unreachable in a shipped build".
-///
-/// Round 36 widened it once more: `#![cfg_attr(not(test), cfg(test))]` is exactly as
-/// test-only as a bare `#![cfg(test)]`, because rustc's own rewrite of a `cfg_attr`
-/// leaves nothing else it could mean — expanding to `cfg(test)` in exactly the builds
-/// where `not(test)` holds (every non-test one) and to no attribute at all in every
-/// build where it does not (every test one, where the guarded `cfg(test)` would have
-/// held anyway) — but this function's own outer filter read only an attribute whose
-/// *path* was `cfg`, so a `cfg_attr`-spelled equivalent never reached the predicate at
-/// all. [`attribute_requires_test`] now reads the attribute's own path instead of
-/// requiring the caller to have already stripped it.
+/// [`Cfg`] is the fix: every attribute is parsed into one formula with
+/// [`attribute_cfg`] and the whole list is joined with [`Cfg::All`], exactly the way
+/// several bare `#[cfg(..)]`s combine in real Rust — but [`Cfg::requires_test`] then
+/// answers the combination by *enumeration* over the flags actually named in it rather
+/// than by a recursive per-node rule, which is what lets a flag occurring twice, once
+/// under `any` and once negated under a sibling attribute, correlate correctly instead
+/// of being treated as two independent unknowns.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| attribute_requires_test(&attr.meta))
+    let combined: Vec<Cfg> = attrs
+        .iter()
+        .filter_map(|attr| attribute_cfg(&attr.meta))
+        .collect();
+    Cfg::All(combined).requires_test()
 }
 
-/// [`has_cfg_test`]'s recursive half, over one attribute's parsed [`syn::Meta`] — its
-/// own path included, so a `#[cfg(..)]` and a `#[cfg_attr(.., ..)]` are told apart here
-/// rather than by the caller.
+/// A `cfg` predicate's truth value, abstracted from `syn`'s parsed tokens into a small
+/// tree of its own so several attributes' formulas can be combined with [`Cfg::All`]
+/// and then answered by [`Cfg::requires_test`]'s exhaustive enumeration — a bare
+/// [`syn::Meta`] cannot be combined this way at all, since two attributes are two
+/// separate parse trees with no operator joining them.
 ///
-/// A `cfg(..)` predicate is handed to [`meta_requires_test`], the same recursive
-/// predicate a `cfg_attr`'s own condition is evaluated against — the two questions are
-/// dual, not the same, which is what [`meta_holds_without_test`] answers instead.
-///
-/// A `cfg_attr(condition, injected..)` requires `test` exactly when its own expansion
-/// does: rustc replaces the whole attribute with every `injected` item when `condition`
-/// holds, and removes it entirely otherwise — so the item's presence, considering only
-/// this one attribute, is `!condition || (every injected item's own presence)`. That is
-/// false whenever `test` is false exactly when both `condition` is *guaranteed true*
-/// whenever `test` is false (so the `!condition` branch is not what lets it through) and
-/// at least one `injected` item is itself [`attribute_requires_test`] (so the branch
-/// that does run still requires it) — the same "any disjunct must hold" shape
-/// [`meta_requires_test`]'s own `any(..)` arm already uses, because `!condition ||
-/// injected` is exactly that shape with two disjuncts. Recursing into each `injected`
-/// item through this same function rather than assuming it is a bare `cfg(..)` is what
-/// lets `cfg_attr(.., cfg_attr(.., cfg(test)))` chain arbitrarily deep, the same reach
-/// [`attr_introduces_cfg`]/[`meta_introduces_cfg`] already give a *reached* `cfg`.
-fn attribute_requires_test(meta: &syn::Meta) -> bool {
-    match meta {
-        syn::Meta::List(list) if path_is_ident(&list.path, "cfg") => list
-            .parse_args::<syn::Meta>()
-            .is_ok_and(|inner| meta_requires_test(&inner)),
-        syn::Meta::List(list) if path_is_ident(&list.path, "cfg_attr") => list
-            .parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            )
-            .is_ok_and(|metas| {
-                metas.first().is_some_and(meta_holds_without_test)
-                    && metas.iter().skip(1).any(attribute_requires_test)
-            }),
-        _ => false,
+/// [`Cfg::Atom`] is the leaf for anything this scan cannot read as `test`, `all`,
+/// `any` or `not` — an ordinary flag such as `feature = ".."`, or a shape this parser
+/// gave up on — carrying the exact tokens it was built from (via [`cfg_atom_text`]) as
+/// its identity. Two atoms with identical rendered text are the *same* flag and are
+/// held to the same value in every enumerated assignment [`Cfg::requires_test`] tries;
+/// two atoms with different text are treated as independent, which is this scan's
+/// residual limit rather than a guess — it cannot know that `feature = "a"` and
+/// `feature = "b"` are mutually exclusive, only that two occurrences of the identical
+/// text name the same flag.
+#[derive(Clone)]
+enum Cfg {
+    /// The bare identifier `test`.
+    Test,
+    /// A named flag this scan cannot evaluate, identified by its own rendered tokens.
+    Atom(String),
+    /// A conjunction: true only when every member is.
+    All(Vec<Self>),
+    /// A disjunction: true when at least one member is.
+    Any(Vec<Self>),
+    /// A negation of one predicate.
+    Not(Box<Self>),
+}
+
+/// The most distinct flags [`Cfg::requires_test`] will enumerate every combination of
+/// before giving up and answering `false` — a real, reviewed `cfg` predicate names a
+/// small handful at most, and this bound keeps a pathological input's cost bounded
+/// rather than turning this scan into a denial of service over its own gate.
+const MAX_CFG_ATOMS: usize = 20;
+
+impl Cfg {
+    /// Whether this predicate is guaranteed **false** whenever `test` is — i.e.,
+    /// whether `self && !test` is unsatisfiable — decided by enumerating every
+    /// assignment of the distinct flags [`Cfg::atoms`] finds in it, with `test` fixed
+    /// to `false`, and requiring [`Cfg::eval`] to answer `false` under every one.
+    ///
+    /// This is what a purely recursive per-node rule (asking each `all`/`any`/`not`
+    /// the same question of its own children in isolation) cannot do: two attributes
+    /// naming the identical flag in different places are the *same* variable across
+    /// the whole formula, and only trying every joint assignment can see that a
+    /// combination is unsatisfiable when no single piece of it is. A formula naming
+    /// more than [`MAX_CFG_ATOMS`] distinct flags is answered `false` — unable to
+    /// prove test-only — rather than paying for `2^n` assignments.
+    fn requires_test(&self) -> bool {
+        let mut atoms = Vec::new();
+        self.atoms(&mut atoms);
+        atoms.sort();
+        atoms.dedup();
+        if atoms.len() > MAX_CFG_ATOMS {
+            return false;
+        }
+        let assignments = 1usize << atoms.len();
+        (0..assignments).all(|mask| {
+            let true_atoms: std::collections::HashSet<&str> = atoms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| (mask & (1 << index) != 0).then_some(name.as_str()))
+                .collect();
+            !self.eval(false, &true_atoms)
+        })
+    }
+
+    /// Collects the distinct [`Cfg::Atom`] names reachable from this formula into
+    /// `out`, for [`Cfg::requires_test`]'s enumeration.
+    fn atoms(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Test => {}
+            Self::Atom(name) => out.push(name.clone()),
+            Self::All(children) | Self::Any(children) => {
+                for child in children {
+                    child.atoms(out);
+                }
+            }
+            Self::Not(inner) => inner.atoms(out),
+        }
+    }
+
+    /// This formula's truth value under `test` and one assignment of atom names to
+    /// `true` (every name absent from `true_atoms` is `false`).
+    fn eval(&self, test: bool, true_atoms: &std::collections::HashSet<&str>) -> bool {
+        match self {
+            Self::Test => test,
+            Self::Atom(name) => true_atoms.contains(name.as_str()),
+            Self::All(children) => children.iter().all(|child| child.eval(test, true_atoms)),
+            Self::Any(children) => children.iter().any(|child| child.eval(test, true_atoms)),
+            Self::Not(inner) => !inner.eval(test, true_atoms),
+        }
     }
 }
 
-/// [`attribute_requires_test`]'s half over one already-unwrapped `cfg` predicate — the
-/// argument of a `cfg(..)`, or one operand of an `all(..)`/`any(..)`/`not(..)` — rather
-/// than over a whole attribute.
-///
-/// A bare `test` is the base case. `all(..)` is true only when every one of its
-/// conjuncts is, so naming a predicate this function already recognizes as test-only
-/// anywhere in the list makes the whole `all(..)` test-only too, whatever the other
-/// conjuncts are. `any(..)` is true when at least one of its disjuncts is, so it is
-/// test-only only when *every* disjunct is — one branch this function cannot vouch for
-/// (a bare `feature = ".."`, or anything [`meta_holds_without_test`] cannot prove either)
-/// is a branch that can fire without `test`, and an empty `any()` is never true at all
-/// so it is not test-only either. `not(..)` is test-only exactly when its own argument
-/// is guaranteed to *hold* whenever `test` is false — see [`meta_holds_without_test`],
-/// its dual — and an unrecognized shape is read as unable to prove, matching this scan's
-/// own rule that guessing is how a broken input talks a check out of testing it.
-fn meta_requires_test(meta: &syn::Meta) -> bool {
+/// Renders `tokens` as [`Cfg::Atom`]'s own identity: the same whitespace- and
+/// raw-marker-free text [`attribute_text`] already uses, so two occurrences of the
+/// identical flag — spelled identically — compare equal.
+fn cfg_atom_text(tokens: impl quote::ToTokens) -> String {
+    unraw_tokens(tokens.to_token_stream())
+        .to_string()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// Parses one already-unwrapped `cfg` predicate — the argument of a `cfg(..)`, or one
+/// operand of an `all(..)`/`any(..)`/`not(..)` — into a [`Cfg`]. A list that fails to
+/// parse becomes a single [`Cfg::Atom`] of its own unparsed tokens rather than an empty
+/// list, so a malformed `all(..)`/`any(..)` is at least as opaque as an ordinary flag
+/// this scan cannot evaluate, never mistaken for an empty one.
+fn parse_cfg_meta(meta: &syn::Meta) -> Cfg {
     match meta {
-        syn::Meta::Path(path) => path_is_ident(path, "test"),
-        syn::Meta::List(list) if path_is_ident(&list.path, "all") => list
-            .parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            )
-            .is_ok_and(|metas| metas.iter().any(meta_requires_test)),
-        syn::Meta::List(list) if path_is_ident(&list.path, "any") => list
-            .parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            )
-            .is_ok_and(|metas| !metas.is_empty() && metas.iter().all(meta_requires_test)),
-        syn::Meta::List(list) if path_is_ident(&list.path, "not") => list
-            .parse_args::<syn::Meta>()
-            .is_ok_and(|inner| meta_holds_without_test(&inner)),
-        _ => false,
+        syn::Meta::Path(path) if path_is_ident(path, "test") => Cfg::Test,
+        syn::Meta::List(list) if path_is_ident(&list.path, "all") => Cfg::All(parse_cfg_list(list)),
+        syn::Meta::List(list) if path_is_ident(&list.path, "any") => Cfg::Any(parse_cfg_list(list)),
+        syn::Meta::List(list) if path_is_ident(&list.path, "not") => {
+            Cfg::Not(Box::new(list.parse_args::<syn::Meta>().map_or_else(
+                |_| Cfg::Atom(cfg_atom_text(list)),
+                |inner| parse_cfg_meta(&inner),
+            )))
+        }
+        _ => Cfg::Atom(cfg_atom_text(meta)),
     }
 }
 
-/// [`meta_requires_test`]'s dual: whether `meta` is guaranteed **true** whenever `test`
-/// is false, over the same predicate grammar.
+/// [`parse_cfg_meta`]'s helper over one `all(..)`/`any(..)`'s own comma-separated
+/// argument list.
+fn parse_cfg_list(list: &syn::MetaList) -> Vec<Cfg> {
+    list.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .map_or_else(
+            |_| vec![Cfg::Atom(cfg_atom_text(list))],
+            |metas| metas.iter().map(parse_cfg_meta).collect(),
+        )
+}
+
+/// Parses one whole attribute's [`syn::Meta`] — its own path included, so a
+/// `#[cfg(..)]` and a `#[cfg_attr(.., ..)]` are told apart here rather than by the
+/// caller — into the [`Cfg`] formula that must hold for the item carrying it to
+/// survive, considering only this one attribute. [`None`] means the attribute is
+/// unrelated to `cfg` entirely, which [`has_cfg_test`] drops rather than folding in a
+/// formula that could never affect the combination's satisfiability.
 ///
-/// No bare identifier or key-value pair is ever recognized here, `test` itself
-/// included — `test` is false exactly when `test` is false, never guaranteed *true*
-/// then, and nothing else (`debug_assertions`, `feature = ".."`) is a fact this scan can
-/// assume about an unrelated flag. `not(P)` holds whenever `test` is false exactly when
-/// `P` is guaranteed false whenever `test` is false, which is [`meta_requires_test`]
-/// applied to `P` — the two functions call each other rather than duplicating one
-/// another's cases. `all(..)` holds whenever `test` is false only if *every* conjunct
-/// does, and `any(..)` only needs *one* disjunct that does, matching each connective's
-/// own truth table rather than [`meta_requires_test`]'s (which asks the opposite
-/// question of the opposite condition).
-fn meta_holds_without_test(meta: &syn::Meta) -> bool {
+/// A `cfg(P)` survives exactly when `P` does, so its formula is `P` itself, parsed with
+/// [`parse_cfg_meta`]. A `cfg_attr(condition, injected..)` requires `test` exactly when
+/// its own expansion does: rustc replaces the whole attribute with every `injected`
+/// item when `condition` holds, and removes it entirely otherwise — so the item's
+/// presence, considering only this one attribute, is `!condition || (every injected
+/// item's own presence)`, which is [`Cfg::Any`] of the negated condition and an
+/// [`Cfg::All`] over each injected item's own recursively parsed formula (an injected
+/// item unrelated to `cfg` contributes nothing, exactly as at the top level). Recursing
+/// through this same function rather than assuming an injected item is a bare
+/// `cfg(..)` is what lets `cfg_attr(.., cfg_attr(.., cfg(test)))` chain arbitrarily
+/// deep, the same reach `attr_introduces_cfg`/`meta_introduces_cfg` already give a
+/// *reached* `cfg`.
+fn attribute_cfg(meta: &syn::Meta) -> Option<Cfg> {
     match meta {
-        syn::Meta::List(list) if path_is_ident(&list.path, "not") => list
-            .parse_args::<syn::Meta>()
-            .is_ok_and(|inner| meta_requires_test(&inner)),
-        syn::Meta::List(list) if path_is_ident(&list.path, "all") => list
-            .parse_args_with(
+        syn::Meta::List(list) if path_is_ident(&list.path, "cfg") => {
+            Some(list.parse_args::<syn::Meta>().map_or_else(
+                |_| Cfg::Atom(cfg_atom_text(list)),
+                |inner| parse_cfg_meta(&inner),
+            ))
+        }
+        syn::Meta::List(list) if path_is_ident(&list.path, "cfg_attr") => Some(
+            list.parse_args_with(
                 syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
             )
-            .is_ok_and(|metas| !metas.is_empty() && metas.iter().all(meta_holds_without_test)),
-        syn::Meta::List(list) if path_is_ident(&list.path, "any") => list
-            .parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            )
-            .is_ok_and(|metas| metas.iter().any(meta_holds_without_test)),
-        _ => false,
+            .map_or_else(
+                |_| Cfg::Atom(cfg_atom_text(list)),
+                |metas| {
+                    let mut rest = metas.iter();
+                    let condition = rest
+                        .next()
+                        .map_or_else(|| Cfg::Atom(cfg_atom_text(list)), parse_cfg_meta);
+                    let injected: Vec<Cfg> = rest.filter_map(attribute_cfg).collect();
+                    Cfg::Any(vec![Cfg::Not(Box::new(condition)), Cfg::All(injected)])
+                },
+            ),
+        ),
+        _ => None,
     }
 }
 
@@ -1147,7 +1230,7 @@ fn resolve_segment_chain(segments: Vec<String>, aliases: &[UseAlias]) -> Vec<Str
 
     let mut frontier = vec![segments];
     let mut finished: Vec<String> = Vec::new();
-    for _ in 0..=aliases.len() {
+    for hop in 0..=aliases.len() {
         if frontier.is_empty() {
             break;
         }
@@ -1275,7 +1358,25 @@ fn resolve_segment_chain(segments: Vec<String>, aliases: &[UseAlias]) -> Vec<Str
                             .iter()
                             .any(|alias| alias.local == format!("{prefix}::{GLOB_IMPORT_MARKER}"))
                     });
-                if glob_could_have_bound_this {
+                // Round 43: on the very first hop — the path exactly as the source
+                // wrote it, never yet substituted through any alias this scan can
+                // see — a qualified path (more than one segment) whose own leading
+                // segment names nothing in this file's own alias table can still be
+                // exactly as aliased as a local one, through a route this per-file
+                // scan has no way to read: `extern crate self as dep; pub use
+                // core::clone::Clone as C;` at the crate root makes `dep::C` name
+                // `Clone` in a reachable sibling this scan visits separately, with
+                // no `dep` in that sibling's own alias table at all — trusting the
+                // last segment (`C`) read it as an unrelated trait instead. Once a
+                // candidate has already been substituted through at least one local
+                // alias (`hop > 0`), its remaining segments are the literal path
+                // that alias's own `use` target named — a real, fully-written path
+                // this scan did see, `core::clone::Clone` included — and continuing
+                // to trust *its* last segment is what lets an ordinary `use
+                // core::clone::Clone as C;` resolve to `Clone` at all; narrowing
+                // this rule to the first hop alone is what keeps that working.
+                let unqualified_at_the_source = hop == 0 && stripped.len() > 1;
+                if glob_could_have_bound_this || unqualified_at_the_source {
                     finished.push(UNRESOLVED_DERIVE.to_owned());
                 } else if let Some(last) = current.last() {
                     finished.push(last.clone());
@@ -1344,7 +1445,19 @@ pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String
 /// it is reached, is nested with respect to that declaration and gets its own top
 /// level shadowed the same way an inline module's would be.
 ///
-/// Found by Codex review of this change (PR #143), round 29.
+/// Found by Codex review of this change (PR #143), round 29. Round 43 found the pinned
+/// file's own exemption was wider than it needed to be: skipping *every* top-level
+/// shadow there — not only the pinned type's own — meant a second, unrelated
+/// declaration at that same top level, sharing a name with something `trait_name`
+/// could otherwise mean, was read as if it did not exist. `trait Clone { .. } impl
+/// Clone for Recovery { .. }` inside the pinned file itself implements only that local,
+/// unrelated trait — round 41's own finding, one scope further in — but with the whole
+/// top level unshadowed, the bare `Clone` resolved past the local declaration to the
+/// real `core::clone::Clone` and rejected code that never implements it. Only the
+/// entry named `pinned_type_name` is now dropped from the pinned file's own shadow
+/// list, so every *other* local declaration there — the pinned file is an ordinary
+/// module scope for anything it is not the pinned type's own name — still shadows the
+/// way round 29 and round 41 already say a local declaration must.
 ///
 /// # Errors
 ///
@@ -1352,13 +1465,16 @@ pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String
 pub fn trait_implementors_for_pinned_type(
     contents: &str,
     trait_name: &str,
+    pinned_type_name: &str,
     is_pinned_type_file: bool,
 ) -> Result<Vec<String>, syn::Error> {
     let file = parse_rust(contents)?;
     let mut aliases = module_scope_aliases(&file.items);
-    if !is_pinned_type_file {
-        aliases.extend(shadow_aliases_for_local_types(file.items.iter()));
-    }
+    aliases.extend(
+        shadow_aliases_for_local_types(file.items.iter())
+            .into_iter()
+            .filter(|alias| !is_pinned_type_file || alias.local != pinned_type_name),
+    );
     aliases.extend(glob_marker_alias(&file.items));
     let mut implementors = Vec::new();
     collect_trait_implementors(&file.items, &aliases, trait_name, true, &mut implementors);

@@ -4314,6 +4314,75 @@ error, the sharpest proof available that the injected impl is real. A real deriv
 cannot be added to `waymaker-flash` itself without an external dependency the layering
 forbids, matching round 33's own two findings of this shape.
 
+Round 43 found three more on the same commit, none of them in the block-descent
+machinery round 42 had just landed. The first is in `has_cfg_test` itself, shared by
+every rule in this file that reads whether an item is test-gated: rounds 35 through 37
+widened a single attribute's own recursive predicate to recognize `#[cfg(any(test))]`,
+`#[cfg(all(test, feature = "x"))]` and a `cfg_attr`-spelled equivalent, but every one of
+those rounds still combined several attributes on one item with `.any()` — sound only
+in the direction it was built for, since a single attribute proving an item test-only is
+enough to prove the whole item test-only, but several `#[cfg(..)]` attributes on one
+item are conjunctive, exactly like `all(..)`'s own arguments, and a per-attribute answer
+cannot see a combination that is test-only only because two attributes *correlate*
+through a flag neither one alone pins down. `#[cfg(any(test, feature = "x"))]
+#[cfg(not(feature = "x"))]` is exactly that: read together the two admit only `test &&
+!x`, which requires `test`, but neither attribute alone does. The fix replaces the
+per-node recursive rule with `Cfg`, a small formula type every attribute's own
+condition is parsed into, joined with `Cfg::All` across the whole attribute list, and
+answered by `Cfg::requires_test` through *exhaustive enumeration* over the distinct
+named flags the combination actually contains (capped at twenty, past which the scan
+gives up rather than paying for `2^n` assignments) — a flag occurring twice, once under
+`any` and once negated under a sibling attribute, is now the same variable held to the
+same value in every assignment tried, which is what a recursive per-node rule
+structurally cannot express no matter how many connectives it special-cases. The second
+is `every_resolution`'s own hand-off one case further: `extern crate self as dep; pub
+use core::clone::Clone as C;` at the crate root, reached from a sibling file with `impl
+dep::C for crate::recovery::Recovery { .. }`, makes `dep::C` name `Clone` — but `dep` is
+declared nowhere the sibling's own per-file alias table reads, the identical residual
+round 34's absolute-path fix left open one shape narrower, so `dep::C` matched no alias
+at all and fell through to trusting its own last segment, `C`. `resolve_segment_chain`
+now fails closed on any qualified (multi-segment) path that matches no alias on its very
+first hop — the path exactly as the source wrote it, before any local alias this scan
+can see has had a chance to explain it — while a path already substituted through at
+least one local alias keeps trusting its own last segment once no further one applies,
+which is what lets an ordinary `use core::clone::Clone as C;` still resolve at all. The
+third is `trait_implementors_for_pinned_type`'s own exemption for the pinned file:
+round 29 skipped *every* top-level shadow there to keep `Recovery`'s own declaration
+from shadowing itself, but that also dropped round 41's trait shadow for an unrelated
+local declaration sharing the searched name — `recovery.rs` itself declaring `trait
+Clone { .. }` beside `impl Clone for Recovery { .. }` implements only that local trait,
+but with the whole top level unshadowed the bare `Clone` resolved past it to the real
+`core::clone::Clone` and rejected code that never implements it. Only the entry named
+`Recovery` is dropped from the pinned file's own shadow list now, so every other local
+declaration there shadows the way round 29 and round 41 already say one must. All three
+were verified against real compilation: the `cfg` conjunction against the full existing
+test suite, which stayed green on every earlier round's own regression case under the
+new exhaustive evaluator; the self-crate alias by injecting `extern crate self as
+round43_dep; pub use core::clone::Clone as Round43C;` and a sibling `impl
+round43_dep::Round43C for crate::recovery::Recovery<'_, u8> { .. }` into
+`waymaker-flash` itself, confirmed to compile and confirmed caught by `check-layering`
+before reverting; and the pinned-file shadow by a standalone `rustc` compile showing a
+local `trait Clone` and its impl on an unrelated `Recovery` leave no real
+`core::clone::Clone` impl behind (`r.clone()` fails to resolve at all), the same
+underlying Rust fact round 41's own fix rests on.
+
+Round 44 found one more on the same commit, and it turned out to already be closed:
+`#[derive(custom::Debug)]`, where `custom` exports a procedural derive macro named
+`Debug` that could emit anything, is legal Rust `push_resolved_names`'s own
+`locally_rebound` check does not catch — that check asks only whether the derive path's
+first segment was ever handed to a *local* alias, and an unaliased, directly qualified
+path like `custom::Debug` never is, so round 39's fix (built for a *renamed* import
+resolving to the same bare name) never applied. Before round 43's fix to
+`resolve_segment_chain`, `custom::Debug` matched no alias at all and fell through to
+trusting its own last segment, the harmless-looking string `"Debug"`, indistinguishable
+from the real builtin. Round 43's fix already closes it from underneath, for the
+identical reason it closes the self-crate-alias case above: an unaliased, qualified
+path unresolved on its own first hop now resolves to `UNRESOLVED_DERIVE` rather than its
+last segment, so `push_resolved_names` never reaches the builtin-name check with a
+trustable string at all. Verified by neutralizing round 43's fix alone and confirming
+the new regression test fails against the unpatched fallback, then passes once restored
+— no code change beyond the test.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

@@ -2190,6 +2190,7 @@ fn recovery_reachable_file_is_clone_free(
     let handwritten = match crate::parse::trait_implementors_for_pinned_type(
         contents,
         "Clone",
+        RECOVERY_TYPE,
         is_pinned_type_file,
     ) {
         Ok(implementors) => implementors,
@@ -13890,6 +13891,42 @@ mod tests {
     }
 
     #[test]
+    fn two_cfg_attributes_neither_alone_test_only_can_still_combine_to_be() {
+        // Found by Codex review of this change (PR #143), round 43: `has_cfg_test`
+        // combined several attributes' own answers with `.any()`, which finds a
+        // *single* attribute that alone proves the item test-only but is blind to a
+        // combination of several that individually could still admit a non-test
+        // build. `#![cfg(any(test, feature = "x"))]` alone is satisfiable under
+        // `feature = "x"` with no test anywhere (the test right above this one), and
+        // `#![cfg(not(feature = "x"))]` alone is satisfiable under `!x` the same way
+        // — but the two together, exactly as conjunctive as `all(..)`'s own
+        // arguments, admit only `test && !x`, which requires `test`. `.any()` over
+        // the two individually-false answers stayed false, and this harmless
+        // test-only `Clone` implementation was rejected as production-reachable.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(any(test, feature = \"x\"))]\n",
+                "#![cfg(not(feature = \"x\"))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_clone_impl_in_a_sibling_file_of_recovery_rs_is_rejected() {
         // Found by Codex review of this change (PR #143), round 38: a `Clone`
         // implementation may be declared anywhere in `waymaker-flash`, not only
@@ -14091,6 +14128,31 @@ mod tests {
     }
 
     #[test]
+    fn a_qualified_procedural_derive_named_like_a_builtin_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 44, the same finding
+        // one segment earlier: `#[derive(custom::Debug)]` is legal Rust whose `Debug`
+        // is a procedural derive macro exported by `custom`, not `core::fmt::Debug` —
+        // no `use` ever imports it, so `locally_rebound` (which asks only whether the
+        // path's own *first segment* was ever handed to a local alias) reads `false`,
+        // and round 39's fix, which exists to catch exactly this shape when the path
+        // arrives through an alias, never applied. Before round 43 widened
+        // `resolve_segment_chain`'s own fallback, `custom::Debug` matched no alias at
+        // all and fell through to trusting its last segment, `"Debug"`, the identical
+        // harmless-looking string a real builtin resolves to — so `push_resolved_names`
+        // could not tell "the literal, qualified path to a procedural macro that
+        // happens to be named `Debug`" from "the real builtin". Round 43's fix already
+        // closes it from underneath: an unaliased, qualified path unresolved on its own
+        // first hop now resolves to `UNRESOLVED_DERIVE` rather than its last segment, so
+        // `push_resolved_names` sees `UNRESOLVED_DERIVE` directly and never reaches the
+        // builtin-name check at all.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "#[derive(custom::Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
     fn an_unaliased_builtin_derive_is_still_accepted() {
         // The negative case beside the last: an ordinary, never-rebound derive of
         // one of the eight safe builtins must still be accepted, or every clean
@@ -14265,6 +14327,35 @@ mod tests {
     }
 
     #[test]
+    fn a_locally_declared_trait_in_the_pinned_file_itself_is_not_the_real_one() {
+        // Found by Codex review of this change (PR #143), round 43: the last two
+        // tests put the local `trait Clone` and its impl in a *sibling* file, where
+        // `is_pinned_type_file` is `false` and every local shadow — round 41's
+        // trait shadow included — is registered normally. Declared in the *pinned*
+        // file itself (`recovery.rs`), the identical code was rejected instead:
+        // `trait_implementors_for_pinned_type` skipped *every* top-level shadow
+        // there, not only `Recovery`'s own, to keep the pinned type's own
+        // declaration from shadowing itself — but that also dropped the local
+        // `Clone` trait's shadow, so the bare `Clone` in `impl Clone for Recovery`
+        // resolved past it to the real `core::clone::Clone` and rejected code that
+        // implements only the unrelated local trait declared two lines above it.
+        let sources = recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "trait Clone {\n",
+            "    fn conjure() -> Self;\n",
+            "}\n",
+            "impl Clone for Recovery {\n",
+            "    fn conjure() -> Self {\n",
+            "        unimplemented!()\n",
+            "    }\n",
+            "}\n",
+        ));
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_procedural_derive_on_a_block_local_struct_is_rejected() {
         // Found by Codex review of this change (PR #143), round 42: a production
         // function containing `#[derive(Evil)] struct Helper;` reached neither
@@ -14368,6 +14459,76 @@ mod tests {
             contents: concat!(
                 "use core::clone::Clone as C;\n",
                 "impl ::dep::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_qualified_trait_path_unresolved_in_its_own_file_is_not_trusted_by_its_last_segment() {
+        // Found by Codex review of this change (PR #143), round 43, fresh beyond the
+        // absolute-path case round 34 closed above: `extern crate self as dep; pub
+        // use core::clone::Clone as C;` at the crate root, reached from a sibling
+        // file with `impl dep::C for crate::recovery::Recovery { .. }`, makes
+        // `dep::C` name `Clone` — but the sibling's own alias table has no `dep` at
+        // all (that declaration lives in a file this per-file scan never opens
+        // while scanning the sibling), so `dep::C` matched no alias on either the
+        // qualified or the plain lookup and fell through to trusting its own last
+        // segment, `C`, the identical harmless-looking miss a leading `::` already
+        // produced before round 34. `resolve_segment_chain` now fails closed on any
+        // qualified (multi-segment) path that matches no alias on its very first
+        // hop — the path exactly as the source wrote it, before any local alias
+        // this scan can see has had a chance to explain it — rather than only on
+        // `crate::`, `super::` and an absolute `::` prefix. The impl lives in a
+        // child file so it cannot also trip the unrelated `RECOVERY_SURFACE`
+        // function-surface pin, which reads `recovery.rs` itself.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl dep::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_chained_alias_still_resolves_through_a_qualified_use_target_after_one_hop() {
+        // The negative case beside the last: round 43's new first-hop-only rule must
+        // not stop an ordinary aliased derive from resolving. `use core::clone::Clone
+        // as C; impl C for Recovery { .. }` chases one alias hop to the fully
+        // written target `core::clone::Clone` — a real path this scan *did* see,
+        // via a local `use` — and that hop must still trust its own last segment,
+        // `Clone`, or every aliased `impl` this file's whole design exists to catch
+        // would stop resolving at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use core::clone::Clone as C;\n",
+                "impl C for super::Recovery {\n",
                 "    fn clone(&self) -> Self {\n",
                 "        super::Recovery\n",
                 "    }\n",
