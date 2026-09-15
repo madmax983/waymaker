@@ -1238,21 +1238,17 @@ Stated so that nobody mistakes silence for coverage:
   under a *different*, unevaluated flag: `own_aliases` still deterministically picks one —
   the first at module scope, the last at block scope — so whichever a real build compiles
   can lose to the other. `struct_literal_counts` closes that residual for its own callers
-  with `alias_could_reach_target` (issue #185): a construction is counted when *any* live
-  alias sharing its name could reach it, not only the one declaration
-  `resolve_local_alias_chain`/`resolve_segments_from` would pick — but only for a bare,
-  single-segment construction path whose live alias resolves without stepping into
-  another module. A qualified site (`super::Unchecked { .. }`) or a live alias reached
-  through a module (`use traits::Marker as Unchecked;`) is not covered, and neither is
-  chasing a resolved target past its own module qualification — a multi-segment target
-  is compared once and the chain stops there, so it cannot be confused with an unrelated
-  local alias of the same bare name, but it also cannot be followed into the module it
-  names. Tracked as issue #197. `resolved_path_uses` and `future_trait_implementors`
-  still have the wider residual too, because they need `resolve_segments`' and
-  `resolve_segments_from`'s one deterministic answer for reasons of their own — see the
-  Status section's own paragraph on issue #185 for why widening those two was not taken
-  up here. Alias resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
-  within one module (issue #109), a nested module does not inherit an outer one's aliases,
+  with `path_could_reach_target`/`segments_could_reach_target` (issues #185 and #197): a
+  construction is counted when *any* live alias sharing its name could reach it, not only
+  the one declaration `resolve_local_alias_chain`/`resolve_segments_from` would pick — for a
+  bare construction path or a qualified one, and chased into a module a multi-segment alias
+  target names, mirroring `resolve_segments_from`'s own `own_modules` descent.
+  `resolved_path_uses` and `future_trait_implementors` still have the wider residual, because
+  they need `resolve_segments`'s and `resolve_segments_from`'s one deterministic answer for
+  reasons of their own — see the Status section's own paragraph on issue #185 for why
+  widening those two was not taken up here. Alias resolution also stops at the file it
+  reads: a chain of `use .. as ..` renames resolves within one module (issue #109), a
+  nested module does not inherit an outer one's aliases,
   and `self::` and `super::` reach the scope each names explicitly rather than by
   inheritance — a stack of each module's own aliases from the file this scan read down makes
   both well-defined *within that file's own nesting*. `crate::` is not well-defined at all:
@@ -5643,3 +5639,369 @@ site or a target reached through another module — which
 [what is not checked](#what-is-not-checked) names rather than leaves implied by a
 stale claim about `#[cfg(test)]` alone. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+Issue #197 closes the two gaps the paragraph above named. `path_could_reach_target`
+replaces `alias_could_reach_target` as `struct_literal_counts`'s fail-closed check. It
+runs for a qualified construction path (`super::Unchecked { .. }`) as well as a bare
+one. A helper beside it, `segments_could_reach_target`, follows a multi-segment alias
+target into the module it names — the same `self`/`super` and module-descent state
+`resolve_segments_from` already keeps, kept separate from it on purpose, for the
+reason the paragraph above states. One shared, decrementing budget bounds the whole
+search, so a crafted alias cycle across two modules still cannot loop forever. Tests
+for both gaps, and their negative controls, are in `xtask/src/parse.rs`'s own
+`cfg_alias_ambiguity_tests` module.
+
+Two unrelated, pre-existing bugs surfaced while fixing this and are fixed alongside
+it. `generic_assoc_type_bindings_naming` still called `resolve_segments` and
+`resolve_segments_from` with two arguments after issue #181 gave both a third,
+`shadow` — a plain build break on `main`. It now passes `&[]`, matching what another
+caller with no shadow tracking of its own already does. And `struct_literal_counts`
+had already grown past clippy's `too_many_lines` gate before this issue touched it;
+its `Literals` visitor moves to module scope, unchanged otherwise, to fix that.
+
+Review found two more real problems in the fix itself, both real gaps rather than
+nitpicks. First: `resolve_local_alias_chain` chases more than one block-local hop
+before it gives up — `type A = C; type C = CheckedDispatch;`, both declared in one
+function body, is a real, two-hop chain. The first version of this fix tried
+`block_items` only on the very first hop, so a live chain like that was missed. A
+missed count is exactly the danger this whole check exists to close. Fixed by
+threading `block_items` through `segments_could_reach_target` itself: it applies at
+every hop where no module has been entered by name and the search is still at the
+scope it started from — the same reach a block-local alias has in real Rust, and no
+wider.
+
+Second: a file with many `#[cfg(..)]`-ambiguous aliases sharing one name, each
+pointing into a different module, plus many struct literals of that name, took
+seconds rather than milliseconds — [what is not checked](#what-is-not-checked)'s own
+standard for this file's scanners. Two causes, both fixed. The search's own spending
+limit was computed from the whole file on every construction site; `alias_search_budget`
+computes it once per file instead, capped at a flat ceiling — `ALIAS_SEARCH_BUDGET_CEILING`
+— since no real alias chain in this codebase needs more than a handful of hops. And the
+search recomputed `own_aliases`/`own_modules` for the same scope from scratch on every
+branch that revisited it; `AliasLookupCache`, shared across a whole file's search, computes
+each scope's aliases and modules once and reuses them. `many_ambiguous_aliases_and_literals_resolve_quickly`
+is the regression: forty modules, two hundred literals, real branching, held to a two-second
+ceiling it clears in well under one.
+
+A second review round found a third real problem, in the fix for the first one above. A
+block-local `type`/`use` item shadows an enclosing generic type parameter of the same name
+unconditionally in real Rust — confirmed against `rustc` — and `resolve_local_alias_chain`
+chases it with no `shadow` check at all. Only the deterministic resolver's own fallback,
+reached when no block-local alias exists at all, ever consults `shadow`. The block-items fix
+above checked `shadow` before trying `block_items`, so a block-local alias sharing a name
+with a generic parameter was refused instead of searched — the same "missed count" danger
+the whole mechanism exists to close. `shadow` is now checked once, against the path's own
+first segment, and gates only the module-scope half of a hop; a block-local alias is tried
+regardless. `a_block_local_alias_still_resolves_when_its_name_shadows_a_generic_parameter`
+and its control are the regression.
+
+An automated review of the open pull request then found three more, all real. First: running
+out of budget answered `false`, the same as a genuine "not reachable" — but a search that
+exhausted its budget has shown nothing, not that `target` is unreachable, and answering
+`false` is exactly the missed-count danger this whole mechanism exists to close. Exhausting
+the budget now answers `true`. Second: once a hop found a live alias, a same-named sibling
+module was never tried, even when none of that hop's aliases reached `target` — but an
+unevaluated `cfg` can make a module and an alias of one name mutually exclusive the same way
+it can two aliases, so a module is now tried too. Third: `self::Unchecked` names the
+enclosing module, never a block-local item, in real Rust — but `self` does not move `scope`,
+so a block-local alias still answered for a path real Rust resolves at module scope alone.
+Whether the search may consult `block_items` at all is now decided once, from the shape of
+the original path, not per hop. `exhausting_the_budget_counts_the_construction_rather_than_clearing_it`,
+`a_module_is_still_tried_when_a_same_named_alias_did_not_reach_the_target`, and
+`a_self_qualified_path_does_not_reach_a_block_local_alias` — each with its own control — are
+the three regressions.
+
+A further review of the same pull request found a fourth: `own_modules` can return more than
+one sibling module of one name, declared under mutually exclusive `cfg` branches, the same
+way `own_aliases` can return more than one alias — but module descent took the first match
+and stopped there. Taking a hop's every same-named module as a further live branch needed
+module descent to recurse rather than loop in place, the way an alias hop already did: once a
+name can name more than one live module, "the one match" is no longer a thing a loop can just
+step into and carry on from. `segments_could_reach_target` no longer loops at all — every hop,
+alias or module, is its own recursive call now. `a_second_live_module_of_one_name_is_still_tried`
+and its control are the regression.
+
+The same review found two more, both in the fixes just above. First: a module-scope alias's
+own target is resolved in the scope it was declared in, never the caller's block — but a
+module-scope alias's recursive call kept the caller's own `block_eligible`, so a
+construction site's own function-local alias could answer for a name the module-scope
+alias's target never meant. `block_eligible` is now forced `false` for a module-scope
+alias's own target; a block-local alias's own target keeps it, since that one really can
+chain through a further block-local hop. Second: `self::T`/`super::T` explicitly names a
+module's own item — a generic type parameter has no `self::`/`super::` form at all — but
+`shadow` was checked after `self`/`super` had already been stripped, so an unrelated generic
+parameter could suppress a search real Rust never lets it touch. `shadow` is now checked
+once, in `path_could_reach_target`, against the path's own first segment exactly as written,
+before any prefix is consumed. `a_module_scope_alias_does_not_reach_a_later_block_local_shadow`
+and `a_self_qualified_path_reaches_a_live_live_module_ambiguity_despite_a_generic_shadow` —
+each with its own control — are the two regressions; one earlier test
+(`a_block_local_alias_still_applies_after_a_module_scope_hop`) rested on a premise real Rust
+does not allow at all — a module-scope alias's target naming an item only a later, unrelated
+function declares — and is replaced by the first of the two.
+
+A further round found a fifth in the same family: a block-local alias's own target can itself
+be `self::`/`super::`-qualified — `type B = self::A;`, declared beside a later, unrelated
+`type A = CheckedDispatch;` in the same block — and `self::A` explicitly names the enclosing
+*module*'s own `A`, never the block-local one, exactly the fact `path_could_reach_target`'s
+own `block_eligible` already states of the original construction path. But a block-local
+alias's own recursive call forwarded `block_eligible` unconditionally, with no check on
+whether *its own target* carried that same qualification, so `B { .. }` was counted as
+possibly reaching `CheckedDispatch` through the later block-local `A` — a name real Rust never
+lets `self::A` see. `try_alias_candidates` now withholds `block_eligible` from a candidate
+whose own target begins `self`/`super`, the same test every other qualified path in this
+search is already held to. `a_block_local_alias_to_a_self_qualified_path_does_not_chain_through_a_shadow`
+and its control, `a_block_local_alias_to_a_bare_name_still_chains_through_a_shadow`, are the
+regression.
+
+The same round found two more, both about the opposite danger from every fix before them:
+not a missed count, but a name accepted before the search had actually shown it reaches
+`target`. The first is in `try_alias_candidates`'s own fast path: it compared an alias
+candidate's *resolved* segments against `target` by name and returned `true` on a match,
+without asking whether that name was itself a further local alias whose own target
+resolves elsewhere — `type CheckedDispatch = Decoy;` beside a `#[cfg(feature = "a")] type
+Marker = CheckedDispatch;` made `Marker` count as reaching the guarded type under that
+feature, even though `CheckedDispatch`'s own alias sends every real build to `Decoy`
+instead. The fast path is now kept only for an *absolute* alias, whose own target reaches
+past every local scope by construction — every other candidate recurses into
+`segments_could_reach_target` instead, letting that function's own base case decide the
+same way it already would for a name with no alias at all.
+`a_module_scope_alias_whose_target_is_itself_shadowed_does_not_count` and its control,
+`a_module_scope_alias_that_really_reaches_the_target_still_counts`, are the regression.
+
+The second is a level up, in `segments_could_reach_target`'s own closing fallback: once
+module descent had tried a same-named module and found it did not reach `target`, the
+caller's own fallback still compared the *untouched, pre-resolution* segments' last piece
+against `target` by name — so `traits::Marker`, whose own alias always resolves to
+`Decoy`, counted as reaching a target literally spelled `"Marker"`, the tail of the path
+as written, a name it never actually constructs. The fallback now fires only when nothing
+already claimed `first` — no block-local alias, no module-scope alias, and no same-named
+module — because a name any of those three explains is never a bare, direct reference,
+whatever its own resolution turned out to answer.
+`a_module_scope_alias_that_resolves_away_does_not_count_its_own_written_name` and its
+control, `a_module_scope_alias_still_reaches_the_name_it_really_resolves_to`, are the
+regression.
+
+A further round found a sixth, and it is the opposite direction from the round before it —
+a missed count rather than a false one. `block_eligible` was computed from the original
+path's own segment count, so a plain (no `self`/`super`) *multi*-segment path never tried
+a block-local alias for its own first segment — but a block-local `use good as traits;`
+really does let `traits::Marker` reach `good::Marker`, confirmed against real `rustc`, and
+this search missed it the same way `resolve_local_alias_chain` — the deterministic
+resolver's own block-local chaser, scoped to one bare segment for an unrelated, older
+reason — already does. `block_eligible` is now computed from whether the path's own first
+segment is `self`/`super`, not from its length; the deterministic resolver stays as
+narrow as it was, since this search is a backstop over it and widening what it alone can
+find still counts every real construction. `a_block_local_alias_still_qualifies_a_further_segment`
+and its control, `a_self_qualified_path_still_does_not_reach_a_block_local_alias_of_its_first_segment`,
+are the regression.
+
+The same round found a seventh, back to an over-count and reaching one hop deeper than the
+round before it: once resolution had stepped into a module by name (issue #169's descent),
+only `self` was ever stripped from a further alias target — a leading `super` was left
+sitting in the segments as an ordinary token, so `traits::Marker`, whose own target is
+`super::CheckedDispatch`, counted as reaching a target spelled `"CheckedDispatch"` even
+when that name is itself only a root-scope alias for `Decoy`, confirmed against real
+`rustc`: the construction is `Decoy`, never a distinct guarded type. `super` now escapes an
+entered module back to the scope that named it — which `scope` already *is*, since module
+descent by name never moves it, so escaping is stripping the one token rather than a
+further decrement `consume_scope_prefix`'s own floor would refuse to take on a
+single-level file. Scoped to one entered module only: `scope` cannot say which of several
+nested parents a second `super` would need, and a deeper chain is left the same residual
+`resolve_segments_from` — the deterministic resolver sharing this exact limitation — already
+has. `a_super_qualified_alias_target_reached_through_module_descent_does_not_count` and its
+control, `a_super_qualified_alias_target_that_really_reaches_the_target_still_counts`, are
+the regression.
+
+A further round found an eighth, and it is a missed count again: module descent only ever
+read the *enclosing scope's* own items — `items`, from `stack`/`entered` — never
+`block_items`, so a `mod` declared directly inside a function body was invisible to it,
+even though a block-local *alias* of the same name was already tried right beside it.
+Confirmed against real `rustc`: a block-local `mod` really is qualifiable from within its
+own body. `own_modules` is generalized to take any `&syn::Item` iterator, the way
+`own_aliases` already was (issue #92's post-merge review), so
+`try_block_local_candidates` can search `block_items` for a same-named `mod` the moment a
+block-local alias branch does not pan out — mirroring the outer scope's own
+alias-then-module order, and unable to rule either out under an unevaluated `cfg` any more
+than two aliases can rule each other out. `a_block_local_module_is_searched_for_a_qualified_path_head`
+and its control, `a_block_local_module_does_not_count_an_unrelated_name`, are the
+regression.
+
+A further round found a ninth and a tenth together, and both are the same shape:
+real Rust shadowing this backstop had never modelled at all, rather than a further
+ambiguity to branch over. An *unconditional* (no `#[cfg]`) block-local `type`/`use`
+declaration of a name completely shadows any same-named declaration further out — a
+module-scope alias of the same name, or an outer block's own alias of the same name —
+confirmed against real `rustc`: the shadowed declaration and its target type are both
+"never used"/"never constructed" in the compiler's own diagnostics, and neither
+`resolve_local_alias_chain`'s block-local search nor the backstop's own module-scope
+section had ever asked whether a closer, unconditional declaration made the farther one
+dead code. `live_block_declarations` is the fix, shared by both directions: it walks
+`block_items` in reverse — innermost first, the order real Rust shadowing resolves in —
+skipping any `#[cfg(test)]` item (test code is not shipped code, `own_aliases`'s own
+reason), and stops at, and includes, the first *unconditional* (`!has_any_cfg`) match; an
+unconditional match means every declaration further out is dead and reports so, and
+running out with none found means module scope is still a live candidate exactly as
+before. `try_block_local_candidates` and `try_block_module_candidates` now search only
+the live slice this returns rather than the whole of `block_items`, and
+`segments_could_reach_target` wraps its own module-scope alias-and-descent section behind
+the "module scope still live" flag this walk reports, skipping it outright once a
+block-local declaration has shadowed it — two mutually exclusive `#[cfg]`-gated
+declarations of one name still count as separate live branches, exactly as an ambiguous
+alias or module already does, because neither one alone is unconditional.
+`an_unconditional_block_local_alias_shadows_a_module_scope_one` and its control,
+`a_conditional_block_local_alias_still_lets_module_scope_through`, are the ninth's
+regression; `an_unconditional_inner_block_alias_shadows_an_outer_block_one` and its
+control, `a_conditional_inner_block_alias_still_lets_the_outer_one_through`, are the
+tenth's.
+
+A further round found an eleventh, and it is a second look at the seventh's own fix
+rather than a new class of gap: `entered` had been modelled as a single `Option`, so a
+`super` inside a module nested *two* deep — `mod a { type X = super::CheckedDispatch;
+mod b { type Marker = super::X; } }` — escaped straight to the file's own top level
+the moment it popped one level, skipping the immediate parent module (`a`) it actually
+names, confirmed against real `rustc`: a live cfg-gated alias to `a::b::Marker` really
+constructs `CheckedDispatch`, but the search resolved the inner `super::X` against the
+root, found nothing there named `X`, and missed the construction — the seventh's own
+documented residual, "one entered module only," restated for the case that residual
+had named as out of reach. `entered` is now a stack, `&[&'a [syn::Item]]`, pushed onto
+by every module-descent hop rather than replaced by it, so `super` pops exactly one
+level and leaves any further-out entered module still in view for the hop after — the
+deterministic resolver keeps its own single-`Option` shape and its own matching
+residual, since this search is a backstop over it and widening what only the backstop
+can find still counts every real construction.
+`a_super_qualified_alias_target_reached_through_nested_module_descent_still_counts`
+and its control,
+`a_super_qualified_alias_target_reached_through_nested_module_descent_that_resolves_elsewhere_does_not_count`,
+are the regression.
+
+A further round found a twelfth, and it is a different class from every one before it:
+not a missing branch under an unevaluated `cfg`, but a block-local alias's own target
+resolved against the wrong scope entirely. A block-local `use good as traits;` declared
+in an outer block, referenced from a nested inner block that later redeclares its own,
+unrelated `mod good`, still names the *outer* `good` — confirmed against real `rustc`,
+twice: once at crate scope and once at block scope, both printing the outer binding's
+own marker. `block_items` had always been one flat, growing list — every enclosing
+block's own items concatenated, with no record of which block declared which item — so
+resolving an alias's own target reused the same flat list the *reference* site sees,
+letting a block nested more deeply than the alias's own declaration shadow a name the
+alias itself could never have resolved to. `resolve_local_alias_chain` (the
+deterministic resolver) carried the identical bug, for the identical reason: both
+functions treated every enclosing block as one merged scope rather than a stack of
+separate ones, so the combined `resolved_elsewhere || path_could_reach_target(..)`
+this search's own answer is `or`ed into missed the real construction either way — not
+the narrower "the backstop lags the deterministic resolver" standing this family's own
+docs excuse elsewhere, but a shared defect in the actual gate.
+`block_items` is now a stack, `&[Vec<&'a syn::Item>]`, one entry per enclosing block
+rather than one flattened list, threaded through both resolvers. `live_block_declarations`
+pairs each live declaration with the depth it was found at, and both
+`resolve_local_alias_chain` and `try_block_local_candidates` narrow the stack to
+`blocks[..=depth]` before resolving that declaration's own target on the next hop —
+bounding a further lookup to the declaration's own scope and everything enclosing it,
+never a block only the reference site could see.
+`a_block_local_alias_target_resolves_at_its_own_declaration_block_despite_a_later_shadow`
+and its control,
+`a_block_local_alias_target_shadowed_at_its_own_declaration_block_does_not_count`, are
+the regression — both RED against the pre-fix code, in opposite directions (a missed
+count and an over-count), confirming the flat list got both scenarios wrong rather than
+merely one.
+
+A further round found a thirteenth: only one leading `super` was ever stripped per hop,
+so a target written `super::super::X` — from a module nested two deep by name — left the
+second `super` as an ordinary segment no real declaration is ever spelled, confirmed
+against real `rustc`: both tokens really do escape, landing at the scope that named the
+outermost entered module. The stripping loop now keeps popping the entered-module stack
+and removing a leading `super` until either runs out, rather than stopping after one;
+once `entered` empties, a further `super` falls through to `consume_scope_prefix`, which
+already loops over the lexical ancestor stack the same way.
+`a_chain_of_two_leading_supers_escapes_both_entered_modules` and its control,
+`a_chain_of_two_leading_supers_that_resolves_elsewhere_does_not_count`, are the
+regression, RED against the pre-fix code.
+
+The same round also raised a finding this search declines: that a `crate`-qualified
+path should be resolved against the file's own top level before candidate lookup. It is
+not taken up, because it is the identical fix this file's own parsing limits already
+tried and reverted for the deterministic resolver (Codex review, PR #160, rounds 5 and
+6): this scan reads one file and has no way to tell whether that file is really the
+crate root, so treating its own top level as `crate`'s target is right only for the one
+file that happens to be `lib.rs` and a guess everywhere else — the same over- vs
+under-matching shape [what is not checked](#what-is-not-checked) already states for it.
+Both resolvers already agree on the honest answer: `consume_scope_prefix` leaves
+`crate` unconsumed, so a `crate`-qualified path is compared by its own untouched last
+segment, exactly as `resolve_segments_from` does — this is a shared, deliberate limit
+rather than a gap where the backstop trails the deterministic path. No new ADR: nothing
+here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a fourteenth, on two Codex findings from PR #204 itself: an
+unconditional module-scope alias or type declaration beside a `#[cfg]`-gated duplicate
+of the exact same name, in the exact same scope, is not a live/live ambiguity the way
+two declarations under mutually exclusive `cfg` flags are — confirmed against real
+`rustc`, twice: the feature-off build compiles with only the unconditional declaration,
+and the feature-on build fails outright with `E0428` ("the name `Unchecked` is defined
+multiple times"), so the conditional declaration is never reachable in any real,
+successful build and treating it as a second live candidate is an over-count, the
+opposite of the missed-count direction this scanner's own fail-closed rule usually
+guards against — and equally worth closing, since an over-count under an exact-count
+gate rejects valid code rather than only missing a forgery. `declares_name` and
+`live_named_items_in_scope` are the shared primitive: the latter scans a *whole* scope
+for an unconditional match — rather than stopping at the first found walking in one
+direction, which Codex's own sharper, block-scope finding shows depends on declaration
+order for a question real Rust does not — and treats it, once found, as the only live
+declaration of that name in the scope. `live_block_declarations` calls it once per
+block depth, innermost to outermost, stopping at the first unconditional match; and
+`AliasLookupCache` moves from per-scope to per-(scope, name) caching, since which
+declarations are live is now itself a function of the name being looked up rather than
+only of the scope. `try_module_scope_candidates` and its two new cache methods,
+`live_aliases_of`/`live_modules_of`, are the module-scope backstop's own callers.
+
+Fixing only that backstop left the block-scope finding open, and a RED test caught it
+before the fix was ever committed: `struct_literal_counts`'s own *deterministic*
+resolvers — `resolve_local_alias_chain` at block scope and `resolve_segments_from` at
+module scope — had always picked among several same-named declarations by declaration
+order alone (last-declared wins at block scope, first-declared wins at module scope),
+with no regard for which one a real build could ever have. So an unconditional
+declaration textually *after* a `#[cfg]`-gated duplicate was silently outvoted by one
+that can never coexist with it — and because the visitor consults the fail-closed
+backstop only when the deterministic answer disagrees with the target, a wrongly
+confident deterministic pick short-circuits before the backstop is ever asked. The
+module-scope regression test had passed the backstop alone only because its own
+declaration order happened to already agree with `.find()`'s first-match rule — the
+unconditional alias was written first — not because the resolver was correct; reversing
+that order reproduces the identical bug one scope up. `preferred_alias` is the fix,
+shared by both resolvers: within one scope, it prefers an unconditional declaration
+outright over every conditional one, falling back to each resolver's own prior
+tie-break only when none is unconditional — a case still genuinely ambiguous under a
+`cfg` this scanner cannot evaluate, and still left to `path_could_reach_target`'s own
+separate, fail-closed search to catch what one deterministic pick still might miss.
+`an_unconditional_module_scope_alias_excludes_a_same_scope_cfg_duplicate` and
+`an_unconditional_block_local_alias_excludes_a_same_scope_cfg_duplicate_regardless_of_order`
+are the regression, both RED against the pre-fix code — the first by coincidence of
+ordering once `preferred_alias` did not yet exist, the second unconditionally. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a fifteenth, and it is a different class from the fourteenth's
+own two findings: not a missing branch under an unevaluated `cfg`, but a namespace this
+scanner has no way to read. `declares_name` and `preferred_alias` both treated a `use`
+item exactly as they treat a `mod` or a `type` alias, but a `use` can import a *value*,
+and real Rust lets a value share a name with a module with no collision at all —
+confirmed against real `rustc`: `use values::traits;`, importing a function named
+`traits`, compiles cleanly beside `mod traits { .. }` in the same scope, where two
+`type` aliases or two `mod`s of one name would be a real `E0428`/`E0255`. So an
+unconditional value import was wrongly read as the scope's one live declaration of
+`traits`, and `live_named_items_in_scope` excluded the module entirely — a missed
+count, the fourteenth round's own danger direction, reached through a route the
+fourteenth round's own fix had not closed. `is_namespace_unambiguous` is the fix: only
+a `mod` or a `type` alias is ever provably in the type namespace, so only one of those
+may now be the unconditional winner `live_named_items_in_scope` treats as exclusive,
+and only one of those may be excluded by such a winner — a `use` match is always kept
+as an independently live candidate, the same residual [what is not
+checked](#what-is-not-checked) already states for a same-spelled alias across
+namespaces, restored here rather than silently narrowed away by the fourteenth round's
+own exclusion logic. `preferred_alias` takes the identical guard, so its own single
+deterministic pick cannot be short-circuited by an unconditional `use` either — a
+weaker requirement than the backstop's, since callers built on it already carry the
+documented live/live-ambiguity residual, but left inconsistent with a stale doc comment
+otherwise. `an_unconditional_value_use_does_not_shadow_a_same_named_module` and its
+control, `an_unconditional_value_use_does_not_count_an_unrelated_name`, are the
+regression, confirmed RED against the pre-fix code (`total: 0` against an expected `1`)
+before this fix landed. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
