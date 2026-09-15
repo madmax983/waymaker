@@ -975,9 +975,9 @@ pub struct ImplTraitPath {
 /// Every `impl <Trait> for <Type>` item in `contents`, outside `#[cfg(test)]`.
 ///
 /// Each path is checked against its own enclosing scope's `use` and `mod`
-/// declarations only — [`resolve_local_alias_chain`] and [`own_modules`], the
+/// declarations only — `resolve_local_alias_chain` and `own_modules`, the
 /// same per-scope, non-inheriting lookups [`struct_literal_counts`] and
-/// [`resolve_segments`] already use for a block-local alias and a sibling
+/// `resolve_segments` already use for a block-local alias and a sibling
 /// module. A trait path names only one root, so this needs no deeper,
 /// multi-hop descent: a first segment not aliased or shadowed in this scope
 /// stays exactly as written, for the caller's own crate-level dependency
