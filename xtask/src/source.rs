@@ -21984,26 +21984,22 @@ mod deferred_answer_pins {
     #[test]
     fn a_nested_block_containing_an_unrecognised_statement_is_refused_rather_than_silently_skipped()
     {
-        // Codex's finding: `{ let mut x: u8 = 30; { if true { x = 3; } } x }` names an `if`
-        // statement with no trailing semicolon, sitting inside a bare nested block —
-        // recognised by `resolve_block_sequential` as neither a `while`, a further nested
-        // block, nor a mutation. Before this fix the fallback was `continue`, so the `if`
-        // was silently treated as a no-op: the inner call "succeeded" having done nothing,
-        // and `evaluate_block` read the block's own tail `x` back at whatever
-        // `let mut x: u8 = 30;` left it — a *resolved* but wrong value (`30`), not merely an
-        // unresolved one, since the `if` never ran. This is exactly the shape
-        // `check_integrity_check`'s own dense-match detector cannot be shown failing on
-        // through *this* particular repair — refusing a wrongly-resolved arm and refusing an
-        // unresolved one look identical to a match-pattern scan, since both mean "no
-        // violation" — so the observable difference is at the resolver itself: `P0` used to
-        // answer `30`, and now must answer nothing at all. Verified against real rustc:
-        // `make(3)` — the identical body, named and with `3` a parameter — is `3`,
+        // The reproduction this test originally used, `{ let mut x: u8 = 30; { if true { x =
+        // 3; } } x }`, stopped being an example of an *unrecognised* statement once
+        // `evaluate_if_statement` was added — it now correctly resolves `P0` to `3`, and the
+        // test now uses `a_dense_match_over_constants_with_a_conditional_body_is_reported`
+        // below to check that. What this test still needs to hold is the general fallback:
+        // a `for` loop — recognised by `resolve_block_sequential` as neither a `while`, a
+        // nested block, an `if`/`else`, nor a mutation — sitting inside a bare nested block.
+        // The fallback refuses the whole call rather than silently treating an unrecognised
+        // statement as a no-op, so `P0` never resolves at all, whatever the `for` loop would
+        // really have done to `x`. Verified against real rustc: this shape compiles cleanly,
         // warning-free.
         // `qualified_constants_with_prefix` only populates `qualified` when `prefix` is
         // non-empty — a module-qualified name is the whole point of that map — so a
         // one-segment prefix is what makes `P0`'s own resolved (or refused) value visible
         // here at all, under the key it would be reached by from another file of the tree.
-        let source = "const P0: u8 = { let mut x: u8 = 30; { if true { x = 3; } } x };";
+        let source = "const P0: u8 = { let mut x: u8 = 30; { for _ in 0..1 { x = 3; } } x };";
         let (qualified, _, _) = crate::parse::qualified_constants_with_prefix(
             source,
             &["m".to_owned()],
@@ -22119,6 +22115,86 @@ mod deferred_answer_pins {
             "\nconst fn dense_table_over_a_while_let_bound_body(nibble: u32) -> u32 {{\n{constants}    \
              match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
              P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_conditional_body_is_reported() {
+        // Codex's finding: `{ let mut x: u8 = n * 10; if x > 0 { x /= 10; } x }` names a
+        // top-level `if` statement with no `else` and no trailing semicolon —
+        // `evaluate_block`'s own statement-count invariant had no term at all for it, unlike
+        // the `while` and nested-block statements beside it, so the block always looked one
+        // statement longer than its own name-counting terms could account for and every
+        // constant built this way refused as unresolved regardless of which branch running
+        // it would have taken. `evaluate_if_statement` now runs the chosen branch for real,
+        // as its own nested lexical scope. Verified against real rustc: dividing `x` by 10
+        // when it is nonzero leaves `x == n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = {n} * 10; if x > 0 {{ x /= 10; }} \
+                 x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_conditional_body(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_assigning_an_unsuffixed_bitwise_not_to_a_typed_local_is_reported()
+     {
+        // Codex's finding: `{ let mut x: u8 = 99; let _old = x; x = !255 + n; x }` names a
+        // *plain assignment* whose right-hand side needs the target's own declared type to
+        // fold the bare negation inside it — but the mutation-handling code called
+        // `literal_or_const_value` directly for a plain `=`, discarding the same
+        // `declared_type` the compound-assignment arm beside it already threads through.
+        // Real Rust uses the assignment target's own declared type as the expected type for
+        // the right-hand side, the identical way it does for a typed `let`'s own initializer,
+        // so the plain-assignment arm now goes through `resolve_declared_initializer` too.
+        // Verified against real rustc: `!255 + n` assigned into a `u8` is `n`, for every `n`
+        // in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = 99; let _old = x; x = !255 + {n}; \
+                 x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_assignments_declared_target_type(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
              P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
              P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
              _ => 15,\n    }}\n}}\n"

@@ -3131,6 +3131,26 @@ fn block_mutation_statement_count(block: &syn::Block) -> usize {
     block_mutation_stmts(block).len()
 }
 
+/// `block`'s own production statements minus its last one — the block's own value-tail,
+/// which `evaluate_block` resolves separately through `literal_or_const_value` rather than
+/// through any of the three scanners beside this one.
+///
+/// Codex's finding: `{ let mut x = 128u8; x <<= 1; if x == 0 { n } else { n * 10 } }` names a
+/// block whose own *tail* is a value-producing `if`/`else` — a legitimate expression, not a
+/// statement, since it is the block's last one and carries no semicolon. `block_if_stmts`'s
+/// own scanner (and `block_while_stmts`'s and `block_nested_block_stmts`'s beside it, sharing
+/// the identical shape) used to scan `block.stmts` whole, so a tail that happened to share
+/// one of these three forms was counted as a *statement* on top of being resolved separately
+/// as the tail — one more than `rest.len()` could ever match, refusing a block that resolves
+/// cleanly. Excluding the tail here, the same way `evaluate_block`'s own `rest` already does,
+/// is what keeps the two sides counting the identical set of statements.
+fn block_non_tail_stmts(block: &syn::Block) -> Vec<&syn::Stmt> {
+    match production_stmts(block).split_last() {
+        Some((_, rest)) => rest.to_vec(),
+        None => Vec::new(),
+    }
+}
+
 /// Every `while` loop statement `block` declares directly, in source order —
 /// [`block_mutation_stmts`]'s own loop twin, read the identical way: a `#[cfg(test)]`-gated
 /// one is skipped. A `while` loop needs no trailing semicolon to stand as a statement (it is
@@ -3138,10 +3158,8 @@ fn block_mutation_statement_count(block: &syn::Block) -> usize {
 /// both `Stmt::Expr` shapes are matched here rather than only the `Some(_)` one
 /// `block_mutation_stmts` requires of an assignment.
 fn block_while_stmts(block: &syn::Block) -> Vec<&syn::ExprWhile> {
-    block
-        .stmts
-        .iter()
-        .filter(|stmt| !stmt_is_cfg_test(stmt))
+    block_non_tail_stmts(block)
+        .into_iter()
         .filter_map(|stmt| {
             let syn::Stmt::Expr(expr, _) = stmt else {
                 return None;
@@ -3169,10 +3187,8 @@ fn block_while_statement_count(block: &syn::Block) -> usize {
 /// same way [`resolve_block_sequential`]'s own arm is: a `break 'a value;` inside one can
 /// produce a value from a control-flow path this scan does not trace.
 fn block_nested_block_stmts(block: &syn::Block) -> Vec<&syn::Block> {
-    block
-        .stmts
-        .iter()
-        .filter(|stmt| !stmt_is_cfg_test(stmt))
+    block_non_tail_stmts(block)
+        .into_iter()
         .filter_map(|stmt| {
             let syn::Stmt::Expr(expr, _) = stmt else {
                 return None;
@@ -3193,6 +3209,34 @@ fn block_nested_block_stmts(block: &syn::Block) -> Vec<&syn::Block> {
 /// outright regardless of what running it would have computed.
 fn block_nested_block_statement_count(block: &syn::Block) -> usize {
     block_nested_block_stmts(block).len()
+}
+
+/// Every `if`/`else` statement `block` declares directly, in source order —
+/// [`block_while_stmts`]'s own conditional-scope twin.
+fn block_if_stmts(block: &syn::Block) -> Vec<&syn::ExprIf> {
+    block_non_tail_stmts(block)
+        .into_iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Expr(expr, _) = stmt else {
+                return None;
+            };
+            let syn::Expr::If(if_expr) = strip_parens(expr) else {
+                return None;
+            };
+            Some(if_expr)
+        })
+        .collect()
+}
+
+/// [`block_if_stmts`]'s own statement count — `evaluate_block`'s `rest.len()` invariant's
+/// third missing term. Codex's finding: `{ let mut x: u8 = n * 10; if x > 0 { x /= 10; } x }`
+/// names a block whose statements are a `let` and a top-level `if` with no `else` — the
+/// identical shape `block_while_statement_count` and `block_nested_block_statement_count`
+/// were each added for, one syntax further over: nothing on either side of the invariant
+/// ever counted the conditional statement, so a block holding one refused outright
+/// regardless of which branch running it would have taken.
+fn block_if_statement_count(block: &syn::Block) -> usize {
+    block_if_stmts(block).len()
 }
 
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
@@ -4165,6 +4209,160 @@ fn evaluate_while_loop(
     None
 }
 
+/// Runs `if_expr` — an `if`/`else` used as a *statement*, never as a value — against
+/// `resolved`/`local_types`: the branch taken opens a nested lexical scope of its own,
+/// exactly as a `while` body or a bare block statement does, restored via its own
+/// `shadow_snapshot` once that branch finishes.
+///
+/// Codex's finding: `{ let mut x: u8 = n * 10; if x > 0 { x /= 10; } x }` names a top-level
+/// `if` with no trailing semicolon and no `else` — `evaluate_block`'s own statement-count
+/// invariant had no term at all for it (unlike the `while` and nested-block statements
+/// beside it), so the block always looked one statement longer than its own name-counting
+/// terms could account for, refusing every constant built this way regardless of what
+/// running the conditional would have computed. [`block_if_statement_count`] is that
+/// missing term; this function is what actually runs the chosen branch, the same way
+/// [`evaluate_while_loop`] runs a loop's body rather than merely being counted for.
+///
+/// An `if let` condition is handled the identical way [`evaluate_if_let`] and
+/// [`evaluate_while_loop`]'s own while-let arm already do: the scrutinee and the match are
+/// decided through `condition_resolve`, and a match extends the branch's own resolver with
+/// the pattern's bound name(s), falling back to the plain `resolve` for everything else.
+fn evaluate_if_statement(
+    if_expr: &syn::ExprIf,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    let condition_resolve_value = |path: &syn::Path| {
+        path.get_ident()
+            .map(ident_name)
+            .and_then(|candidate| resolved.get(&candidate).copied())
+            .or_else(|| (resolve.value)(path))
+    };
+    let condition_resolve_unsigned = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.unsigned)(path),
+            |candidate| {
+                local_types
+                    .get(&candidate)
+                    .is_some_and(|name| is_unsigned_type_name(name))
+            },
+        )
+    };
+    let condition_resolve_width = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.width)(path),
+            |candidate| local_types.get(&candidate).map(String::as_str),
+        )
+    };
+    let condition_resolve = Resolve {
+        value: &condition_resolve_value,
+        unsigned: &condition_resolve_unsigned,
+        width: &condition_resolve_width,
+    };
+    if let syn::Expr::Let(let_expr) = strip_parens(&if_expr.cond) {
+        let scrutinee = literal_or_const_value(&let_expr.expr, &condition_resolve)?;
+        if !match_arm_matches_constant(&let_expr.pat, scrutinee, &condition_resolve)? {
+            return evaluate_else_branch(
+                if_expr.else_branch.as_ref(),
+                resolve,
+                local_types,
+                resolved,
+            );
+        }
+        let bound = pattern_bindings(&let_expr.pat, &condition_resolve);
+        let is_bound = |path: &syn::Path| -> bool {
+            path.get_ident().is_some_and(|ident| bound.contains(&ident))
+        };
+        let bound_unsigned_value =
+            !bound.is_empty() && is_definitely_unsigned(&let_expr.expr, &condition_resolve);
+        let bound_width_value = (!bound.is_empty())
+            .then(|| expr_declared_width(&let_expr.expr, &condition_resolve))
+            .flatten();
+        let bound_value = |path: &syn::Path| -> Option<i128> {
+            if is_bound(path) {
+                return Some(scrutinee);
+            }
+            (resolve.value)(path)
+        };
+        let bound_unsigned = |path: &syn::Path| -> bool {
+            if is_bound(path) {
+                return bound_unsigned_value;
+            }
+            (resolve.unsigned)(path)
+        };
+        let bound_width = |path: &syn::Path| -> Option<&str> {
+            if is_bound(path) {
+                return bound_width_value.as_deref();
+            }
+            (resolve.width)(path)
+        };
+        let let_resolve = Resolve {
+            value: &bound_value,
+            unsigned: &bound_unsigned,
+            width: &bound_width,
+        };
+        let mut shadow_snapshot = ShadowSnapshot::new();
+        resolve_block_sequential(
+            &production_stmts(&if_expr.then_branch),
+            &let_resolve,
+            local_types,
+            resolved,
+            &mut shadow_snapshot,
+        )?;
+        restore_shadow_snapshot(local_types, resolved, shadow_snapshot);
+        return Some(());
+    }
+    let condition = literal_or_const_value(&if_expr.cond, &condition_resolve)?;
+    if condition != 0 {
+        let mut shadow_snapshot = ShadowSnapshot::new();
+        resolve_block_sequential(
+            &production_stmts(&if_expr.then_branch),
+            resolve,
+            local_types,
+            resolved,
+            &mut shadow_snapshot,
+        )?;
+        restore_shadow_snapshot(local_types, resolved, shadow_snapshot);
+        return Some(());
+    }
+    evaluate_else_branch(if_expr.else_branch.as_ref(), resolve, local_types, resolved)
+}
+
+/// [`evaluate_if_statement`]'s own `else` half: nothing when there is no `else` at all — the
+/// statement simply did nothing — a further `if`/`else if` chain recursed into the identical
+/// way, or a plain `else { .. }` block run as its own nested scope. The grammar guarantees
+/// `else_branch`'s expression is always one of the first two; there is no third shape to
+/// refuse.
+fn evaluate_else_branch(
+    else_branch: Option<&(syn::token::Else, Box<syn::Expr>)>,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    let Some((_, else_expr)) = else_branch else {
+        return Some(());
+    };
+    match strip_parens(else_expr) {
+        syn::Expr::If(nested_if) => {
+            evaluate_if_statement(nested_if, resolve, local_types, resolved)
+        }
+        syn::Expr::Block(else_block) => {
+            let mut shadow_snapshot = ShadowSnapshot::new();
+            resolve_block_sequential(
+                &production_stmts(&else_block.block),
+                resolve,
+                local_types,
+                resolved,
+                &mut shadow_snapshot,
+            )?;
+            restore_shadow_snapshot(local_types, resolved, shadow_snapshot);
+            Some(())
+        }
+        _ => None,
+    }
+}
+
 /// `resolve_block_sequential`'s own `shadow_snapshot` — every name a `let` statement in the
 /// walked block binds, mapped to the `(value, type)` it answered with the moment *before*
 /// this call's first shadow of that name, so a caller whose own scope ends where the call's
@@ -4285,6 +4483,13 @@ fn resolve_block_sequential(
                 continue;
             }
         }
+        // An `if`/`else` statement needs no trailing semicolon either, and each branch it
+        // can take opens a nested lexical scope of its own the identical way a `while` body
+        // or a bare block statement does.
+        if let syn::Expr::If(if_expr) = strip_parens(expr) {
+            evaluate_if_statement(if_expr, resolve, local_types, resolved)?;
+            continue;
+        }
         let (name, op, rhs_expr) = mutation_target(expr)?;
         let &current_value = resolved.get(&name)?;
         let mutation_resolve_value = |path: &syn::Path| {
@@ -4322,6 +4527,13 @@ fn resolve_block_sequential(
         // synthetic binary needed at all; `current_value` above still gates it on the target
         // already being a local this scan resolved, the identical refusal a compound
         // assignment to an untracked name already gets, for the identical reason.
+        //
+        // Codex's next-round finding: the plain-assignment arm called `literal_or_const_value`
+        // directly, discarding the same `declared_type` the compound-assignment arm beside it
+        // already threads through — but Rust uses the *target's* own declared type as the
+        // RHS's expected type for a plain assignment exactly as it does for a typed `let`, so
+        // `x = !255 + n;` against a `let mut x: u8 = ..;` needs it the identical way
+        // `resolve_declared_initializer` already serves a `let`'s own initializer.
         let updated = match &op {
             Some(assign_op) => apply_compound_assignment(
                 current_value,
@@ -4330,7 +4542,7 @@ fn resolve_block_sequential(
                 &rhs_expr,
                 &mutation_resolve,
             )?,
-            None => literal_or_const_value(&rhs_expr, &mutation_resolve)?,
+            None => resolve_declared_initializer(&rhs_expr, declared_type, &mutation_resolve)?,
         };
         resolved.insert(name, updated);
     }
@@ -4408,13 +4620,15 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // of whether `resolve_block_sequential` below could actually run the loop.
     // `block_nested_block_statement_count` is the identical gap one syntax over: a bare
     // `{ .. }` statement binds no name at the outer scope either, and was counted by neither
-    // side of this sum until now.
+    // side of this sum until now. `block_if_statement_count` is the same gap a third time: an
+    // `if`/`else` statement binds no name at the outer scope either.
     if rest.len()
         != const_item_count
             + block_let_statement_count(block)
             + block_mutation_statement_count(block)
             + block_while_statement_count(block)
             + block_nested_block_statement_count(block)
+            + block_if_statement_count(block)
             + ignored_lets
     {
         return None;
