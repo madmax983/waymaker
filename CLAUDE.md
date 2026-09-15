@@ -1304,14 +1304,32 @@ Stated so that nobody mistakes silence for coverage:
   the first version wrong in exactly the direction this residual-limit bullet exists to
   catch: it only ever added a shadowing item's own names and never reset, so a nested item one
   level inside the shadowing one inherited a shadow real Rust never gives it, hiding a real
-  alias the pre-#181 code had resolved correctly. A block-local item sharing a name with a
-  sibling module or alias stays open, filed as issue
-  [#193](https://github.com/madmax983/waymaker/issues/193): closing it needs a block's own
-  item declarations to become a scope of their own too, ahead of every module-level lookup —
-  more machinery than the generic-parameter half needed, the same standing #169 itself had on
-  PR #160 before it was filed rather than chased. A `struct`, `enum`, `union` or `type` alias
+  alias the pre-#181 code had resolved correctly. The block-local-item half of #181 is now
+  closed too, by issue
+  [#193](https://github.com/madmax983/waymaker/issues/193). A `struct`, `enum` or `union` a
+  block declares directly now shadows a same-named sibling module or alias too, not only a
+  generic type parameter. It lives in its own `block_shadow` list rather than the generic
+  parameter's `shadow`, because the two reset at different points — confirmed against
+  `rustc`, not assumed: `E0401`'s "nested items are independent... for name resolution" is
+  about a generic parameter, and does not make a nested `fn` or `impl` blind to its
+  enclosing block's own item declarations the way it makes one blind to that block's own
+  generics. `block_shadow` therefore persists through a nested `fn`, `impl` or `trait` in
+  the same block, and resets only at a `mod` boundary — the one place a nested item really
+  does lose visibility into what declared it. Every visitor built on
+  `resolve_segments`/`resolve_segments_from` carries a `visit_block` override for it:
+  `resolved_path_uses`, `name_uses`, `struct_literal_counts`, and
+  `generic_assoc_type_bindings_naming`. That last one, issue #184's own caller, had been
+  calling both functions with the wrong argument count since #181 landed, and the crate did
+  not compile until this fix. A `#[cfg(test)]`-gated declaration is excluded from
+  `block_shadow`, `own_aliases`'s own reason (issue #51). A `let`-bound name is left out on
+  purpose rather than left open: it occupies only Rust's value namespace, never the type or
+  module namespace `resolve_segments`'s callers resolve in, so it cannot shadow a path any
+  of them reads — issue #193's own reproducer names one only as part of the `let _ = ...`
+  statement that reads the already-shadowed struct, not as a second shadowing mechanism.
+  A `struct`, `enum`, `union` or `type` alias
   can declare its own generic type parameter too, and none of the five overrides tracks one:
-  a residual narrower than #193's, left stated rather than closed, since none of the pinned
+  a residual narrower than the block-local-item gap issue #193 closed, left stated rather
+  than closed, since none of the pinned
   rules this scanner backs constructs a struct literal or a suffix path from inside one of
   those declarations today. Nor does
   it carry a namespace: two `use` items can bind one local name in different namespaces — a
@@ -5643,3 +5661,43 @@ site or a target reached through another module — which
 [what is not checked](#what-is-not-checked) names rather than leaves implied by a
 stale claim about `#[cfg(test)]` alone. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+Issue #193 closes the other half of #181's own residual: a block-local `struct`,
+`enum` or `union` now shadows a same-named sibling module or `use` alias too, not
+only a generic type parameter. `block_item_shadow_names` reads a block's own
+directly-declared items, skipping a `#[cfg(test)]`-gated one for `own_aliases`'s own
+reason. Its names go into a *new*, separate list, `block_shadow`, not the generic
+parameter's own `shadow` — the review round that found this checked the claim
+against `rustc` rather than assuming it, and the two lists reset at different points
+because real Rust treats them differently. `E0401`'s "nested items are
+independent... for name resolution" is about a generic parameter; it does not make a
+nested `fn` or `impl` blind to its own enclosing block's item declarations, so
+`block_shadow` persists through a nested `fn`, `impl` or `trait` in the same block
+and resets only at a `mod` boundary, via a new `reset_shadows_for_module` helper.
+`shadow` keeps #181's own reset at all four. Every visitor built on
+`resolve_segments`/`resolve_segments_from` carries a `visit_block` override that
+extends `block_shadow` on the way in and truncates it on the way out —
+`resolved_path_uses` and `name_uses` gained one, and `struct_literal_counts` folded
+it into the `visit_block` override it already had for `block_items`. A `let`-bound
+name is deliberately not tracked: it names a value, never a type or a module, so it
+cannot shadow a path any of these functions resolve — stated in
+[what is not checked](#what-is-not-checked) rather than left implied by the fix.
+
+Fixing this surfaced a real, separate compile break on this branch:
+`generic_assoc_type_bindings_naming` (issue #184's own scan, merged one commit after
+#181 added the `shadow` parameter) still called `resolve_segments`/
+`resolve_segments_from` with the pre-#181 argument count, because the two issues were
+developed concurrently and #184's PR was based on a commit before #181 landed. The
+branch had not compiled since that merge. This change threads `shadow_generic_params!`
+and both shadow fields through its visitor too, both for the fix and to make the
+crate build again. A second caller left uncovered would have been the same defect
+issue #193 exists to close, one function over. `struct_literal_counts`'s and
+`generic_assoc_type_bindings_naming`'s own `visit_block` overrides moved the extend/
+truncate pair into a shared `enter_block` helper, and their own alias-then-segments
+resolution moved into a shared `resolve_with_block_alias`, because writing either
+out by hand twice pushed both functions past `clippy::too_many_lines`.
+`cargo xtask check-layering` reports the same 57 rules `ok` on the workspace as it
+did before this change: the fix widens what a *scanner* resolves, and no production
+file in this workspace happens to declare a block-local item sharing a sibling
+module's or alias's name today. No new ADR: nothing here moves a must-not-own cell,
+a dependency edge, or a rule id.
