@@ -1456,9 +1456,32 @@ fn resolve_segments_from(
     // it unresolved keeps the segment in the answer — a suffix check still
     // reads it — rather than silently substituting through a same-named
     // sibling module or alias.
-    if segments
-        .first()
-        .is_some_and(|first| shadow.contains(first) || block_shadow.contains(first))
+    //
+    // `block_shadow` only refuses a *qualified* head segment (more than one
+    // segment) for this reason (Codex review of PR #203, on
+    // `use TimerSpec::BestEffort as Chosen; fn f() { enum Chosen {} let _ =
+    // Chosen; }`): `block_item_shadow_names` names only a `struct`, `enum`,
+    // `union` or `trait`, and Rust puts those in the type/module namespace,
+    // never the value one, except a unit or tuple `struct` — which also
+    // introduces a value-namespace constructor of the same name — and this
+    // function has no way to tell the two shapes apart. A *qualified* path's
+    // head segment (`X::Y`) is always resolved in the type/module namespace,
+    // whichever shape declared it, so refusing there is sound either way. A
+    // *bare* one segment path can be either namespace, and `block_shadow`
+    // cannot tell without knowing whether the local declaration also
+    // occupies the value namespace — so refusing there risks exactly what
+    // Codex found: a real, aliased value the scanner has to see (an alias
+    // this file's own construction pins, like `timer-capability`'s
+    // `CLOCK_SPEC_CONSTRUCTION`, exist to catch) reported as an inert local
+    // name instead. `shadow` (issue #181's generic type parameters) is not
+    // narrowed the same way: a type parameter never occupies the value
+    // namespace on its own, so a bare one has no namespace ambiguity to
+    // guess at.
+    if segments.first().is_some_and(|first| shadow.contains(first))
+        || (segments.len() > 1
+            && segments
+                .first()
+                .is_some_and(|first| block_shadow.contains(first)))
     {
         return segments;
     }
@@ -15365,24 +15388,93 @@ mod block_local_item_shadow_tests {
     }
 
     #[test]
-    fn a_block_local_trait_shadows_a_same_named_sibling_alias() {
+    fn a_block_local_trait_shadows_a_same_named_sibling_alias_for_a_qualified_reference() {
         // Codex review of this change (PR #203): `Alias` occupies the same
         // namespace a struct, enum or union does, so a block-local
         // `trait Alias {}` shadows a module-level `use Disallowed as
-        // Alias;` for `dyn Alias` exactly the way a block-local struct
-        // already shadows one for `Alias { .. }` — `block_item_shadow_names`
-        // had matched only `Item::Struct`/`Item::Enum`/`Item::Union` and
-        // fell through to `_ => None` on `Item::Trait`.
-        let code = "use Disallowed as Alias;\nfn f() {\n    trait Alias {}\n    fn accepts(_: \
-             &dyn Alias) {}\n}\n";
+        // Alias;` for a *qualified* reference (`Alias::CONST`) exactly the
+        // way a block-local struct already shadows one for `Alias { .. }`
+        // — `block_item_shadow_names` had matched only
+        // `Item::Struct`/`Item::Enum`/`Item::Union` and fell through to
+        // `_ => None` on `Item::Trait`. A *bare* reference (`dyn Alias`) is
+        // a separate, narrower finding — see
+        // `a_bare_reference_to_a_block_local_trait_is_not_shadowed_either`,
+        // below, for why it is pinned rather than fixed the same way.
+        let code = "use Disallowed as Alias;\nfn f() {\n    trait Alias {}\n    let _ = \
+             Alias::CONST;\n}\n";
         let paths = resolved_path_uses(code).expect("the fixture parses");
         assert!(
-            paths.iter().any(|path| path.segments == ["Alias"]),
+            paths.iter().any(|path| path.segments == ["Alias", "CONST"]),
             "a block-local trait did not shadow the module-level alias: {paths:?}"
         );
         assert!(
             !paths.iter().any(|path| path.segments == ["Disallowed"]),
             "the shadowed alias resolved through the block-local trait anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_a_block_local_trait_is_not_shadowed_either() {
+        // The mirror image of the qualified case above, and a known,
+        // deliberate residual rather than a bug this change chases: a bare
+        // `dyn Alias` is a single-segment path, so the narrowing in
+        // `resolve_segments_from` (Codex review, PR #203, P1 — see its own
+        // doc comment) leaves it unshadowed the same way a bare value
+        // reference now is, and it resolves through the module alias to
+        // `Disallowed`. That is the *safe* direction for the checks this
+        // scanner backs — an over-strict false positive on legitimate code
+        // that uses a local trait, never a missed violation — where letting
+        // a bare *value* reference stay wrongly shadowed was the dangerous
+        // one. Fixing this one too needs the same namespace-aware
+        // machinery the doc comment on the narrowing already says this
+        // scanner does not have.
+        let code = "use Disallowed as Alias;\nfn f() {\n    trait Alias {}\n    fn accepts(_: \
+             &dyn Alias) {}\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a bare reference to a block-local trait was unexpectedly shadowed: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_a_block_local_items_name_still_resolves_a_value_namespace_alias() {
+        // Codex review of this change (PR #203, P1): `Chosen` names a
+        // module-level value import (`TimerSpec::BestEffort`, a const) and
+        // a block-local zero-variant `enum`, which occupies only the
+        // type/module namespace and so cannot shadow the import for a
+        // *bare* reference — real Rust resolves `let _bad = Chosen;` to the
+        // import. `block_shadow` used to refuse every occurrence of a
+        // shadowed name regardless of how many segments the path had, which
+        // hid the alias from a construction pin like `timer-capability`'s
+        // `CLOCK_SPEC_CONSTRUCTION`: it would see only the allowed
+        // `TimerSpec::AtPersistentTime` reference and miss the disallowed
+        // one reached through `Chosen`.
+        let code = "use TimerSpec::BestEffort as Chosen;\nfn f() {\n    enum Chosen {}\n    let \
+             _ok = TimerSpec::AtPersistentTime;\n    let _bad = Chosen;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a bare reference wrongly stayed shadowed instead of resolving the value-namespace \
+             alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_reference_through_a_block_local_items_name_still_shadows() {
+        // The narrowing above must not reopen issue #193's own bug: a
+        // *qualified* reference (`Local::Sneaky`) is always the type/module
+        // namespace at its head segment, whichever kind of item shadows it,
+        // so it must still refuse to resolve through the sibling module.
+        let code = "mod Local {\n    pub use Disallowed as Sneaky;\n}\nfn f() {\n    enum Local \
+             {}\n    let _ = Local::Sneaky;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a qualified reference resolved through the sibling module despite the block-local \
+             enum: {paths:?}"
         );
     }
 }

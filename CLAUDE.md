@@ -1308,9 +1308,13 @@ Stated so that nobody mistakes silence for coverage:
   closed too, by issue
   [#193](https://github.com/madmax983/waymaker/issues/193). A `struct`, `enum`, `union` or
   `trait` a block declares directly now shadows a same-named sibling module or alias too,
-  not only a generic type parameter — a trait is on that list because it occupies the same
-  namespace the other three do, which a fourth Codex round found `block_item_shadow_names`
-  missing after the first three landed (see the Status section's own paragraph on #193). It lives in its own `block_shadow` list rather than the generic
+  not only a generic type parameter, for a *qualified* reference (`X::Y`) — a trait is on
+  that list because it occupies the same namespace the other three do, which a fourth Codex
+  round found `block_item_shadow_names` missing after the first three landed. A *bare*,
+  single-segment reference is narrower still, for a reason a fifth round found: only a unit
+  or tuple `struct` also occupies the value namespace, so a bare shadow can be wrong in the
+  dangerous direction for the other three shapes (see the Status section's own paragraph on
+  #193 for both rounds). It lives in its own `block_shadow` list rather than the generic
   parameter's `shadow`, because the two reset at different points — confirmed against
   `rustc`, not assumed: `E0401`'s "nested items are independent... for name resolution" is
   about a generic parameter, and does not make a nested `fn` or `impl` blind to its
@@ -5802,3 +5806,43 @@ same namespace a struct, enum or union does — real Rust resolves `dyn Alias` o
 which stepped past the local trait and reported the module's own alias instead.
 `block_item_shadow_names` now matches `Item::Trait` too, verified red against the
 unpatched match arm before landing.
+
+A fifth round found a sharper problem in the mechanism that fourth round's own fix
+extended rather than in `block_item_shadow_names` itself: `block_shadow` refuses a
+shadowed head segment regardless of how many segments the path has, and Rust's
+namespaces do not work that way. `struct`, `enum`, `union` and `trait` all occupy
+the type/module namespace; only a unit or tuple `struct` also occupies the value
+namespace, and this scanner has no way to tell the four shapes apart. Codex's own
+repro was `use TimerSpec::BestEffort as Chosen; fn f() { enum Chosen {} let _ok =
+TimerSpec::AtPersistentTime; let _bad = Chosen; }`: `Chosen` names a *value*
+import, and a bare, zero-variant `enum Chosen` — type/module namespace only —
+cannot shadow it for a bare reference in real Rust, but `block_shadow` refused it
+anyway, so `timer-capability`'s own `CLOCK_SPEC_CONSTRUCTION` pin saw only the
+allowed `TimerSpec::AtPersistentTime` reference and missed the disallowed one
+reached through `Chosen` entirely — a **missed** violation, the dangerous
+direction for a check built on `resolved_path_uses`/`name_uses`, unlike issue
+#185's own over-counting residuals on `struct_literal_counts`. A *qualified* head
+segment (`X::Y`) is always type/module namespace at that segment, whichever of
+the four shapes declared it, so refusing there stays sound; `resolve_segments_from`
+now only refuses a shadowed `block_shadow` name when the path has more than one
+segment, leaving a bare one to resolve through `own_aliases`/`own_modules` as it
+did before block_shadow existed. `shadow` (issue #181's generic type parameters)
+keeps its unrestricted check: a type parameter never occupies the value namespace
+on its own, so a bare one has no namespace ambiguity to guess at.
+
+That narrowing reopened the fourth round's own fix for exactly one shape — a
+*bare* trait-object bound (`dyn Alias`, one segment) is now unshadowed again,
+resolving through the module alias the same way it did before the trait arm was
+added — while a *qualified* reference through the same trait (`Alias::CONST`)
+stays correctly shadowed. Left as a residual rather than chased further: the
+danger runs the other way for this one. A bare `dyn Alias` resolving to the
+sibling module's alias is an over-strict false positive on legitimate code (the
+same direction the fourth round's own fix was closing), never a missed violation,
+so it is the safe side of the same trade the fifth round's own fix makes for the
+dangerous case. Closing it too needs the same position-aware, per-namespace
+machinery — knowing whether a path was reached from a type position or a value
+position, and threading that through every caller of `resolve_segments`/
+`resolve_segments_from` — that this project has already declined to build twice
+for the same underlying limitation (see
+[what is not checked](#what-is-not-checked)'s own bullet on this file's alias
+resolution). Both directions are pinned by a test rather than left implied.
