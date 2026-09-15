@@ -1230,12 +1230,28 @@ Stated so that nobody mistakes silence for coverage:
   from text patterns to real parsing (`syn` for Rust, `pulldown-cmark` for Markdown), so
   comments, strings, char literals, `use` aliases and `#[path]` modules no longer blind
   them. Parsing is not name resolution: glob imports are not followed, macros are not
-  expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. One concrete
-  shape of the `cfg` gap: two mutually exclusive `#[cfg(..)]`-gated `type` aliases sharing one
-  local name are both collected, since alias collection skips only the exact spelling
-  `#[cfg(test)]` and evaluates no other predicate, so whichever is declared last wins a lookup
-  regardless of which one a real build actually compiles (issue #92, Codex review of PR #163).
-  Alias resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
+  expanded, and a path inside a macro body is invisible. `cfg` is evaluated only enough to
+  drop an alias that can never compile — `Cfg::requires_test` answers that for any formula,
+  not only `test`, because a formula that is always false is, vacuously, "false whenever
+  `test` is false" too (round 43 of Codex review on PR #143). That closes the literal case
+  issue #185 named, `#[cfg(any())]`, but not two declarations of one name that are each live
+  under a *different*, unevaluated flag: `own_aliases` still deterministically picks one —
+  the first at module scope, the last at block scope — so whichever a real build compiles
+  can lose to the other. `struct_literal_counts` closes that residual for its own callers
+  with `alias_could_reach_target` (issue #185): a construction is counted when *any* live
+  alias sharing its name could reach it, not only the one declaration
+  `resolve_local_alias_chain`/`resolve_segments_from` would pick — but only for a bare,
+  single-segment construction path whose live alias resolves without stepping into
+  another module. A qualified site (`super::Unchecked { .. }`) or a live alias reached
+  through a module (`use traits::Marker as Unchecked;`) is not covered, and neither is
+  chasing a resolved target past its own module qualification — a multi-segment target
+  is compared once and the chain stops there, so it cannot be confused with an unrelated
+  local alias of the same bare name, but it also cannot be followed into the module it
+  names. Tracked as issue #197. `resolved_path_uses` and `future_trait_implementors`
+  still have the wider residual too, because they need `resolve_segments`' and
+  `resolve_segments_from`'s one deterministic answer for reasons of their own — see the
+  Status section's own paragraph on issue #185 for why widening those two was not taken
+  up here. Alias resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
   within one module (issue #109), a nested module does not inherit an outer one's aliases,
   and `self::` and `super::` reach the scope each names explicitly rather than by
   inheritance — a stack of each module's own aliases from the file this scan read down makes
@@ -5482,4 +5498,85 @@ not read smaller than the baseline's — flash's own rule, one section over. Nei
 can tell an honest `ram: 0, bss: 0` row from a forged one. That gap stays open. It is
 documented in `runtime_ram_total`'s own doc comment and in
 [what is not checked](#what-is-not-checked). No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+Issue #185 closes a gap Codex named on review of PR #183, and checks that a gap it
+described had *already* closed by accident. Codex's own repro was `#[cfg(any())] type
+Unchecked = Decoy; type Unchecked = CheckedDispatch;`, naming `own_aliases`'s
+`.find()` as the cause: it kept every declaration of one name and picked whichever
+sorted first. Testing it first, the way this repo's own review-depth guidance asks —
+red before green — found it was already green. Round 43's `Cfg::requires_test`
+rewrite, made for a different reason (several `#[cfg(..)]` attributes on one item
+correlating through a shared flag), answers a wider question than its name says: an
+always-false formula is, vacuously, "false whenever `test` is false" too, so
+`own_aliases` already drops a `#[cfg(any())]` declaration on its own. Two regression
+tests lock that in, at both scopes `own_aliases` feeds — module scope, where the
+first declaration wins, and block scope, where `resolve_local_alias_chain` searches
+in reverse and the *last* one wins — so a future change cannot quietly lose either
+direction.
+
+What was not already closed is real, and is the harder half of the finding: two
+declarations of one name that are each *live*, under different flags this scanner
+cannot evaluate — `#[cfg(feature = "a")] type Unchecked = Decoy; #[cfg(not(feature =
+"a"))] type Unchecked = CheckedDispatch;` — where `own_aliases`'s pick still favors
+whichever declaration sorts first (module scope) or last (block scope), regardless of
+which one a real build compiles. Both directions were driven and watched fail before
+being fixed. Closing this by changing what `resolve_local_alias_chain` and
+`resolve_segments_from` deterministically resolve to was rejected: `resolved_path_uses`
+and `future_trait_implementors` depend on that one answer too, and this repo's own
+history (Codex review, PR #160, rounds 3 and 4) already tried "explore every alias a
+name could mean" for a different kind of ambiguity and reverted it, because it can
+attribute an unrelated, legitimate construct to the wrong one as easily as a
+first-match pick can miss a real one — the same risk a wider change here would
+reopen for two callers that do not need it. `alias_could_reach_target` is the
+narrower fix instead, scoped to `struct_literal_counts` alone: it asks only whether
+*some* live alias sharing a name could reach the target, and counts a construction
+when it can, even when the deterministic answer disagreed. A construction pin's
+danger is an uncounted forgery, not an extra count, so failing closed here means
+counting more, not resolving differently. Every construction pin built on
+`struct_literal_counts` — `EFFECT_CONSTRUCTIONS`, `CHECKED_DISPATCH_CONSTRUCTION`,
+and `timer-capability`'s and `kernel-boundary`'s associated-constant bans among them —
+gets this for free, because they all funnel through the one function.
+
+Three review rounds on this change found three more, and this file's own
+review-depth guidance — stop past two or three, open an issue once a further round
+is still finding real bugs — applies to the last two. The first was in the fix
+itself: `alias_could_reach_target`'s first version chased every alias's target by its
+bare last segment alone, so `use foo::Bridge as Entry;` beside an unrelated `type
+Bridge = CheckedDispatch;` chained `Entry` through `Bridge` on name alone and counted
+a construction that was never really `CheckedDispatch` — a false positive, and for a
+caller that compares `total` against `inside` by exact equality, a false positive is
+a spurious violation on honest code. Fixed by chasing a target only while it stays
+one segment; a multi-segment target is compared directly and the chain stops, matching
+the same imprecision `struct_literal_counts` already accepts for a single, correctly
+resolved path. `an_unrelated_alias_sharing_a_bare_target_name_is_not_chained_through`
+is the regression. The second is a doc-comment bug rather than a logic one: the first
+version's doc block for the new function sat directly above it with no blank line
+between it and `struct_literal_counts`'s own, older doc comment, so the whole run
+attached to the wrong item — `struct_literal_counts`'s rustdoc page lost its real
+description, keeping only its "§Errors" line. `cargo doc -D warnings` does not catch
+this, because both items still carry *some* doc text; it is exactly the "a
+measurement that did not happen is not a measurement that passed" gap this file
+already states, met in documentation rather than code. Moved the function after
+`struct_literal_counts` instead of before it, with a real blank line on both sides.
+
+The third is real and not fixed here: `alias_could_reach_target` only runs for a
+bare, single-segment construction path, matching the same restriction
+`resolve_local_alias_chain` already has — so a qualified site
+(`super::Unchecked { .. }`) under the identical live/live ambiguity is not checked
+at all. And it does not follow a live alias whose target itself steps into another
+module (`use traits::Marker as Unchecked;`), unlike `resolve_segments_from`'s own
+`own_modules` descent. Both were confirmed against a real `rustc` build: each
+constructs the pinned type under a real, compiling configuration, and
+`struct_literal_counts` reports zero for it either way. Closing them needs the same
+branching threaded through `resolve_segments_from`'s module descent, which is the
+wider change this paragraph's own second round already argued against for
+`resolved_path_uses`'s and `future_trait_implementors`'s sake. Tracked as issue
+[#197](https://github.com/madmax983/waymaker/issues/197) instead of a fourth round
+here. What stays owed, all in one place now: `resolved_path_uses` and
+`future_trait_implementors` still pick one answer under the same live/live
+ambiguity, and so does `struct_literal_counts` itself for a qualified construction
+site or a target reached through another module — which
+[what is not checked](#what-is-not-checked) names rather than leaves implied by a
+stale claim about `#[cfg(test)]` alone. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.

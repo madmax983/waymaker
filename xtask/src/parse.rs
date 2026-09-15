@@ -4270,11 +4270,13 @@ pub fn struct_literal_counts(
             // bare, single-segment path, the only shape a function-local `type`/`use`
             // alias is ever written against; a multi-segment path and module descent stay
             // `resolve_segments`'s own job over the file's item-slice stack.
-            let local = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
+            let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
                 .then(|| node.path.segments.first())
                 .flatten()
-                .map(|segment| ident_name(&segment.ident))
-                .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
+                .map(|segment| ident_name(&segment.ident));
+            let local = first
+                .as_ref()
+                .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
             let resolved = match local {
                 // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
                 // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
@@ -4284,10 +4286,21 @@ pub fn struct_literal_counts(
                 Some((segments, false)) => resolve_segments_from(segments, &self.stack),
                 None => resolve_segments(&node.path, &self.stack),
             };
-            if resolved
+            let resolves_to_name = resolved
                 .last()
-                .is_some_and(|last| last.as_str() == self.name)
-            {
+                .is_some_and(|last| last.as_str() == self.name);
+            // Issue #185: a name declared more than once, live under more than one
+            // unevaluated `cfg`, is not something the deterministic resolution above
+            // can pick correctly between. Ask separately whether *some* live
+            // declaration could reach `self.name`, so an ambiguous alias is never
+            // silently outvoted by another declaration sharing its name.
+            let reachable_another_way = !resolves_to_name
+                && first.as_deref().is_some_and(|first| {
+                    self.stack.last().is_some_and(|scope| {
+                        alias_could_reach_target(first, &self.block_items, scope, &self.name)
+                    })
+                });
+            if resolves_to_name || reachable_another_way {
                 self.count = self.count.saturating_add(1);
             }
             syn::visit::visit_expr_struct(self, node);
@@ -4323,6 +4336,97 @@ pub fn struct_literal_counts(
         total: total.count,
         inside: inside_count,
     })
+}
+
+/// Whether `name` — a bare, single-segment identifier, as written in source and before
+/// any alias resolution — could reach `target` through a chain of `use`/`type` aliases
+/// in `block_items` or `scope_items`. Tries every alias that shares a local name at each
+/// hop, not only the one declaration [`resolve_local_alias_chain`] or
+/// [`resolve_segments_from`] would pick.
+///
+/// [`struct_literal_counts`]'s extra, fail-closed check (issue #185, Codex review of PR
+/// #183). Those two functions pick one declaration when a name is declared more than
+/// once: the first at module scope, the last at block scope. That is correct once a
+/// dead `cfg` is dropped — [`has_cfg_test`]/[`Cfg::requires_test`] already drop one,
+/// because an always-false formula is also, trivially, "false whenever `test` is false"
+/// — but not when two declarations are both live under different flags this scanner
+/// cannot evaluate. `#[cfg(feature = "a")] type Unchecked = Decoy; #[cfg(not(feature =
+/// "a"))] type Unchecked = CheckedDispatch;` builds `CheckedDispatch` under one
+/// configuration and `Decoy` under the other. This scanner cannot tell which one a real
+/// build picks.
+///
+/// So this asks a narrower question instead: could `target` be reached at all, by any
+/// live candidate sharing `name`, `own_aliases` of `block_items` or `scope_items`?
+/// [`resolve_local_alias_chain`] and [`resolve_segments_from`] keep their one
+/// deterministic answer, because `resolved_path_uses` and `future_trait_implementors`
+/// depend on it too. A construction this function finds reachable is counted even when
+/// that answer disagreed — the safe direction for a construction pin, where a missed
+/// count is the danger, not an extra one.
+///
+/// An alias's target is chased only while it stays a single segment: a multi-segment
+/// target (`use foo::Bridge as Entry;`) names a path outside `block_items`/`scope_items`'
+/// own alias table, so its own last segment is compared to `target` directly and the
+/// chain stops there rather than being looked up again as though it were a further
+/// local name. Codex review of this change found the gap that skips: chasing every
+/// target's bare last segment let an unrelated `type Bridge = CheckedDispatch;` answer
+/// for `Entry` above, purely because `Entry` resolves to something whose *last* segment
+/// happens to read `Bridge` too.
+///
+/// What this still does not reach, found by the same review and left as a residual
+/// rather than widened here: a qualified construction site (`super::Unchecked { .. }`,
+/// two or more segments) never calls this at all, since [`struct_literal_counts`]'s own
+/// caller restricts it to a bare, single-segment path; and a live alias whose target
+/// steps into another module (`use traits::Marker as Unchecked;`) is not chased into
+/// that module, unlike [`resolve_segments_from`]'s own `own_modules` descent. Both are
+/// the same underlying ambiguity issue #185 names, reached through a path shape this
+/// narrower, purely additive check does not follow. Closing them needs the same
+/// branching threaded through `resolve_segments_from`'s module descent, which risks the
+/// two callers that need its one deterministic answer; tracked rather than attempted
+/// here, matching this project's own guidance to stop past a bounded number of review
+/// rounds and open an issue once a further one is still finding real gaps.
+///
+/// Bounded by the number of aliases in scope, so neither a real chain nor a
+/// hand-written alias cycle (`use A as B; use B as A;`) can loop forever.
+fn alias_could_reach_target(
+    name: &str,
+    block_items: &[&syn::Item],
+    scope_items: &[syn::Item],
+    target: &str,
+) -> bool {
+    let candidates: Vec<UseAlias> = own_aliases(block_items.iter().copied())
+        .into_iter()
+        .chain(own_aliases(scope_items.iter()))
+        .collect();
+    let bound = candidates.len().saturating_add(1);
+    let mut frontier = vec![name.to_owned()];
+    let mut explored = std::collections::HashSet::new();
+    for _ in 0..=bound {
+        let mut next = Vec::new();
+        for current in &frontier {
+            if !explored.insert(current.clone()) {
+                continue;
+            }
+            for alias in candidates.iter().filter(|alias| &alias.local == current) {
+                if alias
+                    .target
+                    .last()
+                    .is_some_and(|last| last.as_str() == target)
+                {
+                    return true;
+                }
+                // Only a single-segment target can itself be a further local alias;
+                // a longer one names a path this flat, same-scope table cannot chase.
+                if let [only] = alias.target.as_slice() {
+                    next.push(only.clone());
+                }
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        frontier = next;
+    }
+    false
 }
 
 /// Something [`struct_literal_counts`] can count literals inside of, with the
@@ -13409,6 +13513,136 @@ mod raw_identifier_tests {
             "{:?}",
             modules[0].candidates
         );
+    }
+}
+
+#[cfg(test)]
+mod cfg_alias_ambiguity_tests {
+    //! Issue #185, Codex review of PR #183: a `type`/`use` alias declared more than
+    //! once under `#[cfg(..)]` must not let a construction pin silently pick the wrong
+    //! declaration.
+    use super::{FnScope, struct_literal_counts};
+
+    #[test]
+    fn a_dead_cfg_type_alias_does_not_hide_a_live_construction_at_module_scope() {
+        // `#[cfg(any())]` never compiles. `Cfg::requires_test` already answers this
+        // correctly — an always-false formula is, vacuously, "false whenever `test` is
+        // false" too — so `own_aliases` drops it and the live `Unchecked` wins. Locks
+        // in this behavior against regression.
+        let counts = struct_literal_counts(
+            "#[cfg(any())]\ntype Unchecked = Decoy;\n\
+             type Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_dead_cfg_type_alias_declared_after_a_live_one_does_not_hide_it_either() {
+        // The mirror ordering at block scope: `resolve_local_alias_chain` searches in
+        // reverse, so a dead declaration sorted *last* is the one that used to be
+        // picked there.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
+             \x20   #[cfg(any())]\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn two_live_module_scope_aliases_under_mutually_exclusive_flags_are_both_counted() {
+        // Neither declaration is provably dead: `feature = "a"` is a flag this scanner
+        // cannot evaluate, so `own_aliases`'s filtering cannot help, and
+        // `resolve_segments_from` picks the first declaration, `Decoy`.
+        // `alias_could_reach_target` is the fail-closed safety net issue #185 asks for.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn two_live_block_scope_aliases_under_mutually_exclusive_flags_are_both_counted() {
+        // Same shape, one scope over: `resolve_local_alias_chain`'s `.rev().find()`
+        // picks whichever live declaration sorts last, which here is `Decoy` — the
+        // wrong one.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_live_live_ambiguity_does_not_count_an_unrelated_name() {
+        // The control for the two tests above: the safety net must not turn every
+        // ambiguous alias into a match for *every* name asked about. Neither `Decoy`
+        // nor `CheckedDispatch` is `Unrelated`, so this must stay at zero.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "Unrelated",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unrelated_alias_sharing_a_bare_target_name_is_not_chained_through() {
+        // Codex review of this change: the first version of `alias_could_reach_target`
+        // chased every alias target's bare last segment, so `Entry` — which really
+        // names the unrelated `foo::Bridge` — chained through an unrelated local
+        // `type Bridge = CheckedDispatch;` purely because both happen to end in
+        // `Bridge`. A multi-segment target now stops the chain instead of being looked
+        // up again as a local name.
+        let counts = struct_literal_counts(
+            "use foo::Bridge as Entry;\n\
+             type Bridge = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Entry { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 }
 
