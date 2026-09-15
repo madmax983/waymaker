@@ -1355,7 +1355,13 @@ Stated so that nobody mistakes silence for coverage:
   pin must never move in. Both routes exist only for those two construction pins,
   where an extra count is accepted and a missed one is not, so both stay
   over-counting — pinned by a test rather than chased into a fix likelier to trade
-  one gap for a worse one (Codex review of PR #203, round 3).
+  one gap for a worse one (Codex review of PR #203, round 3). The same round found
+  a third, older instance of the same shape: `own_modules` reads only `stack`, the
+  file/module-level ancestor chain, so a block-local `mod` has never shadowed a
+  same-named sibling module — unchanged since before #181, so #193 neither caused
+  nor worsened it. All three are one class of gap, filed together as issue
+  [#205](https://github.com/madmax983/waymaker/issues/205) rather than chased
+  further here.
   A `struct`, `enum`, `union` or `type` alias
   can declare its own generic type parameter too, and none of the five overrides tracks one:
   a residual narrower than the block-local-item gap issue #193 closed, left stated rather
@@ -5775,4 +5781,10 @@ Both routes exist solely for `struct_literal_counts` and
 is the accepted-safe direction and a missed one is the danger this file's own
 `alias_could_reach_target` doc already states — so both are pinned by a test
 showing the current, over-counting behavior stays exactly what it is, rather than
-chased into a fix likely to trade one review round for a worse one.
+chased into a fix likely to trade one review round for a worse one. The same round
+found a third instance, older than #193 itself: `own_modules` reads only `stack`,
+so a block-local `mod` has never shadowed a same-named sibling module, unchanged
+since before #181. All three are one class of gap — each declaration needs pairing
+with the depth it was made at, compared across kinds — filed as issue
+[#205](https://github.com/madmax983/waymaker/issues/205) rather than fixed here,
+per this project's own two-or-three-round review guidance.
