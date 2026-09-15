@@ -113,10 +113,10 @@ fn boot<W: Workflow, A: Activities + Clocks>(
 
 /// Every record the journal holds, by shape and sequence.
 fn history(device: &mut Device) -> Vec<Shape> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut records = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };
@@ -300,6 +300,31 @@ fn what_redelivery_answers_is_not_what_a_fresh_mint_would() {
 }
 
 #[test]
+fn a_redelivered_effect_is_offered_under_the_kind_its_schedule_record_named() {
+    // Issue #92: `DurableIntent` now carries the kind step 3 committed. So a redelivered
+    // effect cannot be offered under a different kind. Checked here at the driver's real
+    // dispatch point, where `demo::World` records what it was actually asked.
+    let mut world = World::pending_at(1);
+    let mut workflow = Pipeline::new();
+    let mut device = a_run_waiting_on_its_second_effect(&mut world);
+
+    let Ok(progress) = boot(&mut device, &mut world, &mut workflow) else {
+        unreachable!("an activity that is not ready is not a failure")
+    };
+    assert_eq!(progress, Progress::Waiting { id: SECOND });
+
+    let redelivered = world
+        .offered()
+        .last()
+        .expect("the retry offered the outstanding effect");
+    assert_eq!(redelivered.id, SECOND);
+    assert_eq!(
+        redelivered.kind, HASH,
+        "the second effect's schedule record names HASH"
+    );
+}
+
+#[test]
 fn a_schedule_record_carries_the_length_and_digest_of_the_bytes_the_workflow_passed() {
     // §09 records a length *and* a checksum, and the kernel compares the pair. Nothing else
     // here reads what the driver put in the record: a driver that wrote a constant length
@@ -313,10 +338,10 @@ fn a_schedule_record_carries_the_length_and_digest_of_the_bytes_the_workflow_pas
         unreachable!("the reference run completes")
     };
 
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut digests = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };

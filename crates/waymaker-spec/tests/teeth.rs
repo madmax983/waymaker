@@ -30,7 +30,7 @@ fn enforced() -> waymaker_spec::explore::Explored {
 /// it exploits unreachable. It is caught in the machine that guard is removed from, and
 /// `a_gap_skipping_reader_is_harmless_only_because_of_the_append_only_precondition` is what
 /// says so out loud.
-const CAUGHT: [(Mutant, Invariant, Option<Guard>); 5] = [
+const CAUGHT: [(Mutant, Invariant, Option<Guard>); 6] = [
     (Mutant::ProducesOneMore, Invariant::PrefixSafety, None),
     (Mutant::IncludesTorn, Invariant::PrefixSafety, None),
     (Mutant::Reorders, Invariant::PrefixSafety, None),
@@ -43,6 +43,11 @@ const CAUGHT: [(Mutant, Invariant, Option<Guard>); 5] = [
         Mutant::SkipsGaps,
         Invariant::PrefixSafety,
         Some(Guard::AppendOnly),
+    ),
+    (
+        Mutant::BootsTheRetiredBank,
+        Invariant::SingleAuthority,
+        None,
     ),
 ];
 

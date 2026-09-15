@@ -56,9 +56,9 @@ fn reserve() -> Reserve {
 
 /// A gated writer positioned at the start of an erased journal.
 fn writer<S: StableStorage>(storage: &mut S) -> Reserved {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), storage);
     let mut page = [0_u8; 128];
-    while recovery.next(storage, &mut page).is_some() {}
+    while recovery.next(&mut page).is_some() {}
     let Some(journal) = Journal::after(recovery) else {
         unreachable!("an erased journal has an append point")
     };
@@ -79,10 +79,10 @@ const fn request() -> EffectRequest {
 
 /// Every record the journal recovers to.
 fn recovered(storage: &mut Device) -> Vec<RecordKindOf> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), storage);
     let mut page = [0_u8; 128];
     let mut history = Vec::new();
-    while let Some(step) = recovery.next(storage, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else { break };
         history.push(RecordKindOf::of(&record));
     }

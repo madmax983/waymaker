@@ -517,7 +517,7 @@ impl Progress {
     }
 
     /// How many bytes [`encode`](Self::encode) writes.
-    pub const ENCODED_BYTES: usize = 12;
+    pub const ENCODED_BYTES: usize = 15;
 
     /// A high water, as two bytes, with `0xFFFF` for "none".
     ///
@@ -546,10 +546,15 @@ impl Progress {
     /// third "done when" true rather than nearly true. A log line carrying a seed, an
     /// iteration and a geometry can rebuild the *run*; it cannot rebuild what the rig
     /// **knew**, and the obligations §14 puts on a recovery are entirely statements about
-    /// that. Without these twelve bytes a violation is reproducible only if the host still
+    /// that. Without these fifteen bytes a violation is reproducible only if the host still
     /// has the device.
     ///
-    /// The mark count and the tear flag travel too, because `Audit::finish` reads both.
+    /// The mark count and the tear flag travel too, because `Audit::finish` reads both. The
+    /// count uses four bytes, not one. Issue
+    /// [#81](https://github.com/madmax983/waymaker/issues/81) found a one-byte count that
+    /// silently narrowed on a run of 51 or more effects. Two bytes would not be enough
+    /// either: see [`Rig::marks_per_run`](crate::run::Rig::marks_per_run) for the largest
+    /// legal run's mark count.
     ///
     /// # Errors
     ///
@@ -565,11 +570,8 @@ impl Progress {
         acknowledged.copy_from_slice(&Self::word(self.acknowledged));
         let (dispatched, rest) = rest.split_at_mut(2);
         dispatched.copy_from_slice(&Self::word(self.dispatched));
-        let (marks, flags) = rest.split_at_mut(1);
-        // Saturating: the count is a figure in a report, and a wrapped one would read as an
-        // empty witness — which `Audit::finish` treats as "the run never began".
-        let count = u8::try_from(self.marks.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
-        marks.fill(count);
+        let (marks, flags) = rest.split_at_mut(4);
+        marks.copy_from_slice(&self.marks.to_le_bytes());
         // Presence is a flag rather than a reserved iteration number. `u32::MAX` is a legal
         // iteration — `Plan::cut` answers for it and a rig can be asked to run it — so a
         // sentinel would make a real witness from that iteration decode as *no* witness, and
@@ -599,7 +601,7 @@ impl Progress {
         let (attempted, rest) = rest.split_at(2);
         let (acknowledged, rest) = rest.split_at(2);
         let (dispatched, rest) = rest.split_at(2);
-        let (marks, flags) = rest.split_at(1);
+        let (marks, flags) = rest.split_at(4);
         let iteration = u32::from_le_bytes(<[u8; 4]>::try_from(iteration).ok()?);
         let bits = flags.first().copied()?;
         if bits & !(FLAG_TORN | FLAG_ITERATION) != 0 {
@@ -613,7 +615,7 @@ impl Progress {
             attempted: Self::unword(<[u8; 2]>::try_from(attempted).ok()?),
             acknowledged: Self::unword(<[u8; 2]>::try_from(acknowledged).ok()?),
             dispatched: Self::unword(<[u8; 2]>::try_from(dispatched).ok()?),
-            marks: u32::from(marks.first().copied()?),
+            marks: u32::from_le_bytes(<[u8; 4]>::try_from(marks).ok()?),
             torn: bits & FLAG_TORN != 0,
         })
     }
@@ -788,7 +790,7 @@ impl Witness {
                     progress = progress.accept(mark).map_err(promote)?;
                     next = index.saturating_add(1);
                 }
-                Err(_) if slot.iter().all(|byte| *byte == 0xFF) => {
+                Err(_) if slice_is_erased(slot) => {
                     self.verify_erased_to_end(storage, page, offset)?;
                     return Ok((progress, next));
                 }
@@ -844,7 +846,7 @@ impl Witness {
                 return Err(WitnessError::ShortBuffer);
             };
             storage.read(at, slice).map_err(WitnessError::Driver)?;
-            if !slice.iter().all(|byte| *byte == 0xFF) {
+            if !slice_is_erased(slice) {
                 return Err(WitnessError::Hole);
             }
             // `want` is at least one read unit whenever `at < end`, so this always advances.
@@ -855,6 +857,26 @@ impl Witness {
         }
         Ok(())
     }
+}
+
+/// Whether every byte of `bytes` reads as an erased NOR cell.
+///
+/// [`verify_erased_to_end`](Witness::verify_erased_to_end)'s own inner loop, and its doc
+/// comment already named the trade it was owed: `waymaker_flash::recovery`'s erased-tail
+/// walk and `waymaker-conformance`'s `media_is_erased` both moved from a bounds-checked,
+/// per-byte comparison to this one, and this function was the one place in the rig that had
+/// not yet — every byte of an erased cell is `0xFF`, so a whole word of them reads as
+/// [`usize::MAX`] regardless of endianness, and comparing a page one word at a time costs one
+/// comparison per word rather than one per byte. The tail that does not fill a whole word
+/// falls back to the byte-at-a-time check, which is also what a page shorter than one word
+/// runs entirely.
+fn slice_is_erased(bytes: &[u8]) -> bool {
+    const WORD: usize = size_of::<usize>();
+    let mut words = bytes.chunks_exact(WORD);
+    let words_erased = words.by_ref().all(|word| {
+        matches!(<[u8; WORD]>::try_from(word), Ok(word) if usize::from_ne_bytes(word) == usize::MAX)
+    });
+    words_erased && words.remainder().iter().all(|&byte| byte == 0xFF)
 }
 
 /// Widens a driver-free refusal to one carrying a driver's error type.
@@ -869,5 +891,38 @@ const fn promote<E>(error: WitnessError) -> WitnessError<E> {
         WitnessError::Region => WitnessError::Region,
         WitnessError::WrongGeometry => WitnessError::WrongGeometry,
         WitnessError::Driver(never) => match never {},
+    }
+}
+
+#[cfg(test)]
+mod slice_is_erased_tests {
+    use super::slice_is_erased;
+
+    #[test]
+    fn agrees_with_the_byte_at_a_time_definition_at_every_length_and_position() {
+        // The word-at-a-time walk must answer exactly what `iter().all(|b| *b == 0xFF)`
+        // would, at every length around a word boundary and with the one non-erased byte at
+        // every position — including inside the word-sized chunks and inside the remainder
+        // the chunking leaves over. Fixed-size rather than a `Vec`: this crate is
+        // `#![no_std]` with no allocator anywhere in it, tests included.
+        const MAX_LEN: usize = 32;
+        let word = size_of::<usize>();
+        let widest = word * 3 + 1;
+        assert!(widest <= MAX_LEN, "word size outgrew this fixture");
+        for len in 0..=widest {
+            let all_erased = [0xFF_u8; MAX_LEN];
+            assert!(
+                slice_is_erased(&all_erased[..len]),
+                "length {len} of all erased bytes"
+            );
+            for spoiled in 0..len {
+                let mut bytes = all_erased;
+                bytes[spoiled] = 0x00;
+                assert!(
+                    !slice_is_erased(&bytes[..len]),
+                    "length {len} with byte {spoiled} programmed"
+                );
+            }
+        }
     }
 }

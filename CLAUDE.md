@@ -10,7 +10,7 @@ layering rules, and what each crate must not own.
 
 Much of it is checked rather than remembered: the must-not-own cells, the permitted
 dependency edges, the eight decision ids, the command list, the five deferred questions and
-all 56 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
+all 57 rule ids below are compared against the tables that own them, and `cargo xtask check-layering` fails a pull
 request when this file and those tables stop agreeing. The rest is prose, and
 [What is not checked](#what-is-not-checked) says which.
 
@@ -39,7 +39,7 @@ cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
-cargo build --locked -p waymaker-drive --no-default-features --features without-facade --lib --target thumbv6m-none-eabi
+cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
 cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
 cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings
@@ -135,7 +135,7 @@ All 6 recovery invariants, with the id to cite when a change touches one:
 | `prefix-safety` | recovery exposes only a legal prefix of committed records | `tests/spine.rs`, exhaustively over every reachable state, and refined against the real `Scan` at every crash point |
 | `acknowledged-durability` | any record acknowledged after its barrier is recovered after reset | `tests/spine.rs`; `tests/necessity.rs` shows which precondition it rests on |
 | `durable-intent` | no Waymaker-dispatched effect lacks a recoverable schedule record | `tests/spine.rs`, with §02 decision 3 as a precondition rather than a hope |
-| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, against the model alone — there is now a two-bank adapter to abstract (issue #22's `waymaker_flash::bank`) and `tests/refinement.rs` does not yet abstract it, so the refinement is owed against real code rather than against nothing |
+| `single-authority` | exactly one bank is authoritative after any crash | `tests/spine.rs`, exhaustively over the model — records now carry a `BankId` and recovery is scoped to the bank a reader would boot from (issue #67), so a reader that boots the retired bank is caught by `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank`, and refined against a real two-bank swap since issue #73's `tests/refinement.rs` abstraction of `waymaker_flash::bank` — though that refinement and the record refinement beside it have never been driven by one writer, so the bank check itself is still owed against a real device with a record on it |
 | `stable-redelivery` | retries and reboot redelivery reuse the original effect identity | `tests/redelivery.rs`, over every resume point of a bounded run, against the real allocator |
 | `bounded-decoding` | malformed storage cannot cause out-of-bounds reads or allocation | `tests/bounded_decoding.rs`, over a stated domain: every byte string to three bytes, every truncation, every single-byte mutation and coordinated pair of three real frames, and every payload length a header can declare |
 
@@ -212,6 +212,39 @@ where no such operation exists the case says so rather than reaching somewhere u
 `xtask::policy::LAYERS` are empty — only `waymaker-embassy` has entries, and only for issue
 #37's optional codecs — so the kernel growing that dependency fails
 `kernel-zero-dependencies` and `waymaker-flash` growing it fails `dependency-direction`.
+
+## The storage-shape catalogue
+
+Issue [#130](https://github.com/madmax983/waymaker/issues/130) item 2 asks that "every legal
+operation shape the firmware issues must appear in the suite". `xtask::docs::STORAGE_SHAPES`
+holds the six shapes, the conformance crate's own `shape.rs` holds them again, and the
+`storage-shapes` rule fails a build in which this section, that table, the crate and
+[ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md) stop naming the
+same set.
+
+A shape is a claim about a legal call, transcribed by a reviewer from `waymaker-flash`'s
+writers the same way `STORAGE_CONTRACT_CLAUSES` transcribes §12 rather than deriving it from
+source. What holds the claim to the suite is `shape::ShapeWitness`, which wraps a
+`StableStorage` and records which shapes a run really issues, crediting nothing an adapter
+refused —
+`crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape` fails a
+build in which a declared shape goes unexercised.
+
+All 6 storage shapes, with the id to cite when a change touches one:
+
+| Id | Sentence | Issued by |
+| --- | --- | --- |
+| `program-single-unit` | A program of exactly one program unit. | `append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value — at the journal's own alignment, which may be coarser than the device program unit — comes to exactly one device program unit |
+| `program-multi-unit` | A program of more than one program unit in one call. | `append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever that padded value spans more than one device program unit |
+| `erase-single-block` | An erase of exactly one erase block. | `swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block |
+| `erase-multi-block` | An erase of more than one erase block in one call. | `swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks |
+| `read-single-unit` | A read of exactly one read unit. | `recovery::Recovery::stage`'s header read and its erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — come to exactly one read unit |
+| `read-multi-unit` | A read of more than one read unit in one call. | `recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; and its header read and erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — span more than one read unit |
+
+Issue #130 item 3 — a generator that mutation-tests the suite against its own model, with a
+conformant arm so a false positive is reachable and not only a broken adapter — is still
+open. It is `waymaker-spec`-shaped work, not a small addition to `tests/teeth.rs`, and this
+catalogue does not attempt it.
 
 ## The frozen wire format
 
@@ -402,12 +435,17 @@ stop naming the same set.
 The model half is `crates/waymaker-drive/tests/matrix.rs`: one test per row, named after it,
 and the rule reads the names out of the file. The rig half is
 `crates/waymaker-rig/tests/matrix.rs`: one test per swept row, named after it with
-`_on_the_rig`, which classifies every crash point the injector lists, resumes the run with
-`Rig::resume`, and holds it to the row. Both run in the `verification` job as the `matrix`
-stage. The rig half runs on the host through `waymaker-fault`; no board has run it, and
-[the boards](#what-the-boards-still-owe) stay `Not run`. The rig reaches six rows; the "On the
-rig" column says which, and `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap` requires
-the rig's census to refuse rather than to stop at six.
+`_on_the_rig` for the six effect rows and the two bank rows, resumes the run with
+`Rig::resume` (or, once a swap has moved authority, reads the bank it moved to directly),
+and holds it to the row. The two remaining rows are driven rather than swept — a capacity
+refusal and a declared-workflow mismatch are not media crashes the injector produces — and
+credit their row without the `_on_the_rig` suffix, matching the model half's own naming for
+its driven rows. Both run in the `verification` job as the `matrix` stage. The rig half runs
+on the host through `waymaker-fault`; no board has run it, and
+[the boards](#what-the-boards-still-owe) stay `Not run`. The rig reaches all ten rows; the
+"On the rig" column says how, and
+`every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned` pins every count so a
+sweep that quietly thinned fails closed.
 
 All 10 failure rows, with the id to cite when a change touches one:
 
@@ -419,10 +457,10 @@ All 10 failure rows, with the id to cite when a change touches one:
 | `after-activity-before-completion-barrier` | After physical activity, before completion barrier | `after_physical_activity_before_completion_barrier_the_same_id_is_redelivered` | Swept |
 | `during-completion-write` | During completion write | `during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed` | Swept |
 | `after-completion-barrier` | After completion barrier | `after_completion_barrier_the_completion_is_replayed_and_the_activity_never_runs_again` | Swept |
-| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Owed |
-| `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Owed |
-| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Owed |
-| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Owed |
+| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Swept |
+| `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Swept |
+| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Driven |
+| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Driven |
 
 Row 5 does not hold as §14 writes it. It says "redeliver": a torn completion leaves no append
 point ([ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)),
@@ -433,12 +471,24 @@ performed before the crash is performed again under another `(RunId, EffectSeq)`
 duplicate `stable-redelivery` forbids, and it is issue
 [#95](https://github.com/madmax983/waymaker/issues/95).
 
-The four `Owed` rows are the rig's, not the model's: a swap workload, a capacity refusal and a
-divergent replay are things this rig does not do — issue
-[#96](https://github.com/madmax983/waymaker/issues/96). To move a row to `Swept`: name its
-rig test in `FAILURE_ROWS`, reach it in the rig's census, and move the pinned gap test. The
-same issue records what a board cannot do: rows 2, 3 and 4 are told apart by whether the
-dispatcher was entered and returned, which the harness sees and a reset takes with the RAM.
+Issue [#96](https://github.com/madmax983/waymaker/issues/96) closed the four rows the rig
+used to owe. Rows 7 and 8 needed a workload that rolls over: `Rig::iterate_until_rollover`
+writes a run's opening records and stops before its `RunCompleted`, a test drives §10's
+seven-step swap directly against the bank it leaves off in, and the crash injector sweeps
+every point of the combined sequence. Which row a point lands in is read from
+`bank::select` alone — a swap writes no journal record and marks no witness, so the old
+bank still authoritative is row 7 and the new bank authoritative is row 8. That needed
+`Rig::judge` and `Rig::resume` to stop assuming `Rig::BANK` is always the bank a boot would
+choose: the fix is `Rig::authority`, and reverting it reproduces the defect the rows exist
+to catch — a resumed run answering as current from a bank a swap had already retired. Row 9
+gates `Rig::iterate_reserved`/`Rig::resume_reserved` with `waymaker_flash::capacity::Reserve`
+and finds a declared tail wide enough to refuse the second effect on the rig's own fixture,
+then drives the same explicit swap to show the exit past it. Row 10 gives `Workload` a
+`diverging` knob that changes one schedule's activity kind with everything else — shape, run
+identity, every other record — untouched, and `Rig::resume_declaring` audits history against
+it instead of the workload that wrote it. The same issue records what a board still cannot
+do: rows 2, 3 and 4 are told apart by whether the dispatcher was entered and returned, which
+the harness sees and a reset takes with the RAM.
 
 ## The book
 
@@ -511,7 +561,7 @@ row you are reading is the string the gate reads.
 adapter can be written later against the same semantic kernel; it must not expand the
 firmware traits to accommodate host conveniences.
 
-Eight crates are in the workspace and are *not* layers:
+Nine crates are in the workspace and are *not* layers:
 
 - `xtask` — host tooling, the gate itself. Kept out of firmware builds by `default-members`.
 - `waymaker-size-probe` — firmware linked only so its section sizes and its symbols can be
@@ -579,10 +629,9 @@ Eight crates are in the workspace and are *not* layers:
   firmware target builds. §07 is here rather than in `waymaker-flash` because step 4 is an
   activity, and that crate's must-not-own cell names activities — see
   [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md).
-  Outside `default-members`, and the only crate that depends on it is `xtask`, which reads
-  §04's context term and the generated workflow future sizes out of §06's example rather than
-  transcribing them — the same reason `xtask` depends on `waymaker-fault` and
-  `waymaker-rig`. It is the third member of this
+  Outside `default-members`, and it names no dependency on `waymaker-embassy` at all, in any
+  table — issue [#106](https://github.com/madmax983/waymaker/issues/106). It is the third
+  member of this
   category that is `#![no_std]` and allocation-free, and the reason is the claim it exists to
   make: issue #28 asks for a workflow driven to completion with "no `Future`, no Embassy, and
   no allocation", and a driver that could only be built for the host would leave the last
@@ -591,6 +640,23 @@ Eight crates are in the workspace and are *not* layers:
   dispatcher and wakeups are rung 0.4's, and a façade that contained the protocol would be
   the opposite of the thing #28 asks to be proved. See
   [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
+- `waymaker-facade-demo` — issue
+  [#106](https://github.com/madmax983/waymaker/issues/106)'s bridge from `waymaker-drive` to
+  `waymaker-embassy`, also `policy::TEST_SUPPORT_CRATES`. `facade`, `ota` and `provisioning`
+  used to be three modules of `waymaker-drive` itself, removed by a `without-facade` feature
+  to test that the driver did not need them — which proved only that no *other* module
+  needed them, since `waymaker-drive`'s manifest kept the edge to `waymaker-embassy` either
+  way. This crate holds the edge instead, so `waymaker-drive`'s independence from the façade
+  is a fact `cargo metadata` states rather than a claim a feature flag argued for. Outside
+  `default-members`, and the only crate that depends on it is `xtask`, which reads §04's
+  context term and the generated workflow future sizes out of §06's two examples rather than
+  transcribing them — the same reason `xtask` depends on `waymaker-fault` and
+  `waymaker-rig`. It is the fourth member of this category that is `#![no_std]` and
+  allocation-free, for `waymaker-drive`'s own reason one layer up: a bridge that could only
+  be built for the host would leave "the protocol is fully usable through the synchronous
+  driver" unchecked on the one crate that names the façade at all — so the
+  `facade-demo-firmware` stage builds its library for `thumbv6m-none-eabi`. See
+  [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md).
 - `waymaker-spec` — the formal specification of the recovery invariants, also
   `policy::TEST_SUPPORT_CRATES`. The ghost model of committed history, the journal and bank
   state machines, and the exhaustive search that discharges design document §14's guarantees
@@ -614,7 +680,7 @@ linked image with banks in it. Nothing compares the numbers in this table to `bu
 
 | Budget | Target |
 | --- | --- |
-| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any row |
+| Runtime RAM | ≤ 768 B with a 512 B scratch page (§04, v0.1). Composed and gated since [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md): the scratch page, the kernel-state registry, the context, and the largest statics delta of any row — every row, gated or not, since issue [#115](https://github.com/madmax983/waymaker/issues/115) closed a gap where a `--report` document could omit the row with the largest delta and compose a smaller, wrong total; the document's row *set* is now held to what `matrix` derives for the workspace |
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
 | Context | ≤ 128 B — what kernel state leaves of the 256 B the scratch page leaves of runtime RAM. Not a §04 row: §04 names the context as a runtime RAM term and nothing measured it before ADR 0035 |
 | Incremental code flash | ≤ 13 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a **v0.1** target; [ADR 0017](docs/adr/0017-the-two-bank-layout-is-geometry-derived-and-the-seal-names-its-header.md) raises it to 16 KiB for rung 0.2's two-bank lifecycle and [ADR 0020](docs/adr/0020-the-capacity-reserve-is-an-outcome-and-a-terminal-record.md) to 18 KiB for §10's capacity reserve; [ADR 0029](docs/adr/0029-the-code-flash-gate-charges-the-layers-and-the-probe-pays-for-itself.md) cut it to 12 KiB once the gate stopped charging the size probe's own arithmetic, and [ADR 0036](docs/adr/0036-workflow-versioning-is-a-range-and-a-recorded-branch.md) takes it to 13 KiB for §08's versioning) |
@@ -830,7 +896,7 @@ new ADR naming what it supersedes; an accepted ADR is never edited to say someth
 
 ## What the gate rejects
 
-All 56 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
+All 57 rules `cargo xtask check-layering` can emit. The id is what appears in the failure, so
 this table is how you find out what a red build is telling you.
 
 ### Layering
@@ -852,14 +918,14 @@ this table is how you find out what a red build is telling you.
 | `commit-discipline` | The two-barrier writer's public function surface differs from `source::APPEND_SURFACE`; or the typestate that makes design document §07's order unrepresentable comes apart — the staged frame grows a second method or the word `program`, the sealable frame grows anything but `commit`, the sealable frame is constructed anywhere but inside `payload_barrier`, or that barrier stops calling `storage.barrier` exactly once. Issue [#24](https://github.com/madmax983/waymaker/issues/24) asks that "it is not possible to program a seal without the intervening payload barrier having returned", and a `compile_fail` doctest in the crate proves that of the code as it stands. This is what stops it being given back: a `Staged::commit`, a `Journal::write` that did all four steps in one call, or a second constructor for `Sealable` would each break no other rule and turn a protocol into a convention. What it cannot see is whether the barrier is a real one — that is §12's contract and `waymaker-conformance`'s across-reset witness. |
 | `capacity-reserve` | §10's capacity reserve gains a public function `source::CAPACITY_SURFACE` does not list, in either direction — or the gate comes apart: `source::CAPACITY_GATE` declares no inherent `impl`, declares `stage` other than exactly once, or its `stage` does not *open* with `source::CAPACITY_ADMISSION_CALL` and go on to `source::CAPACITY_DELEGATION`. §10 says "the runtime never overwrites committed history to make room", and every way of giving that back is an *addition*: a `Reserved::stage_unchecked`, a `Reserved::into_journal` handing the ungated writer back, a `Reserve::none()`, or a `Reserve::for_bytes(tail)` taking the figure from its caller rather than from a `BankLayout` — which is the sharpest of the four, because a reserve is only a promise because a layout vouched for it. The order half is the other word §10 uses: scheduling fails **early**, and issue #25 asks that the failure "produce no mutation at all". §12 says a failed program may still have changed media, so the only refusal that changes nothing is one taken before the device is called. The decision must therefore be the body's **first** statement, not merely one that precedes the delegation — review of this change wrote an admission inside `if false`, inside a closure nobody calls, and guarded so that only `RunStarted` reached it, and watched a rule that only checked the order stay green on all three. The blocks are read for the named type rather than by finding the first `fn stage` in the file, because the surface half counts only *public* functions and a private decoy carrying the pinned call stood in for the real one. What it cannot see is the arithmetic: a `tail_bytes` that quietly stopped counting the outcome record is `crates/waymaker-flash/tests/capacity.rs`'s, where `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` drives the wrong reserve and watches a run reach a state it can never leave. |
 | `swap-discipline` | §10's bank swap gains a public function `source::SWAP_SURFACE` does not list, in either direction — or its step order comes apart: a state in `source::SWAP_TYPESTATE` declares anything but the one method its row names, `Staged` names `program`, a value in `source::SWAP_CONSTRUCTIONS` is built anywhere but inside the body its row names, `payload_barrier` stops taking `source::SWAP_BARRIER_CALL`, or a row of `source::SWAP_ERASE_CALLS` stops erasing exactly the bank it names, before a barrier, without naming the other one. Issue [#26](https://github.com/madmax983/waymaker/issues/26) states §10 as seven steps and two recovery rules — "a crash before step 5 recovers the old run, a crash after step 6 recovers the new run" — and every one of those is a statement about *where the barriers are*. A `Prepared::commit` skipping the header, a `Staged::seal_now` skipping the payload barrier, an `Installed` built anywhere but in `commit`, or a `Swap::install(bank)` taking the bank to erase from its caller would each break no other rule and turn a protocol into a convention. The erase rows are the sharpest: which bank a swap clears is derived from the authority the device booted, and a `prepare` that erased the *retiring* bank is a device clearing the run it is executing. What it cannot see is whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness, nor whether the crash windows behave — that is `crates/waymaker-fault/tests/swap.rs`, at every crash point of all seven steps. |
-| `ctx-facade` | Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s façade stops adding sugar and starts adding authority. `waymaker-embassy/src/ctx.rs` or `waymaker-embassy/src/journal.rs` gains or loses a public function `source::CTX_SURFACE` or `source::CTX_JOURNAL_SURFACE` lists; `ctx.rs` declares a future `source::CTX_FUTURES` does not name, or a number of `fn poll` bodies other than that list's length; `Ctx` declares a method `source::CTX_SURFACE` and `source::CTX_PRIVATE_METHODS` do not list between them — read at *every* visibility — or an associated constant; **any** file of the crate names one of `source::CTX_FORBIDDEN_VOCABULARY` — `StableStorage`, `Reserved`, `RecordRef`, `Recovery`, `ReplayMachine`, `BankLayout`, `Swap` — declares a `static`, declares a `macro_rules!`, or implements `Future` for a type `CTX_FUTURES` does not name; or a `waymaker-drive` module outside `source::FACADE_DRIVER_MODULES` names one of `source::FACADE_FREE_VOCABULARY`. §05's must-not-own cell for this crate is "on-media authority or hidden global state", and every way of giving that back is an *addition*: a `Ctx::record` that appends for itself, a journal method that answers a question the workflow never asked, a `static` buffer two runs share. Each would break no layering rule — `waymaker-embassy` may depend on `waymaker-flash`, so nothing else stops the façade reaching a writer — and pass every test, because the run still completes. The surface pin sets `poll` aside, because four futures declare it and a pin that is a list of names cannot speak about a name declared four times; `CTX_FUTURES` holds the count instead, and the *set* of types the crate implements `Future` for beside it, so a fifth future is a line a reviewer writes wherever it is declared. The vocabulary, `static`, macro and future-set bans read every file of the crate rather than the two the surfaces are pinned in, because those four are statements about the crate: review of this change put a renamed `StableStorage`, a `pub static AtomicUsize`, a `macro_rules!` expanding a tenth public method into `impl Ctx`, and a fifth future in `dispatch.rs` — one file over — and watched a two-file version stay green on all four. Codex round 4 found the fifth, and it is about the *reader* rather than the rule: the future-set scan tested `starts_with("impl")` on the raw line while every classifier beside it stripped attributes first, so `#[rustfmt::skip] impl Future for SignalFuture` — a spelling `cargo fmt` preserves — walked past the one check that looks outside `ctx.rs`. The driver half is the fast half of issue #35's second "done when": every `waymaker-drive` module but the three in `source::FACADE_DRIVER_MODULES` is held to naming none of `source::FACADE_FREE_VOCABULARY`, so a module added tomorrow is covered without anyone remembering a row. The half a *compiler* decides is the `drive-facadeless` stage, which builds the crate under `without-facade` — with `facade.rs`, `ota.rs` and their four lines in `lib.rs` gone — for the firmware target. Both exist because a scanner cannot see an import routed through `crate::facade`, or a dependency renamed in a manifest, and a compiler sees each at once. What the stage does *not* establish is that the crate would build with `waymaker-embassy` deleted: the manifest entry is not optional, so a compile error inside the façade fails it too — issue [#106](https://github.com/madmax983/waymaker/issues/106). What it cannot see is a public *function* added from a sibling module — the two surfaces are pinned in one file each, exactly as `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin — and it compares *names*, so a `Ctx::payload` that started handing back the journal's buffer is `crates/waymaker-embassy/tests/ctx.rs`'s. The `static` scan sets the `'static` *lifetime* aside before it looks for the identifier: the rule is about a `static` **item**, and `&'static str` is what compile-time metadata is spelled as — issue #36's activity names. An item is `static NAME:` and never `'static`, so the narrowing loses nothing, and `a_static_item_beside_a_static_lifetime_is_still_reported` is what says so rather than leaving it argued. [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md). |
+| `ctx-facade` | Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s façade stops adding sugar and starts adding authority. `waymaker-embassy/src/ctx.rs` or `waymaker-embassy/src/journal.rs` gains or loses a public function `source::CTX_SURFACE` or `source::CTX_JOURNAL_SURFACE` lists; `ctx.rs` declares a future `source::CTX_FUTURES` does not name, or a number of `fn poll` bodies other than that list's length; `Ctx` declares a method `source::CTX_SURFACE` and `source::CTX_PRIVATE_METHODS` do not list between them — read at *every* visibility — or an associated constant; **any** file of `waymaker-embassy` or `waymaker-facade-demo` names one of `source::CTX_FORBIDDEN_VOCABULARY` — `StableStorage`, `Reserved`, `RecordRef`, `Recovery`, `ReplayMachine`, `BankLayout`, `Swap` — declares a `static`, declares a `macro_rules!`, or implements `Future` for a type `CTX_FUTURES` does not name; or a `waymaker-drive` module outside `source::FACADE_DRIVER_MODULES` names one of `source::FACADE_FREE_VOCABULARY`. §05's must-not-own cell for this crate is "on-media authority or hidden global state", and every way of giving that back is an *addition*: a `Ctx::record` that appends for itself, a journal method that answers a question the workflow never asked, a `static` buffer two runs share. Each would break no layering rule — `waymaker-embassy` may depend on `waymaker-flash`, so nothing else stops the façade reaching a writer — and pass every test, because the run still completes. The surface pin sets `poll` aside, because four futures declare it and a pin that is a list of names cannot speak about a name declared four times; `CTX_FUTURES` holds the count instead, and the *set* of types the crate implements `Future` for beside it, so a fifth future is a line a reviewer writes wherever it is declared. The vocabulary, `static`, macro and future-set bans read every file of `waymaker-embassy` rather than the two the surfaces are pinned in, because those four are statements about the crate: review of this change put a renamed `StableStorage`, a `pub static AtomicUsize`, a `macro_rules!` expanding a tenth public method into `impl Ctx`, and a fifth future in `dispatch.rs` — one file over — and watched a two-file version stay green on all four. Issue #106's review found the same four bans stopped at the crate boundary: `Bridge` moved to `waymaker-facade-demo`, and a `facade.rs` naming `StableStorage` directly passed every check here until the same four bans started reading that crate's files too, attributing each violation to whichever crate the offending file is actually in. Codex round 4 found the fifth, and it is about the *reader* rather than the rule: the future-set scan tested `starts_with("impl")` on the raw line while every classifier beside it stripped attributes first, so `#[rustfmt::skip] impl Future for SignalFuture` — a spelling `cargo fmt` preserves — walked past the one check that looks outside `ctx.rs`. The driver half is the fast half of issue #35's second "done when": every `waymaker-drive` module is held to naming none of `source::FACADE_FREE_VOCABULARY`, so a module added tomorrow is covered without anyone remembering a row — `source::FACADE_DRIVER_MODULES` is empty rather than gone, because issue [#106](https://github.com/madmax983/waymaker/issues/106) moved `facade`, `ota` and `provisioning` into `waymaker-facade-demo`, a crate above `waymaker-drive`, rather than exempting a file inside it. The half a scanner cannot decide is `cargo metadata`'s: a companion check reads the resolved graph directly and refuses a dependency from `waymaker-drive` to an Embassy crate — a direct one in any table, the manifest-only edge a source scan cannot see since a dependency needs no `use` to be linked, *and* one reached through a chain of `[dependencies]` at any depth, the shape a later normal dependency on some other crate would take. The walk stops at the first `[dev-dependencies]` or `[build-dependencies]` edge rather than crossing it, at the root or below: `waymaker-drive` dev-depends on `waymaker-rig`, which normal-depends on `waymaker-embassy` for `PersistentClock` (issue #34) — a legitimate edge a walk that crossed every kind would misattribute, and one that stopped at the root entirely would miss the same edge arriving through a *normal* dependency instead. Together the two halves are what make "the protocol is fully usable through the synchronous driver" a fact about the resolved graph rather than a claim a feature flag argued for. A fifth round found the direct half had a gap of its own: it had skipped every `Normal`-kind declaration on the assumption the walk would catch it, but `facade = { package = "waymaker-embassy", optional = true }` with no feature enabling it stays in `packages[].dependencies` and drops out of `resolve.nodes[].deps` entirely, so an unresolved optional dependency was invisible to both halves at once. The direct check now reads every declared dependency regardless of kind, and the two halves' findings are deduplicated by crate name so an *enabled* optional dependency — caught by both — is reported once. A sixth round found both halves resolved `waymaker-drive` with a bare name search, which `cargo metadata` does not promise returns the workspace's own package first: a same-named dependency at another version or source sorting ahead of it in `packages[]` would have let the real driver declare or reach Embassy unnoticed. Both now resolve the root through a lookup that also checks `workspace_members`. What it cannot see is a public *function* added from a sibling module — the two surfaces are pinned in one file each, exactly as `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin — and it compares *names*, so a `Ctx::payload` that started handing back the journal's buffer is `crates/waymaker-embassy/tests/ctx.rs`'s. The `static` scan sets the `'static` *lifetime* aside before it looks for the identifier: the rule is about a `static` **item**, and `&'static str` is what compile-time metadata is spelled as — issue #36's activity names. An item is `static NAME:` and never `'static`, so the narrowing loses nothing, and `a_static_item_beside_a_static_lifetime_is_still_reported` is what says so rather than leaving it argued. [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md). |
 | `dispatch-wiring` | Issue [#36](https://github.com/madmax983/waymaker/issues/36)'s dispatch path stops being a number. `waymaker-embassy/src/dispatch.rs` or `waymaker-embassy/src/wiring.rs` gains or loses a public function `source::DISPATCH_SURFACE` or `source::WIRING_SURFACE` lists, or declares one of them twice so the pin can no longer speak about it; a type in `source::WIRING_TYPE_METHODS` — `Activity`, `Table` — declares a method set other than its row's, read at *every* visibility, stops being a braced struct, or declares a public field; or a body in `source::WIRING_SELECTION_BODIES` is declared other than exactly once or names one of `source::WIRING_SELECTION_FORBIDDEN`; or either module is gone, so the pin checks nothing. Issue #36 states two of its work items as absences — "numeric `ActivityKind` on the dispatch path", and "no dynamic workflow loading and no string-addressed activity registry" — and every way of giving either back is an *addition*: a `Table::by_name`, a `Table::register`, a `pub rows` field a caller can rewrite at run time, a lookup that falls back to a label. Each would break no layering rule, need no dependency, and pass every test in the workspace, because the run still completes. The selection half is read out of the file rather than out of an `impl` body, because `poll_dispatch` is a *trait* method, which `inherent_impl_bodies` skips. The declaration is counted first, for `effect-protocol`'s reason: `braced_body` takes the first match, so a decoy above the real one is what a first-match scan reads. Four of the halves are things review demonstrated rather than things anybody predicted, and each was watched passing on a mutation before it was closed: a free `pub(crate) fn by_name` at *module* scope, which is on neither a surface pin nor a method pin — and which the label ban does not catch either, because `names_identifier` reads `by_name` as one identifier; a `register` beside it, which is the dynamic-loading non-goal as a free function; a `mod shim { pub struct Table {} }` above the real one, whose empty body is what the public-field scan read; and `Activity::name` renamed to `label` with the accessor left in place, which frees a selection body to compare it and names nothing forbidden. The function pin therefore reads every `fn` in the file at every visibility, and the field pin compares names as well as visibility — which is also what refuses a tuple struct, since one has no braced body of its own for the field scan to read. What it cannot see is a function added from a sibling module — it pins two files, exactly as `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin — and it compares *names*, so that a label never reaches media is `crates/waymaker-drive/tests/dispatch.rs`'s, which reads the device image back with a needle short enough to fit a record. [ADR 0033](docs/adr/0033-the-dispatcher-answers-in-a-bound-the-journal-states.md). |
 | `codec-is-optional` | Issue [#37](https://github.com/madmax983/waymaker/issues/37)'s codec helpers stop being optional. A `waymaker-embassy` module other than `source::CODEC_PATH` names one of `source::CODEC_VOCABULARY` — `serde`, `postcard`, `Serialize`, `Deserialize`, `DeserializeOwned`, `Coded`, `Format`, `Postcard`, `FromPostcard`, matched as *identifiers* over code with its comments and `#[cfg(test)]` modules removed; an item of the codec module that names one of them — anywhere in the item, not only on its declaration line — carries no bare `#[cfg(feature = ..)]`; `source::CODEC_FREE_TRAIT` is missing or is itself behind a feature; a dependency in `source::CODEC_DEPENDENCIES` is declared without `optional = true`; or a feature in `source::CODEC_FEATURES` stops enabling what its row names. §02 decision 4 says Serde and Postcard are "optional conveniences, never wire-format requirements", and the way that is given back is not a dependency — it is a *bound*: a `Ctx::activity` asking for `DeserializeOwned`, or a `Handoff` naming a codec type, makes every workflow carry the codec whatever the manifest says, and every other rule stays green because the run still completes. The manifest half is the other one that fails silently: a `serde` declared without `optional` links in every build, and the size report's row for it then measures an image that already had it. What it cannot see is a codec named from a sibling crate, or a bound written without one of those words — a type alias for `DeserializeOwned` declared in the codec module and used in `ctx.rs` names nothing forbidden. It reads *items* rather than lines, because review of this change wrote a `pub struct Bridge {` whose declaration line named no codec and whose field below it did, and watched a line-based version stay green. Two things it does not read: which feature gates an item — `code_only` removes string literals along with comments, and any single positive feature gate keeps the item out of a default build, which is the whole of the claim — and a compound `#[cfg(all(..))]`, `any(..)` or `not(..)`, which is *not* read as gating, so an item behind one is reported rather than trusted. It pins one crate and one module of it, the way `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one file they pin. [ADR 0034](docs/adr/0034-a-codec-is-a-bridge-behind-a-feature-and-the-probe-mirrors-it.md). |
 | `rig-oracle` | `waymaker-rig`'s oracle or its census gains a public function `source::RIG_AUDIT_SURFACE` or `source::RIG_CENSUS_SURFACE` does not list, in either direction — or either file is gone, so the pin checks nothing. A rig is the one piece of code here whose bugs are *invisible*: a firmware bug shows up as a failing test, a rig bug as a passing one. Every way of giving the instrument back is an addition — an `Audit::assume_passed`, an `Audit::ignore`, a `Breach::suppress`, a second `finish` taking the authority count as advisory, a `Coverage::force_complete`, a `Gap::ignore` — and each would break no other rule, need no dependency and pass every test that exists. The census is a file of its own rather than part of `phase.rs` for this rule's sake: `Phase` and `ResetCause` each declare an `index`, a `from_index` and a `name`, and a pin that compares names cannot tell two such declarations apart. What it cannot see is whether the oracle's arithmetic is right — `crates/waymaker-rig/tests/teeth.rs` is what holds that, with two writers wrong in one way each and a control writer required to pass. |
 | `transition-surface` | The replay machine's public function surface differs from `source::TRANSITION_SURFACE`, in either direction. Issue #15 asks for divergence that is "terminal and loud: no reinterpretation of history, no best-effort recovery", and every word of that is an *absence*: a `reset`, a `clear_divergence`, a `force` flag on `intent` would each break no other rule and turn "stop, never guess" into a suggestion. A test cannot call a function that is not there, so the surface is pinned instead. |
-| `timer-capability` | Design document §11's timer semantics stop being the ones that were reviewed, in any of its four halves. The *kernel* half: `waymaker-core/src/timer.rs` gains or loses a public function `source::TIMER_SURFACE` lists, or a type in `source::TIMER_TYPES` — `TimerSpec`, `ClockCapability`, `Deadline` — is declared twice, is gone, or declares a member set other than its row's. It also pins each type's *methods*, at every visibility (`source::TIMER_TYPE_METHODS`), and refuses a public field on a type in `source::TIMER_BRACED_STRUCTS`; and it checks that `waymaker-core/src/lib.rs` re-exports each pinned type. The *façade* half: `waymaker-embassy/src/clock.rs` gains or loses a public function `source::CLOCK_SURFACE` lists, names one of `source::CLOCK_FORBIDDEN_VOCABULARY` — `AfterBoot`, `BootOnly`, matched as *identifiers* over code with its comments stripped — or names a `TimerSpec` that is not `source::CLOCK_SPEC_CONSTRUCTION` — as a name and not a prefix — or names none at all. The crate-root half compares the *source* name of `pub use timer::…`, so an alias or a path through a submodule is not the pinned type. The *board* half reads the two modules `source::BOARD_CLOCK_MODULES` names — `waymaker-rig/src/rtc.rs` and `waymaker-rig/src/epoch.rs` — and fires when either gains or loses a public function its `surface` lists, declares a method its `methods` list does not have at *any* visibility, declares a public field on its driver type, declares any constant that is not a `const fn`, names one of `source::CLOCK_FORBIDDEN_VOCABULARY`, or names one of `source::BOARD_CLOCK_FORBIDDEN_VOCABULARY` — `TimerSpec`, `ClockCapability` — because a driver reports a reading and decides no policy. §02 decision 8 is that timer semantics match the hardware's clock and never pretend, and every way of giving that back is an *addition*: a `TimerSpec::best_effort(capability)`, a `Timer::arm_or_downgrade`, a `Timer::force_elapsed`, a `PersistentClock::now_or_zero`, a third `Deadline` meaning "cannot tell", or a second constructor for a persistent timer that takes a reading rather than a clock. Each would break no layering rule, need no dependency, and pass every other gate. The kernel half is three checks rather than one because review of that change defeated the version without them and watched the gate stay green: a `pub(crate) const fn arm_or_downgrade` on `impl Timer`, which a surface pin counting `pub ` and not `pub(` cannot see; a `pub spec` field on `Timer`, which adds no function and changes no member and makes the invariant the whole design rests on a value any caller can set; and a `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec`, reached from the façade as `TimerSpec::BEST_EFFORT` behind an "epoch not restored yet" guard — no banned identifier, no changed surface, and a persistent deadline served by a clock that restarts on every reset. So the façade's spec pin is positive rather than negative: it must name a spec, and every spec it names must be the persistent one. Codex then found two more of the same shape, and both are tests: `TimerSpec::AtPersistentTimeFallback` walked past a `starts_with`, and `pub use timer::TimerPolicy as TimerSpec` — or `pub use timer::compat::TimerSpec` — satisfied a root check that only asked whether the identifier appeared. Review of the *board* half then landed the same three on it — a `pub(crate) fn counter_unchecked` on `impl Rtc`, a `pub registers` field on `Rtc`, and a `pub const ASSUME_HELD: Self = Self::Held` on `impl Continuity` — which is why the board half carries a method pin at every visibility, a public-field refusal, and a constant ban read over the whole module rather than over one `impl` body: the constant was declared on the *enum a driver answers with*, which no per-driver pin looks at. The member sets are a wire-format commitment as much as an API one — issue #33 puts the clock kind on media for the life of the format. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is an `admits` that stopped consulting its argument or an `evaluate` that credited an interval it could not measure, which is `crates/waymaker-core/tests/timer.rs`'s; and each half pins one file, so a door added from a sibling module is a door the rule is silent about — including a `macro_rules!` in a sibling module invoked inside a pinned `impl`, which review of the board half landed and which expands to exactly the accessor the pin is written against. [ADR 0028](docs/adr/0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md). |
-| `kernel-boundary` | Design document §06's kernel boundary stops being the one that was reviewed, in either half. The *shape* half: a type in `source::BOUNDARY_TYPES` — `EffectRequest`, `Intent`, `Resolve`, `Outcome`, `Next` — declares a member the pin does not have, or stops declaring one it does, or is gone so the pin checks nothing. Issue [#28](https://github.com/madmax983/waymaker/issues/28) asks that "adding a new record kind does not change this signature", and §09 numbers eleven record kinds of which five — `TIMER_SCHEDULED`, `TIMER_FIRED`, `VERSION_MARKER`, `SIGNAL_RECEIVED`, `CHILD_STARTED` — have no body yet. A `Resolve::TimerFired` arriving with the first of them would break no other rule, need no dependency, and turn one boundary into a boundary per record. The *routing* half: `waymaker-drive`'s driver stops naming a row of `source::BOUNDARY_DECISIONS`, or grows one of `source::DRIVER_FORBIDDEN_VOCABULARY` — `RecordKind`, `Step` or `EffectIdAllocator`, matched as *identifiers*, because a `Step::` spelling ban is evaded by `Step ::Record` and by `use …::Step as S;` and fires on an unrelated `BootStep::`. A driver that decided from a record rather than from `Intent` and `Resolve` would be a second transition table, and the one below it would no longer be where §08 is enforced. The allocator is issue [#30](https://github.com/madmax983/waymaker/issues/30)'s: §14's fourth guarantee is that a retry and a reboot redeliver the *original* identity, and the driver keeps it by never having an identity of its own — every `(RunId, EffectSeq)` it dispatches under comes from `Intent::Schedule` or `Resolve::Redeliver`, and a fresh mint for an outstanding effect is a second effect to every downstream system. `RecordRef` is not on the list because the driver constructs them — the kernel names the record it wants written and something has to write it — and it reads two, which [what is not checked](#what-is-not-checked) names rather than leaves implied. Both halves read the file with its `#[cfg(test)]` modules removed, for `integrity-check`'s reason: a decision named only under `cfg(test)` discharges nothing about the code that ships. A type declared *twice* fails too — `braced_body` reads the first declaration, so a decoy above the real one is what a first-match scan reads. One rule id because it is one decision. What it cannot see is a *widened* member behind a name already on the list, and a driver that names every decision and then ignores one; `crates/waymaker-drive/tests/` is what holds the behaviour. [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md). |
-| `effect-protocol` | Design document §07's seven-step effect protocol stops being the one that was reviewed. `waymaker-drive/src/effect.rs` gains or loses a public function `source::EFFECT_PROTOCOL_SURFACE` lists; the state in `source::EFFECT_DISPATCH_STATE` declares anything but the two methods its row names; a type in `source::EFFECT_TYPE_METHODS` is declared twice, stops being a braced struct, declares a public field, or declares a method set other than its row's — read at *every* visibility, because a surface pin counts `pub ` and not `pub(`; a type in `source::EFFECT_NO_SELF_LITERAL` builds a `Self` or implements a trait; the file declares a module; a value in `source::EFFECT_CONSTRUCTIONS` is built outside the two bodies its row names, or is not built inside each of them; a body in `source::EFFECT_STEP_BODIES` — located in its owning type's own `impl` blocks — stops taking each of `source::EFFECT_STEPS` exactly once, in that order, and at the body's own nesting depth — braces, parentheses and brackets together — or declares a closure or a short-circuit (`|`, `&&`); `source::EFFECT_PROOF_AFTER`'s body builds a proof before the step its row names; or `redelivering` names one of `source::EFFECT_REDELIVERY_FORBIDDEN`. Issue [#29](https://github.com/madmax983/waymaker/issues/29) asks that step 4 be unreachable without step 3, "structurally, not by review", and every way of giving that back is an *addition*: a `DurableIntent::new`, a public `id` field on it, an `Effect::dispatchable_now`, a `Dispatchable::into_writer`, or a `Resolution::outcome` a caller can call before step 7. Each would break no other rule, need no dependency, and turn §02 decision 3 back into a convention. The step rows are the other half: §07 states the frame, the payload barrier and the seal twice, and a body that takes them in another order is not that protocol. Six of the halves are things review demonstrated rather than things anybody predicted, and each was watched passing on a mutation before it was closed: a `pub(crate) const fn new(id) -> Self` on `DurableIntent`, wired into the driver, with the gate green; a `Self { .. }` the name-based construction pin cannot see; a private free `fn resolve` above the real one, taking all three steps while `Dispatchable::resolve` stopped at the payload barrier; a decoy `pub struct` above the real one; a `pub` tuple field, where `braced_body` reads the first `{` after a declaration and so reported on the `impl` block below; and an `impl` inside a nested module, which `inherent_impl_bodies` cannot see because it reads `impl` at column zero. Codex round 1 found the seventh: the construction pin and the order pin were independent, so an early `return` carrying a freshly built `Dispatchable` satisfied both. Codex round 2 found the eighth, which is the sharpest of the lot: brace depth is not execution, and `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has no braces at all — three pinned calls, in order, at brace depth zero, in a closure nothing runs. The depth counts parentheses and brackets now, and a step body may not declare a closure. Round 3 found the ninth in the same family — `false && self.writer.stage(..)?…` puts every call once, in order, at depth zero, on a right-hand side that never runs — so the two short-circuit operators are refused as well. A scanner cannot follow control flow, so what it does instead is refuse the constructs that create it, and [what is not checked](#what-is-not-checked) says which. Round 2's other finding did not reproduce: `public_functions` counts a trait `impl`'s method as callable, so the surface pin already rejected an `impl From<EffectId> for DurableIntent`; the direct refusal is here anyway, because the two pins that are *about* construction do go blind on a trait `impl` and a guarantee should not rest on another pin's side effect. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is a step added from another file — it pins one file, exactly as `capacity-reserve` and `recovery-surface` do — nor whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness; the crash windows are `crates/waymaker-drive/tests/crash.rs`. [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md). |
+| `timer-capability` | Design document §11's timer semantics stop being the ones that were reviewed, in any of its four halves. The *kernel* half: `waymaker-core/src/timer.rs` gains or loses a public function `source::TIMER_SURFACE` lists, or a type in `source::TIMER_TYPES` — `TimerSpec`, `ClockCapability`, `Deadline` — is declared twice, is gone, or declares a member set other than its row's. It also pins each type's *methods*, at every visibility (`source::TIMER_TYPE_METHODS`), and refuses a public field on a type in `source::TIMER_BRACED_STRUCTS`; and it checks that `waymaker-core/src/lib.rs` re-exports each pinned type. The *façade* half: `waymaker-embassy/src/clock.rs` gains or loses a public function `source::CLOCK_SURFACE` lists, names one of `source::CLOCK_FORBIDDEN_VOCABULARY` — `AfterBoot`, `BootOnly`, matched as *identifiers* over code with its comments stripped — or names a `TimerSpec` that is not `source::CLOCK_SPEC_CONSTRUCTION` — as a name and not a prefix — or names none at all. The crate-root half compares the *source* name of `pub use timer::…`, so an alias or a path through a submodule is not the pinned type. The *board* half reads the two modules `source::BOARD_CLOCK_MODULES` names — `waymaker-rig/src/rtc.rs` and `waymaker-rig/src/epoch.rs` — and fires when either gains or loses a public function its `surface` lists, declares a method its `methods` list does not have at *any* visibility, declares a public field on its driver type, declares any constant that is not a `const fn`, names one of `source::CLOCK_FORBIDDEN_VOCABULARY`, or names one of `source::BOARD_CLOCK_FORBIDDEN_VOCABULARY` — `TimerSpec`, `ClockCapability` — because a driver reports a reading and decides no policy. §02 decision 8 is that timer semantics match the hardware's clock and never pretend, and every way of giving that back is an *addition*: a `TimerSpec::best_effort(capability)`, a `Timer::arm_or_downgrade`, a `Timer::force_elapsed`, a `PersistentClock::now_or_zero`, a third `Deadline` meaning "cannot tell", or a second constructor for a persistent timer that takes a reading rather than a clock. Each would break no layering rule, need no dependency, and pass every other gate. The kernel half is three checks rather than one because review of that change defeated the version without them and watched the gate stay green: a `pub(crate) const fn arm_or_downgrade` on `impl Timer`, which a surface pin counting `pub ` and not `pub(` cannot see; a `pub spec` field on `Timer`, which adds no function and changes no member and makes the invariant the whole design rests on a value any caller can set; and a `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec`, reached from the façade as `TimerSpec::BEST_EFFORT` behind an "epoch not restored yet" guard — no banned identifier, no changed surface, and a persistent deadline served by a clock that restarts on every reset. So the façade's spec pin is positive rather than negative: it must name a spec, and every spec it names must be the persistent one. Codex then found two more of the same shape, and both are tests: `TimerSpec::AtPersistentTimeFallback` walked past a `starts_with`, and `pub use timer::TimerPolicy as TimerSpec` — or `pub use timer::compat::TimerSpec` — satisfied a root check that only asked whether the identifier appeared. Review of the *board* half then landed the same three on it — a `pub(crate) fn counter_unchecked` on `impl Rtc`, a `pub registers` field on `Rtc`, and a `pub const ASSUME_HELD: Self = Self::Held` on `impl Continuity` — which is why the board half carries a method pin at every visibility, a public-field refusal, and a constant ban read over the whole module rather than over one `impl` body: the constant was declared on the *enum a driver answers with*, which no per-driver pin looks at. The member sets are a wire-format commitment as much as an API one — issue #33 puts the clock kind on media for the life of the format. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. What it cannot see is an `admits` that stopped consulting its argument or an `evaluate` that credited an interval it could not measure, which is `crates/waymaker-core/tests/timer.rs`'s; and each half pins one file, so a door added from a sibling module is a door the rule is silent about — including a `macro_rules!` in a sibling module invoked inside a pinned `impl`, which review of the board half landed and which expands to exactly the accessor the pin is written against. Issue [#99](https://github.com/madmax983/waymaker/issues/99) closed the two doors `BEST_EFFORT` opened. `TimerSpec`, `Timer` and `ClockCapability` may declare no associated constant. `source::CLOCK_KIND_CONSTANTS` pins `ClockKind`'s two constants by name and value, since a `u8` newtype has no member and no method for the pins above to read. And the façade's `TimerSpec` pin resolves `use` aliases before it scans, so `use TimerSpec::BEST_EFFORT as PERSISTENT_SPEC;` is seen for what it names. Codex then found six more on this pull request: a raw `r#BEST_EFFORT` no longer drops the whole declaration from what the scan sees; `ClockKind` refuses a trait `impl`, which could otherwise carry a constant the pin above never reads; `ClockKind` declared twice is reported rather than resolved by whichever value a map collect happens to keep; a leading attribute on the same line as a declaration no longer hides it from the scan; and a self type's path — `impl crate::timer::ClockKind` and `impl Forge for crate::timer::ClockKind` — is stripped before either scan compares a name, a fix shared by every other pin built on the same two functions. [ADR 0028](docs/adr/0028-timer-semantics-are-a-spec-a-capability-and-no-downgrade.md). |
+| `kernel-boundary` | Design document §06's kernel boundary stops being the one that was reviewed, in either half. The *shape* half: a type in `source::BOUNDARY_TYPES` — `EffectRequest`, `Intent`, `Resolve`, `Outcome`, `Next` — declares a member the pin does not have, or stops declaring one it does, or is gone so the pin checks nothing. Issue [#28](https://github.com/madmax983/waymaker/issues/28) asks that "adding a new record kind does not change this signature", and §09 numbers eleven record kinds of which five — `TIMER_SCHEDULED`, `TIMER_FIRED`, `VERSION_MARKER`, `SIGNAL_RECEIVED`, `CHILD_STARTED` — have no body yet. A `Resolve::TimerFired` arriving with the first of them would break no other rule, need no dependency, and turn one boundary into a boundary per record. The *routing* half: `waymaker-drive`'s driver stops naming a row of `source::BOUNDARY_DECISIONS`, or grows one of `source::DRIVER_FORBIDDEN_VOCABULARY` — `RecordKind`, `Step` or `EffectIdAllocator`, matched as *identifiers*, because a `Step::` spelling ban is evaded by `Step ::Record` and by `use …::Step as S;` and fires on an unrelated `BootStep::`. A driver that decided from a record rather than from `Intent` and `Resolve` would be a second transition table, and the one below it would no longer be where §08 is enforced. The allocator is issue [#30](https://github.com/madmax983/waymaker/issues/30)'s: §14's fourth guarantee is that a retry and a reboot redeliver the *original* identity, and the driver keeps it by never having an identity of its own — every `(RunId, EffectSeq)` it dispatches under comes from `Intent::Schedule` or `Resolve::Redeliver`, and a fresh mint for an outstanding effect is a second effect to every downstream system. `RecordRef` is not on the list because the driver constructs them — the kernel names the record it wants written and something has to write it — and it reads two, which [what is not checked](#what-is-not-checked) names rather than leaves implied. Both halves read the file with its `#[cfg(test)]` modules removed, for `integrity-check`'s reason: a decision named only under `cfg(test)` discharges nothing about the code that ships. A type declared *twice* fails too — `braced_body` reads the first declaration, so a decoy above the real one is what a first-match scan reads. One rule id because it is one decision. A type in `source::BOUNDARY_TYPES` may also declare no associated constant — issue [#99](https://github.com/madmax983/waymaker/issues/99)'s shape. A constant is neither a member nor a function, so it is invisible to the member pin above. So is one carried by a trait `impl`, which Codex found on this pull request and which each of the five types now refuses outright. What it cannot see is a *widened* member behind a name already on the list, and a driver that names every decision and then ignores one; `crates/waymaker-drive/tests/` is what holds the behaviour. [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md). |
+| `effect-protocol` | Design document §07's seven-step effect protocol stops being the one that was reviewed. `waymaker-drive/src/effect.rs` gains or loses a public function `source::EFFECT_PROTOCOL_SURFACE` lists; the state in `source::EFFECT_DISPATCH_STATE` declares anything but the two methods its row names; a type in `source::EFFECT_TYPE_METHODS` is declared twice, stops being a braced struct, declares a public field, or declares a method set other than its row's — read at *every* visibility, because a surface pin counts `pub ` and not `pub(`; a type in `source::EFFECT_NO_SELF_LITERAL` builds a `Self` or implements a trait; the file declares a module; a value in `source::EFFECT_CONSTRUCTIONS` is built outside the two bodies its row names, or is not built inside each of them; a name in `source::EFFECT_PROOF_FIELDS` is assigned to, has a `&mut` reference taken to it, has a method called on it, or is bound `ref mut` in a struct pattern, anywhere in the file; a `type` alias anywhere in the file targets a qualified associated-type projection; a body in `source::EFFECT_STEP_BODIES` — located in its owning type's own `impl` blocks — stops taking each of `source::EFFECT_STEPS` exactly once, in that order, and at the body's own nesting depth — braces, parentheses and brackets together — or declares a closure or a short-circuit (`|`, `&&`); `source::EFFECT_PROOF_AFTER`'s body builds a proof before the step its row names; or `redelivering` names one of `source::EFFECT_REDELIVERY_FORBIDDEN`. Issue [#29](https://github.com/madmax983/waymaker/issues/29) asks that step 4 be unreachable without step 3, "structurally, not by review", and every way of giving that back is an *addition*: a `DurableIntent::new`, a public `id` field on it, an `Effect::dispatchable_now`, a `Dispatchable::into_writer`, or a `Resolution::outcome` a caller can call before step 7. Each would break no other rule, need no dependency, and turn §02 decision 3 back into a convention. The step rows are the other half: §07 states the frame, the payload barrier and the seal twice, and a body that takes them in another order is not that protocol. Six of the halves are things review demonstrated rather than things anybody predicted, and each was watched passing on a mutation before it was closed: a `pub(crate) const fn new(id) -> Self` on `DurableIntent`, wired into the driver, with the gate green; a `Self { .. }` the name-based construction pin cannot see; a private free `fn resolve` above the real one, taking all three steps while `Dispatchable::resolve` stopped at the payload barrier; a decoy `pub struct` above the real one; a `pub` tuple field, where `braced_body` reads the first `{` after a declaration and so reported on the `impl` block below; and an `impl` inside a nested module, which `inherent_impl_bodies` cannot see because it reads `impl` at column zero. Codex round 1 found the seventh: the construction pin and the order pin were independent, so an early `return` carrying a freshly built `Dispatchable` satisfied both. Codex round 2 found the eighth, which is the sharpest of the lot: brace depth is not execution, and `false.then(|| self.writer.stage(..).payload_barrier(..).commit(..))` has no braces at all — three pinned calls, in order, at brace depth zero, in a closure nothing runs. The depth counts parentheses and brackets now, and a step body may not declare a closure. Round 3 found the ninth in the same family — `false && self.writer.stage(..)?…` puts every call once, in order, at depth zero, on a right-hand side that never runs — so the two short-circuit operators are refused as well. A scanner cannot follow control flow, so what it does instead is refuse the constructs that create it, and [what is not checked](#what-is-not-checked) says which. Round 2's other finding did not reproduce: `public_functions` counts a trait `impl`'s method as callable, so the surface pin already rejected an `impl From<EffectId> for DurableIntent`; the direct refusal is here anyway, because the two pins that are *about* construction do go blind on a trait `impl` and a guarantee should not rest on another pin's side effect. Read with `#[cfg(test)]` modules removed, for `integrity-check`'s reason. A type in `source::EFFECT_TYPE_METHODS` may also declare no associated constant — issue [#99](https://github.com/madmax983/waymaker/issues/99)'s shape, closed here the way `timer-capability`'s kernel half closes it. A constant is neither a member nor a function, so it is invisible to the method pin above. So is one carried by a trait `impl`: `DurableIntent` and `Dispatchable` already refused one for the construction pin's reason, and `Effect` now refuses one for this reason, which Codex found on this pull request. What it cannot see is a step added from another file — it pins one file, exactly as `capacity-reserve` and `recovery-surface` do — nor whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness; the crash windows are `crates/waymaker-drive/tests/crash.rs`. [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md). `DurableIntent::kind`, `Dispatchable::perform`, `CheckedDispatch::bytes` and `CheckedDispatch::durable_intent` are issue [#92](https://github.com/madmax983/waymaker/issues/92)'s. A `DurableIntent` now carries the request step 3 committed. So `kind` cannot be read from a second argument, and `perform` refuses `input` that disagrees with the digest, before an activity is ever asked. `Activities::perform` then takes the one `CheckedDispatch` that refusal builds, not an identity and a `&[u8]` as two separate arguments, so calling it directly carries no bytes the check did not vouch for and no identity paired with another call's bytes either. None of the four is a storage step, so `EFFECT_STEP_BODIES` is unchanged. `source::CHECKED_DISPATCH_CONSTRUCTION` is `EFFECT_CONSTRUCTIONS`'s twin for `CheckedDispatch`, one body rather than two: `Dispatchable::perform` is the only place that may build one, so `EFFECT_NO_SELF_LITERAL`'s ban on a `Self` literal and a trait `impl` is not carrying the whole guarantee alone against a `pub(crate)` forge elsewhere in the file, which is what Codex's third round on this issue found. A fourth round found that the construction pin's own scanner, `struct_literal_counts`, resolved only `use` aliases — `type Unchecked<'a> = CheckedDispatch<'a>;` followed by a literal spelled `Unchecked { .. }` built the pinned type under a name the pin never compared against. The scanner now resolves `type` aliases the same way it already resolved `use` aliases (issue #99), chased through a chain of either kind, which closes the gap for every construction pin built on it — `EFFECT_CONSTRUCTIONS` included — rather than for this one alone. A fifth round found the scanner's own remaining blind spot: it walked file items and inline modules only, so a `type` alias declared *inside* a function body — legal Rust — was invisible to it just as the file-scoped one had been. `struct_literal_counts` now gives every block its own alias scope, entered on the way in and popped on the way out, and resolves a name against the innermost scope that declares it — a local alias correctly shadows a same-named one declared elsewhere in the file, rather than the scan picking whichever declaration happens to sort first in a flattened list. A sixth round found a hole in what counts as an alias's right-hand side rather than in where it is looked for: `type Unchecked<'a> = (CheckedDispatch<'a>);` is valid Rust, `#[allow(unused_parens)]` lets it through `-D warnings`, and `syn` keeps the parens as their own `Type::Paren` node — so the `Type::Path` match that reads a target saw nothing and built no alias at all. `type_alias_target` now unwraps `Type::Paren`, and `Type::Group` beside it for the same reason, recursively. A seventh round found a different shape of gap: `CheckedDispatch`'s, `DurableIntent`'s and `Dispatchable`'s fields are private to the *module*, not to the type, so a sibling function anywhere in `effect.rs` could already write `dispatch.bytes = other;` on a legitimately built value — no struct literal anywhere, so no construction pin sees it — or take a `&mut` reference to the field and rewrite it through `core::mem::swap`, `core::mem::replace`, or any other `&mut`-taking call, none of which spells `=` either. `source::EFFECT_PROOF_FIELDS` names the fields this matters for — `id` and `request` from `DurableIntent`, `intent` from `Dispatchable` and `CheckedDispatch`, `bytes` from `CheckedDispatch` — and `check_effect_proof_fields_are_not_rebound` refuses both routes, anywhere in the file. Nesting the type in a private submodule to get real per-type field privacy was considered and rejected: the file-declares-a-module refusal a few clauses up exists precisely so a construction site cannot hide there, and a submodule added for this reason would open that same hole. An eighth round found the third route the first two left open: a method call. `dispatch.bytes.clone_from(&other)` reassigns `bytes` through an *implicit* `&mut self` autoref — nothing in the source spells `=` or `&mut`, so neither the assignment check nor the reference check sees it, and whether a given method really takes `&mut self` is a question `syn` cannot answer without type inference. So `mutated_field_names` refuses every method call whose receiver is a guarded field, not only the ones a reviewer could confirm mutate — over-broad the same way every other scanner here is, and free here because no method is ever legitimately called directly on one of these fields today, only on the whole value through its own accessor, whose receiver is a plain path rather than a field access. A ninth round found two more gaps in two different mechanisms. The first is a fourth route into the field-rebinding problem: `let CheckedDispatch { bytes: ref mut slot, .. } = dispatch;` borrows `bytes` mutably through the pattern itself, with no assignment, `&mut` expression or method call anywhere for the first three routes to see; `mutated_field_names` now also refuses a `ref mut` binding on a guarded field in any struct pattern, found at any nesting depth by walking the sub-pattern with a nested visitor rather than checking only its outermost shape. A field bound `mut slot` with no `ref` is deliberately left alone, since it moves or copies the value into a fresh local rather than aliasing the original place. The second is in the type-alias resolution itself: `type Unchecked = <Via as Alias>::Dispatch;` is a qualified associated-type projection, which `type_alias_target` explicitly skips — correctly, since resolving what a trait's `impl` names as its associated type needs type inference this scanner does not have — but skipping was silently permissive, since the alias built nothing and so counted as nothing while the projection itself could still name `CheckedDispatch`. Unlike a tuple, a reference or a trait object, none of which can ever appear where `Name { .. }` construction syntax is legal, a projection genuinely can resolve to a struct usable that way — so `qself_type_alias_names` reports every such alias, and a new check refuses the file outright over it, a hard refusal of the construct rather than an attempt at type resolution neither `syn` nor this scanner can safely do. A tenth round found that `mutated_field_names` checked only the outermost field of a chain — `dispatch.intent.request.kind = x;` assigns to `kind`, not a guarded name, but `intent` and `request` are guarded *ancestors* in the same chain — so `note` now walks the whole chain back to its root for all three routes at once. Two further tenth-round findings — an implicit mutable alias match ergonomics can bind with no `ref`/`mut`/`&mut` written anywhere, and a generic type alias with a trait bound (`type Unchecked<T: Alias> = T::Dispatch;`) projecting with no `qself` for the ninth round's check to key on — are real and not fixed here: ten rounds deep, both need genuinely new detection machinery rather than a completion of what exists, and this project's review-depth guidance is to stop past two or three rounds and open an issue once a fourth still finds real bugs. They are issue [#171](https://github.com/madmax983/waymaker/issues/171). An eleventh round, on the merge of this branch with a concurrent one, found a gap in the tenth's own fix: `dispatch.intent.request.kind ^= 1;` rewrites `kind` in place, but `syn` parses every compound-assignment operator — `+=`, `^=`, and the other eight — as a `BinOp` on an `Expr::Binary`, never as `Expr::Assign`, which is `=` alone, so the visitor that only visited `Expr::Assign` never called `note` for one. `mutated_field_names` now also visits `Expr::Binary` and calls `note` on the left operand for any of the ten assignment operators. A twelfth round found a gap in the eleventh's own review rather than its fix: `(dispatch.bytes,) = (replacement,);` is still an `Expr::Assign`, but its left side is `Expr::Tuple`, not `Expr::Field`, and `note`'s chain walk only recognised the latter. `note` now recurses into each element of a tuple or array and each field's value in a struct literal — arbitrarily nested — before falling back to the field-chain walk, so a field buried inside a destructuring assignment target is found the same way one behind a compound assignment is. A thirteenth round found a gap in the tenth round's own chain walk rather than in the eleventh's or twelfth's: `(dispatch.intent.request).kind = x;` puts a guarded ancestor behind an `Expr::Paren`, and the chain walk's `while let Expr::Field(field) = current { .. current = &field.base; }` loop stopped the moment `.base` was a paren rather than another field access, so `intent` and `request` were invisible behind their own parenthesized prefix. The walk now unwraps `Expr::Paren` and `Expr::Group` as it descends, the same two wrappers `type_alias_target` already unwraps for the same reason. Three rounds deep in this post-merge chain — this project's own review-depth guidance is to stop past two or three and open an issue once a fourth still finds real bugs — so a fourteenth finding of the same shape goes to a new issue rather than a fourteenth fix here. Review of the merge itself found a separate bug, in code the merge introduced rather than in `mutated_field_names`'s own chain: `resolve_local_alias_chain`, written to keep function-local type-alias resolution working after issue #169's rewrite of `struct_literal_counts`, resolved a block's own aliases with `collect_item_aliases`, which recurses into any `mod` the block declares — so a nested module's own, private alias could shadow the block's real one at the construction site. `own_aliases` is generalized to take any `&syn::Item` iterator, and `resolve_local_alias_chain` now calls it instead — the same non-recursive, own-level-only collection a module lookup already gets. Review of that fix found the inverse leak the same round: `visit_item_mod` pushed the nested module's own items onto `self.stack` and popped them on the way out, but never touched `self.block_items`, so a block's own local aliases stayed visible while the visitor traversed a `mod` declared inside that same block — a scope a nested module never inherits, whether the enclosing scope is a function body or another module. `visit_item_mod` now sets `block_items` aside with `core::mem::take` before descending and restores it afterward, the same discipline `self.stack`'s own push/pop already has. Codex then found a gap in a different mechanism, not in the alias scanner at all: `syn::Visit` does not descend into a `macro_rules!` body, which is an opaque token stream, so a local macro defined and invoked inside `effect.rs` and expanding to `CheckedDispatch { intent, bytes }` builds the pinned type at a construction site none of `struct_literal_counts`'s callers can see. Rather than attempt to expand or inspect a macro body — the same kind of type resolution this file already declines for a qualified associated-type projection — `check_effect_types` now refuses the file outright over a bare `macro_rules` identifier, the same shape `ctx-facade` already uses for the same reason: a scanner cannot expand a macro, so it refuses the construct. Codex found the gap that ban left open the same round: it reads the *definition* identifier, so an invocation of a macro defined anywhere else in the crate — `emit!(CheckedDispatch { intent, bytes })`, spelling `macro_rules` nowhere — reaches the identical opaque-token blind spot. `crate::parse::invokes_any_macro` replaces the identifier check with a `syn::Visit` override of `visit_macro`, the one node type `ItemMacro`, `StmtMacro`, `ExprMacro`, `TypeMacro` and `PatMacro` all share, so a single override catches every invocation shape — `macro_rules!` included — without naming any of them individually; `effect.rs` now refuses the file outright over any macro use at all, outside `#[cfg(test)]`. Codex found a third shape in the same family the round after: an attribute macro or a custom derive is a `syn::Attribute`, not a `syn::Macro` invocation, so `invokes_any_macro`'s `visit_macro` override — however exhaustive over every invocation shape — never sees `#[forge]` on a method or `#[derive(Forge)]` on a struct, either of which expands in its own defining crate with nothing here able to read what comes out. `crate::parse::unaudited_attributes` closes it the same way as the two before it: rather than resolve what an attribute expands to, every attribute in `effect.rs` is required to be one of a fixed set (`source::EFFECT_ALLOWED_ATTRIBUTES`) the compiler itself interprets with no macro behind it, and a `#[derive(..)]` to name only the compiler's own derives (`source::EFFECT_ALLOWED_DERIVES`) — since `#[derive(A, B)]` can mix an inert one with a custom one in the same attribute, each name in the list is checked on its own rather than the attribute as a whole. `cfg_attr` is refused outright rather than classified recursively, since it can emit an arbitrary attribute and `effect.rs` has no legitimate use for one. Three rounds deep in this macro-opacity family — this project's own review-depth guidance is to stop past two or three and open an issue once a fourth still finds real bugs — so a fourth finding of this shape goes to a new issue rather than a fourth round here. A fourth round of Codex review found two more, back in the alias-scoping mechanism rather than the macro one: one is closed here, and one is not. `resolve_local_alias_chain` correctly stops at the end of a block's own aliases — a block-local `type Inner = Outer;` where `Outer` is itself a *module*-level alias — but the caller took that partial result as final rather than feeding it on to `resolve_segments`'s own module-level lookup, so `Inner { .. }` was never counted as whatever `Outer` really named. `resolve_local_alias_chain` now reports whether its own chain ended on an absolute alias or simply ran out of block-local names to try, and in the latter case the leftover head is resolved again through `resolve_segments_from` — the module-lookup half of `resolve_segments` split out for reuse — which is a no-op if the name is not itself a module-level alias. The other finding is not fixed: `own_aliases` skips only `#[cfg(test)]`, so two mutually exclusive `#[cfg(..)]`-gated `type` aliases sharing one name both enter the alias list, and whichever is declared last wins the lookup regardless of which one a real build would actually compile — the same "`cfg` is not evaluated" limitation this file's own parsing documentation already states as an accepted, structural property of every scanner in this family, met here in a form specific enough that resolving it would mean evaluating `cfg` predicates this workspace has decided its scanners do not attempt. Codex found one more on review of that same merge, in a different dimension from every one above: `CHECKED_DISPATCH_CONSTRUCTION` counts *where* `CheckedDispatch` is built and never *what precedes it*, so deleting the length/digest check inside `Dispatchable::perform` outright, or replacing its literal's `bytes: input` field with a hardcoded `bytes: &[]`, still leaves one construction, all of it inside the pinned body — the pin's own counts do not move, so `effect-protocol` stays green over a value `Activities::perform` receives with no real check behind it. This is not a new class of gap; it is `capacity-reserve`'s own "the admission the gate opens with is reachable in every case" limit, met here for the first time: a scanner counts a construction's position, never whether the code around it does what it claims, and closing that needs the semantic evaluation this whole scanner family has consistently declined to build. What holds the real guarantee is not this rule but two tests — `perform_refuses_input_that_disagrees_with_what_was_scheduled` fails if the check is weakened or removed, and `perform_binds_the_kind_and_forwards_matching_input` fails if the literal stops forwarding the checked bytes — which is this project's own "no invariant ships without a test" answer for exactly the class of defect a syntax-only pin cannot see. Codex found one more on review of the same merge, in `EFFECT_ALLOWED_DERIVES` rather than in the two tests: `Default` sat on that list beside `Clone`, `Copy` and `Debug`, and unlike every other entry on it, `Default` *constructs* — `#[derive(Default)]` on `DurableIntent` or `CheckedDispatch` would generate `CheckedDispatch::default()`, a second public constructor that is neither a `Self` literal `EFFECT_NO_SELF_LITERAL` refuses nor a construction site `CHECKED_DISPATCH_CONSTRUCTION` counts, since both look for something written in source and a derive's expansion is neither. `Default` is removed from the allowlist rather than special-cased for the three proof types, matching every other refusal in this file's macro-and-derive family, which is stated file-wide for the same reason a module ban and a macro-invocation ban both are: resolving which types are "proof types" needs the same name resolution this scanner has consistently declined to build. `a_derive_default_on_a_proof_type_is_reported` is the regression. [ADR 0050](docs/adr/0050-a-durable-intent-carries-its-request-and-perform-checks-it.md). |
 | `embassy-below-facade` | A *layer* other than `waymaker-embassy` reaches the Embassy ecosystem. The rule iterates `policy::LAYERS`, so `xtask` and the size probe are outside it. |
 | `layer-missing` | A crate named in `policy::LAYERS` is not in the workspace. |
 | `layer-not-local` | A crate with a layer's name resolves to a registry crate rather than the path dependency. |
@@ -887,7 +953,7 @@ this table is how you find out what a red build is telling you.
 | `toolchain-targets` | `rust-toolchain.toml` stops pinning `thumbv6m-none-eabi` or `llvm-tools-preview`. The emulated boot's own targets are `emulation-boot`'s, which reads the same file: a rule about which cores the rig is started on belongs with the rest of that subject rather than here. |
 | `size-probe` | The size probe stops being the `#![no_std]`, `#![no_main]`, feature-gated firmware the size gate links — or it stops mirroring a layer feature under a feature of its own, so the row named after that feature links code the probe can reach none of. A probe cannot `#[cfg]` on another crate's feature, so `--features waymaker-embassy/postcard` would report the delta of an image nobody exercised, and no other rule would notice: the row is not identical to its base, because the probe's own constants already differ. |
 | `size-probe-reach` | A layer grows a public function the probe does not reach, so no budget charges for it. |
-| `emulation-boot` | The emulated image stops being the thing the `emulate` stage started, in any of its five halves. The *attributes* half: `crates/waymaker-emu/src/main.rs` loses `#![no_std]` or `#![no_main]`, or declares its `unsafe_code` exception without a `reason` — an image that quietly became a host binary has no reset vector for a machine to start, and an unreasoned `allow` is the one thing the workspace manifest asks of the exception it permits. The *`unsafe`* half: any file of the crate writes the `unsafe` **keyword**, as opposed to naming the lint `unsafe_code` in the `allow`. This is the one crate in the workspace that carries `#![allow(unsafe_code)]`, and the whole of what it is carried for is two macro expansions — `#[cortex_m_rt::entry]`, which writes the exported symbol the reset vector points at, and `debug::exit`, which performs the semihosting call. Without this half the exception would be a licence for a crate rather than for two expansions, and the one place `unsafe` is permitted would be the one place nothing checks. The *prefix* half: the image no longer declares `emulate::PREFIX`. The harness reads the image's own lines to decide whether a boot was a measurement, so a space added on one side turns every later run into "the image printed no census" — which fails closed, and fails for a reason nobody would find quickly. The *manifest* half: the `[[bin]]` is not behind `required-features = ["emu"]`, without which every host build in the workspace tries to link a `#![no_main]` firmware binary. The *machines* half: a core in `emulate::MACHINES` has no Rust target pinned in `rust-toolchain.toml`, or no pipeline stage runs `cargo xtask emulate` at all — a machine the table claims and nothing starts. What it cannot see is whether the image *does* anything, which is the run's own job: `emulate::Census::shortfall` and `emulate::Report::shortfall` read what the boot printed, and a scanner and a run answer different questions. [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md). |
+| `emulation-boot` | The emulated image stops being the thing the `emulate` stage started, in any of its five halves. The *attributes* half: `crates/waymaker-emu/src/main.rs` loses `#![no_std]` or `#![no_main]`, or declares its `unsafe_code` exception without a `reason` — an image that quietly became a host binary has no reset vector for a machine to start, and an unreasoned `allow` is the one thing the workspace manifest asks of the exception it permits. The *`unsafe`* half: any file of the crate writes the `unsafe` **keyword** outside `emulate::PERMITTED_UNSAFE_FUNCTIONS`, as opposed to naming the lint `unsafe_code` in the `allow`. This is the one crate in the workspace that carries `#![allow(unsafe_code)]`, and the whole of what it is carried for is two macro expansions — `#[cortex_m_rt::entry]`, which writes the exported symbol the reset vector points at, and `debug::exit`, which performs the semihosting call — and, since [ADR 0045](docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md), one measurement: `stack::paint` and `stack::high_water_mark`, confined to `emulate::STACK_MODULE`'s crate-relative path, plus the one `unsafe extern "C" { .. }` block the 2024 edition requires to name the linker's `_stack_end` symbol. A name is not the whole of the pin: the header must reach a `{` before a `;` or a bodiless signature would still borrow the exemption, every permitted `unsafe` must sit at that function's own nesting depth or a nested item or a closure could hide a second one beside it, that depth-zero `unsafe` must also be the *only* one the function declares or a second, sibling `unsafe` placed beside the legitimate one would pass unnoticed, and the one permitted extern block must declare `_stack_end` and `_stack_start` and nothing else or a foreign function whose `unsafe` is also followed by the word `extern` would pass as one. Without this half the exception would be a licence for a crate rather than for two expansions and one measurement, and the one place `unsafe` is permitted would be the one place nothing checks. The *prefix* half: the image no longer declares `emulate::PREFIX`. The harness reads the image's own lines to decide whether a boot was a measurement, so a space added on one side turns every later run into "the image printed no census" — which fails closed, and fails for a reason nobody would find quickly. The *manifest* half: the `[[bin]]` is not behind `required-features = ["emu"]`, without which every host build in the workspace tries to link a `#![no_main]` firmware binary. The *machines* half: a core in `emulate::MACHINES` has no Rust target pinned in `rust-toolchain.toml`, or no pipeline stage runs `cargo xtask emulate` at all — a machine the table claims and nothing starts. What it cannot see is whether the image *does* anything, which is the run's own job: `emulate::Census::shortfall`, `emulate::StackUsage::shortfall` and `emulate::Report::shortfall` read what the boot printed, and a scanner and a run answer different questions. [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md), [ADR 0045](docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md). |
 | `gate-broken` | The gate's own expected values do not parse. A gate must not be able to silently uncheck one of its rules. |
 
 ### Documentation
@@ -897,8 +963,9 @@ this table is how you find out what a red build is telling you.
 | `claude-md` | This file loses a must-not-own cell, a permitted dependency edge, a settled-decision id, a backticked gate rule id, a pipeline command, or its links to the decision record and the diagrams. |
 | `recovery-spec` | The recovery specification and the four places it lives stop agreeing: a clause in `docs::SPEC_CLAUSES` is missing from this file, from [ADR 0015](docs/adr/0015-the-recovery-invariants-are-a-ghost-model-and-an-exhaustive-proof.md), or from `crates/waymaker-spec/src/obligation.rs`; its row here does not carry the guarantee's words or the test target that discharges it; the count is wrong; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Issue #20 asks that a change to the record representation update the model and the invariants first, then the proofs, then the code. Nothing mechanical can check the *order* — this checks that the four never disagree, which is the part that fails silently. |
 | `storage-conformance` | Design document §12's storage contract and the four places it lives stop agreeing: a clause in `docs::STORAGE_CONTRACT_CLAUSES` is missing from this file, from [ADR 0016](docs/adr/0016-the-storage-contract-is-a-conformance-suite-and-a-port.md), or from `crates/waymaker-conformance/src/clause.rs`; its row here does not carry the sentence or what discharges it; the count is wrong; the crate discharges a clause differently than the table does; the crate declares a clause the table never did; or the clause table is not where the gate looks for it. Two tables agreeing on the names of six things and disagreeing about what any of them costs is the failure worth catching, so ids and discharges are compared in both directions. What it cannot see is inside the crate: that a clause the table calls in-process is reached by a case is `crates/waymaker-conformance/tests/clauses.rs`. |
+| `storage-shapes` | Issue #130 item 2's shape catalogue and the four places it lives stop agreeing: a shape in `docs::STORAGE_SHAPES` is missing from this file, from [ADR 0047](docs/adr/0047-a-shape-catalogue-holds-the-suite-to-the-writers.md), or from `crates/waymaker-conformance/src/shape.rs`; its row here does not carry the sentence or the issuer; the count is wrong; the crate names a shape's issuer differently than the table does; the crate declares a shape the table never did; or the shape table is not where the gate looks for it. What it cannot see is inside the crate: that a declared shape is really issued by a run is `crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape`. |
 | `hardware-attestation` | Rung 0.2's board runs and the places they are recorded stop agreeing: a target in `docs::HARDWARE_TARGETS` has no backticked table row in this file, its row does not carry the headline or the status the table renders, the count is wrong, a target marked `Passed` has no accepted ADR carrying `docs::HARDWARE_ATTESTATION_MARKER` for it or has more than one, a target marked `Not run` is nevertheless claimed by an ADR, or an ADR attests a target the table never declared. What it cannot check is that a `Passed` row is *true* — the evidence is a log from a bench — only that the claim is a line in an accepted decision record rather than a status somebody flipped. |
-| `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]` or `#[cfg(` is not a test. What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
+| `failure-matrix` | Design document §14's failure-semantics table and the five places it lives stop agreeing: a row in `docs::FAILURE_ROWS` is missing from this file or from [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md), or its variant is answered with another id, or none, by the `fn id` body of `crates/waymaker-rig/src/matrix.rs` — pairs rather than a set, because two ids swapped between arms leave the set whole; it has no `#[test]` of its own name in `crates/waymaker-drive/tests/matrix.rs`, or that test's body never names its variant; a row the table calls swept has no `#[test]` of its rig name in `crates/waymaker-rig/tests/matrix.rs`, or that test's body never names its variant — the body rather than the file, because two tests with their names swapped keep every variant in the file; its row here does not carry the failure point, the test or the rig standing the table renders; the count is wrong; the rig answers a variant the table never declared; or one of the three files is not where the gate looks for it. A test under `#[ignore]`, `#[cfg(` or `#[cfg_attr(` is not a test — a conditional attribute is refused outright, because a row test is either a test or it is not (issue #97). What it cannot see is whether a named test asserts the row's *behaviour*: that is each file's own census, which pins the count per row on the model and requires the rig's to refuse at the first owed row. |
 | `adr-numbering` | An ADR skips or reuses a number, is not named `NNNN-slug.md`, or the record has no template. |
 | `adr-structure` | An ADR loses its title, `- Status:`, `- Date:`, `## Context`, `## Decision` or `## Consequences`, or carries an unrecognised status. |
 | `adr-index` | An ADR is not linked from `docs/adr/README.md`, or the index links one that does not exist. |
@@ -906,7 +973,7 @@ this table is how you find out what a red build is telling you.
 | `deferred-questions` | A question in `docs::DEFERRED_QUESTIONS` is missing from this file, its row does not carry the headline and the status the table renders, the count is wrong, a settled one's ADR is absent, unaccepted or does not carry its `Settles deferred question:` marker, two ADRs claim one question, an open one is already claimed by an ADR, or an ADR claims a question the table never declared. |
 | `diagrams` | `docs/architecture.md` loses a labelled Mermaid block, a protocol step, a layer, or a permitted dependency edge — or draws an edge the layering does not permit, or labels two blocks with one id. |
 | `missing-docs` | A crate root stops warning, denying or forbidding `missing_docs`, or turns it back off — `allow`, `expect`, the `warnings` group, a `cfg_attr` wrapper, or an attribute split over several lines are all the same regression. |
-| `book` | Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s book stops being the book it asks for. The *shape*: a row of `book::BOOK_CHAPTERS` has no file under `docs/book/src` or no link of its own title in `SUMMARY.md`, or a **file** appears under that directory that the table does not declare — every file rather than every `.md` file, because review of this change added a chapter named `rogue.MD`, linked it, and watched a case-sensitive collector leave it covered by nothing. The *samples*: a fence whose language `book::QUOTABLE_FENCE_LANGUAGES` does not name — the *unlabelled* one included — carries anything but `{{#include}}` directives; a line carries a directive and something else; a directive that is not `{{#include}}` appears at all; a line is indented four spaces; an include names a file `book::BOOK_SAMPLE_FILES` does not, an anchor that file does not declare, an anchor with no `#[test]` of its name, or a line *range*; an anchor is declared and no chapter shows it; or an anchor does not **contain** the `#[test] fn` of its own name and is not named in `book::BOOK_FIXTURE_ANCHORS` — a fixture anchor being one that shows a type a test uses, which must still declare an item rather than commentary. A `#[test]` under `#[ignore]` or `#[cfg(` is not a test, which is `failure-matrix`'s standard met here. Five of those are things review demonstrated rather than predicted, each watched passing on a mutation before it was closed: a bare ` ``` ` fence carrying Rust, past a version that asked whether the info string said "rust"; `{{#include a}} let x = 1; {{#include b}}`, which satisfies `starts_with` and `ends_with` and renders the source between them; `{{#playground}}`, which renders an arbitrary source file as a Rust block with no fence at all; `#[ignore]` written *above* the anchor marker, where a reader of the book never sees it and the test never runs; and an anchor shrunk to two comment lines advertising an API that does not exist, which a name-only tie accepted. The *contents*: the wire-format chapter must `{{#include}}` [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) and state no table of its own; the failure chapter must carry every row of `docs::FAILURE_ROWS`; the non-goals chapter every row of `book::NON_GOALS`; and `CLAUDE.md` and `README.md` must both link `docs/book/src/SUMMARY.md` — the path rather than the directory, because `docs/book (deleted; see the archive)` satisfied the looser check. What it cannot see is prose, and it cannot say the *rendered* book is whole: `cargo xtask book` is what does that, because mdBook exits zero for an include it cannot resolve and renders an anchor it cannot find as nothing at all. |
+| `book` | Issue [#42](https://github.com/madmax983/waymaker/issues/42)'s book stops being the book it asks for. The *shape*: a row of `book::BOOK_CHAPTERS` has no file under `docs/book/src` or no link of its own title in `SUMMARY.md`, or a **file** appears under that directory that the table does not declare — every file rather than every `.md` file, because review of this change added a chapter named `rogue.MD`, linked it, and watched a case-sensitive collector leave it covered by nothing. The *samples*: a fence whose language `book::QUOTABLE_FENCE_LANGUAGES` does not name — the *unlabelled* one included — carries anything but `{{#include}}` directives; a line carries a directive and something else; a directive that is not `{{#include}}` appears at all; a line is indented four spaces; an include names a file `book::BOOK_SAMPLE_FILES` does not, an anchor that file does not declare, an anchor with no `#[test]` of its name, or a line *range*; an anchor is declared and no chapter shows it; or an anchor does not **contain** the `#[test] fn` of its own name and is not named in `book::BOOK_FIXTURE_ANCHORS` — a fixture anchor being one that shows a type a test uses, which must still declare an item rather than commentary. A `#[test]` under `#[ignore]`, `#[cfg(` or `#[cfg_attr(` is not a test, which is `failure-matrix`'s standard met here. Five of those are things review demonstrated rather than predicted, each watched passing on a mutation before it was closed: a bare ` ``` ` fence carrying Rust, past a version that asked whether the info string said "rust"; `{{#include a}} let x = 1; {{#include b}}`, which satisfies `starts_with` and `ends_with` and renders the source between them; `{{#playground}}`, which renders an arbitrary source file as a Rust block with no fence at all; `#[ignore]` written *above* the anchor marker, where a reader of the book never sees it and the test never runs; and an anchor shrunk to two comment lines advertising an API that does not exist, which a name-only tie accepted. The *contents*: the wire-format chapter must `{{#include}}` [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) and state no table of its own; the failure chapter must carry every row of `docs::FAILURE_ROWS`; the non-goals chapter every row of `book::NON_GOALS`; and `CLAUDE.md` and `README.md` must both link `docs/book/src/SUMMARY.md` — the path rather than the directory, because `docs/book (deleted; see the archive)` satisfied the looser check. What it cannot see is prose, and it cannot say the *rendered* book is whole: `cargo xtask book` is what does that, because mdBook exits zero for an include it cannot resolve and renders an anchor it cannot find as nothing at all. |
 | `hardware-matrix` | The matrix stops covering every part, or starts claiming something. A board in `docs::HARDWARE_TARGETS` or a modelled part in `wear::PARTS` has no row in `book::HARDWARE_MATRIX`; a row names a board or a part neither table declares; the matrix chapter's table is not, cell for cell and row for row, `book::MATRIX_TABLE_HEADER` followed by every derived row in order; the chapter says `Passed` while no row renders it; or a modelled part's figure could not be measured, which is a failure rather than a blank column. Whole rows compared by equality rather than each cell searched for somewhere in the page, because review of this change fabricated a table of two boards that do not exist — both `Passed`, with invented geometry and invented wear — hid the honest rows in HTML comments, and watched a substring version print `ok`; it separately took a wear figure from `63.37` to `163.37`, which no `contains` can see, and duplicated a declared id with `Passed` in it. Every cell but the clock column is derived: the geometry from `wear::PARTS`, the power-cut standing from `HARDWARE_TARGETS` for a board and from `book::SWEPT_PROGRAM_BYTES` for a model — every crash sweep in this workspace lays the part out at a four-byte program unit, so the other two modelled rows say so rather than borrowing a sweep that never ran — and the written bytes per effect from the measurement this run took. So the book cannot say `Passed` where the record says `Not run`, and moving that record needs an accepted ADR, which is `hardware-attestation`'s. What it cannot see is whether a `Passed` row is *true*; that is a log from a bench, and [what the boards still owe](#what-the-boards-still-owe) is where its absence is recorded. |
 
 ## What is not checked
@@ -997,6 +1064,13 @@ Stated so that nobody mistakes silence for coverage:
   pins one file. A `trait StorageExt: StableStorage { fn read_all(..) }` with a blanket impl
   in a sibling module adds a method to every port's type with the rule silent, the same way
   `integrity-check`'s table scan cannot see a table in a module `crc.rs` calls.
+- **That a shape's `issued_by` names the function that really issues it.** `storage-shapes`
+  compares the sentence and the issuer *text* across the four places the table lives, the
+  same as `storage-conformance` does for a clause's discharge — it does not resolve
+  `append::Sealable::commit` against the crate and check that such a function exists. A row
+  transcribed against the wrong type — a program attributed to `Journal::commit` when the
+  method is `Sealable::commit`'s — reads and checks the same as a correct one; review of this
+  section is what catches it.
 - **Crash points of operations that exist only after an injected failure.** `injections` is
   computed from the *fault-free* write sequence, so a retry a writer performs only because a
   call failed has no crash points of its own — it is never torn, interrupted or power-lost
@@ -1027,19 +1101,51 @@ Stated so that nobody mistakes silence for coverage:
 - **That the crash oracle is as strict as the specification.** `waymaker_fault::verify_oracle`
   compares a recovery against *committed* history, which filters out records that never
   reached media, so it accepts a history that skips a gap and carries on; the specification's
-  prefix safety is a prefix of *declaration order* and refuses it. The two agree over the
-  specified machine — no reachable state has a gap — and `tests/oracle.rs` measures where
-  they stop agreeing rather than leaving the difference implied.
+  prefix safety is a prefix of *declaration order* and refuses it. `waymaker-fault`'s own
+  `tests/harness.rs` drives that acceptance on purpose — a writer whose middle record's
+  program call fails outright and who carries on to the next is exactly the case a stricter
+  oracle would wrongly refuse — so the fix for issue #67's smaller item is not a stricter
+  `verify_oracle`. The two agree over the specified machine because no reachable state has a
+  gap, and that used to be argued from a theorem about a different type
+  (`tests/machine.rs`'s, about `Journal`) rather than checked directly against what the
+  agreement tests actually judge; `tests/oracle.rs`'s
+  `the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history` is now that check,
+  against the `Ledger` itself.
 - **That the ghost model is a model of *this* firmware.** `tests/refinement.rs` drives the
   real codec through the injector and requires every crash it can be in to be a state the
   model describes, which is what makes the model more than a second implementation. It covers
-  records; it does not cover banks, because rung 0.2 owns the two-bank adapter and there is
-  nothing yet to abstract. `single-authority` is therefore proved about a model and not about
-  a device, and its row in `obligation.rs` says so.
+  records, and — since issue #73 — banks: a real swap writer, styled on
+  `crates/waymaker-fault/tests/banks.rs`'s own, is folded into `[Bank; 2]` at every crash
+  point and checked against the model's reachable set. Issue #67 gave the *model* the
+  dimension that made a bank-aware refinement possible in the first place — a `Record`'s
+  `BankId`, and recovery scoped to the one a reader would boot from. What it has not made
+  possible yet is a *joint* refinement: the record writers never touch a bank and the
+  bank-swap writer never declares a record, so `single_authority`'s own bank check — that a
+  recovered record's bank is the sole authoritative one — has been refined only against
+  `recovered: &[]`, never against a real crash that leaves a device with both an authority
+  and a record on it. `obligation.rs`'s row says so rather than the earlier, wider claim that
+  `single-authority` was fully proved about a device; Codex found the gap between the claim
+  and the two sweeps' actual coverage on review of the pull request that closed issue #67.
+  What is not covered is every bank sequence a firmware could produce, only the one swap this
+  file drives — and, until the two sweeps compose, no sequence with a record in it. See
+  [ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md) and
+  [ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
 - **That a clause was updated before the code it constrains.** `recovery-spec` compares the
   four places a recovery invariant lives and fails when they disagree. Issue #20 asks for the
   model and the invariants to be changed *first*, then the proofs, then the code, and the
   order of edits inside one commit is not a thing a rule can read.
+- **A wrong-bank reader whose wrong bank happens to be empty.** `Invariant::SingleAuthority`'s
+  bank check — issue #67 — is handed `recovered` and nothing else, matching every other
+  guarantee here: a `Reader` reports what it produced, not which bank it consulted. An empty
+  answer from the retired bank is byte-for-byte the same `Vec` an empty answer from the
+  authoritative one would be, and `legal_recoveries` already treats stopping before anything
+  is required as correct, so flagging every empty `recovered` would reject readers that broke
+  no rule. Codex's review of the pull request that added this clause asked for exactly this
+  fix and it is not one: it is the same shape of gap `tests/teeth.rs`'s `Mutant::SkipsGaps`
+  already lives with under `Guard::AppendOnly` — a wrong reader coinciding with a legal
+  answer in *some* states without being right everywhere — and that file's
+  `Mutant::BootsTheRetiredBank` already supplies the one state where this mutant and a
+  correct reader diverge, which is what a falsifier owes rather than every state.
 - **Allocation, as a measurement — no longer.** This bullet used to end "a global allocator
   that counted allocations would need the `unsafe` this workspace denies", and that was true
   of the only mechanism it considered. `cargo xtask profile` needs no allocator at all:
@@ -1108,9 +1214,65 @@ Stated so that nobody mistakes silence for coverage:
   from text patterns to real parsing (`syn` for Rust, `pulldown-cmark` for Markdown), so
   comments, strings, char literals, `use` aliases and `#[path]` modules no longer blind
   them. Parsing is not name resolution: glob imports are not followed, macros are not
-  expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. Markdown
-  parsing does not check that a rendered claim is true, only that it is rendered prose
-  rather than a code fence. The scanners that stayed textual are the ones whose rule is
+  expanded, `cfg` is not evaluated, and a path inside a macro body is invisible. One concrete
+  shape of the `cfg` gap: two mutually exclusive `#[cfg(..)]`-gated `type` aliases sharing one
+  local name are both collected, since alias collection skips only the exact spelling
+  `#[cfg(test)]` and evaluates no other predicate, so whichever is declared last wins a lookup
+  regardless of which one a real build actually compiles (issue #92, Codex review of PR #163).
+  Alias resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
+  within one module (issue #109), a nested module does not inherit an outer one's aliases,
+  and `self::` and `super::` reach the scope each names explicitly rather than by
+  inheritance — a stack of each module's own aliases from the file this scan read down makes
+  both well-defined *within that file's own nesting*. `crate::` is not well-defined at all:
+  this scan sees one file and never the crate, so it has no way to tell whether that file is
+  really the crate root — treating its own top level as `crate`'s target was tried (Codex
+  review, PR #160, round 5) and reverted (round 6), because it is right only for the one file
+  that happens to be `lib.rs` and a guess everywhere else, catching an unrelated
+  `impl crate::X for Y` as a false fifth future in one file and staying silent on a real one
+  reached through a named submodule (`crate::traits::X`) in another — the same shape of
+  over- vs under-matching namespace ambiguity settles below, decided the same way. `super::`
+  has the identical edge once it is asked to step *above* the file's own top level — a
+  `super::X` written with no enclosing `mod {}` inside the scanned file names the module that
+  declared that file as `mod child;`, which this scan equally never sees, and the stack's own
+  floor at index 0 had silently stood in for it (round 7) exactly the way index 0 had stood
+  in for the crate root; it is left unresolved the same way `crate::` is, rather than guessed
+  against the file's own aliases. A *plain relative* path naming a sibling module declared in
+  this same file — `traits::Pollable`, where `mod traits { pub use .. as Pollable; }` sits in
+  the same scope, with no `crate`/`super`/`self` prefix at all — is resolved (issue
+  [#169](https://github.com/madmax983/waymaker/issues/169)): `resolve_segments` steps into a
+  sibling `mod` block by name when no alias matches, and keeps resolving there, chained
+  through as many levels of nested sibling module as the path names. Three narrower limits are
+  left where descent cannot go. An out-of-line declaration (`mod traits;`, no body in this
+  file) and a module gated on exactly `#[cfg(test)]` are both left unresolved rather than
+  guessed at. The first is because the module's real content lives in a file this per-file
+  scan never reads. The second is for `own_aliases`'s own reason (issue #51: test code is not
+  shipped code). Once resolution has stepped into a module by name it is off the lexical
+  ancestor stack, so `self::` still resolves inside it but `super::` does not. That is the
+  same residual-limit shape as `crate::` and a top-level `super::` above, and the same reason:
+  a module reached by name has no ancestor this per-file scan can identify past the point it
+  was entered from. An alias declared in one module
+  and reached through a `use` in another *file* is invisible outright, the same limit
+  `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
+  they pin. Module descent (issue #169) inherits this scanner's oldest limit rather than
+  adding a new one: `resolve_segments` has never tracked a function body's own scope, so a
+  generic parameter or a block-local item named the same as a `use` alias was already able to
+  shadow it unsoundly before #169 existed, and a sibling `mod` block reached the same way now
+  can be shadowed the same way (issue
+  [#181](https://github.com/madmax983/waymaker/issues/181), Codex review, PR #176). Closing it
+  needs generic parameter lists and block-local scopes to become scopes of their own, ahead of
+  every module-level lookup — a materially larger mechanism than anything here today, the same
+  standing #169 itself had on PR #160 before it was filed rather than chased. Nor does
+  it carry a namespace: two `use` items can bind one local name in different namespaces — a
+  function and a trait can both spell `Pollable` — and a syntactic scan cannot tell which one
+  a later occurrence meant. Picking the first-declared alias can silently miss a real match;
+  exploring every alias that name could mean can just as easily attribute an unrelated,
+  legitimate construct to a different one (Codex review, PR #160, rounds 3 and 4 — the second
+  finding is what took the first back out). Guessing a direction was tried and rejected in
+  both directions, matching this repository's own rule about the storage-contract suite:
+  guessing is how a broken input talks a check out of testing it. A same-spelled alias across
+  namespaces is a residual limit rather than a guess. Markdown parsing does not check
+  that a rendered claim is true, only that it is rendered prose rather than a code fence.
+  The scanners that stayed textual are the ones whose rule is
   about *spelling* — a forbidden vocabulary item, a handwritten `unsafe` keyword — and they
   read comment- and string-stripped text, because there a mention in prose is a false
   positive, not an evasion.
@@ -1159,17 +1321,30 @@ Stated so that nobody mistakes silence for coverage:
   the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
   in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
   and it is stated here so its absence is a decision.
-- **That a device is an *instance* rather than a geometry.** Four modules refuse storage that
-  is "not the device this was validated against" — `append` at three steps, `recovery`,
-  `capacity` and `swap` at all five — and all four decide it by comparing a `Geometry`. Two
-  parts of the same model have the same one, so none of them can tell two instances apart: a
-  caller holding two chips can prepare a swap on one and commit it on the other, sealing a
-  bank whose erase happened elsewhere or erasing an unrelated device's active bank. Codex
-  found it on issue #26's second review round. It is stated rather than closed because it is
-  one contract in four places and a `swap` that bound an instance while the writer beside it
-  did not would be the one module whose `WrongDevice` meant something else; binding the
-  storage with a borrow instead of a comparison is issue
-  [#84](https://github.com/madmax983/waymaker/issues/84).
+- **That a device is an *instance* rather than a geometry, in `capacity`.** Issue
+  [#84](https://github.com/madmax983/waymaker/issues/84) closed this for `append`,
+  `recovery` and `swap`: each now borrows `storage` for the whole life of its protocol, so a
+  caller holding two chips of one model cannot start on one and finish on the other — the
+  call to do so does not exist, rather than being refused at runtime.
+  `capacity::CapacityError::WrongDevice` stays a value comparison, and deliberately: neither
+  `Reserve::for_layout` nor `Reserved::over` takes a `storage` argument at all, so there is
+  no device instance here to bind — what disagrees is a bank size and a program granularity,
+  both plain numbers a `BankLayout` derived, and two devices of one model agreeing on those
+  is the check working rather than the gap issue #84 named.
+  [ADR 0044](docs/adr/0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+  says which of the two shapes each `WrongDevice` variant is.
+- **That the device handed to the *first* call of a new protocol invocation is the right
+  one.** `Journal::stage`, `Recovery::new`/`with_integrity` and `Swap::prepare` are each
+  still the one place a caller introduces a device, and that introduction is still a
+  `Geometry` comparison — the same check issue #84 opens with, because there is no earlier
+  borrow yet to hold a first call to. Issue #84's fix ties one record's three steps, one
+  scan's many reads, and one swap's seven steps to a single device each; it does not tie one
+  journal's *many separate records* to one device, so a caller who calls `Journal::stage`
+  once per record over a journal's life can still hand two different same-model chips to two
+  separate calls with no refusal. That is a precondition on the caller, the same standing
+  `Swap::beginning`'s two unverified arguments already have, and
+  [ADR 0044](docs/adr/0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+  is where it is argued rather than implied closed.
 - **That a run id a swap installs is one the device has never used.** `SwapError::RunReused`
   compares the next run against the one being retired, which is the adjacent mistake and not
   a uniqueness check: a run id from any *earlier* run passes it, and the `(RunId, EffectSeq)`
@@ -1280,18 +1455,29 @@ Stated so that nobody mistakes silence for coverage:
   are an `EffectFailed` with an empty payload, because an empty payload is the only payload
   that fits every declared bound, `effect_result_bytes == 0` included. ADR 0025 states the
   loss rather than hiding it.
-- **A §07 step reachable only on one branch, or written by a macro.** `effect-protocol`
-  requires each of §07's storage steps to be a statement of its body — at nesting depth zero,
-  counting parentheses and brackets as well as braces, in a body that declares neither a
-  closure nor a short-circuit — and every proof of durable intent to be built after the
-  commit barrier. Codex rounds 2 and 3 are why: `false.then(|| ...)` has no braces, and
-  `false && …` has no nesting either, and both put three calls in order at depth zero in code
-  that never runs. A scanner cannot follow control flow, so it refuses the constructs that
-  create it — which is a *syntactic* answer to a semantic question, and it holds only as far
-  as the list of constructs does. A macro is outside it, since a macro-generated `fn` is in
-  no `impl` body the rule reads, and so is any future spelling nobody has thought of.
-  `capacity-reserve` records a limit of the same shape, and
-  `crates/waymaker-drive/tests/crash.rs` is what holds the behaviour.
+- **A §07 step reachable only on one branch.** `effect-protocol` requires each of §07's
+  storage steps to be a statement of its body — at nesting depth zero, counting parentheses
+  and brackets as well as braces, in a body that declares neither a closure nor a
+  short-circuit — and every proof of durable intent to be built after the commit barrier.
+  Codex rounds 2 and 3 are why: `false.then(|| ...)` has no braces, and `false && …` has no
+  nesting either, and both put three calls in order at depth zero in code that never runs. A
+  scanner cannot follow control flow, so it refuses the constructs that create it — which is a
+  *syntactic* answer to a semantic question, and it holds only as far as the list of
+  constructs does. What is no longer outside it is a macro: issue #92's fifteenth round found
+  a macro-generated `fn`, or a macro-generated construction, invisible to every scan built on
+  a parsed `impl` body, and `effect.rs` now refuses any macro invocation at all rather than
+  try to enumerate the shapes one could take. `capacity-reserve` records a limit of the same
+  shape for its own pinned file, and `crates/waymaker-drive/tests/crash.rs` is what holds the
+  step-order behaviour.
+- **That the code before a permitted construction site does what it claims.**
+  `CHECKED_DISPATCH_CONSTRUCTION` counts where `CheckedDispatch` is built, not what happens
+  first: deleting `Dispatchable::perform`'s length/digest check, or swapping its literal's
+  `bytes: input` for a hardcoded `bytes: &[]`, leaves the pin's own counts unchanged, so
+  `effect-protocol` stays green over a value nothing real checked. `capacity-reserve`'s own
+  admission-reachability limit is the same shape, met here for the first time: a positional
+  pin cannot evaluate the body around it. `perform_refuses_input_that_disagrees_with_what_was_scheduled` and
+  `perform_binds_the_kind_and_forwards_matching_input` are what actually hold this — tests
+  rather than a scanner, for the class of defect a syntax-only pin cannot see.
 - **A §07 step added from another file.** `effect-protocol` pins one file, exactly as
   `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they pin:
   an `impl Dispatchable { fn ... }` in a sibling module of `waymaker-drive` adds a step with
@@ -1332,17 +1518,49 @@ Stated so that nobody mistakes silence for coverage:
   against: an RTC that moved backwards while the power was off is invisible here. Issue #33's
   `TimerScheduled` record is what carries the floor across a reboot, which is why that record
   has to hold the arming reading as well as the deadline.
-- **An associated `const` on a timer type, and an aliased import of one.**
-  `timer-capability`'s method pin reads `fn` declarations, so a
-  `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec` is
-  invisible to it; and the façade's spec pin drops `use` declarations before it scans, so
-  `use waymaker_core::timer::TimerSpec::BEST_EFFORT as PERSISTENT_SPEC;` removes the one
-  occurrence that ties the alias to the type. Together they are a downgrade the gate passes,
-  and `admits` does not backstop it either, because the constant resolves to a variant that
-  already exists. Codex found it on the fourth review round of issue #32, and it is issue
-  [#99](https://github.com/madmax983/waymaker/issues/99). `effect-protocol` and
-  `kernel-boundary` read `fn` declarations too, so the blind spot is theirs as well. The same
-  gap is why `ClockKind`'s numbers are unpinned, below.
+- **A constant added from a sibling module, for the three bans issue #99 added.** Issue
+  [#99](https://github.com/madmax983/waymaker/issues/99)'s route is closed. `TimerSpec`,
+  `Timer` and `ClockCapability` may declare no associated constant. `ClockKind`'s two
+  constants are pinned by name and value (`source::CLOCK_KIND_CONSTANTS`) instead: a `u8`
+  newtype has no member and no method for the pins above to read. The façade's `TimerSpec`
+  pin resolves `use` aliases before it scans. `effect-protocol` and `kernel-boundary` gained
+  the same constant ban for their own pinned types. All four checks read one file each, the
+  way `capacity-reserve`, `recovery-surface` and `storage-contract` do: a constant added from
+  a sibling module is invisible to them. The `ClockKind` value pin also reads one line: a
+  right-hand side that wraps to a second line reports an empty value. That is a mismatch, not
+  a silent pass — but it is not a read of the real value either. Six more routes Codex found
+  on this change's own pull request are closed rather than left open. A raw identifier —
+  `r#BEST_EFFORT` names the same constant as `BEST_EFFORT` — no longer drops the whole
+  declaration from what the scan sees. Every one of the six pinned types now refuses a trait
+  `impl` outright, because `inherent_impl_bodies` reads only inherent ones and a trait `impl`
+  can carry a constant of its own; `DurableIntent` and `Dispatchable` already refused one for
+  the construction pin's reason, and `Effect`, every `source::BOUNDARY_TYPES` type and
+  `ClockKind` refuse one now for this reason instead. `ClockKind` declared twice — even under
+  two mutually exclusive `#[cfg]` attributes this scan does not evaluate — is ambiguous
+  rather than resolved by whichever value a map happens to keep last. A leading attribute on
+  the same line as a declaration — `#[rustfmt::skip] pub const X: Self = ..;`, which
+  survives `cargo fmt` — is stripped before the line is read, `next_impl_line`'s reason, so
+  it no longer hides the declaration entirely. And `implemented_type` and
+  `implements_trait_for` both now strip a self type's path before comparing it to a pinned
+  name, so `impl crate::timer::ClockKind` and `impl Forge for crate::timer::ClockKind` are
+  found the same way a bare `impl ClockKind` already was — the fix is shared by every other
+  pin built on either function, not only the three this issue added. Two routes Codex found
+  stay open, both a name split across lines rather than a name misread on one — the residual
+  every line-scanned pin in this file already carries, not a new one. A macro invocation
+  inside a pinned `impl` — `impl ClockKind { extra!(); }`, where `extra!` expands to a
+  `pub const` — is a line these bans read and not a constant they see, the same shape
+  `effect-protocol` and `dispatch-wiring` already carry this limit for. And a declaration
+  `#[rustfmt::skip]` holds split before its name — `pub const\nBEST_EFFORT: Self = ..;` — is
+  two lines neither of which reads as a whole declaration, the same shape the wrapped-value
+  residual above is. Both need a token parser rather than a line scanner, which is a larger
+  change than this issue's three bans; each is a hand-written, `#[rustfmt::skip]`-guarded
+  spelling rather than one `cargo fmt` produces. A third stays open for the same reason and
+  needs more than a token parser: `implements_trait_for` compares a written name, so
+  `type Alias = ClockKind; impl Forge for Alias { .. }` is invisible to it, the same way a
+  glob import is invisible to the `syn`-based scanners issue #51 built — "what the parsed
+  scanners cannot resolve", above, in [what is not checked](#what-is-not-checked), is the
+  same floor, one scanner over. Resolving an alias needs a name-resolution pass this
+  workspace's gate does not have for any of its scanners, textual or parsed.
 - **That a pinned timer type is the type the crate ships.** `timer-capability`'s member pin
   reads a header string, so a rename that carries the crate root with it — `TimerSpec` becomes
   `TimerSpecV2`, a decoy `mod compat` keeps the pinned name and the pinned members — leaves it
@@ -1350,11 +1568,6 @@ Stated so that nobody mistakes silence for coverage:
   careless version, and what closes the dangerous one is not the gate: `ClockCapability::admits`
   names every pair and uses no `_`, so a third policy is a compile error at the arm that would
   have permitted it. `kernel-boundary` shares the reader and the same limit.
-- **`ClockKind`'s numbers.** The surface pin counts functions and the member pin names three
-  enums, so `pub const AFTER_BOOT: Self = Self(1)` — the one thing in this module that reaches
-  media — can be renumbered with the gate green.
-  `crates/waymaker-core/tests/timer.rs` is what holds them until issue #33 makes them a wire
-  format.
 - **That a persistent deadline is measured by a persistent reading.** `PersistentTimer::timer`
   returns the kernel type and `Timer::evaluate` takes a bare `u64`, so a caller that goes
   around `poll` can judge a persistent deadline with a boot-clock reading and get a verdict
@@ -1462,37 +1675,44 @@ Stated so that nobody mistakes silence for coverage:
   `Sealable`. Reaching a writer still needs a `Reserved` or a `Recovery`, both of which
   *are* banned, so this is a hole in a list presented as exhaustive rather than an open
   door.
-- **That `waymaker-drive` would build with `waymaker-embassy` deleted.** Its dependency is
-  not optional, so the `drive-facadeless` stage still resolves and compiles the façade
-  crate — a `compile_error!` inside the façade fails that stage too, which Codex round 3
-  measured. What the stage establishes is the weaker and still useful claim: no module
-  outside `facade.rs`, `ota.rs` and `provisioning.rs` *needs* the façade, because the crate
-  compiles with those deleted. Making the dependency optional would take the façade out of
-  the lint, test, docs and coverage stages, which all pass `--no-default-features`; moving
-  the façade-naming modules into a crate of their own would say it in the dependency graph,
-  and is issue [#106](https://github.com/madmax983/waymaker/issues/106).
+- **That `Suspended::awaiting_dispatch` is called only when a dispatcher is genuinely still
+  working.** `waymaker-facade-demo`'s `Bridge` stores the boundary's own `Suspended` on
+  every call that returns one, and `ota`'s and `provisioning`'s `Workflow::run` read it back
+  rather than minting a fresh value. One stall has no boundary call behind it at all:
+  `ActivityFuture`'s dispatching stage answers `Poll::Pending` straight from
+  `ActivityDispatcher::poll_dispatch`, with nothing recorded and nothing to propagate, so
+  `take_suspended()` reads back `None` and the fallback is
+  `Suspended::awaiting_dispatch()` — a value named for that one case rather than a fresh
+  `Suspended::NEW`, which stays `pub(crate)` to `waymaker-drive`. `awaiting_dispatch` is
+  `pub`, though, because a caller outside this crate needs it too; nothing stops a
+  `Workflow` calling it without any dispatcher behind it at all, which is the same
+  standing `Suspended::NEW`'s own doc comment already states the type cannot prevent on its
+  own — a scanner cannot see every future's poll body, only the examples' tests can.
 - **That a workflow stops at its own ending, for a caller that is not an `async fn`.**
   `TerminalFuture` never resolves and every other future refuses once a conclusion is
   recorded, which is two mechanisms for one rule: a run that ended has no boundaries left.
-  Both are `crates/waymaker-embassy/tests/ctx.rs`'s. Two things neither can stop. A caller
-  that never asks — nothing obliges anybody to read `Ctx::conclusion` at all, and a caller
-  that ignored it would report a run that did not end. And a caller that *cancels*: the rule
-  holds only while the future that recorded the ending is alive, because `TerminalFuture`
-  and `ContinueFuture` each keep their "I have done my side" flag in the future rather than
-  in the `Ctx`. Poll a `complete`, drop it, poll a `fail`, and the second overwrites the
-  first; poll a `continue_as_new`, drop it, and the `Ctx` is unconcluded with the run
-  already asked to be replaced. No `async fn` reaches either — both futures are `Pending`
-  for ever, so no straight-line code follows the `.await` — which is why this is stated
-  rather than fixed at the round it was found. Codex round 5 of #105; issue
-  [#107](https://github.com/madmax983/waymaker/issues/107), and the executor of issue
+  Both are `crates/waymaker-embassy/tests/ctx.rs`'s. One thing no mechanism here can stop: a
+  caller that never asks. Nothing obliges anybody to read `Ctx::conclusion` at all, and a
+  caller that ignored it would report a run that did not end. A caller that *cancels* used to
+  defeat the other mechanism: `TerminalFuture` and `ContinueFuture` each kept their "I have
+  done my side" flag in the future rather than in the `Ctx`, so a future polled once and
+  dropped took the flag with it, and a second future could re-decide or un-decide the run.
+  Issue [#107](https://github.com/madmax983/waymaker/issues/107) moved the flag into the
+  `Ctx`, shared by all four futures, so a dropped future cannot be replaced by one that
+  changes what it recorded. No `async fn` reaches this path at all — both futures are
+  `Pending` for ever, so no straight-line code follows the `.await` — which is why a scanner
+  cannot hold this and `crates/waymaker-embassy/tests/ctx.rs` does. Codex round 5 of #105
+  found it; the executor of issue
   [#110](https://github.com/madmax983/waymaker/issues/110) is what makes cancellation a thing a
   caller really does.
 - **That the façade's journal is the driver below it.** `ctx-facade` pins two files in
-  `waymaker-embassy` and six in `waymaker-drive`. It says the façade declares no authority
-  and that the driver names no façade type; it cannot say that a given `Journal`
-  implementation is honest. A journal that answered `Handoff::Replayed` from a buffer rather
-  than from media would satisfy every rule here, and the façade would dispatch nothing.
-  `crates/waymaker-drive/tests/ota.rs` is what runs the real driver under the real façade.
+  `waymaker-embassy` and holds every file of `waymaker-drive` to naming no façade — seven of
+  them, since issue #106 moved `facade`, `ota` and `provisioning` above the crate. It says
+  the façade declares no authority and that the driver names no façade type; it cannot say
+  that a given `Journal` implementation is honest. A journal that answered
+  `Handoff::Replayed` from a buffer rather than from media would satisfy every rule here, and
+  the façade would dispatch nothing. `crates/waymaker-facade-demo/tests/ota.rs` is what runs
+  the real driver under the real façade.
 - **That a workflow future is small.** §04 says the workflow future is user memory and is
   *reported* rather than budgeted, and `cargo xtask size` now reports it: a section of its
   own, summed into nothing, with a line saying it is not part of the runtime RAM total above
@@ -1517,12 +1737,28 @@ Stated so that nobody mistakes silence for coverage:
   diff cannot read the base checkout's registry, for `kernel_state_change`'s reason — the
   head binary is the only one that can read a type size — so `runtime_ram_change` always says
   "not compared". A future that grew is visible in the run that measured it and nowhere else.
-- **How deep the call chain goes.** Runtime RAM is now composed rather than sampled — the
-  caller's scratch page, the kernel-state registry, the context, and the largest statics
-  delta of any row, gated against §04's 768 B. Three of those four live on the stack, and
-  what is still unaccounted is the *depth* of the chain holding them: a deeper one moves no
-  writable section and no type size. The report says so where it prints the total rather
-  than printing "runtime RAM: ok", and stack accounting needs a call graph.
+- **How deep the call chain goes, in this composed figure.** Runtime RAM is now composed
+  rather than sampled — the caller's scratch page, the kernel-state registry, the context,
+  and the largest statics delta of any row, gated against §04's 768 B. Three of those four
+  live on the stack, and what is still unaccounted *here* is the *depth* of the chain holding
+  them: a deeper one moves no writable section and no type size. The report says so where it
+  prints the total rather than printing "runtime RAM: ok". Depth is measured elsewhere now,
+  by painting the stack rather than by a call graph — see the "Stack usage" entry below — and
+  that figure is the whole emulated image's, not this composed one's, so this bullet's own gap
+  stands even though the workspace is no longer silent about call-chain depth everywhere.
+- **That a document's row set is complete, without a live build.** `runtime_ram_total`
+  composes the largest `Δram` of *every* row, gated or not — a per-feature row is a
+  configuration somebody ships, and §04 states one runtime-RAM ceiling for the device, not
+  one per configuration. `--report` reads a document this process did not produce, and
+  before issue [#115](https://github.com/madmax983/waymaker/issues/115) nothing checked that
+  the row set itself was complete: a document that omitted the row with the largest `Δram`
+  composed a smaller, wrong total and could pass a budget a complete document would fail.
+  `completeness_shortfalls` closes it by resolving `cargo metadata` for the workspace at
+  `--report`'s own path and holding the document's rows to what `matrix` derives from it —
+  cheap, since it links nothing, which is what keeps `--report` usable without a firmware
+  build. What it cannot see is a document read against a *different* checkout than the one
+  on disk: the comparison is against *this* workspace's `cargo metadata`, not against
+  whatever commit actually produced the document.
 - **That the façade registers a wakeup.** §05's Owns cell for `waymaker-embassy` names
   wakeups, and this crate registers none of its own: it plumbs the task's waker to
   `ActivityDispatcher::poll_dispatch`, which is the one thing that knows when the world will
@@ -1698,14 +1934,32 @@ Stated so that nobody mistakes silence for coverage:
   count at zero. It says nothing about a firmware that links an allocator for its *own*
   reasons and passes Waymaker a buffer from it, which is a firmware author's decision and one
   this engine is written to allow.
-- **Stack usage.** Section sizes cannot see a cursor that lives on the caller's stack, and
-  the size report says so rather than implying otherwise. Neither can either tool here: DHAT
-  is a heap profiler and callgrind counts instructions, so the depth of the chain
-  [the budgets](#budgets) already say is unaccounted stays unaccounted. The `emulate` stage is
-  the first thing in this workspace that *could* measure it — paint the region, run, read the
-  high-water mark — and it does not. Doing it needs a second `unsafe` expansion and a
-  memory-map symbol, and ADR 0040 records it as the obvious next thing that image is good for
-  rather than attaching a half-argued number to it.
+- **Stack usage, by `cargo xtask size`, and the limit of the technique that measures it
+  elsewhere.** Section sizes cannot see a cursor that lives on the caller's stack, and the
+  size report says so rather than implying otherwise. Neither can either tool `cargo xtask
+  profile` runs: DHAT is a heap profiler and callgrind counts instructions, so the depth of
+  the chain [the budgets](#budgets) already say is unaccounted stays unaccounted *there*.
+  [ADR 0045](docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md)
+  closes the other half: each emulated boot now paints its own unused stack before the rig
+  runs and reports how far the paint was disturbed after, gated by `emulate::StackUsage`. What
+  that figure is *not* is §04's runtime RAM total — it is the whole image's call-chain depth,
+  on one run, on one core, and this image links `waymaker-rig` and `waymaker-conformance`
+  alongside the three layers, so it is not the engine's share alone. Nor is it exact: painting
+  the stack and reading back a high-water mark is a lower bound, not a ceiling — a frame can
+  reserve bytes it never writes, and a byte like that still reads as the paint pattern
+  afterwards, so a run can use more than it reports — by an amount the guard margin does
+  nothing to bound, since an unwritten reservation can sit anywhere below the scan's own
+  ceiling. What the guard margin guarantees is narrower: it is never painted or scanned, so
+  the reported figure itself can never read below the margin's own width, whatever a run
+  actually did. That is a floor on the *number*, not a ceiling on how far it can underestimate
+  real usage. The two machines are not required to agree about the figure, unlike
+  their census: different cores compile the same source into different instructions. A decoy
+  `stack.rs` reproducing the crate-relative path in a different, deeper directory is still
+  read as the permitted module — narrower than a bare-file-name suffix would allow, not
+  eliminated; `a_decoy_stack_rs_in_another_directory_is_rejected` is the test that shows the
+  common case is closed. A closure or nested item defined but never invoked, at the permitted
+  function's own nesting depth, would not be caught by depth alone either — the same shape of
+  gap `effect-protocol` accepts for its own pinned bodies.
 - **That an emulated core is the part a row of the hardware table names.** It is not, in four
   ways, and each one is a whole class of failure. QEMU's `microbit` is a Cortex-M0 and
   `cortex-m0plus` names a **Cortex-M0+** — the same instruction set and a different core, with
@@ -2426,19 +2680,20 @@ futures the executor polls, and a plain `core::future::Future` is one; a façade
 in an executor to hand out four futures would be more than the adapter §02 decision 5 says
 it is. `embassy-below-facade` still guards the edge if a later rung needs one.
 Both "done when"s are driven rather than argued.
-`crates/waymaker-drive/tests/ota.rs` runs §06's OTA example — three activities and a
-completion, with the image crossing every boundary as an eight-byte handle — through the
-real façade, the real driver and `waymaker-fault`'s NOR model: it completes, it dispatches
-nothing on replay, a reboot mid-run redelivers the identity the schedule record committed,
-and the synchronous `Activities` world is asked zero times. The second is structural rather
-than behavioural: `Boundary`, `Driver` and §07's typestate name no `waymaker-embassy` type,
-so the façade edge is two modules — `facade.rs` and `ota.rs` — plus their four lines in
-`lib.rs` and the manifest entry. `waymaker-drive`'s `without-facade` feature deletes the two
-modules and the `drive-facadeless` stage builds that configuration for the part, which is as
-much of the claim as a compile can make while the manifest entry stands; `ctx-facade` is the
-scan beside it, and it reads every module of the crate rather than a list, so a module added
-tomorrow is covered. Issue
-[#106](https://github.com/madmax983/waymaker/issues/106) is the rest of it.
+`crates/waymaker-facade-demo/tests/ota.rs` (moved there by issue #106, below) runs §06's OTA
+example — three activities and a completion, with the image crossing every boundary as an
+eight-byte handle — through the real façade, the real driver and `waymaker-fault`'s NOR
+model: it completes, it dispatches nothing on replay, a reboot mid-run redelivers the
+identity the schedule record committed, and the synchronous `Activities` world is asked zero
+times. The second is structural rather than behavioural: `Boundary`, `Driver` and §07's
+typestate name no `waymaker-embassy` type, so the façade edge is two modules — `facade.rs`
+and `ota.rs` — plus their four lines in `lib.rs` and the manifest entry. `waymaker-drive`'s
+`without-facade` feature deleted the two modules and the `drive-facadeless` stage built that
+configuration for the part, which was as much of the claim as a compile could make while the
+manifest entry stood; `ctx-facade` is the scan beside it, and it reads every module of the
+crate rather than a list, so a module added tomorrow is covered. Issue
+[#106](https://github.com/madmax983/waymaker/issues/106), below, is the rest of it — moving
+the edge above the crate instead, so the manifest never stands.
 Two things came out of this rather than out of reading the code. A dispatcher that answered
 `Poll::Pending` after the schedule record was committed left the boot with no recorded
 reason at all, because the façade tells the journal nothing on a stall and only the driver
@@ -2454,6 +2709,12 @@ a dispatcher that obliges a caller to go through any of this are rung 0.4's rest
 [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md).
 
 [`Ctx`]: crates/waymaker-embassy/src/ctx.rs
+
+Issue #107 closes a gap Codex found in round 5 of #105: `TerminalFuture` and `ContinueFuture`
+each kept their own "already recorded" flag, so a caller that polled one, dropped it, and
+polled another could re-decide or un-decide the run. The flag now lives in the `Ctx`, shared
+by all four futures. `crates/waymaker-embassy/tests/ctx.rs` drives both scenarios directly,
+since no `async fn` can reach either path.
 
 Issue #36 is rung 0.4's second item, and what it asks for is one sentence made structural:
 the output "is written into a caller-owned buffer and the returned length is validated
@@ -2787,9 +3048,1297 @@ and a Cortex-M0 is not a Cortex-M0+. ADR 0040 carries no attestation marker, so
 `hardware-attestation` fails a build in which somebody moves a row and cites it. See
 [ADR 0040](docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
 
+Issue #51 then answers a question ADR 0005 had left open: the documentation rules this file's
+own gate enforces were hand-rolled text scanners, and four review rounds on the pull request
+that added them (#11/#50) found the same defect fourteen times — a scanner accepting syntax
+`rustc` or a Markdown renderer would not. Five more were filed rather than patched, because the
+fifth round would have found a sixth spelling: a `#![warn(missing_docs)]` on a nested module
+satisfying the crate-root rule; a `reason = "/*"` string truncating the attribute that held it;
+ADR metadata readable only inside a fenced example; a `~~~` fence the scanner did not recognise
+as a fence; and a `- Date:` with no value passing a bare presence check. `xtask/src/parse.rs`
+is the answer: `syn::parse_file` reads Rust, `pulldown-cmark` reads Markdown, and
+`xtask/src/source.rs` and `xtask/src/docs.rs` are rewritten to ask the parsed tree the question
+each rule needs answered rather than to scan lines for it. All five filed evasions are now
+named tests — `an_attribute_on_a_nested_module_does_not_satisfy_the_crate_rule`,
+`a_reason_string_containing_a_comment_opener_does_not_hide_an_allow`,
+`adr_structure_ignores_fenced_code`, `a_marker_inside_a_tilde_fenced_example_does_not_settle_anything`,
+`an_empty_adr_date_is_reported` — and so are nine further evasions the same rewrite closed
+along the way, filed as their own issues (#59, #62, #68, #82, #90, #97, #99, #108, #109) rather
+than folded in silently. `parse.rs`'s own module documentation states what parsing still cannot
+answer: no name resolution across crates, no macro expansion, no `cfg` evaluation, no glob
+imports followed, and a Markdown check that reads structure rather than judging whether a
+claim is true.
+That did not close the class outright, and a later adversarial pass over the same two files
+found why: `used_call`, the check behind `integrity-check`'s call routing, resolves a pinned
+function's body with `syn` and then renders it back to text for a boundary-match scan — and a
+literal token's rendered text reproduces its exact source spelling, string contents included.
+A digest function whose body never touched the real checksum, decorated with a string merely
+*mentioning* it — `let _spoof = "route via crc32(input).into() for humans";` — satisfied the
+pin, because to the scan `crc32(input).into()` inside the quotes reads the same as a real call,
+though to `rustc` a string's contents are data and never a call. Issue #51's own pattern,
+reintroduced one level up by the fix that closed it elsewhere: a text scan built on a real
+parse is still a text scan wherever it renders the parse back to text before matching against
+it. Filed as issue #158 and closed in the same change: `block_text` now blanks every string
+and byte-string literal before rendering, through a token-level pass beside `unraw_tokens`'
+own, so a mention inside a string can no longer spell a callee's name. The regression is
+`a_callee_name_inside_a_string_literal_is_not_a_call`, isolated to `used_call` the way issue
+#62's own decoy reproduction was, for the same reason: `check_integrity_routing` end to end
+cannot isolate a single routing function from the others it also checks.
+
+Issue #73 then closes the refinement half of `single-authority`'s gap. Issue #22 added the
+real two-bank adapter; nothing had abstracted it into the ghost model yet, so a state rebuilt
+from a real crashed run had no banks and answered the guarantee vacuously.
+`waymaker-spec`'s `refine` module gains two functions, `bank_after_erase` and
+`bank_after_seal`, each folding one crash into a `Bank` from what the bank's own region shows
+afterwards — not from whether the writer's call returned `Ok`, because `waymaker-fault`'s
+writes land synchronously and a watchdog reset can finish a unit in flight and still answer
+`Err`. `tests/refinement.rs` drives a swap writer styled on
+`crates/waymaker-fault/tests/banks.rs`'s own, and checks every crash point three ways: is the
+reconstructed state one the model's search reaches, does the guarantee hold of it, and does
+`waymaker_flash::bank::select` over the real bytes agree with it. `obligation.rs`'s row for
+`single-authority` no longer says the refinement is missing. What is left owed is the model's
+own expressiveness, unchanged by this issue: a bank holds no record, so "never recover the
+old run as current" is not a statement the machine can make, only "exactly one bank is
+bootable"; and a generation is an unbounded integer, where the firmware refuses at the
+ceiling rather than proving the refusal unnecessary. See
+[ADR 0041](docs/adr/0041-the-bank-refinement-abstracts-a-real-swap.md).
+
+Issue #47 then closes a question ADR 0002 had deferred rather than answered: `cargo xtask
+size` gates *engine statics*, not runtime RAM, because most of §04's own accounting —
+cursor, context, record header — lives on the stack, and a deeper call chain moves no
+writable section the size gate can see. ADR 0035 composed the figure further and said the
+same about what was left: three of its four terms are stack-resident, and the depth of the
+chain holding them was still unaccounted. ADR 0040 built the one thing that could account for
+it — a linked image, run on real cores — and declined to, naming a second `unsafe` expansion
+and a memory-map symbol as the cost. This closes it: `waymaker_emu::stack` paints the image's
+own unused stack before the rig runs and reads back how far the paint was disturbed, over the
+region between the linker's `_stack_end` and a stack-pointer reading `main` takes — through
+`cortex_m::register::msp::read()`, a plain register read, before calling anything else.
+`measured_run` — `#[inline(never)]` — holds every local the run touches in a frame of its own,
+so the paint can never reach memory `main` still needs. The figure is a *lower bound* rather
+than an exact reading — a frame can reserve bytes it never writes, and painting cannot see
+that — and the module says so rather than the sharper claim an earlier draft made; a guard
+margin near the reading still guarantees a floor, never a ceiling. The figure is real and it
+fails closed on a degenerate measurement, but it is not gated against a §04 ceiling — none
+exists for it, the same standing as the write-amplification and `no_alloc` instruction
+figures — and it is not §04's own number regardless: this image links `waymaker-rig` and
+`waymaker-conformance` alongside the three layers, so what is reported is the whole call
+chain's depth on this run, not the engine's share of it, and the two machines are not required
+to agree about it the way their census is — different cores compile the same source into
+different instructions. `emulation-boot`'s `unsafe`-keyword rule grows its third and last
+named exception, and a name alone was not enough to close it: a bodiless signature, a nested
+item, a sibling `unsafe` placed beside the legitimate one at the same depth, and a foreign
+function all passed an earlier version of the rule and are refused by this one, each behind a
+test that was watched failing first. Every other file of the crate is held to the rule
+exactly as before. `paint`, `high_water_mark` and `available_bytes` are safe `pub fn`s over a
+caller-supplied `depth_from`, and a safe function has to stay sound for any argument — so a
+second linker symbol, `_stack_start`, names the stack's other end and
+`stack::clamp_to_stack_region` holds `depth_from` inside `[_stack_end, _stack_start]` before
+either function computes a pointer from it. Being inside that range is not being below the
+*live* stack pointer, though — a stale address that is still a legal stack address, or
+`usize::MAX` clamped down to `_stack_start`, both pass that check — so the clamp also takes
+the lower of the region-clamped value and a fresh stack-pointer reading of its own, taken at
+the moment either function is called; a stale or wrong reading is now a wrong measurement,
+never an out-of-bounds access, and a caller's `depth_from` can only narrow what gets touched,
+never widen it past where the stack genuinely is. Three independent live readings taken at
+three different points in the boot can still disagree with each other by those same few
+bytes, and `available_bytes` — called earliest, before `paint`, with the least stack consumed
+since `main`'s own reading — tends to disagree in the wrong direction: a run that disturbed
+every painted byte could report `used` a few bytes short of `available`, which is exactly the
+case `StackUsage::shortfall`'s `used >= available` check exists to catch. `paint` now returns
+the bound it resolved, and `main` passes that same value to `high_water_mark` and to a second,
+later `available_bytes` call rather than letting either re-derive its own reading. A region no
+wider than `GUARD_BYTES` is one `paint` writes nothing into at all, and `high_water_mark`
+honestly reports `used = 0` over it — but `available_bytes` does not know about `GUARD_BYTES`
+and reports the region's full width regardless, so a resolved bound 50 bytes wide read as
+`used=0 available=50`, which the shortfall check's original `available == 0` line did not
+catch even though nothing was measured. `emulate::StackUsage::shortfall` now refuses any
+`available` no wider than a duplicated `STACK_GUARD_BYTES`, held to the real constant by a
+test that reads the literal back out of the shipped file. Passing the same `resolved` value to
+two separate calls still let them disagree, because each still clamped it against its own
+fresh stack-pointer reading at its own call site — `stack::high_water_mark` now returns both
+`used` and `available` together, computed from the one `depth_from` it resolves for itself in
+that single call, so there is no second call left to read a different bound. A bounded address
+is not the same thing as an initialized one, though, and that gap was still open: `paint`'s own
+doc comment asked a caller to pass its return value on to `high_water_mark`, but nothing
+stopped a safe caller reaching `high_water_mark` directly with an arbitrary `usize` and no
+`paint` call at all — and a raw read of stack memory nobody painted is undefined behavior
+however tightly the address is clamped. `paint` now returns `Painted`, a type this module is
+the only one able to construct, and `high_water_mark` takes one instead of a bare `usize`, so
+a caller with no `Painted` in hand cannot call it at all. Two more findings came from a
+review of the merge that followed. `current_stack_pointer` read the core's MSP register
+unconditionally, which is correct only because this image never selects the other Thread-mode
+candidate, PSP — a fact about how the crate happens to be used today rather than one its
+`pub` signature states; it now reads `CONTROL.SPSEL` first and follows it to whichever
+register is actually live. And `emulation-boot`'s extern-block exemption was a byte *range*
+rather than the one keyword's own offset the two permitted functions are each held to, so a
+second, unrelated `unsafe` sitting anywhere between the linker-symbol block's braces passed
+unnoticed; it now matches only that one offset, the same way `sole_depth_zero_unsafe` already
+does for `paint` and `high_water_mark`. A third finding on that same commit is that the
+`CONTROL.SPSEL` check answered a narrower question than the one it needed to: `SPSEL` only
+governs which register *Thread mode* uses, and Handler mode — running an exception — always
+executes on MSP regardless of it, so a caller reached from a handler after Thread mode had
+selected PSP would still have read the inactive register. `current_stack_pointer` now checks
+`SCB::vect_active()` first — a safe function, reading a read-only status register with no
+side effects — and answers MSP outright in Handler mode, consulting `SPSEL` only in Thread
+mode. A fourth finding is that answering "which register is active" correctly is not the same
+question as "is it safe to paint below it": MSP genuinely is active in Handler mode, but an
+exception can interrupt Thread mode while Thread mode was using PSP for a *second*, still-live
+stack this module's one `_stack_end`/`_stack_start` pair has no way to represent — so treating
+MSP as though everything below it were free is wrong in exactly the case a second stack
+exists, whichever register correctly answered "active". `clamp_to_stack_region` now checks
+`SCB::vect_active()` itself and collapses to the empty region at `stack_floor()` outside
+Thread mode, reusing the same degenerate case a region no wider than `GUARD_BYTES` already
+produces — which `paint` already declines to write into and `StackUsage::shortfall` already
+refuses as a measurement that did not happen, so no new mechanism was needed to close it. A
+fifth finding is that checking processor *mode* answered only half of "is MSP the register in
+use": Handler mode always executes on MSP, but Thread mode can select PSP too, and nothing
+about being in Thread mode confines a PSP reading to `[_stack_end, _stack_start]` — a PSP
+value above `_stack_start` makes `clamp_to_stack_region`'s own `.min` a no-op, silently
+dropping the live-pointer protection back to the region clamp alone. `clamp_to_stack_region`
+now asks the real question directly — `msp_is_the_stack_in_use`, true unconditionally in
+Handler mode and by `SPSEL` in Thread mode — and collapses to the same empty region whenever
+MSP is not it. That fifth fix's own framing was the sixth finding's bug: answering "is MSP the
+register in use" `true` for Handler mode is a true fact about which register is active, and not
+the fact the fourth finding needed — MSP being active in Handler mode does not make the memory
+below it safe, because an exception can land there having interrupted a Thread-mode context
+that was using PSP for a second, still-live stack. Treating "which register" as "safe" quietly
+undid the fourth finding's unconditional Handler-mode refusal. The two conditions are
+conjunctive, not a choice of which to ask: `clamp_to_stack_region` now trusts the live reading
+in exactly one state, Thread mode with `SPSEL` naming MSP, and collapses in every other one —
+Handler mode included, unconditionally, regardless of what register answers there. This image
+runs in Thread mode with MSP selected for the whole of every boot this ADR measures, so the
+branch is dead code here too; it exists for the caller this crate does not have yet. See
+[ADR 0045](docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
+
 The kernel-state registry has three entries — the replay machine, the record view and an
 armed timer — so the 128 B budget is a number about something, and 104 B of it is spent. The
 async `Ctx`, the dispatcher, the codec helpers, the two examples and rung 0.4's exit
 criterion are here — issues #35, #36, #37, #38 and #39, above — and in-boot sleep is the
 rest of 0.4. The gates went in before the code they govern, which is the point: a gate
 retrofitted after coverage has slipped is a gate that ratifies the slip.
+
+Issue #67 closes the three dimensions issue #20's review found `waymaker-spec`'s ghost model
+short of, none of which raising `Bound::PROOF` would have reached: the shapes of history the
+model admitted were one-dimensional, and the bound was never what they were short of.
+`model::Record` now carries a `BankId`; `Journal::begin_erase` drops exactly the erased
+bank's records and dispatch-log entries, and `recover`, `committed`, `declared` and
+`acknowledged` are all scoped to the bank a reader would boot from — so "never recover the
+old run as current" is a fact `Journal::recover` states rather than a sentence the model had
+no way to say. `Invariant::SingleAuthority` takes the recovered history now, not only
+`state.banks`, and `tests/teeth.rs`'s `Mutant::BootsTheRetiredBank` shows the guarantee
+falsifiable by a reader instead of only by deleting a guard — issue #67's own "done when",
+met by name. Record identity moved off `records.len()` onto a counter that only grows, which
+is what let `begin_erase` drop a record from the middle of history without a later `declare`
+reissuing its id to something else; `Transition::Reboot` is the transition that identity
+scheme exists for, legal only while unpowered, restoring power and changing nothing else —
+`recover()` already computes the survived prefix fresh from the same bytes, and an earlier
+version that pruned `records` toward that answer was a real bug review caught: the prune was
+scoped to one bank and silently erased the *other* bank's own history too, which only
+`begin_erase` may do, and let a live write land back in a bank a crash had left with no legal
+append point. Compaction — the obvious firmware response to
+`Interruption::Failure`, retrying elsewhere rather than being stuck behind a torn record —
+turned out to need no transition of its own: `begin_seal` and `begin_erase` never consulted
+the other bank's records, so a live device behind a torn tail could already seal the blank
+bank and carry on there, and `tests/compaction.rs` is the proof that this reachable state is
+reached with no power loss anywhere in the run. A necessity proof found
+`Guard::DispatchFromCurrentBank` — added on the reasoning that a real swap consumes the old
+run's writer — unnecessary once `durable_intent` correctly treats a dispatch from a retired
+bank as moot the same way `continue_as_new` already forfeits identity across one (issue #95);
+it was removed rather than kept, per this crate's own rule that a guard removable at no cost
+was never load-bearing. Generation arithmetic now refuses at `u32::MAX`
+(`checked_add`, not `saturating_add`) instead of silently repeating it — a hand-built state
+in `model.rs`'s own `#[cfg(test)]` module, since no explorable bound reaches the ceiling.
+And a direct "no gap before committed history" check in `waymaker_fault::verify_oracle` was
+tried and reverted: `waymaker-fault`'s own `tests/harness.rs` deliberately drives a writer
+whose failed middle record is skipped over, which the oracle's committed-history filter is
+what makes acceptable, so the circularity issue #67 named is closed by a test that checks the
+claim directly against the `Ledger` the agreement tests build
+(`tests/oracle.rs`'s `the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history`)
+rather than by a stricter oracle. Issue #73 had already closed the refinement half of this
+guarantee's gap — the paragraph above — and this issue closes the other half, the model's
+own expressiveness, so `obligation.rs`'s `single-authority` row now says nothing is owed. See
+[ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md).
+
+Review of the pull request that closed issue #67 then found a fourth gap `Guard::
+NeverEraseTheAuthority` left open: `authoritative()` is always empty before the first seal,
+so the guard protected nothing pre-seal — `BeginErase(A)` was legal on a fresh device even
+though `A` is where `declare` puts every record, letting a live `Declare`-`Program` land
+inside a bank already `Erasing` and survive `CommitErase`, which never touches `records`.
+`Journal::protects_current_run(bank)` closes it: post-seal it is `authoritative().contains`
+exactly as before, and pre-seal it is `bank == current_bank()`, the implicit bank a fresh
+device writes into. `tests/machine.rs`'s
+`erasing_the_pre_seal_current_bank_is_refused_the_same_as_erasing_the_authority` is the
+proof, over every pre-seal reachable state; `REACHABLE_STATES` and `TRANSITION_EDGES` in
+`tests/census.rs` moved again, down rather than up, because a whole family of states in
+which a fresh device erased its only writable bank stopped being reachable.
+
+A fifth finding asked for a guard refusing `Dispatch` against a bank a swap has since
+retired, arguing a dispatch happening *after* retirement is a physical effect with no run
+behind it rather than merely an old run's forfeited one. Investigated directly: restricting
+`Dispatch` to `current_bank()` moves `TRANSITION_EDGES` and leaves `REACHABLE_STATES`
+unchanged, because every state a post-retirement dispatch could reach is also reachable by
+dispatching while the bank is still current and retiring it afterward — a `Journal` is a
+snapshot rather than a log, so the two are one state, not two. `tests/necessity.rs`'s
+`a_dispatch_from_a_bank_a_swap_later_retires_can_happen_before_the_swap_ever_starts`
+constructs that legitimate trace by hand; no guard was added, and ADR 0043's alternatives
+section says why.
+
+A sixth found a real bug: `Journal::from_parts` (which `Journal::reconstructed` uses to turn
+a crash harness's observation into a state) takes `next_id` from the observation's own record
+ids via `saturating_add`, so an observation naming `RecordId(u32::MAX)` left `next_id` at the
+ceiling, and `declare`'s plain `+= 1` then overflowed on the next declaration — a panic with
+overflow checks, a reused `RecordId(0)` without them. `next_id` now advances with
+`checked_add`, refusing with `Illegal::CapacityReached` instead;
+`a_record_id_at_the_ceiling_is_refused_rather_than_reused` is a hand-built unit test beside
+the existing generation-ceiling one, since no exhaustive search reaches either ceiling.
+
+A seventh found that `tests/refinement.rs`'s own `REFINEMENT` bound — one generation, because
+its own comment says no writer there touches a bank — was reachable in states split across
+both banks anyway, since nothing stops the model's first-ever seal landing on bank B while
+bank A already holds records. `Observation` carries no bank identity, so
+`reachable_observations` flattening one of those states in declaration order could produce a
+`Whole` record following a gap, a shape no single-bank writer this file drives could ever
+leave, and the refinement check's first assertion ("is this a state the model says is
+reachable") would have accepted it. `reachable_observations` now filters to states where
+every record is in `BankId::A` before projecting;
+`no_reachable_observation_is_a_shape_no_single_bank_writer_could_leave` asserts the filtered
+set is clean, verified to fail without the filter (488 of the run's reachable states leaked
+an impossible shape) and pass with it.
+
+An eighth finding was the sharpest of the round: `Declare -> Program -> Barrier` in bank A
+(pre-seal, current), then `BeginSeal(B) -> CommitSeal(B)` as the device's very first seal,
+left A's `Bank` tag at `Erased` — it was never touched — while A still held the record it
+declared before B took over. `Journal::begin_seal` read only that tag, so `BeginSeal(A)`
+afterward saw nothing wrong and resealed A's stale record at a higher generation than B, with
+no erase anywhere in the trace — recovering a superseded run as current, exactly what §14's
+failure table forbids. `begin_seal` now also refuses a bank that still holds records unless
+that bank is the one currently being written to (`current_bank()`), which is the ordinary
+shape of a device's very first seal and the only case a bank may carry records into its own
+seal. `tests/machine.rs`'s `a_bank_the_first_seal_retires_cannot_be_resealed_without_an_erase`
+drives the trace end to end; `REACHABLE_STATES` and `TRANSITION_EDGES` moved down a third
+time, and `tests/compaction.rs`'s surviving-bank test needed its witness search corrected to
+look for a bank with no records rather than an `Erased` tag alone — the tag-only search had
+been finding this same bug's witness and calling it a demonstration.
+
+A ninth, in the same round, was in the previous round's own fix: `next_id`'s `checked_add`
+refused *before* advancing, so a `Journal` reconstructed with `RecordId(u32::MAX)` already
+the highest id in it refused `RecordId(u32::MAX)` itself rather than only the id after it —
+the last representable id was never allocatable, not just the one past the ceiling.
+`next_id: Option<u32>` fixes it: `None` means no id is left, `Some(u32::MAX)` still hands out
+the last one and then becomes `None`. `the_last_record_id_is_still_allocated_exactly_once`
+and `declaring_past_the_last_record_id_is_refused_rather_than_reused` are the positive and
+negative halves.
+
+This branch's own merge with issue #73's landed on `main`, reconciling the two independent
+halves of `single-authority`'s "owed" gap each issue closed, drew a tenth and an eleventh
+finding on the merge commit. The tenth: `Journal::reboot` restored power and left *every*
+record in place, `OnMedia::Absent` ones included — a record `declare` puts in `records`
+before a single byte is programmed, so it is a fact about RAM rather than about media, and a
+power cut takes RAM with the power. `Declare(Schedule)` immediately followed by
+`PowerLoss`/`Reboot` left the phantom declaration in place, and `unresolved_schedule_in` and
+`whole_before` read it exactly as they would a real one — permanently stranding that bank,
+refusing a second `Declare` as `OutOfProtocolOrder` and refusing every later `Program` behind
+the absent record's own `whole_before` check, with no real bytes anywhere to blame it on.
+`reboot` now discards every still-`Absent` record and prunes `dispatched` to match, the same
+way `begin_erase` already does for an erased bank's records; `next_id` does not roll back,
+matching the "total ever declared" accounting `declare`'s own doc comment already states for
+an erased bank. `a_reboot_discards_only_records_still_absent_from_media` is the positive
+claim and `a_declared_record_is_never_renumbered_or_removed_except_by_erasing_its_bank`
+gained `Reboot` as a second, narrower exception beside `BeginErase`'s. `REACHABLE_STATES` and
+`TRANSITION_EDGES` moved up substantially this time — a whole family of states that used to
+dead-end at `Reboot` behind an undischarged declaration reopened into the states a bank that
+had never declared anything reaches.
+
+The eleventh was independent of the tenth, on the observation/reconstruction path
+`tests/refinement.rs` abstracts a real crashed device through: `Journal::from_parts` inferred
+`next_id` from `records.iter().map(id).max() + 1`, which is exact only while nothing has ever
+been dropped from `records`. A device that declares record 0, swaps authority away from its
+bank and erases it has a real counter at 1 with no record anywhere naming 0; inferring from
+what survives computed 0 and handed that id out a second time on the very next `Declare` —
+the identity collision issue #67's whole scheme exists to forbid, unreachable by any test
+here only because the bank-swap refinement declares no records at all. `Observation` gained
+its own `next_id: Option<u32>` field, reported by the caller rather than inferred — exactly
+the shape `banks` and `sealed_once` already take, for the same reason: `Journal::observation`
+reads the real field directly, `refine::abstraction`'s record-only callers compute it from
+the ledger's own records because none of them ever erases, and `Journal::from_parts` takes it
+as a parameter instead of computing it at all.
+`reconstruction_never_reissues_an_id_an_erase_already_spent` is the regression, built directly
+against a hand-supplied `Observation` rather than a full crash-harness run, since the gap is
+in the reconstruction machinery itself rather than in any particular writer's behaviour.
+
+A twelfth finding, on the same round's next pass, was in the tenth's own fix: dropping a
+still-`Absent` record on reboot without rolling `next_id` back too meant a device that
+crashes before its first-ever media write, over and over, eventually reads
+`Illegal::CapacityReached` against media that has never held a single byte —
+`Declare`/`PowerLoss`/`Reboot` repeated `bound.records` times, with nothing else ever
+happening, strands a device the real firmware would never strand. Codex's evidence was the
+real firmware itself: `waymaker_core::id::EffectIdAllocator::resume` derives the next
+sequence from the *highest committed* one, so an attempt that never durably landed is never
+counted against a run at all. `reboot` now rolls `next_id` back by exactly the count of
+`Absent` records it discards — but never past `1 +` the highest surviving id, because an id
+`begin_erase` retired earlier in the *same* run is not in `records` to protect itself, and
+rolling all the way down to what the current residents alone justify would let a later,
+unrelated `Declare` reuse an id an erased bank had already spent — the collision issue #67's
+whole scheme exists to forbid, reached through the combination of the two transitions rather
+than through either alone. `a_crash_before_the_first_media_write_never_spends_capacity` is
+the positive claim, driven ten cycles deep against `Bound::PROOF`'s three-record ceiling
+(which stranded a device after exactly three, before the fix); the sharper edge is
+`an_id_an_erase_already_spent_survives_a_later_reboots_own_rollback`, which declares and
+commits two records in one bank, retires it behind a seal on the other, erases it, and
+requires a crash-and-reboot of a fresh, still-`Absent` declaration in the new bank to skip
+both of the first bank's spent ids rather than reusing either — verified against the naive
+fix (recomputing purely from surviving residents, with no floor) before landing this one,
+since that naive version reaches exactly the collision this test exists to catch.
+`REACHABLE_STATES` and `TRANSITION_EDGES` moved again, down substantially this time (8,360 →
+5,620): every distinct crash count a device could accumulate before its first media write
+used to be a distinct state, purely because `next_id` climbed higher with each cycle even
+though nothing on media ever changed, and those cycles now collapse back onto the states a
+device that crashed once, or never, already reaches.
+
+Review of that round's fix drew two more findings, both on the observation/reconstruction
+path rather than on `reboot` itself. The first was documentation left behind by the second
+finding's own history: this ADR still said a reboot "changes nothing but the power" and
+still named `a_reboot_changes_nothing_but_the_power` as the proof, both stale since the tenth
+finding taught `reboot` to discard `Absent` records — [ADR 0043](docs/adr/0043-the-model-gains-banked-records-a-reboot-and-a-live-compaction.md)
+now narrates all three versions of the transition in order, with the test's current, narrower
+name. The second was a real gap in `refine::Observation::reconstructed`: the eleventh
+finding's `next_id` field is the caller's own report and was checked against nothing, so an
+observation could name a `next_id` that collides with a record in its *own* `records` list
+rather than only with one an earlier erase had dropped. Records 0 and 1 with
+`next_id: Some(1)` used to reconstruct without complaint; a `Reboot` then a
+`Declare(Schedule)` minted a second `RecordId(1)`, and the `Program` after it found the older
+record already whole and refused with `RecordAlreadyWritten`, stranding the new declaration
+on the identity collision issue #67's whole counter scheme exists to forbid — reached with no
+erase anywhere in the trace. `reconstructed` now refuses with
+`Impossible::NextIdReissuesAResident` whenever `next_id` is not strictly past every resident
+record's id, the same floor `reboot` itself keeps.
+`reconstruction_refuses_a_next_id_that_reissues_a_resident` is the regression, verified
+against a scratch reproduction of the stranding before the check existed and checking both
+the refusal and that the exact floor (one past the highest resident id) is still accepted.
+
+The same round's next pass found the sharper of the two: `Observation`'s per-record tuple
+carried no bank identity at all, so `Journal::reconstructed` hardcoded every record to
+`BankId::A` regardless of which bank `observation()` had actually read it from. A device that
+retires a record in bank A behind its very first seal — landing on B — and then declares a
+fresh record in B recovers `[1]` directly; round-tripped through `observation()` and
+`reconstructed()`, both records land in `BankId::A`, `recovering_bank()` stays `B`, and
+neither record's bank matches it, so the reconstructed state recovers `[]` instead — a real
+defect in the general bridge, invisible only because every writer this crate currently drives
+through it is single-bank. `Observation::records` now carries each record's bank as a fifth
+tuple element; `Journal::observation()` reports the real field, `Journal::reconstructed()`
+uses it instead of the hardcoded convention, and `refine::abstraction()` tags every record
+`BankId::A`, matching the module docs' "no writer this function abstracts ever touches a
+second bank" exactly as it already does for `next_id`.
+`observation_and_reconstruction_agree_on_a_state_with_records_in_two_banks` is the
+regression, driving the real two-record two-bank sequence end to end and asserting the
+round-trip preserves what `Specified.recover` returns, verified against a scratch
+reproduction of the `[1]` vs `[]` divergence before the fix existed.
+
+The round after that found the sharper defect the new bank field made reachable:
+`Journal::bank_of` — which `single_authority` and `durable_intent` both call to ask "which
+bank is this id's record really in" — answers with the *first* matching record it finds,
+ignoring bank entirely, so a hand-built `Observation` naming `RecordId(0)` once in a retired
+bank and again in the sole authoritative bank made `single_authority` misreport a
+legitimately recovered record as belonging to the retired one, and could equally make
+`durable_intent` skip checking a dispatch that needed checking. The real firmware's own
+effect sequence does restart at zero across a swap
+(`waymaker_core::id::EffectIdAllocator` via `Installed::allocator`), but that is a different
+identity space from this crate's `RecordId`: the model's id is a single, device-wide counter
+invented by issue #67 specifically so it is never reused, so no legal transition sequence
+can ever declare the same id twice, in one bank or two — a caller bridging a real device that
+restarts its own sequence per run has to assign each record a distinct label the way
+`refine::abstraction()` already does, not reuse the real restarting number directly.
+`Journal::reconstructed` now refuses with a new `Impossible::RecordIdDeclaredTwice` whenever
+an observation's `records` names one id more than once, closing the gap the same way as
+`next_id`'s own floor rather than by threading bank identity through every by-id lookup and
+through `dispatched` (which carries no bank tag at all, and would need one too).
+`reconstruction_refuses_the_same_id_declared_in_two_banks` is the regression, verified
+against a scratch reproduction of `single_authority`'s false-positive breach before the check
+existed.
+
+The same round's Codex pass raised a second finding on the same shift the eleventh finding's
+fix uses: `refine::bank_after_seal`'s `real_generation.0 + 1` numbering has no model value for
+the real firmware's actual final usable generation, since `Generation::successor` only
+refuses *at* `Generation::MAX` and the shift would need `u32::MAX + 1` to represent sealing
+there. Investigated rather than fixed: the reservation exists so a bank with no seal
+(`authoritative_generation() == None`) and a bank the model has not yet distinguished from one
+both read as "nothing sealed here" through `begin_seal`'s own `None => 1`, and removing it
+(numbering the model's first seal `0`, since `Bank`'s variants already tell "unsealed" apart
+from `Sealed(0)` without needing the reservation) would change how many distinct generation
+values `Bound::generations` admits at a given cap, moving `tests/census.rs`'s pinned counts —
+for a boundary nothing here drives anywhere near: `Bound::PROOF` and the bank-swap refinement
+sweep both cap generations at 3, and the one place this crate reaches a real `u32::MAX` is
+`model.rs`'s own hand-built `a_generation_at_the_ceiling_is_refused_rather_than_tied_with_the_other_bank`,
+entirely on the model's own terms and never through this shift. Documented as the same
+standing `obligation.rs` already records for `single-authority`'s generation dimension — "a
+generation is an unbounded integer, where the firmware refuses at the ceiling rather than
+proving the refusal unnecessary" — one integer narrower than stated there, in both
+`refine::bank_after_seal`'s doc comment and beside `begin_seal`'s own `checked_add`, rather
+than moving the census for a boundary no proof or refinement test comes near.
+
+The same round's next pass on the pull request that closed issue #67 found that the "nothing
+is owed" `single-authority` row itself overclaimed. `tests/refinement.rs`'s two refinements
+never compose: the record writers (`journal`, `effect_protocol`, and the one that survives a
+failed program) never touch a bank, and the bank-swap writer's own bound —
+`BANK_REFINEMENT.records: 0` — never declares one, so every `Observation` the swap sweep
+builds is `records: Vec::new()` and `single_authority` is checked there against
+`recovered: &[]`. `Invariant::SingleAuthority`'s bank check — that a recovered record's bank
+is the sole authoritative one, the very thing this round's earlier finding fixed `bank_of`
+over — has therefore never been refined against a real crashed device that both wrote a
+record and swapped banks, only proved exhaustively over the model and unit-tested directly
+against a hand-built multi-bank `Observation`. `obligation.rs`'s `single-authority` row now
+names this gap in its `owed` field instead of `None`, matching the standing every other
+partly-discharged clause here already has;
+`what_is_still_owed_is_written_down_rather_than_left_out` in `tests/obligations.rs` pins the
+exact set of clauses with something owed, which is now `single-authority` and
+`bounded-decoding` rather than `bounded-decoding` alone. CLAUDE.md's own guarantees table and
+its "that the ghost model is a model of *this* firmware" bullet are corrected the same way,
+rather than left to read as though the earlier, wider claim still held. Closing it for real
+needs a writer that both declares records and performs a real two-bank swap — the two things
+`crates/waymaker-fault/tests/banks.rs` and `tests/refinement.rs`'s two existing halves each
+do on their own — refined together the way each already is separately.
+
+A merge-time round found a second real bug beside the ADR staleness above: `durable_intent`'s
+own retired-bank exemption compared `bank_of(intent) != recovering_bank()`, and `bank_of`
+answers `None` when `intent` names no record at all — not only when it names one in a bank
+other than the one recovery would boot from. `None != Some(bank)` took the same branch as a
+genuine retired-bank mismatch, so a dispatched effect with no schedule record on media
+*anywhere* was silently exempted rather than breaching, even though `refine::abstraction`'s
+`dispatched` parameter is documented to report exactly that shape on purpose — "an effect
+that reached the world" independent of what the ledger holds, so a run whose effect left
+nothing recoverable behind can be described and judged rather than shrugged off as moot. The
+fix only takes the exemption when `bank_of` answers `Some(bank)` that disagrees with
+`recovering_bank()`, via `is_some_and`; `a_dispatch_with_no_record_at_all_is_a_breach_rather_than_moot`
+in `tests/refinement.rs` is the regression, verified to fail against the old check. No
+reachable state changes: `Journal::dispatch` refuses a `Transition::Dispatch` naming a record
+that does not exist, so `explore()`'s exhaustive search never produces the shape this bug
+needed — only a hand-built `Observation`, of the kind `refine::abstraction` exists to build
+from a real crashed device, could reach it.
+
+The next round found a third: `Journal::reconstructed` passed `observation.sealed_once`
+straight through with no check against `observation.banks`, so a hand-built `Observation`
+could claim `banks: [Bank::Erased, Bank::Sealed(1)]` while leaving `sealed_once` at its
+default of `false` — a combination no real transition sequence can produce, since
+`commit_seal` is the only place a bank becomes `Sealed` and it sets `sealed_once` true in the
+same step. Left unrefused, `recovering_bank()` took the pre-seal convention at face value and
+answered `BankId::A` regardless of which bank was really sealed, and `has_sealed()` then
+exempted the state from `SingleAuthority` entirely — a reconstructed state could recover a
+stale bank's records while the truly sealed bank's were ignored, with the one guarantee built
+to catch exactly that never even consulted. `Impossible::SealedBeforeAnyHistoryOfSealing` is
+the fix, refused in `reconstructed` the same way as the existing `RecordIdDeclaredTwice` and
+`NextIdReissuesAResident` checks; `reconstruction_refuses_a_sealed_bank_with_sealed_once_left_false`
+in `tests/refinement.rs` is the regression, verified to fail against the old code.
+
+Issue #84 then closes a gap the second review round of issue #26 had only stated: four
+modules refused storage that was "not the device this was validated against", and all four
+decided it by comparing a `Geometry` — a description of a part number, which two chips of
+one model share, so none of the four could tell two *instances* apart. `append`,
+`recovery` and `swap` now borrow `storage` for the whole life of their protocol instead of
+re-accepting it at every step: `Journal::stage`, `Recovery::new`/`with_integrity` and
+`Swap::prepare` are the one call each protocol still takes a `storage` argument at, and
+`Staged`, `Sealable`, `Recovery` and `swap`'s own `Prepared`/`Staged`/`Sealable`/`Installed`
+all carry that borrow onward. A caller who wants to finish a record, a scan, or a swap on a
+second device does not meet `AppendError::WrongDevice` or `SwapStepError::WrongDevice` at
+run time — the call is not one the type lets a caller write, which a `compile_fail,E0061`
+doctest in each module proves of the code as it stands. `capacity`'s `WrongDevice` stays a value
+comparison rather than moving to a borrow, and correctly: neither of its two entry points
+takes a `storage` argument at all, so there is no device instance there to bind, only a bank
+size and a program granularity that two devices of one model are right to agree on. Every
+`WrongDevice` variant's documentation now says which of the two shapes it is, and
+[ADR 0044](docs/adr/0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md)
+is where the choice is argued end to end.
+
+Closing the gap by construction rather than by a wider comparison cost two new functions —
+`Journal::after_taking_storage` and `Recovery::into_storage` — because a `Recovery` that no
+longer hands `storage` back at every call still has to hand it back *once*, to the writer a
+finished scan starts. Both are on `APPEND_SURFACE` and `RECOVERY_SURFACE`, both are linked
+from `waymaker-size-probe`, and both are why `waymaker-drive`'s `Context` changed shape:
+a struct cannot have one field borrow another field of the same instance, so once `Recovery`
+holds the device itself, `Context` cannot hold `storage` as an independent field beside it.
+`Source<'storage, S, C>` is the fix — the device lives in every state of it, `Scanning`,
+`Writing`, `Spent`, and a `Taken` sentinel for the one `mem::replace` needs — so the boot has
+exactly one owner of the device rather than two that would have to stay in step. The test
+suites that drove the old per-call API — `waymaker-fault`'s crash sweeps,
+`waymaker-rig`'s writers under test, and the size probe's linked calls — moved to the new
+one; two of `waymaker-fault`'s writers needed a way to declare a record's operations after
+the fact rather than live, since a borrowed `Sealable` now owns the device for the span they
+used to bracket, which is `Session::operations` and `Session::mark_operations`. Nothing
+about `Sealable` or `Staged` grew to make any of this easier: `commit-discipline` and
+`swap-discipline` both still hold "the one type that may program a seal should do nothing
+else," and a `storage_mut` accessor tried against both was rejected by the gate for exactly
+that reason.
+
+Issue #99 then closes the route Codex found on issue #32's fourth review round. A
+`pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec`, reached
+through an aliased `use`, named no forbidden identifier and changed no surface. So
+`timer-capability` passed a persistent deadline served by a clock that restarts on reset.
+`TimerSpec`, `Timer` and `ClockCapability` may now declare no associated constant at all.
+The façade's construction pin resolves `use` aliases before it scans, so the alias is seen
+for what it names rather than dropped as an import. `ClockKind` is a `u8` newtype with no
+member and no method for either pin to read. Its two values — the byte a `TimerScheduled`
+record carries — are pinned on their own, by name and value (`source::CLOCK_KIND_CONSTANTS`).
+A renumbering is now a build failure rather than a round-trip test that stays green.
+`effect-protocol` and `kernel-boundary` shared the same blind spot — an associated constant
+is neither a function nor a member — and gained the same ban for their own pinned types.
+Issue #97 closes a gap Codex found in the `failure-matrix` rule itself: a row test under
+`#[cfg_attr(.., ignore)]` is a test the compiler can skip, and the old scan refused only a
+direct `#[ignore]` or `#[cfg(..)]`, so such a test still vouched for its row. The scanner's
+own rewrite for issue #51 had already closed this — `crate::parse::declares_test` reads a
+test function's own attributes through `syn` and refuses `#[cfg_attr(..)]` the same way —
+but no regression test drove that specific attribute through `failure-matrix`'s own check,
+and `book`'s matching scanner, `#[cfg_attr(..)]`-aware since issue #42, had the same untested
+gap. `an_ignored_or_compiled_out_test_does_not_vouch_for_its_row` now does.
+
+`book`'s own scanner turned out to need more than a test. It was a hand-written line scan —
+collect the lines above a `fn name(` that look like attributes, reset on anything that does
+not, refuse if `#[ignore]`, `#[cfg(..)]` or `#[cfg_attr(..)]` is one of them by *prefix* —
+and across four Codex review rounds on this PR it lost every one of those four ways: a
+spelling with extra whitespace or a raw-identifier marker never matched the prefix; two
+attributes sharing one line hid the second behind the first a patched version checked; an
+attribute spanning several lines lost its own continuation to the "reset on anything that
+does not look like an attribute" rule; and once that was patched with a bracket count, a
+delimiter character inside a string literal — `doc = ")]"` — closed the count early and let
+the same multi-line trick back in. Four patches to one heuristic is four attempts to
+reimplement enough of Rust's grammar to answer "is this really `#[cfg_attr(..)]`" by hand,
+which is the mistake: `crate::parse::declares_test` never had any of these four bugs, because
+a real parser has no such thing as a line or a bracket count.
+
+`book`'s `declares_test` now asks `syn` the same way: [`crate::parse::fns_matching`] — the
+same structural lookup the `failure-matrix` scanner already uses, made `pub(crate)` for this
+— finds the function by name and hands back its real attributes, and every attribute is
+checked regardless of order, line breaks, whitespace, a raw-identifier marker, or what a
+string literal inside it happens to contain.
+
+Codex found a fifth bug in the line index the caller still needs, to check the test sits
+inside its anchor: it was found by a second, independent plain-text search, kept apart from
+the attribute check on the theory that position is a *shape* question and skippability is a
+*does this run* question. Two independent searches for "the same" declaration can each answer
+about a different one when a name is declared twice — a real, running
+`#[test] pub fn a_first_sample()` declared earlier in the file (found first by `syn`, since it
+does not care about visibility) paired its own passing attributes with the position of a
+*later*, non-test `fn a_first_sample()` the text search found instead (since `pub` does not
+match a search for a bare `"fn a_first_sample("` prefix) — and that later declaration is the
+one actually sitting inside the anchor. The anchor passed while showing untested content.
+`crate::parse::NamedFn` now carries `line`, the 1-indexed source line of the exact function
+whose attributes were just checked, read off that function's own `syn` span rather than
+re-found by a second search; `proc-macro2`'s `span-locations` feature is what makes a span
+carry a real line outside an actual proc-macro.
+
+Codex found a sixth bug, the mirror image of the fifth, on the very next round: fixing "the
+first declaration found can be the wrong one" by taking `fns_matching`'s first match still
+takes *a* first match — of every declaration of `name` in the file, not of the ones that are
+actually candidates for *this* anchor. A plain helper `fn a_first_sample()` declared earlier
+in the file, not a test at all, made `declares_test` stop there and report "declares no
+test" for an anchor whose own content was a real, running `#[test]` — the old line scanner
+had tolerated exactly this by continuing past a same-named non-test, and the structural
+rewrite lost it. `declares_test` now takes the anchor's own line range as a third argument
+and prefers, among every candidate `fns_matching` finds, the one whose line falls inside it;
+only when none do is the first candidate taken, which is what keeps the "declared, but
+outside the anchor" report for a file with exactly one declaration. This one change closes
+both the fifth bug and the sixth by the same construction — preferring the in-anchor
+candidate answers "is the anchor's own declaration a real test" directly, rather than "does
+some declaration of this name run," which is a different question in each direction once a
+name can be declared more than once.
+
+Round 7 found two more, both in the sixth's own fix. The first is the sixth's mistake one
+level in: preferring the first *in-anchor* candidate is still "the first match," now scoped
+to a smaller pool rather than answered. Two same-named declarations can both sit inside one
+anchor — an ordinary helper in one nested module, a real `#[test]` in another — and the
+first one is not necessarily the qualifying one. `declares_test` now tries every in-anchor
+candidate in turn (widening to every declaration in the file only when none sit in the
+anchor at all) and takes the first that actually qualifies, via a `verdict` helper the
+per-candidate check was pulled into.
+
+The second is sharper: [`crate::parse::NamedFn::line`] read the function's *identifier*
+span, and a line comment between the `fn` keyword and the name — legal Rust, since a comment
+is whitespace to the lexer — can put the keyword outside an anchor whose line range still
+contains the identifier. mdBook would then render the fragment starting after `fn`, which is
+not the tested function the check claims to have found. `line` now reads
+`Signature::fn_token`'s own span instead, the start of the item rather than the start of its
+name.
+
+The parametrized test grew eleven cases across the first four rounds, one or more per bug
+found, and every earlier one still passes unmodified against each fix in turn. Rounds five
+through seven were not spellings any single attribute check could see — each was a mismatch
+between which declaration answered and which one the anchor actually meant — so
+`a_real_test_declared_elsewhere_cannot_vouch_for_a_decoy_of_the_same_name`,
+`a_non_test_declared_elsewhere_cannot_block_the_real_test_in_the_anchor`,
+`a_qualifying_test_is_found_even_behind_a_non_test_inside_the_same_anchor` and
+`an_anchor_marker_between_fn_and_the_name_does_not_count_as_containing_the_test` each stand
+beside that parametrized test rather than inside it.
+
+Round eight found an eighth: `NamedFn::line` is still only where the item *starts*, and
+nothing checks where it *ends*, so an anchor whose own end marker sits between the `fn`
+keyword and the identifier "contains" a function that is, on the rendered page, the single
+word `fn`. Left open rather than fixed here — by round eight the construction needed to
+show it is an anchor's own end marker planted inside a function signature, which is the
+kind of input this design has never claimed to survive: this function's whole positional
+check exists for authors, not adversaries. Tracked as issue
+[#165](https://github.com/madmax983/waymaker/issues/165) instead of a ninth round on this
+one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #92 then closes a gap Codex found on the fourth review round of issue #91, past that
+change's review budget: `DurableIntent` proved *an* effect was committed, not *which* one.
+`Activities::perform` took the kind and the input as free arguments beside it. So a caller
+could dispatch one effect's identity under another effect's kind or input. Nothing in
+`waymaker-drive`'s own path could do this: `decide` builds its dispatch call from the same
+locals it built the request from. But a second caller at rung 0.4 would have had no such
+accident to rely on. `DurableIntent` now carries the `EffectRequest` step 3 committed;
+`DurableIntent::kind` reads it, so `Activities::perform` drops the free `kind` argument —
+there is no second place to read one from. `Dispatchable::perform` is the one route from a
+proof and raw bytes to a dispatch, and it checks the input's length and digest against that
+request before `Activities::perform` is ever called; a mismatch is `InputMismatch`, and the
+world is not asked. Codex found three more gaps in review, one round apart each. The first
+version left `Activities::perform` taking a bare `&[u8]`, so a caller could still skip the
+check by calling `activities.perform(intent, wrong_bytes, out)` directly. Wrapping the bytes
+in a `CheckedInput` — a type with a private field that only `Dispatchable::perform` could
+build — closed that, but left the identity a second, separate argument, so an adapter
+forwarding to another `Activities` implementor could still pair one effect's `DurableIntent`
+with a different effect's `CheckedInput` and produce a value that was individually valid in
+each field and wrong as a pair. `Activities::perform` now takes one `CheckedDispatch`,
+binding the identity and the checked bytes into a single value `Dispatchable::perform` builds
+atomically — there is no second value left for an adapter to swap in. That closed the field,
+but not the file: `EFFECT_NO_SELF_LITERAL` refuses a `Self` literal inside `CheckedDispatch`'s
+own `impl` and a trait built for it, and said nothing about a `pub(crate)` sibling function
+elsewhere in `effect.rs` naming the type directly and pairing its own fields by hand — the
+third gap, closed by `source::CHECKED_DISPATCH_CONSTRUCTION`, `EFFECT_CONSTRUCTIONS`'s twin
+for a type with one legitimate origin: `Dispatchable::perform`, and nowhere else in the file.
+Codex found a fourth gap in that pin on the round after: `struct_literal_counts` resolved
+only `use` aliases, so `type Unchecked<'a> = CheckedDispatch<'a>;` followed by a literal
+spelled `Unchecked { .. }` built the type under a name the pin never compared against —
+`Self`-literal and construction-site refusals alike name `"CheckedDispatch"`, never the local
+alias a caller wrote. `xtask::parse::struct_literal_counts` now resolves `type` aliases the
+same way it already resolved `use` aliases (issue #99), chased through a chain of either
+kind, so `type A = B; type B = CheckedDispatch;` still reaches `CheckedDispatch` from a
+literal spelled `A { .. }`. The fix lives in the shared scanner rather than in this rule
+alone, so every other construction pin built on `struct_literal_counts` —
+`EFFECT_CONSTRUCTIONS` included — closed the same gap in the same change.
+Codex found a fifth gap in the scanner itself, in the round right after: it walked file
+items and inline modules only, so a `type` alias declared *inside* a helper's own function
+body — legal Rust, and invisible to a scan built for module-level declarations — evaded it
+exactly as the file-scoped one had. `struct_literal_counts` now gives every block its own
+alias scope: entering a block collects the `use` and `type` aliases declared directly in its
+own statements, a name resolves against the innermost scope that declares it — so a local
+alias correctly shadows a same-named one declared elsewhere in the file, the same rule a real
+compiler resolves a name under, rather than the scan picking whichever declaration a flat
+list happened to sort first — and that scope is popped on the way back out. The same
+block-scoped resolution is what every construction pin built on `struct_literal_counts` now
+gets, not a change scoped to this one pin.
+Codex found a sixth gap the round after that, and it is a hole in what counts as an alias's
+right-hand side rather than in where one is looked for: `type Unchecked<'a> =
+(CheckedDispatch<'a>);` is valid Rust — `#[allow(unused_parens)]` lets it through
+`-D warnings` — and `syn` keeps the parens as their own `Type::Paren` node rather than
+discarding them, so the `Type::Path` match that reads a type alias's target saw nothing
+there and built no alias at all. `type_alias_target` now unwraps `Type::Paren`, and
+`Type::Group` beside it for the same reason — a macro's own hygiene grouping is the same
+shape — recursively, so `((CheckedDispatch))` reaches the same target in two hops.
+A seventh round found a gap in a different shape from all six before it: not a way to
+*build* a forged value, but a way to *rewrite* a legitimate one's field in place.
+`CheckedDispatch`'s, `DurableIntent`'s and `Dispatchable`'s fields are private to the
+*module* `effect.rs` declares, not to the type — Rust has no finer grain — so a sibling
+function anywhere in that module can already write `dispatch.bytes = other;` on an
+otherwise-legitimate value, with no struct literal anywhere for a construction pin to count.
+A `&mut` reference taken to the field is the same capability under a second spelling:
+`core::mem::swap`, `core::mem::replace`, and passing the reference to an arbitrary
+`&mut`-taking function all rewrite the field with no `=` in the source at all.
+`source::EFFECT_PROOF_FIELDS` names the fields this matters for — `id` and `request` from
+`DurableIntent`, `intent` from `Dispatchable` and `CheckedDispatch` (spelled once, since both
+name it the same way), and `bytes` from `CheckedDispatch` — and
+`check_effect_proof_fields_are_not_rebound` refuses both an assignment and a `&mut`
+reference to any of them, anywhere in the file. `Effect`'s and `Dispatchable`'s `writer` field is deliberately left off: it
+carries no identity, kind or byte binding, so rewriting it is not the guarantee this list
+exists for. Nesting `CheckedDispatch` in a private submodule of its own — the usual way Rust
+narrows field visibility below module scope — was considered and rejected: `effect-protocol`
+already refuses a module declared anywhere in this file, precisely so a construction site
+cannot hide from a scan that reads `effect.rs` as one flat file, and a submodule added for
+this reason would open exactly the hole that refusal exists to close. Costs nothing measured:
+the check is entirely on the `xtask` side, over `effect.rs`'s own text, and touches no line
+the shipped crate builds — the gated `layers` figure stays at 12732 B.
+An eighth round found the third route the first two left open, and it needs neither `=` nor
+`&mut` written anywhere: `dispatch.bytes.clone_from(&other)` reassigns `bytes` through an
+*implicit* `&mut self` autoref, the method-call form every mutating trait method — `Clone`'s
+included — takes. Whether a given method really takes `&mut self` is a question `syn` cannot
+answer without type inference, so `mutated_field_names` refuses every method call whose
+receiver is a guarded field, not only the ones a reviewer could confirm mutate — over-broad
+the same way every other scanner in this workspace already is, and free here because no
+method is ever legitimately called directly on one of these fields today, only on the whole
+value through its own accessor, whose receiver is a plain path rather than a field access.
+A ninth round found two more gaps, in two different mechanisms. The first is a fourth route
+into the field-rebinding problem the seventh and eighth rounds closed:
+`let CheckedDispatch { bytes: ref mut slot, .. } = dispatch;` borrows `bytes` mutably
+through the pattern itself, with no assignment, no `&mut` expression and no method call
+anywhere for the first three routes to see. `mutated_field_names` now also refuses a
+`ref mut` binding on a guarded field in any struct pattern, found at any nesting depth by
+walking the sub-pattern with a nested visitor rather than checking only its outermost shape.
+A field bound `mut slot` with no `ref` stays legal: it moves or copies the value into a
+fresh local, which is a read, and reconstructing `CheckedDispatch` from that local
+afterward is a struct literal the construction pins already cover. The second is in the
+type-alias resolution itself: `type Unchecked = <Via as Alias>::Dispatch;` is a qualified
+associated-type projection, and `type_alias_target` explicitly skips every `Type::Path`
+with a `qself` — correctly, since resolving what a trait's `impl` names as its associated
+type needs type inference this scanner does not have. Skipping was silently permissive,
+though: the alias built nothing, so it counted as nothing, while the projection itself
+could still name `CheckedDispatch`. Unlike a tuple, a reference or a trait object — none of
+which can ever appear where `Name { .. }` construction syntax is legal — a projection
+genuinely can resolve to a struct usable that way, so `qself_type_alias_names` reports every
+such alias, and a new check refuses the file outright over it: a hard refusal of the
+construct, the same shape as `effect-protocol`'s ban on a module declared anywhere in this
+file, rather than an attempt at the type resolution neither `syn` nor this scanner can
+safely do.
+A tenth round found that `mutated_field_names` itself checked only the outermost field of a
+chain: `dispatch.intent.request.kind = x;` assigns to `kind`, which is not a guarded name,
+but `intent` and `request` are both guarded *ancestors* in the same chain, and rewriting
+through either reaches the identity or the kind the whole family of checks exists to
+protect. `note` now walks the full chain of field accesses back to its root rather than only
+its leaf, for assignment, `&mut` reference and method call alike, since all three share the
+one helper. Two further findings from that round are real and not fixed here: that Rust's
+match ergonomics can bind a struct pattern's field to a mutable alias with no `ref`, `mut`
+or `&mut` written anywhere, purely from the scrutinee's own reference-ness, which `syn`
+cannot see; and that a generic type alias with a trait bound
+(`type Unchecked<T: Alias> = T::Dispatch;`) is an associated-type projection with no `qself`
+for the ninth round's check to key on. Ten review rounds deep, both would need genuinely new
+detection machinery rather than a completion of what already exists, and this project's own
+review-depth guidance is to stop iterating past two or three rounds and open an issue once a
+fourth round is still finding real bugs rather than continue an unbounded loop — so they are
+tracked in issue [#171](https://github.com/madmax983/waymaker/issues/171) instead of fixed
+in this change.
+`Effect::redelivering` threads the same binding through with no kernel-boundary change:
+`decide` already checks the workflow's current request against history with
+`ReplayMachine::intent` before the redelivery row is reached, so the request `redelivering`
+binds is the one the kernel already vouched for — issue #92's own guess that this would need
+`Resolve::Redeliver` widened did not hold up once the call site was read. `effect-protocol`
+pins all four new methods (`DurableIntent::kind`, `Dispatchable::perform`,
+`CheckedDispatch::bytes` and `CheckedDispatch::durable_intent`) on `EFFECT_PROTOCOL_SURFACE`
+and `EFFECT_TYPE_METHODS`; none is one of §07's storage steps, so `EFFECT_STEP_BODIES` is
+unchanged. The gated `layers` figure moves to **12732 B** of 13312, 88 B below ADR 0036's
+12820 B and unmoved again by
+`CheckedDispatch`, which the optimiser erases — the wider `DurableIntent` and the new checked
+call cost less than the free `kind` argument they replace, on this optimiser, at this
+setting; no raise is asked for. See
+[ADR 0050](docs/adr/0050-a-durable-intent-carries-its-request-and-perform-checks-it.md).
+
+An eleventh round, found on review of this branch's own merge with a concurrent one, closed
+a gap in the tenth's fix rather than opening a new one. `note`'s chain walk covers a
+compound assignment once reached — `dispatch.intent.request.kind ^= 1;` still names `kind`
+at the end of the same chain `x.field = value;` does — but nothing called `note` for it:
+`visit_expr_assign` was the only route in, and `syn` parses every compound-assignment
+operator, `^=` and the other nine, as a `BinOp` on an `Expr::Binary` rather than as an
+`Expr::Assign`, which is `=` alone. `mutated_field_names` now also visits `Expr::Binary`
+and calls `note` on the left operand for any of the ten assignment operators, leaving an
+ordinary binary expression — which reads a field and rewrites nothing — untouched.
+
+A twelfth round found a gap in the eleventh's own review, not its fix.
+`(dispatch.bytes,) = (replacement,);` is still an `Expr::Assign` — `note` is still called on
+its left side — but that left side is `Expr::Tuple`, not `Expr::Field`, and `note`'s chain
+walk only recognised the latter, doing nothing at all otherwise. A field buried inside a
+tuple, array or struct-literal destructuring target was invisible the same way a
+compound-assignment target had been. `note` now recurses into each element of a tuple or
+array and each field's value in a struct literal — arbitrarily nested, since a tuple can
+hold another tuple — before falling back to the field-chain walk.
+
+A thirteenth round found a gap in the tenth round's own chain walk, rather than in the
+eleventh's or twelfth's own fixes: `(dispatch.intent.request).kind = x;` is still a plain
+field assignment, but a parenthesized ancestor sits in the middle of the chain — the outer
+field's `.base` is an `Expr::Paren`, not the `Expr::Field` the tenth round's `while let`
+loop matched, so it stopped there and never saw `intent` or `request` inside the parens.
+The loop now unwraps `Expr::Paren` and `Expr::Group` as it descends, the same two wrappers
+`type_alias_target` already unwraps for the same shape of reason (the sixth round, above),
+so `((dispatch.intent).request).kind = x;` still reports both ancestors through two hops of
+nesting. This is the third round of Codex findings in this file's own post-merge review of
+commit 16c7135, and this project's own review-depth guidance is to stop iterating past two
+or three rounds and open an issue once a fourth still finds real bugs — so a fourth finding
+of this shape is issue [#171](https://github.com/madmax983/waymaker/issues/171)'s rather
+than a fourteenth round here.
+
+Review of the merge itself found a separate bug, in code the merge introduced rather than in
+`mutated_field_names`'s own chain above: `resolve_local_alias_chain` — written to keep issue
+#92's function-local type-alias resolution working after issue #169's rewrite of
+`struct_literal_counts` onto a stack of raw `&[syn::Item]` slices — resolved a block's own
+aliases by calling `collect_item_aliases`, which recurses into any `mod` the block declares.
+A block that declares `type S = Foo;` directly and also a `mod hidden { type S = Bar; }`
+alongside it has `hidden`'s own `S` collected into the same flat list as the block's own, so
+a bare `S {}` outside `hidden` could resolve to `hidden::S` — a scope `real` Rust never lets
+it see — rather than to the block's own alias, exactly the leak `own_aliases`'s own doc
+comment already states module-level lookups must not have. `own_aliases` is generalized to
+take any `&syn::Item` iterator rather than only a `&[syn::Item]` slice, and
+`resolve_local_alias_chain` now calls it instead of `collect_item_aliases` — the same
+non-recursive, own-level-only collection a module lookup already gets, reused rather than
+reimplemented. `a_nested_modules_alias_does_not_leak_into_the_enclosing_blocks_lookup` is
+the regression, confirmed RED against the unpatched lookup.
+
+Review of that fix found the inverse leak in the same round: `visit_item_mod` pushed the
+nested module's own items onto `self.stack` and popped them afterward, but never touched
+`self.block_items`, so a block's own local aliases stayed visible while the visitor
+traversed a `mod` declared directly inside that block — a scope a nested module never
+inherits, whether the enclosing scope is a function body or another module. A block
+declaring `type S = Foo;` and, alongside it, `mod hidden { pub struct S; fn make() -> S { S
+{} } }` had `hidden::make`'s own `S {}` incorrectly resolved through the outer block's alias
+to `Foo`, when real Rust never lets `hidden` see that alias at all. `visit_item_mod` now
+sets `block_items` aside with `core::mem::take` before descending into the module and
+restores it on the way back out, the same discipline `self.stack`'s own push/pop already
+has. `a_blocks_local_alias_does_not_leak_into_a_nested_module` is the regression, confirmed
+RED against the unpatched visitor.
+
+Codex then found a gap in a different mechanism the same round: `syn::Visit` never descends
+into a `macro_rules!` body, since it is an opaque token stream to a syntax-only scan, so a
+local macro defined and invoked inside `effect.rs` and expanding to
+`CheckedDispatch { intent, bytes }` builds the pinned type at a site `struct_literal_counts`
+and every check built on it cannot see, whatever the alias scanner's own scope discipline is.
+Expanding or inspecting a macro body was rejected for the same reason resolving a qualified
+associated-type projection already was — it needs machinery this scanner does not have — so
+`check_effect_types` now refuses `effect.rs` outright over a bare `macro_rules` identifier,
+the same construct `ctx-facade` already refuses in its own two pinned files for the identical
+reason. `a_macro_rules_in_the_effect_protocol_file_is_reported` is the regression, confirmed
+RED against the unpatched rule.
+
+Codex found, in the same round, the gap that ban left open: it reads the *definition's own*
+identifier, so an invocation of a macro defined anywhere else in the crate —
+`emit!(CheckedDispatch { intent, bytes })`, spelling `macro_rules` nowhere at all — reaches
+the identical opaque-token construction site a local definition does. `syn::Macro` is the one
+type every invocation shares, whether it sits in item, statement, expression, type or pattern
+position, so a new function, `crate::parse::invokes_any_macro`, overrides `syn::Visit`'s
+single `visit_macro` method instead of naming `macro_rules` as text — catching every
+invocation shape, `macro_rules!` included, in one mechanism rather than five. `effect.rs` now
+refuses the file outright over any macro use at all, outside `#[cfg(test)]`, which is
+strictly stronger than the identifier ban it replaces and closes the same class of gap this
+file's own "what is not checked" bullet on a macro-generated `fn` used to record.
+`a_macro_invocation_in_the_effect_protocol_file_is_reported` is the regression, confirmed RED
+against the identifier-only check.
+
+A third round in the same family found the shape neither of the first two catches: an
+attribute macro or a custom derive is a `syn::Attribute`, not a `syn::Macro` invocation, so
+`invokes_any_macro`'s `visit_macro` override never sees `#[forge]` on a method or
+`#[derive(Forge)]` on a struct — each expands in its own defining crate with nothing here
+able to read what comes out. `crate::parse::unaudited_attributes` closes it the same way:
+every attribute in `effect.rs` is required to be one of a fixed set the compiler itself
+interprets with no macro behind it (`source::EFFECT_ALLOWED_ATTRIBUTES`), and a
+`#[derive(..)]` to name only the compiler's own derives (`source::EFFECT_ALLOWED_DERIVES`),
+each name in the list checked on its own since one attribute can mix an inert derive with a
+custom one. `cfg_attr` is refused outright, since it can emit an arbitrary attribute and
+`effect.rs` has no legitimate use for one. Three rounds deep in this macro-opacity family —
+this project's own review-depth guidance is to stop past two or three and open an issue once
+a fourth still finds real bugs — so a fourth finding of this shape goes to a new issue rather
+than a fourth round here.
+`a_procedural_attribute_in_the_effect_protocol_file_is_reported` and
+`a_custom_derive_in_the_effect_protocol_file_is_reported` are the regressions, confirmed RED
+against the unpatched rule. A fourth round found two more real gaps — an attribute macro on a
+trait member the new check never visits, and a `use ... as Clone;` import that shadows an
+allowlisted derive name — both left open rather than fixed here, per this project's own
+review-depth guidance once a fourth round is still finding real bugs; they are issue
+[#186](https://github.com/madmax983/waymaker/issues/186).
+
+The same fourth round found a real bug back in the alias-scoping mechanism instead, and this
+one is fixed. `resolve_local_alias_chain` correctly stops at the end of a block's own
+aliases — it only ever searches its own scope, the same discipline a module lookup has — but
+a block-local `type Inner = Outer;` beside a *module*-level `type Outer = Foo;` left
+`Inner {}` resolved only as far as `Outer`, because the caller took that partial chain as
+final instead of feeding it on to `resolve_segments`'s own module-level lookup.
+`resolve_local_alias_chain` now reports whether its own chain ended on an absolute alias — in
+which case it is already fully resolved, the same as `resolve_segments`'s leading-colon
+short-circuit — or simply ran out of block-local names, in which case the leftover head is
+resolved again through `resolve_segments_from`, the module-lookup half of `resolve_segments`
+split out for reuse; it is a no-op when the leftover name is not itself a module-level alias.
+`a_function_local_alias_of_a_module_level_alias_still_resolves` and
+`a_checked_dispatch_built_through_a_local_alias_of_a_module_level_alias_is_reported` are the
+regressions, confirmed RED against the unpatched caller. The round's second alias finding —
+two mutually exclusive `#[cfg(..)]`-gated `type` aliases sharing one name, where `own_aliases`
+skips only `#[cfg(test)]` and so lets whichever is declared last win the lookup regardless of
+which a real build compiles — is not fixed: it is the same "`cfg` is not evaluated" limitation
+this file's own parsing documentation already states as an accepted, structural property of
+every scanner in this family, met here in a form specific enough to be worth naming rather
+than a new gap needing new machinery.
+
+Issue #111 closes a gap ADR 0033 named in its own consequences section. The old code
+recorded a kind with no row as an `EffectFailed`, with no payload. That decision was
+permanent: §08 has no edge back from a resolved effect to an unresolved one. So no later
+firmware could complete that effect, no matter how many rows it gained. `dispatch::Produced`
+gains a third answer, `Unserviceable`, carrying no payload — the same shape §11's
+`KernelError` already uses for "this firmware cannot service this now", as distinct from
+"this firmware can never replay this history". `Ctx`'s `ActivityFuture` stops for it as it
+stops for `Poll::Pending` — neither calls `Journal::resolve`, so the effect stays outstanding
+under the identity its schedule record already committed — but it is not a retry: `stage`
+moves to `Ended` rather than staying at `Dispatching`, so a future retained across a spurious
+repoll within the same boot never asks a dispatcher already known to have no answer for this
+kind. Codex found the gap on review of this change: the first version left `stage` where a
+retry leaves it, and a repoll would have asked again. A second round found the fix itself
+incomplete: `stage` lives in the future, so a dropped-then-recreated `ActivityFuture` — a
+`select!` cancellation, say — started fresh at `Stage::Scheduling` and asked again this boot.
+The flag now lives in `Ctx`, shared across every future it builds, the way issue #107 moved
+`TerminalFuture` and `ContinueFuture`'s own flag into `Ctx` for the identical reason.
+`wiring::Table` answers it for a kind no row declares, in place of the
+`Unhandled::NoSuchActivity` it used to construct; since that was `Unhandled`'s only reason to
+exist beside wrapping a row's own error, `Unhandled<E>` is gone and `Table<W, E>::Error` is
+`E` itself. Two tests are the "done when", at two levels: `crates/waymaker-embassy/tests/wiring.rs`'s
+`a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_could_not` proves the
+façade's own sequencing over a fake journal, and
+`crates/waymaker-facade-demo/tests/dispatch.rs`'s
+`a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_left_outstanding`
+proves the same claim over real media — a table with no row commits a schedule record and
+writes nothing else, and a second boot over the same device, with a table that has the row,
+redelivers and completes it. That second test's own boot 1 answers `Ok(Progress::Waiting)`,
+because its `Wired::run` bridges the façade through `waymaker-drive`'s synchronous boundary
+the same way `ota.rs`'s `Downloader::run` does: it reads back the real `Suspended` the
+boundary returned on its last call, and falls back to `Suspended::awaiting_dispatch()` on the
+one path with no boundary call behind it at all. A third round found the flag from the second
+had only ever been read in `ActivityFuture`: `waymaker-drive`'s boundary refuses a *second*
+boundary call while an effect is outstanding, so a workflow that met `Unserviceable` on one
+boundary and then asked for a timer, a completion or a `continue_as_new` on the same boot
+turned its own clean stall into a hard `DriveError::EffectOutstanding` — the very failure
+this issue exists to prevent, met one boundary over. `TimerFuture`, `ContinueFuture` and
+`TerminalFuture` now each carry the same flag and refuse to reach the journal or record a
+conclusion once it is set. That same round found the test's own `Wired::run` still asserting
+the wrong thing — an earlier draft believed the bridge had no way to build a real `Suspended`
+for this stall, which was false: `ota.rs`'s bridge already carried the mechanism, and this
+crate's test harness had simply not used it. A fourth round found the third round's own flag
+was read only by `Ctx`'s own futures: `ota.rs`'s and `provisioning.rs`'s bridges each fall
+back to the workflow's bare `Result` whenever `ctx.conclusion()` answers `None` and the poll
+answered `Ready`, which is right for an ordinary `?`-propagated activity failure and wrong
+for a workflow that polled a stalled `ActivityFuture` directly — a `select!` that dropped it
+for another branch — and then returned on its own with the effect still outstanding and
+nothing recorded. `Ctx` gains a fourth accessor, `unserviceable`, and both bridges now refuse
+that fallback while it answers true, folding the case into the same clean stall a direct
+`.await` already produces.
+`crates/waymaker-facade-demo/tests/dispatch.rs`'s
+`a_workflow_that_abandons_a_stalled_effect_and_returns_directly_still_waits` is the
+regression: it polls one activity once, drops it, and returns `Ok(())` directly, and the boot
+answers `Ok(Progress::Waiting)` rather than `Err(DriveError::EffectOutstanding)`. The
+code-flash cost was nil for the first round's own diff — `cargo xtask size`'s `facade` row
+measured 13174 B of layers both before and after, because removing `Unhandled`'s wrapping
+paid for the third `Produced` arm — the second and third rounds' three added `&bool` fields
+moved that figure to 13122 B, and the fourth round's new accessor holds it there: the size
+probe now calls it too, so its cost lands entirely in `probe` rather than `layers`.
+One thing stays the same throughout: a caller still cannot tell "the world is slow" from "no
+firmware will ever service this" from the return value alone. Both cases return
+`Poll::Pending` — a halted journal and an unpassed deadline already work the same way. Design
+document §13's boundary gives no reason for any stop, and this change adds none. See
+[ADR 0049](docs/adr/0049-an-unserviceable-kind-is-an-answer-not-a-record.md).
+
+Issue #115 closes a gap Codex found on the fourth review round of issue #39's own pull
+request: `SizeReport::runtime_ram_total` composed the statics term from the largest `Δram`
+of *every* row the document held, and `--report` reads a document this process did not
+produce, so nothing checked that the row *set* was the one the workspace actually derives.
+A document that left out the row with the largest `Δram` composed a smaller, wrong total and
+could pass a budget a complete document would have failed — the one figure this gate takes
+*across* rows rather than gating each row on its own.
+
+The first version of this fix took the issue's fourth, smallest option: narrow the
+composition to gated rows alone, which are pinned and required, so an omitted row could no
+longer starve it. Codex's review of that version on this pull request found the cost of
+narrowing: a per-feature row is a configuration somebody ships, and design document §04
+states one runtime-RAM ceiling for the *device*, not one per configuration — ADR 0035's own
+words for the original design were "a per-feature row is a configuration somebody ships, and
+taking the largest is the direction that fails closed". Narrowing to gated rows stopped
+gating every configuration that enables an optional feature, silently, forever, which is a
+real regression rather than only the closing of an adversarial-document hole — and it is
+exactly the cost issue #115 named for its first option and did not take.
+
+The fix taken instead is that first option, made affordable: `runtime_ram_total` composes
+the largest `Δram` of *every* row again, matching ADR 0035 unchanged, and a new function,
+`completeness_shortfalls`, closes the omission by resolving `cargo metadata` for the
+workspace and holding the document's row set to what `matrix` derives from it — a row
+`matrix` would produce and the document lacks, by name or by feature selection, is refused.
+Resolving metadata costs nothing a firmware build would: no image is linked, which is what
+keeps `--report` usable without one. `main.rs`'s `run_size` runs it alongside
+`SizeReport::shortfalls` and renders both lists as one report. `missing_rows` is refused
+outright on an empty `expected` rather than read as nothing to check — a workspace with no
+`waymaker-size-probe` has `matrix` derive no row at all, and a document from before the
+probe was removed would otherwise pass against it vacuously, the same empty matrix
+`measure_into` already refuses to link. Four tests drive it: a per-feature row's large
+`Δram` raising the total again, `missing_rows` catching a document missing a row `matrix`
+derives, catching a row whose name is reused with a narrowed feature selection, and catching
+a document read against a probe-less workspace. Review also found an out-of-scope,
+genuinely separate gap — a gated row's own `ram`/`bss` fields carry no non-zero floor,
+unlike `flash`'s — filed as issue
+[#172](https://github.com/madmax983/waymaker/issues/172) rather than folded in, since `0 B`
+is this engine's real, current statics figure and a floor there would fail every honest
+report. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
+id — see
+[ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md), which this
+leaves exactly as accepted.
+
+Issue #106 then closes a gap Codex found on the third review round of issue #35: the
+`drive-facadeless` stage proved that no *other* `waymaker-drive` module needed the façade,
+not that the crate would build with `waymaker-embassy` deleted — the dependency was never
+optional, so a façade regression failed the same stage a façade absence would have.
+`waymaker-facade-demo` is the fix. `facade`, `ota` and `provisioning` — issue #35's bridge
+and design document §06's two examples — now live in a crate above `waymaker-drive` rather
+than inside it, and `waymaker-drive` names no dependency on `waymaker-embassy` in any table.
+`cargo metadata` states the claim the feature flag could only argue for. `without-facade`
+and the `drive-facadeless` stage are gone; `facade-demo-firmware` replaces the second,
+building the new crate's library for `thumbv6m-none-eabi` — `nm` on the rlib still finds
+`ota_update` and `ActivityFuture`, for `ota.rs`'s own reason. `ctx-facade`'s driver half
+keeps its shape and loses its exemption: `source::FACADE_DRIVER_MODULES` is empty, so every
+`waymaker-drive` module is held to naming no façade rather than every module but three.
+
+Moving `ota` and `provisioning` moved a dependency their new home could not carry for free.
+Both mint a `Suspended` when a driven future stalls with no recorded ending, and
+`Suspended`'s field is private to `waymaker-drive` — a privilege the two modules held only
+by being files of that crate. `facade::Bridge` now keeps the real value the boundary
+returned on every call that produced one, and the two examples read it back after their
+poll rather than building a new one; `Suspended::NEW` stays `pub(crate)` and neither example
+names it. That is a strengthening rather than a workaround: the value returned is now
+provably the boundary's own, carried across the `.await`, rather than a fresh one asserted
+to match it.
+
+The lint, test, docs and coverage stages that pass `--no-default-features` reach the new
+crate exactly as they reached the three modules before: an ordinary workspace member rather
+than a feature-gated one, so nothing fell out of them. See
+[ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md),
+which records the split as superseding its own `without-facade` compromise.
+
+Issue #96 closes the four rows [the failure matrix](#the-failure-matrix-row-by-row) owed on
+the rig, and it does so without moving a single count of the six rows already swept. The
+insight it rests on is that `Rig::judge` and `Rig::resume` hardcoded `Rig::BANK` in a way
+that happened to be harmless, because nothing had ever asked this rig to install a second
+run: `bank::select`'s own answer was always `Rig::BANK`, so reading it by name and reading it
+by authority were the same read. `Rig::authority` is the fix — a new private method that
+keeps *which* bank `bank::select` named rather than only how many — and `installed_journal`
+now refuses a bank whose header names this run but is not the one currently authoritative,
+which a stale, unerased losing bank's header could otherwise still satisfy. Reverting that
+one check and rerunning the row 8 test reproduces the defect directly: a resumed run answers
+`Ok(Completed { recovered: 3, .. })` from the retiring bank's own three records, on a device
+whose authority had already moved to the bank a swap installed.
+
+Rows 7 and 8 needed a workload that rolls over, and `Rig::iterate_until_rollover` is the
+smallest addition that provides one: it writes a run's `RunStarted` and as many
+schedule/completion pairs as it is asked for, and stops — no `RunCompleted`, because the
+run's continuation is whichever bank a swap leaves authoritative rather than this bank's own
+end. `crates/waymaker-rig/tests/matrix.rs`'s `drive_rollover_swap` drives §10's seven
+steps directly against the bank the partial run left off in, the same way
+`crates/waymaker-fault/tests/swap.rs` drives them for the model; the whole sequence — the
+partial run, the swap, and a small complete run written into the bank it installs — runs
+through the crash injector once, and every point is classified by `bank::select`'s answer
+alone. A swap declares no journal record and marks no witness, so there is nothing else a
+row-7-or-8 point could be read from. Where the point lands *before* the swap's own
+operations began, it is one of rows 1 to 6 already, not a new one — `classify_rollover`
+reads the operation index against a boundary taken from a separate fault-free run of just
+the partial sequence, so the two counts stay apart.
+
+Rows 9 and 10 are driven rather than swept, matching the model half's own treatment of the
+same two rows: a capacity refusal and a declared-workflow mismatch are not media crashes the
+injector produces. `Rig::iterate_reserved` and `Rig::resume_reserved` gate every append with
+`waymaker_flash::capacity::Reserve` instead of the ungated writer, and a search over
+declared tail widths on the rig's own fixture finds one that refuses the second effect's
+schedule once the first has completed — the same shape of search `waymaker-drive`'s row nine
+already uses, run here against a real bound instead of a real geometry, because this rig's
+own construction-time check already prices every record at its worst case and only a
+reserve stricter than that check can refuse before the run's true end. The explicit exit
+past it is the same seven-step swap rows 7 and 8 drive, run once by hand rather than swept.
+`Workload::diverging` is row 10's whole addition: an index and a different activity kind at
+it, leaving the run's shape, its identity and every other record's bytes exactly as they
+were, so `Rig::resume_declaring` meets a genuine one-record disagreement rather than a
+shortened or corrupted run — and refuses it with `Breach::RecordDiffers`, before any effect
+runs again and before any byte is written, at every crash point that leaves the changed
+effect's schedule recovered and its completion outstanding.
+
+What is owed is written down rather than implied closed. The two bank rows are swept at one
+`effects_before_swap` value and one declared next-run input; `waymaker-fault`'s own swap
+sweep is the one that varies the geometry and the step at which every crash lands. Row 9's
+search is over declared bounds rather than over geometries, so it says nothing about a bank
+sized differently than the rig's shared fixture. And issue #96's board half — rows 2, 3 and
+4 need the dispatcher's own record of what it was entered for, which a reset takes with the
+RAM — is exactly as unmet as it was before this issue, and stays a board's to close.
+
+Review of the pull request that closed issue #96 found two more real defects, both the same
+shape as `Rig::authority`'s own fix: an instrument reading a state issue #96 made reachable
+for the first time and answering the question it was never asked to answer. The first is in
+row 9's own no-mutation claim: `iterate_reserved` and `resume_reserved` wrote the witness's
+`Attempted` mark for a record *before* asking `Reserve::admits` whether that record would fit
+— so the very first encounter with a near-capacity refusal genuinely mutated the device's
+instrument region, even though `Reserved::stage` itself never touched the journal. The
+existing test could not see it: a *replay*'s witness continuation skips a mark the first
+attempt already wrote, so `assert_replay_refuses_without_mutation`'s wear comparison compared
+two states that were already equal for the wrong reason. A free `admits` function — the same
+`Reserve::admits` call `Reserved::stage` makes internally, read one call earlier — closes it;
+`the_first_capacity_refusal_writes_no_mark_of_its_own` compares the first refusal's rig-only
+wear against a device that legitimately stops after the same one-effect prefix and never
+meets a refusal at all, verified failing against the prior order (one extra program operation
+and barrier — the mark) before the fix landed.
+
+The second is `Rig::judge` itself, and it is the sharper of the two: gating the audit on
+*current* authority, the way `Rig::resume` correctly must, made a row-8 rollover's own
+retired bank read as though its acknowledged records had gone missing, because `uninstalled`
+assumes a bank with no current authority has nothing to say about this run rather than that
+it said something and was superseded. `installed_journal` stays authority-gated for
+`resume` and `recover_prefix`, which do need to know whether a bank is still the one a boot
+would choose; `judge` moves to a new `own_bank_journal`, which reads `Rig::BANK`'s own header
+by run id alone and audits what it holds regardless of which bank is authoritative now — a
+retired bank's own history does not change when a swap moves authority away from it.
+The row 8 test now asserts `rig.verify(0, ..)` reports `Outcome::Passed` at every one of its
+crash points, beside the assertion that `resume` refuses them; verified failing with
+`Breached(LostAcknowledgedRecord { .. })` against the prior single check before this split
+existed.
+
+A further round found two more, again the shape of an instrument answering a question the
+previous round made reachable for the first time. The first is in the pair of fixes above:
+`Rig::new` sizes the bank and the witness for `self.effects` alone, and `resume_declaring`'s
+`declared` can share this rig's seed and iteration — so it matches the recovered prefix —
+while naming more effects than either was ever provisioned for. Left as the earlier round
+left it, that call ran past its own provisioning until an unrelated capacity error
+(`AppendError::NoRoom`, `WitnessError::Full`) stopped it, rather than the refusal-before-
+mutation `resume`'s own postcondition promises. `resume_as` now refuses any workload wider
+than `self.effects` before touching the device at all, ahead of the recovery this rig's own
+authority check already gates on. Reproduced first from the same crash point the earlier
+round used — both of the rig's own effects durably completed, `RunCompleted` not yet begun —
+where the prior code durably appended and dispatched the extra effect's schedule record
+before this refusal existed.
+
+The second found that `rollover_sweep`'s combined run never called `Installed::reclaim` at
+all: `Installed::recovery` and `Installed::reclaim` both consume the value `commit` returns,
+and the sweep took the former to keep writing into the bank it installed, so the crash
+injector never produced a point during the retiring bank's own erase or its barrier — even
+though row 8 held authoritative throughout that window exactly as it does after `commit`,
+and the row was published as fully swept regardless. `drive_rollover_swap` now reclaims
+first and re-derives the installed bank's journal region by hand — the same read
+`iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past` already does —
+so the erase is under the injector and the caller still gets a writer for the bank it
+installed. Row 8's own count moved from 167 to 175 crash points, the eight new ones all
+inside the erase and its barrier; row 7's count did not move, because reclaiming the
+retiring bank can only ever lose it `bank::select`'s vote, never regain it ahead of the
+bank the swap already installed.
+
+A further round found a fourth, in `require_own_authority` itself: it names the *bank* —
+`Rig::BANK` must be the current sole authority — and never the *run*, so a bank that is
+this rig's own and currently authoritative could still have been installed for a different
+iteration, and `iterate`, `iterate_until_rollover` and `iterate_reserved` would each write
+that iteration's records and witness marks into the wrong iteration's journal rather than
+refuse. `journal_region` — the write path's own twin of the run-id check
+`installed_journal` already holds `resume` and `recover_prefix` to — now takes the
+workload it means to write and refuses unless the bank's header names that workload's own
+run. Reproduced first by preparing a part for iteration 0 and calling `iterate(1, ..)` on
+it directly: the unfixed code answered `Ok(Stop::Completed)`, having written iteration 1's
+records and marks over iteration 0's bank, rather than `RigError::Bank`. Two existing tests
+had built their own fixtures by relying on exactly that gap — one in `resume`'s own test
+suite, one in the rig's crash-sweep judge test — and both now reach the same device states
+through the lower-level primitives `Rig` itself writes with, rather than through the write
+path this fix closes.
+
+A fifth was `resume_declaring` itself. `recover_prefix`'s audit only compares `declared`
+against what recovery actually found, so a crash landing before
+[`Workload::diverging`](crate::workload::Workload::diverging)'s own changed index left
+nothing there for the audit to disagree with — `resume_as`'s loop then wrote the declared,
+diverged record fresh and dispatched it, same as any other never-before-recorded record.
+The fix widens what a fresh write is checked against: a record `resume_as` is about to
+write for the first time must now agree with this rig's own undiverged truth —
+`self.workload(iteration)` — before it is marked, appended or dispatched, not only with
+whatever recovery happened to find. For an ordinary `resume` the two are the same workload
+and the check never fires; `resume_declaring`'s `declared` is where it can differ.
+Reproduced first from a crash point that left the first effect durably completed and the
+second effect's schedule — the record `diverging` changes — not yet recovered at all: the
+unfixed code answered `Ok(Completed { recovered: 3, .. })`, having written and dispatched
+the diverged record, rather than `RigError::Breach(Breach::RecordDiffers { .. })` before
+either happened.
+
+A sixth was the capacity preflight's own other half: it refused a `declared` *wider* than
+`self.effects` but let a *narrower* one through. A narrower run's opening effects are a
+byte-for-byte prefix of a longer one's, so its early records still agree with this rig's
+own truth and the per-record check above does not fire — the mutation and the dispatch it
+exists to prevent both happen for every record before the declaration's own early
+`RunCompleted` finally collides with an index the real run still has open. The preflight
+now refuses any effect count other than `self.effects`, not only a wider one:
+`resume_declaring` only ever means to audit a workload that agrees with this rig's own run
+everywhere but the one record `diverging` names, and a workload of another length is not
+that shape. Reproduced first from a crash point that left only `RunStarted` durable and a
+narrower declared workload: the unfixed code dispatched the first effect and only then
+answered `Breach::RecordDiffers` at the index where the shapes finally disagreed.
+
+A seventh was the per-record check's own placement, in the same shape once more: it ran
+*inside* the write loop, so a record that genuinely agreed with this rig's own truth was
+still written — and dispatched, if it scheduled an effect — before the loop reached
+whichever later index `declared` actually disagreed at. Row 10's own promise, "no further
+execution and history untouched", is about the whole declaration, not only the one record
+that turns out to disagree. The check now runs once, over every record this resume would
+still need to write, before the outstanding-effect redelivery or the write loop touch
+anything — so a disagreement anywhere in what is left of the run refuses before the first
+agreeing record in front of it is touched, not only before the disagreeing one itself.
+Reproduced first from a crash point that left only `RunStarted` durable, with a `declared`
+diverging at the *second* effect: the unfixed code dispatched the first effect — which
+agreed with `declared` — before reaching the second and refusing there.
+
+An eighth returned to row 9, and it is the same shape once more, in `iterate_reserved` and
+`resume_reserved` rather than in `resume_declaring`: `admits` is checked for the record
+about to be written and nothing else, so a schedule that fits a reserve whose
+`effect_result_bytes` is too narrow for the completion still gets marked, appended and
+dispatched — the effect runs — before the loop reaches the completion's own index and
+discovers `Refusal::OverDeclaredBound` there. By then refusing cannot undo the dispatch,
+and every retry through `resume_reserved` performs the effect again. A schedule's own
+width does not depend on `effect_result_bytes`, so the schedule's admission is never
+evidence that its completion's will follow. Both fresh-write loops now preflight the
+completion `Workload::completion_index` names, admitting it against the same reserve
+before the schedule's effect is dispatched — the same shape the redelivery branch above
+each loop already carried for an *outstanding* effect, extended to a schedule written
+fresh in the same call. Reproduced first with a zero-width `effect_result_bytes` reserve
+against a freshly prepared device: `iterate_reserved` dispatched effect 0 and only then
+answered `Refusal::OverDeclaredBound` at its completion's index, and `resume_reserved`
+did the same from a device recovered no further than `RunStarted`, where the main loop
+rather than the redelivery branch reaches the fresh schedule.
+
+A ninth, and a different shape from every one before it: `Workload::diverging` took a raw
+record index rather than an effect number, and `record`'s only consultation of it is in
+the `Role::Schedule` arm — so a caller who passed the index of a `Start`, `Completion` or
+`Finish` record, or one past the end of the run, got back a workload that agreed with the
+base one everywhere, byte for byte, rather than diverging at all. That is the same
+silent-masking shape every earlier finding in this issue closed against a media state;
+here the wrong input is a caller's own argument, and the fix is the same kind wrong-role
+arguments elsewhere in this codebase are refused by construction: `diverging` now takes
+the effect whose schedule diverges and derives the record index itself through
+`schedule_index`, so a `Start`, `Completion` or `Finish` index cannot be named through
+this API at all. An effect this run does not schedule still diverges nothing — honestly,
+since there is no schedule record for it to disagree at, which `schedule_index` already
+answers `None` for. Reproduced first against the old signature: `.diverging(0)` — record
+index 0, `Role::Start` — produced a workload indistinguishable from the base one across
+every record, and every existing caller turned out to have already been deriving the
+right index through `schedule_index` before calling it, so none needed anything but the
+one call site simplified to the effect number it was computing a schedule index from.
+
+A tenth returned to round 7's write-path check, and it is one identity narrower than the
+round it followed: `journal_region` compared `header.run` against the workload's own run
+id and stopped there, so a bank whose header names the right run but a different
+`workflow_kind` or `input` still passed. A run id agreeing is not the whole of a
+workflow's identity — a real boot (`crates/waymaker-drive/src/drive.rs`) refuses a
+recorded kind or input that disagrees with the one it expected — and nothing stops the
+public swap surface installing a header that reuses a run id under a different declared
+identity, since `SwapError::RunReused` only compares the *next* run against the
+*retiring* one. `journal_region` now also compares the header's `workflow_kind`,
+`workflow_version` and `input` against `workload`'s own opening record before handing
+back a region to write into. Reproduced first with two real swaps rather than a
+hand-fabricated header — a single swap moves authority to the *other* bank and would
+refuse earlier, at `require_own_authority`, for an unrelated reason: the first retires a
+freshly prepared run onto the other bank under a throwaway identity, and the second
+retires that throwaway run back onto `Rig::BANK` naming one iteration's own run id but
+another iteration's workflow input. The unfixed code answered `Ok(Completed)`, having
+written and dispatched into the mismatched bank, before this check existed.
+
+An eleventh found the read path's own twin of the ninth's gap: `resume_as`'s preflight
+compared `workload.effects()` against `self.effects`, but never `workload`'s own run
+against the run `iteration` names. Two iterations of one plan share an effect count by
+construction, so a `declared` sharing this rig's seed and *another* iteration's number
+passes that check while still naming a bank installed for a different run.
+`recover_prefix`'s audit then checks `declared` against the bank's own header, which
+agrees — `declared` genuinely is that other iteration's own workload — and once the
+recovered prefix already covers the whole run, the `recovered >= records` branch answers
+`Completed` before the per-record comparison against `self.workload(iteration)` is ever
+reached: a run belonging to iteration 0 is reported as iteration 1's. `resume_as` now
+also refuses unless `workload.run()` agrees with `self.workload(iteration).run()`, before
+recovery is read at all. Reproduced first by completing iteration 0 with no cut anywhere,
+then calling `resume_declaring(1, rig.workload(0), ..)` on the same device: the unfixed
+code answered `Ok(Completed { recovered: 6, .. })`, reporting iteration 0's own history as
+iteration 1's, rather than refusing with `RigError::Workload`.
+
+A twelfth found the eleventh's own fix unsound: comparing `Workload::run` is comparing a
+hash, and `RunId` is `SplitMix64::new(seed).at(iteration)` — `mix(seed + GAMMA *
+(iteration + 1))`, injective in the mixed word but not in the *pair* the word is built
+from. `seed` plus `GAMMA` at iteration zero sums to the same word as plain `seed` at
+iteration one, so a device whose real history was written by a wholly different rig —
+seeded `SEED` plus `GAMMA` rather than this rig's own `SEED` — at iteration zero satisfies
+both the eleventh's check and `own_bank_journal`'s header comparison for a
+`resume_declaring(1, ..)` call on the genuine rig: the header truly names the colliding
+run, and so does the declaration. `resume_as` now compares the seed and the iteration
+directly against this rig's own plan and the `iteration` argument, rather than routing the
+comparison through a hash nothing ever claimed was injective over two arguments at once.
+Reproduced first with two rigs sharing a geometry and differing only by that one seed
+offset: the foreign rig wrote a complete run at its own iteration zero, and the genuine
+rig's `resume_declaring(1, ..)` over that same device answered `Ok(Completed { recovered:
+6, .. })` under the eleventh's fix alone, never having written a byte to the device it
+just reported completing.

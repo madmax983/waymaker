@@ -9,21 +9,24 @@
 //!
 //! # What the rig can reach
 //!
-//! Six rows: the schedule, dispatch and completion rows a rig that cuts during those three
-//! writes can land in. Rows 7 to 10 need a swap workload, a capacity refusal and a divergent
-//! replay, and this rig has none of them — issue
-//! [#96](https://github.com/madmax983/waymaker/issues/96).
-//! [`the_rig_fills_six_rows_and_names_the_seventh_as_its_gap`] pins that: [`Matrix::verdict`]
-//! must refuse, naming the first bank row. A census that passed here would be a census of six
-//! cells wearing ten names.
+//! All ten rows. Issue [#96](https://github.com/madmax983/waymaker/issues/96) closed the
+//! four this rig used to owe. Six come from the ordinary crash injector: the schedule,
+//! dispatch and completion rows a rig that cuts during those three writes can land in.
+//! Two more come from a swap workload: [`rollover_sweep`] runs a run that rolls over
+//! mid-way, through the same injector, and classifies each crash point by which bank
+//! [`bank::select`] names afterward. The last two are driven rather than swept —
+//! [`row_nine`] and [`row_ten`] each build one crash point by hand, because a capacity
+//! refusal and a declared-workflow mismatch are not media crashes the injector produces.
+//! [`every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned`] pins all ten
+//! counts, so a sweep that quietly thinned fails closed.
 //!
 //! # How a row is read off a run
 //!
-//! From the witness, the recovered count and the journal's ending — all of which a board
-//! has after a reset — plus one thing only the harness has: whether the dispatcher was
-//! entered, and whether it returned. A `Dispatched` mark is written *before* the effect, so
-//! a mark is not evidence of a dispatch; `tests/sweep.rs` says why. Rows 2, 3 and 4 rest on
-//! that evidence, and a board cannot supply it — issue #96 again.
+//! For the six effect rows: from the witness, the recovered count and the journal's
+//! ending — all of which a board has after a reset — plus one thing only the harness
+//! has: whether the dispatcher was entered, and whether it returned. A `Dispatched` mark
+//! is written *before* the effect, so a mark is not evidence of a dispatch; `tests/sweep.rs`
+//! says why. Rows 2, 3 and 4 rest on that evidence, and a board cannot supply it.
 //!
 //! Row 3 is not a crash point of the injector: it is a run whose dispatcher is entered and
 //! does not return, which is the supply going during the effect as the rig sees it. It is
@@ -32,23 +35,34 @@
 //! Row 6 is decided by what recovery produced, so a completion seal that landed whole with
 //! its barrier refused is in it beside the points that are strictly after the barrier; the
 //! model half says the same of rows 2 and 6.
+//!
+//! For the two bank rows: a swap writes no journal record and marks no witness, so there
+//! is no mark to read. [`bank::select`]'s own answer is the whole of it — the old bank
+//! authoritative is row 7, the new bank authoritative is row 8, and nothing else about a
+//! crash point during the swap's own operations needs to be asked.
 
 use std::cell::RefCell;
 
+use waymaker_core::{ActivityKind, EffectSeq, RecordRef};
 use waymaker_fault::{Device, FaultError, Harness, Injection, Interruption, Op, Progress, Run};
+use waymaker_flash::append::Journal;
 use waymaker_flash::bank;
+use waymaker_flash::capacity::{Bounds, Refusal, Reserve};
+use waymaker_flash::frame::input_digest;
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery};
 use waymaker_flash::storage::{Geometry, StableStorage};
+use waymaker_flash::swap::{Installed, Retired, Swap};
 use waymaker_rig::audit::Breach;
-use waymaker_rig::cutter::{Dispatcher, NeverCut};
+use waymaker_rig::cutter::{Dispatcher, NeverCut, PlannedCut};
 use waymaker_rig::log::Outcome;
 use waymaker_rig::matrix::{Matrix, Row};
+use waymaker_rig::phase::Phase;
 use waymaker_rig::plan::Plan;
-use waymaker_rig::run::{Resumed, Rig, RigError, Verdict};
+use waymaker_rig::run::{Resumed, Rig, RigError, Stop, Verdict};
 use waymaker_rig::wear::Metered;
 use waymaker_rig::window::Window;
-use waymaker_rig::witness::{Progress as Marks, Witness, WitnessError};
-use waymaker_rig::workload::Role;
+use waymaker_rig::witness::{Mark, Progress as Marks, Stage, Witness, WitnessError};
+use waymaker_rig::workload::{Role, Workload};
 
 const SEED: u64 = 0x0031_0031_0031_0031;
 const EFFECTS: u16 = 2;
@@ -136,8 +150,8 @@ fn ending_on(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Option<Ending> 
     engine.read(region.base(), page.get_mut(..want)?).ok()?;
     let header = bank::decode_header(page.get(..want)?).ok()?;
     let journal = JournalRegion::of(layout, Rig::BANK, &header).ok()?;
-    let mut recovery = Recovery::new(journal);
-    while let Some(step) = recovery.next(&mut engine, page) {
+    let mut recovery = Recovery::new(journal, &mut engine);
+    while let Some(step) = recovery.next(page) {
         if step.is_err() {
             break;
         }
@@ -549,16 +563,883 @@ fn after_completion_barrier_the_completion_is_replayed_and_the_activity_never_ru
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Rows 7 and 8: the bank swap
+// ---------------------------------------------------------------------------------------
+
+/// How many effects the retiring run completes before it rolls over. Strictly less than
+/// `EFFECTS`, so the swap replaces a run that still had an effect left to schedule rather
+/// than one that had already reached its own end.
+const ROLLOVER_EFFECTS_BEFORE: u16 = EFFECTS - 1;
+
+/// The input for the run a swap installs. The bank header names it, and the installed
+/// bank's own `RunStarted` record names it too — the same bytes in both places, as a real
+/// writer would write them.
+const NEXT_RUN_INPUT: &[u8; 1] = b"n";
+
+/// The header the swap installs: a fresh run id, distinct from the retiring one.
+const fn rollover_next_header(rig: &Rig) -> bank::BankHeader<'static> {
+    bank::BankHeader {
+        run: waymaker_core::RunId(rig.workload(0).run().0 ^ 1),
+        align: rig.layout().align(),
+        workflow_kind: Workload::WORKFLOW_KIND,
+        workflow_version: Workload::WORKFLOW_VERSION,
+        input_schema: 0,
+        input: NEXT_RUN_INPUT,
+    }
+}
+
+/// Writes the retiring run's opening records: `RunStarted` and
+/// [`ROLLOVER_EFFECTS_BEFORE`] schedule/completion pairs, stopping there.
+fn drive_rollover_prefix(session: &mut waymaker_fault::Session) -> Result<(), String> {
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut dispatcher = Log::default();
+    let mut metered = Metered::new(session);
+    rig.prepare(&mut metered, 0, &mut page)
+        .map_err(|error| format!("prepare: {error:?}"))?;
+    rig.iterate_until_rollover(
+        0,
+        &mut metered,
+        &mut dispatcher,
+        &mut page,
+        ROLLOVER_EFFECTS_BEFORE,
+    )
+    .map_err(|error| format!("iterate_until_rollover: {error:?}"))
+}
+
+/// §10's seven-step swap from the retiring bank into the other one, driven directly the
+/// way [`row_nine`]'s explicit exit is — all seven steps, [`Installed::reclaim`] included.
+/// Returns the engine window and the installed bank's journal, positioned after whatever
+/// [`Journal::after`] found there. The window still borrows `session`, so the caller can
+/// keep writing into the bank it installed.
+///
+/// Review found this stopping at step 6, because [`Installed::recovery`] and
+/// [`Installed::reclaim`] both consume the value `commit` returns and a caller can only
+/// take one — so the crash injector never produced a point during the retiring bank's own
+/// erase or its barrier, even though row 8 held authoritative throughout it exactly as it
+/// does after `commit`. Reclaiming first and then re-deriving the installed bank's journal
+/// region by hand — the same read [`iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past`]
+/// already does — gets both: the erase is under the injector, and the caller still gets a
+/// writer for the bank it installed.
+///
+/// [`Installed::recovery`]: waymaker_flash::swap::Installed::recovery
+/// [`Installed::reclaim`]: waymaker_flash::swap::Installed::reclaim
+fn drive_rollover_swap(
+    session: &mut waymaker_fault::Session,
+) -> Result<(Window<'_, waymaker_fault::Session>, Journal), String> {
+    let rig = rig();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next = rollover_next_header(&rig);
+    let Ok(mut engine) = Window::new(session, 0, layout.geometry().capacity()) else {
+        return Err("engine window".to_string());
+    };
+    let region = try_bank_region(&rig, Rig::BANK, &mut engine, &mut page)?;
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(&mut page) {
+        step.map_err(|error| format!("recovery: {error:?}"))?;
+    }
+    let swap = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    )
+    .map_err(|error| format!("swap plan: {error:?}"))?;
+    let prepared = swap
+        .prepare(&mut engine)
+        .map_err(|error| format!("swap prepare: {error:?}"))?;
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let staged = prepared
+        .stage(&mut header_page)
+        .map_err(|error| format!("swap stage: {error:?}"))?;
+    let sealable = staged
+        .payload_barrier()
+        .map_err(|error| format!("swap barrier: {error:?}"))?;
+    let installed = sealable
+        .commit()
+        .map_err(|error| format!("swap commit: {error:?}"))?;
+    installed
+        .reclaim()
+        .map_err(|error| format!("swap reclaim: {error:?}"))?;
+    let new_region = try_bank_region(&rig, Rig::BANK.other(), &mut engine, &mut page)?;
+    let mut new_recovery = Recovery::new(new_region, &mut engine);
+    while let Some(step) = new_recovery.next(&mut page) {
+        step.map_err(|error| format!("new recovery: {error:?}"))?;
+    }
+    let Some(new_journal) = Journal::after(new_recovery) else {
+        return Err("new journal not extendable".to_string());
+    };
+    Ok((engine, new_journal))
+}
+
+/// The whole combined run: the retiring prefix, the swap, and a small complete run
+/// written into the bank it installs.
+fn drive_rollover(session: &mut waymaker_fault::Session) -> Result<(), String> {
+    drive_rollover_prefix(session)?;
+    let (mut engine, mut new_journal) = drive_rollover_swap(session)?;
+    try_write_tiny_run(&mut engine, &mut new_journal)?;
+    Ok(())
+}
+
+/// The tiny run [`write_tiny_run`] writes, as records, in order.
+const fn tiny_run_records(input: &[u8; 1]) -> [RecordRef<'_>; 4] {
+    [
+        RecordRef::RunStarted {
+            workflow_kind: Workload::WORKFLOW_KIND,
+            workflow_version: Workload::WORKFLOW_VERSION,
+            input,
+        },
+        RecordRef::EffectScheduled {
+            seq: EffectSeq(0),
+            kind: ActivityKind(1),
+            input_len: 1,
+            input_crc: input_digest(input),
+        },
+        RecordRef::EffectCompleted {
+            seq: EffectSeq(0),
+            result: b"ok",
+        },
+        RecordRef::RunCompleted { result: b"done" },
+    ]
+}
+
+/// Continues [`write_tiny_run`]'s run from whatever prefix `recovered` already covers.
+/// Returns the effects dispatched by this call.
+fn continue_tiny_run<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+    recovered: u16,
+) -> Vec<u16>
+where
+    S::Error: core::fmt::Debug,
+{
+    let input = NEXT_RUN_INPUT;
+    let records = tiny_run_records(input);
+    let mut dispatcher = Log::default();
+
+    // The schedule (index 1) is durable and its completion (index 2) is not: the effect
+    // is outstanding, and it is redelivered under the same index before anything else is
+    // written — the redelivery `resume_as` requires of a real resume. Without this, the
+    // loop below would skip both the write *and* the dispatch at index 1 and go straight
+    // to writing the completion at index 2, reporting an effect as done that this call
+    // never ran.
+    if recovered == 2 {
+        let Ok(()) = dispatcher.dispatch(0, input) else {
+            unreachable!("the new run's own dispatcher accepts effect 0")
+        };
+    }
+
+    for (index, record) in records.iter().enumerate() {
+        let Ok(index) = u16::try_from(index) else {
+            unreachable!("four records index in a u16")
+        };
+        if index < recovered {
+            continue;
+        }
+        write_record(engine, journal, record);
+        if index == 1 {
+            let Ok(()) = dispatcher.dispatch(0, input) else {
+                unreachable!("the new run's own dispatcher accepts effect 0")
+            };
+        }
+    }
+    dispatcher.entered
+}
+
+/// Which bank is authoritative, read the way [`Rig::verify`] reads it.
+fn authority_of(rig: &Rig, device: &mut Device, page: &mut [u8]) -> bank::Authority {
+    let layout = rig.layout();
+    let Ok(mut engine) = Window::new(device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut generations = [None, None];
+    for (slot, id) in generations
+        .iter_mut()
+        .zip([bank::BankId::A, bank::BankId::B])
+    {
+        let region = layout.bank(id);
+        let Some(want) = usize::try_from(region.payload_bytes())
+            .ok()
+            .map(|want| want.min(page.len()))
+        else {
+            unreachable!("a header fits a page")
+        };
+        let Some(header_slot) = page.get_mut(..want) else {
+            unreachable!("a header fits a page")
+        };
+        let Ok(()) = engine.read(region.base(), header_slot) else {
+            unreachable!("a readable bank")
+        };
+        let mut seal = [0_u8; Rig::MAX_PROGRAM_BYTES as usize];
+        let Ok(seal_len) = usize::try_from(region.seal_bytes()) else {
+            unreachable!("a seal fits its own width")
+        };
+        let Some(seal_slot) = seal.get_mut(..seal_len) else {
+            unreachable!("a seal fits its own width")
+        };
+        let Ok(()) = engine.read(region.seal_offset(), seal_slot) else {
+            unreachable!("a readable seal")
+        };
+        let Some(header_bytes) = page.get(..want) else {
+            unreachable!("a header fits a page")
+        };
+        *slot = bank::sealed_generation(header_bytes, seal_slot);
+    }
+    bank::select(generations)
+}
+
+/// Which row a crash point of the combined sequence is an instance of, or `None` for a
+/// point before the swap's own operations began — rows 1 to 6 already cover those.
+fn classify_rollover(
+    injection: Injection,
+    swap_start: usize,
+    rig: &Rig,
+    device: &mut Device,
+    page: &mut [u8],
+) -> Option<Row> {
+    if injection.op < swap_start {
+        return None;
+    }
+    match authority_of(rig, device, page) {
+        bank::Authority::Bank { id, .. } if id == Rig::BANK => {
+            Some(Row::DuringInactiveBankEraseOrWrite)
+        }
+        bank::Authority::Bank { .. } => Some(Row::AfterNewBankSealBarrier),
+        bank::Authority::Unsealed | bank::Authority::Ambiguous { .. } => {
+            unreachable!(
+                "the installed bank's own seal is untouched by reclaiming the retiring one, \
+                 so exactly one bank is always a candidate even while that erase is under way"
+            )
+        }
+    }
+}
+
+/// Every crash point of the combined run, classified into row 7 or row 8.
+fn rollover_sweep() -> Vec<(Injection, Row)> {
+    let rig = rig();
+    let geometry = geometry();
+    let harness = Harness::new(geometry);
+
+    let Ok(prefix_only) = harness.run_fault_free(drive_rollover_prefix) else {
+        unreachable!("the rollover prefix completes fault-free")
+    };
+    let swap_start = prefix_only.ops().len();
+
+    let Ok(runs) = harness.run(|session| drive_rollover(session).map_err(|_| ())) else {
+        unreachable!("the fault-free rollover completes")
+    };
+    let mut points = Vec::new();
+    for run in &runs {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut device = device_after(run);
+        if let Some(row) = classify_rollover(injection, swap_start, &rig, &mut device, &mut page) {
+            points.push((injection, row));
+        }
+    }
+    points
+}
+
 #[test]
-fn the_rig_fills_six_rows_and_names_the_seventh_as_its_gap() {
-    // The honest shape of this rig: six effect rows reached, and a verdict that refuses
-    // rather than a census that stops at six. Rows 7 to 10 are owed — see
-    // `xtask::docs::FAILURE_ROWS` and issue #96.
+fn during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues_on_the_rig()
+ {
+    let retiring: Vec<Injection> = rollover_sweep()
+        .into_iter()
+        .filter_map(|(injection, row)| {
+            (row == Row::DuringInactiveBankEraseOrWrite).then_some(injection)
+        })
+        .collect();
+    assert!(
+        !retiring.is_empty(),
+        "no crash point left the retiring bank authoritative"
+    );
+    let rig = rig();
+    for injection in retiring {
+        let Ok(cut) = Harness::new(geometry())
+            .run_one(injection, |session| drive_rollover(session).map_err(|_| ()))
+        else {
+            unreachable!("a deterministic crash point, at {injection:?}")
+        };
+        let mut device = device_after(&cut);
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+            unreachable!("a judgeable part, at {injection:?}")
+        };
+        assert_eq!(
+            verdict.outcome(),
+            Outcome::Passed,
+            "the retiring bank's own history is intact, at {injection:?}"
+        );
+        let mut metered = Metered::new(&mut device);
+        let mut dispatcher = Log::default();
+        let resumed = rig.resume(0, &mut metered, &mut dispatcher, &mut page);
+        assert!(
+            matches!(resumed, Ok(Resumed::Completed { .. })),
+            "the old run continues, at {injection:?}: {resumed:?}"
+        );
+    }
+}
+
+#[test]
+fn after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current_again_on_the_rig()
+ {
+    let installed: Vec<Injection> = rollover_sweep()
+        .into_iter()
+        .filter_map(|(injection, row)| (row == Row::AfterNewBankSealBarrier).then_some(injection))
+        .collect();
+    assert!(
+        !installed.is_empty(),
+        "no crash point left the new bank authoritative"
+    );
+    let rig = rig();
+    for injection in installed {
+        let Ok(cut) = Harness::new(geometry())
+            .run_one(injection, |session| drive_rollover(session).map_err(|_| ()))
+        else {
+            unreachable!("a deterministic crash point, at {injection:?}")
+        };
+        let mut device = device_after(&cut);
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+
+        // The old run is never current again: it is not this rig's authoritative bank.
+        {
+            let mut metered = Metered::new(&mut device);
+            let mut dispatcher = Log::default();
+            let resumed = rig.resume(0, &mut metered, &mut dispatcher, &mut page);
+            assert!(
+                matches!(resumed, Err(RigError::Bank)),
+                "the retiring run answered as current, at {injection:?}: {resumed:?}"
+            );
+        }
+
+        // Retired is not lost: the old bank's own witness-claimed history is still exactly
+        // what it was before the swap, and `verify` must say so rather than reading "not
+        // current any more" as "records went missing".
+        {
+            let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+                unreachable!("a judgeable part, at {injection:?}")
+            };
+            assert_eq!(
+                verdict.outcome(),
+                Outcome::Passed,
+                "the retired bank's own history was reported lost, at {injection:?}"
+            );
+        }
+
+        // The new bank is authoritative. Where its own journal still has an append point
+        // — every case but a torn first frame, which ADR 0018 refuses rather than
+        // repairs, the same as any other bank — it starts and does work.
+        let layout = rig.layout();
+        let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+            unreachable!("the engine window")
+        };
+        let region = bank_region(&rig, Rig::BANK.other(), &mut engine, &mut page);
+        let mut recovery = Recovery::new(region, &mut engine);
+        let mut recovered = 0_u16;
+        while let Some(step) = recovery.next(&mut page) {
+            match step {
+                Ok(_) => recovered = recovered.saturating_add(1),
+                Err(_) => break,
+            }
+        }
+        if let Some(mut journal) = Journal::after(recovery) {
+            let ran = continue_tiny_run(&mut engine, &mut journal, recovered);
+            // Below `recovered == 3` the effect's completion is not yet durable, so this
+            // call owes it a dispatch — either fresh or redelivered. At `recovered >= 3`
+            // the completion already landed in an earlier attempt, and this call owes it
+            // nothing: an empty `ran` there is correct, not vacuous.
+            assert!(
+                recovered >= 3 || !ran.is_empty(),
+                "the new run's effect was never dispatched, at {injection:?} \
+                 (recovered={recovered})"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Row 9: history capacity reached
+// ---------------------------------------------------------------------------------------
+
+/// §10's exits, priced for a run whose records are at most
+/// [`Workload::MAX_PAYLOAD_BYTES`] wide. `tail` covers the outcome and terminal record.
+/// This bound is wider than any real record. The reserve never spends the room on a real
+/// payload — only on its own floor.
+// Guards the literal `bounds` uses below: a `usize as u16` cast cannot prove at compile
+// time that it fits, so the width is asserted here instead of cast there.
+const _: () = assert!(Workload::MAX_PAYLOAD_BYTES == 16);
+
+const fn bounds(tail: u16) -> Bounds {
+    Bounds {
+        run_input_bytes: 16,
+        effect_result_bytes: tail,
+        terminal_bytes: tail,
+    }
+}
+
+/// A declared tail wide enough that the reserve refuses the second effect's schedule once
+/// the first effect has completed, on the rig's own standard fixture.
+///
+/// This searches for the value rather than hard-coding one. The number comes from the
+/// reserve's own arithmetic on real records, not from a figure copied out of a passing run.
+fn near_capacity() -> (Rig, Reserve, Device) {
+    for tail in [
+        32_u16, 48, 64, 96, 128, 160, 192, 224, 256, 300, 350, 400, 450, 500,
+    ] {
+        let rig = rig();
+        let Ok(reserve) = Reserve::for_layout(bounds(tail), rig.layout()) else {
+            continue;
+        };
+        let mut device = Device::new(geometry());
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let entered = {
+            let mut metered = Metered::new(&mut device);
+            if rig.prepare(&mut metered, 0, &mut page).is_err() {
+                continue;
+            }
+            let mut dispatcher = Log::default();
+            let outcome =
+                rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+            if !matches!(outcome, Err(RigError::Capacity(Refusal::NearCapacity))) {
+                continue;
+            }
+            dispatcher.entered
+        };
+        if entered == [0] {
+            return (rig, reserve, device);
+        }
+    }
+    unreachable!("no declared tail in the search fills after exactly one effect")
+}
+
+/// The refusal [`near_capacity`] finds writes no witness mark of its own for the record
+/// it refuses.
+///
+/// [`assert_replay_refuses_without_mutation`] cannot see this: it checks a *replay*, and a
+/// replay's witness continuation skips any mark the first attempt already wrote, which is
+/// exactly what would hide one written just before that attempt's own refusal. This
+/// compares the first attempt's rig-only wear against a device that legitimately stopped
+/// after the same one-effect prefix and never met a refusal at all — equal wear is the
+/// only way the refused record's mark was never programmed.
+#[test]
+fn the_first_capacity_refusal_writes_no_mark_of_its_own() {
+    let mut found = None;
+    for tail in [
+        32_u16, 48, 64, 96, 128, 160, 192, 224, 256, 300, 350, 400, 450, 500,
+    ] {
+        let rig = rig();
+        let Ok(reserve) = Reserve::for_layout(bounds(tail), rig.layout()) else {
+            continue;
+        };
+        let mut device = Device::new(geometry());
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let refused_rig_wear = {
+            let mut metered = Metered::new(&mut device);
+            if rig.prepare(&mut metered, 0, &mut page).is_err() {
+                continue;
+            }
+            let mut dispatcher = Log::default();
+            let outcome =
+                rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+            if !matches!(outcome, Err(RigError::Capacity(Refusal::NearCapacity))) {
+                continue;
+            }
+            if dispatcher.entered != [0] {
+                continue;
+            }
+            metered.rig_wear()
+        };
+        found = Some((rig, refused_rig_wear));
+        break;
+    }
+    let Some((rig, refused_rig_wear)) = found else {
+        unreachable!("no declared tail in the search fills after exactly one effect")
+    };
+
+    let mut clean = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let clean_rig_wear = {
+        let mut metered = Metered::new(&mut clean);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("the same fixture prepares")
+        };
+        let mut dispatcher = Log::default();
+        let Ok(()) = rig.iterate_until_rollover(0, &mut metered, &mut dispatcher, &mut page, 1)
+        else {
+            unreachable!("one full effect, driven without a reserve, does not refuse")
+        };
+        metered.rig_wear()
+    };
+
+    assert_eq!(
+        refused_rig_wear, clean_rig_wear,
+        "the refused record's own witness mark was written before the refusal"
+    );
+}
+
+/// `bank`'s journal region, read the way a boot reads it. Fails rather than panicking, for
+/// a caller driven by the crash injector — a read this close to a fault point can fail
+/// like any other storage call.
+fn try_bank_region<S: StableStorage>(
+    rig: &Rig,
+    bank: bank::BankId,
+    engine: &mut Window<'_, S>,
+    page: &mut [u8],
+) -> Result<JournalRegion, String> {
+    let layout = rig.layout();
+    let region = layout.bank(bank);
+    let Some(want) = usize::try_from(region.payload_bytes())
+        .ok()
+        .map(|want| want.min(page.len()))
+    else {
+        return Err("a header does not fit a page".to_string());
+    };
+    let Some(slot) = page.get_mut(..want) else {
+        return Err("a header does not fit a page".to_string());
+    };
+    engine
+        .read(region.base(), slot)
+        .map_err(|_| "bank read".to_string())?;
+    let Some(bytes) = page.get(..want) else {
+        return Err("a header does not fit a page".to_string());
+    };
+    let header = bank::decode_header(bytes).map_err(|_| "an unreadable bank header".to_string())?;
+    JournalRegion::of(layout, bank, &header).map_err(|error| format!("journal region: {error:?}"))
+}
+
+/// `bank`'s journal region, read the way a boot reads it.
+///
+/// For a caller inspecting a part the injector has already stopped: every read here is
+/// against media that is no longer changing, so a failure is a bug rather than a crash
+/// point. See [`try_bank_region`] for the fallible twin a live writer needs.
+fn bank_region<S: StableStorage>(
+    rig: &Rig,
+    bank: bank::BankId,
+    engine: &mut Window<'_, S>,
+    page: &mut [u8],
+) -> JournalRegion {
+    let Ok(region) = try_bank_region(rig, bank, engine, page) else {
+        unreachable!("a readable, already-crashed bank")
+    };
+    region
+}
+
+/// Bank A's journal region, read the way a boot reads it.
+fn bank_a_region(rig: &Rig, device: &mut Device, page: &mut [u8]) -> JournalRegion {
+    let Ok(mut engine) = Window::new(device, 0, rig.layout().geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    bank_region(rig, Rig::BANK, &mut engine, page)
+}
+
+/// Writes one record with §07's two-barrier protocol, the way [`Rig`] itself does. Fails
+/// rather than panicking, for a caller driven by the crash injector.
+fn try_write_record<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+    record: &RecordRef<'_>,
+) -> Result<(), String>
+where
+    S::Error: core::fmt::Debug,
+{
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let staged = journal
+        .stage(engine, record, &mut page)
+        .map_err(|error| format!("stage: {error:?}"))?;
+    let sealable = staged
+        .payload_barrier()
+        .map_err(|error| format!("payload barrier: {error:?}"))?;
+    sealable
+        .commit()
+        .map_err(|error| format!("commit: {error:?}"))?;
+    Ok(())
+}
+
+/// Writes one record with §07's two-barrier protocol, the way [`Rig`] itself does.
+///
+/// For a caller writing into an already-crashed, no-longer-injected device: every step
+/// here is fault-free, so a failure is a bug rather than a crash point. See
+/// [`try_write_record`] for the fallible twin a live writer needs.
+fn write_record<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+    record: &RecordRef<'_>,
+) where
+    S::Error: core::fmt::Debug,
+{
+    let Ok(()) = try_write_record(engine, journal, record) else {
+        unreachable!("a fault-free record write")
+    };
+}
+
+/// Replays the near-capacity run and requires the same refusal, having read, programmed
+/// and barriered nothing for it.
+fn assert_replay_refuses_without_mutation(
+    rig: &Rig,
+    reserve: Reserve,
+    device: &mut Device,
+    page: &mut [u8],
+) {
+    let mut metered = Metered::new(device);
+    let before = (metered.wear(), metered.rig_wear());
+    let mut dispatcher = Log::default();
+    let resumed = rig.resume_reserved(0, &mut metered, &mut dispatcher, reserve, page);
+    assert_eq!(
+        before,
+        (metered.wear(), metered.rig_wear()),
+        "the refusal touched the device"
+    );
+    assert!(
+        matches!(resumed, Err(RigError::Capacity(Refusal::NearCapacity))),
+        "{resumed:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the refused effect was dispatched again"
+    );
+}
+
+/// Writes one complete, one-effect run into `journal`: `RunStarted`, a schedule and
+/// completion for effect 0, and `RunCompleted`. Fails rather than panicking, for a caller
+/// driven by the crash injector. Returns the effects it dispatched.
+fn try_write_tiny_run<S: StableStorage>(
+    engine: &mut Window<'_, S>,
+    journal: &mut Journal,
+) -> Result<Vec<u16>, String>
+where
+    S::Error: core::fmt::Debug,
+{
+    let input = NEXT_RUN_INPUT;
+    let records = tiny_run_records(input);
+    let mut dispatcher = Log::default();
+    for (index, record) in records.iter().enumerate() {
+        try_write_record(engine, journal, record)?;
+        if index == 1 {
+            dispatcher
+                .dispatch(0, input)
+                .map_err(|error| format!("dispatch: {error:?}"))?;
+        }
+    }
+    Ok(dispatcher.entered)
+}
+
+/// Writes one complete, one-effect run into `journal`, as [`try_write_tiny_run`] does.
+///
+/// For a caller writing into an already-crashed, no-longer-injected device. See
+/// [`try_write_tiny_run`] for the fallible twin a live writer needs.
+fn write_tiny_run<S: StableStorage>(engine: &mut Window<'_, S>, journal: &mut Journal) -> Vec<u16>
+where
+    S::Error: core::fmt::Debug,
+{
+    let Ok(entered) = try_write_tiny_run(engine, journal) else {
+        unreachable!("a fault-free tiny run")
+    };
+    entered
+}
+
+/// §10's explicit exit from the near-capacity state: a swap into the other bank, and a
+/// small complete run written into it. Returns the effects the new run dispatched.
+fn explicit_rollover(rig: &Rig, device: &mut Device, page: &mut [u8]) -> Vec<u16> {
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next = rollover_next_header(rig);
+    let region = bank_a_region(rig, device, page);
+    let Ok(mut engine) = Window::new(device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(page) {
+        if step.is_err() {
+            unreachable!("bank A's journal is whole up to its last completed effect")
+        }
+    }
+    let Ok(swap) = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    ) else {
+        unreachable!("a swap can be planned from the near-capacity state")
+    };
+    let Ok(prepared) = swap.prepare(&mut engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+    assert_eq!(
+        installed.authority(),
+        bank::Authority::Bank {
+            id: Rig::BANK.other(),
+            generation: bank::Generation(2),
+        },
+        "the new bank is authoritative, at the next generation, and the old run is retired"
+    );
+
+    let mut new_recovery = installed.recovery();
+    while let Some(step) = new_recovery.next(page) {
+        if step.is_err() {
+            unreachable!("a freshly installed bank scans clean")
+        }
+    }
+    let Some(mut new_journal) = Journal::after(new_recovery) else {
+        unreachable!("a freshly installed bank is a clean, extendable journal")
+    };
+    write_tiny_run(&mut engine, &mut new_journal)
+}
+
+/// Row 9, driven: no mutation on a replayed refusal, and an explicit swap past it that
+/// starts a new run and dispatches its first effect. Returns the row it credits.
+fn row_nine() -> Row {
+    let (rig, reserve, mut device) = near_capacity();
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    assert_replay_refuses_without_mutation(&rig, reserve, &mut device, &mut page);
+    let dispatched = explicit_rollover(&rig, &mut device, &mut page);
+    assert_eq!(dispatched, [0], "the new run starts and does work");
+    Row::HistoryCapacityReached
+}
+
+#[test]
+fn history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new() {
+    assert_eq!(row_nine(), Row::HistoryCapacityReached);
+}
+
+// ---------------------------------------------------------------------------------------
+// Row 10: replay divergence
+// ---------------------------------------------------------------------------------------
+
+/// Row 10, driven. Take every crash point where the second effect's schedule is
+/// recoverable and its completion is not. A declared workload naming a different activity
+/// for that schedule is refused there, twice in a row. Nothing is dispatched and nothing
+/// is rewritten. Returns the row it credits.
+///
+/// Not swept through [`classified`]. That function resumes each point as it classifies
+/// it, so a resumed device is no longer the crash image this test needs. This runs its own
+/// pass over the harness instead, and stops at [`evidence`], which only reads the device —
+/// so every device checked here stays untouched.
+fn row_ten() -> Row {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
+        unreachable!("a run of two effects schedules a second one")
+    };
+    let declared = rig.workload(0).diverging(1);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // The sharpest case row 10's model half names: the second effect's schedule is
+        // recovered, its completion is not, so the effect is outstanding when the
+        // declared workflow stops agreeing with history.
+        if !matches!(
+            (evidence.attempted, evidence.activity, evidence.recovered_it),
+            (Role::Schedule(1), Activity::NotEntered, true)
+        ) {
+            continue;
+        }
+        let at = format!("{injection:?}");
+        for attempt in 0_u8..2 {
+            let before = device.image().to_vec();
+            let mut page = [0_u8; Rig::PAGE_BYTES];
+            let mut dispatcher = Log::default();
+            let outcome = {
+                let mut metered = Metered::new(&mut device);
+                rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+            };
+            assert!(
+                matches!(
+                    outcome,
+                    Err(RigError::Breach(Breach::RecordDiffers { index }))
+                        if index == diverging_at
+                ),
+                "attempt {attempt} at {at}: {outcome:?}"
+            );
+            assert!(
+                dispatcher.entered.is_empty(),
+                "executed past a divergence, attempt {attempt} at {at}"
+            );
+            assert_eq!(
+                device.image(),
+                before.as_slice(),
+                "history was reinterpreted, attempt {attempt} at {at}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no crash point left the second effect's schedule outstanding"
+    );
+    Row::ReplayDivergence
+}
+
+#[test]
+fn replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched() {
+    assert_eq!(row_ten(), Row::ReplayDivergence);
+}
+
+#[test]
+fn every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned() {
+    // All ten rows, filled: the six effect rows swept through the ordinary crash
+    // injector, the two bank rows swept through the swap workload, and the two driven
+    // rows — history capacity and replay divergence — credited once each by their own
+    // assertions. Issue #96 closes the gap `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap`
+    // used to pin.
     let (points, _) = classified();
     let mut matrix = Matrix::EMPTY;
     for point in points.iter().chain(&row_three()) {
         matrix = matrix.record(point.row);
     }
+    for (_, row) in rollover_sweep() {
+        matrix = matrix.record(row);
+    }
+    for row in [row_nine(), row_ten()] {
+        matrix = matrix.record(row);
+    }
+    matrix
+        .verdict()
+        .expect("every row of §14's table is reached on the rig");
     let counts: Vec<(Row, u32)> = Row::ALL
         .into_iter()
         .map(|row| (row, matrix.iterations(row)))
@@ -573,17 +1454,11 @@ fn the_rig_fills_six_rows_and_names_the_seventh_as_its_gap() {
             (Row::AfterActivityBeforeCompletionBarrier, 42),
             (Row::DuringCompletionWrite, 84),
             (Row::AfterCompletionBarrier, 138),
-            (Row::DuringInactiveBankEraseOrWrite, 0),
-            (Row::AfterNewBankSealBarrier, 0),
-            (Row::HistoryCapacityReached, 0),
-            (Row::ReplayDivergence, 0),
+            (Row::DuringInactiveBankEraseOrWrite, 61),
+            (Row::AfterNewBankSealBarrier, 175),
+            (Row::HistoryCapacityReached, 1),
+            (Row::ReplayDivergence, 1),
         ]
-    );
-    let gap = matrix.verdict().expect_err("four rows are owed");
-    assert_eq!(gap.row(), Row::DuringInactiveBankEraseOrWrite);
-    assert_eq!(
-        gap.to_string(),
-        "no crash point landed in row `during-inactive-bank-erase-or-write`"
     );
 }
 
@@ -927,11 +1802,11 @@ fn blank_last_record(rig: &Rig, device: &mut Device, page: &mut [u8]) {
         let Ok(journal) = JournalRegion::of(layout, Rig::BANK, &header) else {
             unreachable!("a journal region")
         };
-        let mut recovery = Recovery::new(journal);
+        let mut recovery = Recovery::new(journal, &mut engine);
         let mut start = None;
         loop {
             let at = recovery.offset();
-            match recovery.next(&mut engine, page) {
+            match recovery.next(page) {
                 Some(Ok(_)) => start = Some(at),
                 Some(Err(_)) | None => break,
             }
@@ -1175,21 +2050,34 @@ fn a_resume_refuses_a_short_page_an_uninstalled_part_and_another_runs_prefix() {
     let refused = rig.resume(0, &mut metered, &mut Log::default(), &mut page);
     assert!(matches!(refused, Err(RigError::Bank)), "{refused:?}");
 
-    // A bank installed for iteration 0 and written by iteration 1: the witness and the
-    // prefix are another run's, and the resume refuses before writing, with the breach
-    // `verify` reports.
+    // A bank installed for iteration 0, but a witness mark that belongs to iteration 1:
+    // the resume refuses before writing, with the breach `verify` reports. `Rig::iterate`
+    // no longer lets a mismatched iteration reach the witness at all — see
+    // `iterate_and_its_siblings_refuse_a_bank_installed_for_another_iteration` — so this
+    // plants the mark directly, through the same low-level API `Rig::iterate` itself uses,
+    // to exercise `resume`'s own protection against a witness that answers a different run.
     let mut device = Device::new(geometry());
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+    }
+    {
+        let Ok(mut instrument) =
+            Window::new(&mut device, rig.instrument_base(), geometry().erase_size())
+        else {
+            unreachable!("the instrument window")
+        };
+        let mut witness = Witness::new(rig.witness_region());
+        witness
+            .mark(
+                &mut instrument,
+                Mark::new(1, 0, Stage::Attempted),
+                &mut page,
+            )
+            .expect("a fault-free mark");
+    }
     let mut metered = Metered::new(&mut device);
-    rig.prepare(&mut metered, 0, &mut page)
-        .expect("a prepared part");
-    rig.iterate(
-        1,
-        &mut metered,
-        &mut Log::default(),
-        &mut NeverCut,
-        &mut page,
-    )
-    .expect("another iteration writes into the bank");
     let before = (metered.wear(), metered.rig_wear());
     let refused = rig.resume(0, &mut metered, &mut Log::default(), &mut page);
     assert!(
@@ -1204,5 +2092,1002 @@ fn a_resume_refuses_a_short_page_an_uninstalled_part_and_another_runs_prefix() {
     assert_eq!(
         rig.verify(0, &mut device, &mut page).map(Verdict::outcome),
         Ok(Outcome::Breached(Breach::WitnessUnreadable))
+    );
+}
+
+/// `resume_reserved` refuses an outstanding effect's own completion without redelivering the
+/// effect first.
+///
+/// A reserve is passed in at resume time and need not be the one the prefix was written
+/// under — the prefix here is written ungated, by the plain [`Rig::iterate`], cut at effect
+/// 1's own dispatch so its schedule is durable and its completion is not. The reserve handed
+/// to `resume_reserved` then declares a zero-width effect-result bound, which refuses *any*
+/// real completion (never empty; see [`Workload::MAX_PAYLOAD_BYTES`]) regardless of how much
+/// room the journal has left — deterministic, and independent of the shared fixture's small
+/// geometry, unlike a room-based refusal.
+#[test]
+fn resume_reserved_refuses_before_redelivering_an_effect_its_own_completion_cannot_hold() {
+    let mut seed = None;
+    for candidate in 0_u64..200_000 {
+        let cut = Plan::new(candidate).cut(0);
+        if cut.phase() == Phase::Dispatch && cut.effect_index(EFFECTS) == 1 {
+            seed = Some(candidate);
+            break;
+        }
+    }
+    let Some(seed) = seed else {
+        unreachable!("some seed cuts at dispatch for effect 1")
+    };
+    let Ok(custom_rig) = Rig::new::<FaultError>(geometry(), Plan::new(seed), EFFECTS) else {
+        unreachable!("the shared geometry holds two banks and a witness")
+    };
+
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = custom_rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+        let mut dispatcher = Log::default();
+        let mut cutter = PlannedCut::at(custom_rig.cut_at(0), EFFECTS);
+        let outcome = custom_rig.iterate(0, &mut metered, &mut dispatcher, &mut cutter, &mut page);
+        assert!(
+            matches!(
+                outcome,
+                Ok(Stop::Cut {
+                    phase: Phase::Dispatch,
+                    effect: 1
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            dispatcher.entered,
+            [0],
+            "effect 0 completed and effect 1 was not yet dispatched"
+        );
+    }
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 0,
+            terminal_bytes: 16,
+        },
+        custom_rig.layout(),
+    ) else {
+        unreachable!("a zero-width bound is never harder to satisfy than a real one")
+    };
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let resumed = custom_rig.resume_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(
+        matches!(resumed, Err(RigError::Capacity(Refusal::OverDeclaredBound))),
+        "{resumed:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the outstanding effect was redelivered despite the refusal: {:?}",
+        dispatcher.entered
+    );
+}
+
+/// `iterate_reserved` refuses a fresh schedule's own completion bound before dispatching the
+/// effect that schedule is for.
+///
+/// The reserve admits the schedule record on its own — its width does not depend on
+/// `effect_result_bytes` — so the loop used to mark it, append it, and dispatch the effect
+/// before it ever reached the completion record's own index and discovered the zero-width
+/// bound could not hold it. By then the effect had already run once for nothing: refusing at
+/// the completion cannot undo it, and a retry through `resume_reserved` performs it again.
+#[test]
+fn iterate_reserved_refuses_a_narrow_completion_bound_before_dispatching_the_schedule_it_is_for() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut metered = Metered::new(&mut device);
+    let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+        unreachable!("prepare")
+    };
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 0,
+            terminal_bytes: 16,
+        },
+        rig.layout(),
+    ) else {
+        unreachable!("a zero-width bound is never harder to satisfy than a real one")
+    };
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(
+        matches!(outcome, Err(RigError::Capacity(Refusal::OverDeclaredBound))),
+        "{outcome:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the schedule's own effect was dispatched before its completion's bound was checked: \
+         {:?}",
+        dispatcher.entered
+    );
+}
+
+/// `resume_reserved` refuses a fresh schedule's own completion bound before dispatching the
+/// effect that schedule is for, the same way [`iterate_reserved`] must.
+///
+/// Distinct from
+/// [`resume_reserved_refuses_before_redelivering_an_effect_its_own_completion_cannot_hold`]:
+/// that test's schedule is already durable and the effect is *outstanding*, redelivered
+/// through the branch above the main write loop. This one recovers only `RunStarted`, so the
+/// main loop writes effect 0's schedule fresh — a record the redelivery preflight never
+/// touches — and must not dispatch it before checking that the completion right after it
+/// would fit.
+///
+/// [`iterate_reserved`]: Rig::iterate_reserved
+#[test]
+fn resume_reserved_refuses_a_narrow_completion_bound_before_dispatching_a_fresh_schedule() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    let mut metered = Metered::new(&mut device);
+    // `prepare` writes the bank header and nothing else: the journal is empty, so recovery
+    // finds `recovered == 0` and the main write loop — not the redelivery branch above it,
+    // which needs a durable schedule already recovered — is what reaches effect 0's own
+    // schedule fresh.
+    let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+        unreachable!("prepare")
+    };
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 0,
+            terminal_bytes: 16,
+        },
+        rig.layout(),
+    ) else {
+        unreachable!("a zero-width bound is never harder to satisfy than a real one")
+    };
+    let mut dispatcher = Log::default();
+    let resumed = rig.resume_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(
+        matches!(resumed, Err(RigError::Capacity(Refusal::OverDeclaredBound))),
+        "{resumed:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the fresh schedule's own effect was dispatched before its completion's bound was \
+         checked: {:?}",
+        dispatcher.entered
+    );
+}
+
+/// `verify` does not report a reclaimed, superseded bank as one that lost its acknowledged
+/// records.
+///
+/// Distinct from [`after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current_again_on_the_rig`]'s
+/// own `verify` check: that one crashes mid-swap and leaves the retiring bank intact, which
+/// `own_bank_journal` reads directly regardless of authority. This one drives the swap to
+/// completion and past it — §10 step 7, [`Installed::reclaim`] — so the retiring bank is
+/// erased media and `own_bank_journal` has nothing to read at all. `judge` still has to tell
+/// that apart from a part this run was never installed on.
+///
+/// [`Installed::reclaim`]: waymaker_flash::swap::Installed::reclaim
+#[test]
+fn verify_does_not_report_a_reclaimed_bank_as_having_lost_its_acknowledged_records() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+        let mut dispatcher = Log::default();
+        let Ok(()) = rig.iterate_until_rollover(
+            0,
+            &mut metered,
+            &mut dispatcher,
+            &mut page,
+            ROLLOVER_EFFECTS_BEFORE,
+        ) else {
+            unreachable!("the fault-free prefix writes cleanly")
+        };
+    }
+
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next = rollover_next_header(&rig);
+    let region = bank_a_region(&rig, &mut device, &mut page);
+    let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(&mut page) {
+        if step.is_err() {
+            unreachable!("bank A's journal is whole up to its last completed effect")
+        }
+    }
+    let Ok(swap) = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    ) else {
+        unreachable!("a swap can be planned from the rolled-over prefix")
+    };
+    let Ok(prepared) = swap.prepare(&mut engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+    let Ok(()) = installed.reclaim() else {
+        unreachable!("a fault-free erase and barrier")
+    };
+
+    let Ok(verdict) = rig.verify(0, &mut device, &mut page) else {
+        unreachable!("a judgeable part")
+    };
+    assert_eq!(
+        verdict.outcome(),
+        Outcome::Passed,
+        "the reclaimed bank's superseded history was reported lost: {verdict:?}"
+    );
+}
+
+/// `iterate_until_rollover` and `iterate_reserved` refuse rather than append into a bank a
+/// swap has already moved authority away from.
+///
+/// Before this, both checked only that *some one* bank was authoritative, so calling either
+/// again on a device a swap had already moved past would read and append into the retired
+/// bank instead of refusing it.
+#[test]
+fn iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+        let mut dispatcher = Log::default();
+        let Ok(()) = rig.iterate_until_rollover(
+            0,
+            &mut metered,
+            &mut dispatcher,
+            &mut page,
+            ROLLOVER_EFFECTS_BEFORE,
+        ) else {
+            unreachable!("the fault-free prefix writes cleanly")
+        };
+    }
+
+    let layout = rig.layout();
+    let booted = bank::Authority::Bank {
+        id: Rig::BANK,
+        generation: Rig::GENERATION,
+    };
+    let next = rollover_next_header(&rig);
+    let region = bank_a_region(&rig, &mut device, &mut page);
+    let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+        unreachable!("the engine window")
+    };
+    let mut recovery = Recovery::new(region, &mut engine);
+    while let Some(step) = recovery.next(&mut page) {
+        if step.is_err() {
+            unreachable!("bank A's journal is whole up to its last completed effect")
+        }
+    }
+    let Ok(swap) = Swap::beginning(
+        layout,
+        booted,
+        rig.workload(0).run(),
+        Retired::Recovery(recovery),
+        next,
+    ) else {
+        unreachable!("a swap can be planned from the rolled-over prefix")
+    };
+    let Ok(prepared) = swap.prepare(&mut engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(_installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+
+    // Bank B is now the sole authority. Calling either write path again must refuse rather
+    // than blindly reading and appending into bank A, which a boot will never choose again.
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_until_rollover(
+        0,
+        &mut metered,
+        &mut dispatcher,
+        &mut page,
+        ROLLOVER_EFFECTS_BEFORE,
+    );
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+
+    let Ok(reserve) = Reserve::for_layout(
+        Bounds {
+            run_input_bytes: 16,
+            effect_result_bytes: 16,
+            terminal_bytes: 16,
+        },
+        rig.layout(),
+    ) else {
+        unreachable!("the shared fixture's own bounds price a valid reserve")
+    };
+    let outcome = rig.iterate_reserved(0, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+}
+
+/// Round 7: `require_own_authority` named the bank but never checked whose run its header
+/// holds, so `iterate`, `iterate_until_rollover` and `iterate_reserved` would all happily
+/// write one iteration's records and witness marks into the authoritative bank's journal
+/// even when that bank was installed for a *different* iteration entirely.
+///
+/// `resume`/`recover_prefix` already refuse this shape, through `installed_journal`'s own
+/// run-id check; `journal_region` — the write path's twin — now takes the workload it means
+/// to write and refuses the same way before it hands back a region to append into.
+#[test]
+fn iterate_and_its_siblings_refuse_a_bank_installed_for_another_iteration() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+    }
+    let before = device.image().to_vec();
+
+    // The bank is authoritative and readable; it simply names iteration 0, not the
+    // iteration 1 each call below is asked to continue.
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate(1, &mut metered, &mut dispatcher, &mut NeverCut, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched"
+    );
+
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_until_rollover(
+        1,
+        &mut metered,
+        &mut dispatcher,
+        &mut page,
+        ROLLOVER_EFFECTS_BEFORE,
+    );
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched"
+    );
+
+    let Ok(reserve) = Reserve::for_layout(bounds(16), rig.layout()) else {
+        unreachable!("the shared fixture's own bounds price a valid reserve")
+    };
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate_reserved(1, &mut metered, &mut dispatcher, reserve, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched"
+    );
+
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "a mismatched iteration mutated the device"
+    );
+}
+
+/// Drives `swap` through its remaining steps — erase, program, barrier, seal — and returns
+/// what it installed. The four-step chain is identical for every swap this file drives; only
+/// the plan differs between them.
+fn drive_swap<'storage, S: StableStorage>(
+    swap: Swap<'_>,
+    engine: &'storage mut S,
+) -> Installed<'storage, S> {
+    let Ok(prepared) = swap.prepare(engine) else {
+        unreachable!("a fault-free erase and barrier")
+    };
+    let mut header_page = [0_u8; Rig::PAGE_BYTES];
+    let Ok(staged) = prepared.stage(&mut header_page) else {
+        unreachable!("the header and its seal fit a page")
+    };
+    let Ok(sealable) = staged.payload_barrier() else {
+        unreachable!("a fault-free barrier")
+    };
+    let Ok(installed) = sealable.commit() else {
+        unreachable!("a fault-free commit")
+    };
+    installed
+}
+
+/// `journal_region` refuses a bank whose header names the right run but the wrong workflow
+/// identity, before writing or dispatching anything.
+///
+/// The check above this one compares only `header.run` against the workload's own run id.
+/// A run id agreeing is not the whole of a workflow's identity: a real boot
+/// (`crates/waymaker-drive/src/drive.rs`) also refuses a recorded `workflow_kind` or `input`
+/// that disagrees with what it expected. Built through two real swaps rather than a
+/// hand-fabricated header — a single swap moves authority to the *other* bank and would
+/// refuse at `require_own_authority` instead, for an unrelated reason, never reaching
+/// `journal_region` at all. Swap 1 retires iteration 0's run onto the other bank under a
+/// throwaway identity nothing ever reads through `Rig`; swap 2 retires that throwaway run
+/// back onto `Rig::BANK`, naming iteration 1's own run id but iteration 0's workflow input.
+#[test]
+fn iterate_refuses_a_bank_whose_header_names_the_right_run_but_the_wrong_identity() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        let Ok(()) = rig.prepare(&mut metered, 0, &mut page) else {
+            unreachable!("prepare")
+        };
+    }
+
+    let layout = rig.layout();
+    let mut wrong_input_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+    let Some(RecordRef::RunStarted {
+        input: wrong_input, ..
+    }) = rig.workload(0).record(0, &mut wrong_input_page)
+    else {
+        unreachable!("a workload's own opening record")
+    };
+    let mismatched = bank::BankHeader {
+        run: rig.workload(1).run(),
+        align: layout.align(),
+        workflow_kind: Workload::WORKFLOW_KIND,
+        workflow_version: Workload::WORKFLOW_VERSION,
+        input_schema: 0,
+        input: wrong_input,
+    };
+
+    {
+        let booted = bank::Authority::Bank {
+            id: Rig::BANK,
+            generation: Rig::GENERATION,
+        };
+        let throwaway = bank::BankHeader {
+            run: rig.workload(2).run(),
+            align: layout.align(),
+            workflow_kind: Workload::WORKFLOW_KIND,
+            workflow_version: Workload::WORKFLOW_VERSION,
+            input_schema: 0,
+            input: NEXT_RUN_INPUT,
+        };
+        let region = bank_a_region(&rig, &mut device, &mut page);
+        let Ok(mut engine) = Window::new(&mut device, 0, layout.geometry().capacity()) else {
+            unreachable!("the engine window")
+        };
+        let mut recovery = Recovery::new(region, &mut engine);
+        while let Some(step) = recovery.next(&mut page) {
+            if step.is_err() {
+                unreachable!("a freshly prepared bank's empty journal is whole")
+            }
+        }
+        let Ok(swap) = Swap::beginning(
+            layout,
+            booted,
+            rig.workload(0).run(),
+            Retired::Recovery(recovery),
+            throwaway,
+        ) else {
+            unreachable!("a swap can be planned from a freshly prepared bank")
+        };
+        let installed = drive_swap(swap, &mut engine);
+        let after_first_swap = installed.authority();
+        let mut recovery = installed.recovery();
+        while let Some(step) = recovery.next(&mut page) {
+            if step.is_err() {
+                unreachable!("a freshly installed bank scans clean")
+            }
+        }
+        let Ok(swap) = Swap::beginning(
+            layout,
+            after_first_swap,
+            rig.workload(2).run(),
+            Retired::Recovery(recovery),
+            mismatched,
+        ) else {
+            unreachable!("a swap can be planned back onto Rig::BANK")
+        };
+        let _installed = drive_swap(swap, &mut engine);
+    }
+
+    let before = device.image().to_vec();
+    let mut metered = Metered::new(&mut device);
+    let mut dispatcher = Log::default();
+    let outcome = rig.iterate(1, &mut metered, &mut dispatcher, &mut NeverCut, &mut page);
+    assert!(matches!(outcome, Err(RigError::Bank)), "{outcome:?}");
+    assert!(
+        dispatcher.entered.is_empty(),
+        "the mismatched bank's effect was dispatched before its identity was checked"
+    );
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "the mismatched bank's journal or witness was mutated before its identity was checked"
+    );
+}
+
+/// Round 5, review finding B: `perform` used to rebuild its own workload from the iteration
+/// number instead of using the one `resume_as` was auditing against, so `resume_declaring`
+/// could durably append a schedule record its own narrower workload could not answer for.
+/// `perform` now takes the caller's `workload` directly, which is what makes the refusal
+/// below possible at all: without it, the extra effect's schedule record would land durably
+/// before the narrower `self.workload(iteration)` refused to dispatch it.
+///
+/// Round 6, review finding C: a `declared` workload wider than [`Rig::effects`](Rig) has the
+/// same run id as this rig's own workload whenever it shares its seed and iteration, so it
+/// can match the recovered prefix exactly — but the bank and witness were only ever
+/// provisioned for `Rig::effects`. Left ungated, review found this would run past that
+/// provisioning until an unrelated capacity error (`AppendError::NoRoom`,
+/// `WitnessError::Full`) stopped it, which is not the failure `resume`'s own postcondition
+/// promises: a refusal *before* any write or dispatch. `resume_as` now refuses any workload
+/// wider than `self.effects` before touching the device at all.
+///
+/// This finds a crash point that leaves both of the rig's two effects durably completed and
+/// `RunCompleted` not yet begun, then resumes it declaring a workload with one more effect
+/// than the rig was provisioned for. Reverting the capacity check reproduces the review
+/// finding directly: the extra effect's schedule record lands durably and is dispatched
+/// (finding B's own fix serves it, since the declared workload's extra effect matches the
+/// recovered prefix) — exactly the mutation-before-refusal finding C flags.
+#[test]
+fn resume_declaring_refuses_a_workload_wider_than_the_rig_was_provisioned_for() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let declared = Workload::new(SEED, 0, EFFECTS + 1);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Both of the rig's own effects durably completed, and `RunCompleted` not yet
+        // begun: the sharpest case, because the recovered prefix agrees with the declared
+        // workload exactly and the only disagreement is what comes after it — which is
+        // exactly the state from which the unfixed code would proceed to mutate.
+        if !matches!(
+            (evidence.attempted, evidence.activity, evidence.recovered_it),
+            (Role::Completion(1), Activity::Returned, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(matches!(outcome, Err(RigError::Workload)), "{outcome:?}");
+        assert!(
+            dispatcher.entered.is_empty(),
+            "an over-wide declaration was dispatched before being refused"
+        );
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "an over-wide declaration mutated the device before being refused"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(
+        checked > 0,
+        "no crash point left both effects durably completed with RunCompleted not yet begun"
+    );
+}
+
+/// Round 8: `resume_declaring` could durably write and dispatch a divergent record that was
+/// never actually on media, if the crash it resumed from landed *before*
+/// [`Workload::diverging`]'s own changed index — `recover_prefix`'s audit only compares
+/// `declared` against what recovery actually found, so with nothing recorded yet at that
+/// index there was nothing there to disagree with, and the loop that writes what the run
+/// still owes wrote the declared, diverged record fresh and dispatched it.
+///
+/// The fix widens what a fresh write is checked against: not only must a *recovered* record
+/// agree with `declared`, a record `resume_as` is about to write for the first time must
+/// agree with this rig's own undiverged truth — `self.workload(iteration)` — before it is
+/// marked, appended, or dispatched. For an ordinary `resume` the two are the same workload
+/// and the check never fires; `resume_declaring`'s `declared` is where it can differ.
+#[test]
+fn resume_declaring_refuses_a_divergent_record_it_would_write_fresh() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
+        unreachable!("a run of two effects schedules a second one")
+    };
+    let declared = rig.workload(0).diverging(1);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Effect 0 durably completed, and effect 1's schedule — the record `declared`
+        // changes — not yet recovered at all: the gap, since nothing on media there could
+        // have disagreed with `declared` during `recover_prefix`'s own audit.
+        if !matches!(
+            (evidence.attempted, evidence.activity, evidence.recovered_it),
+            (Role::Completion(0), Activity::Returned, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(
+            matches!(
+                outcome,
+                Err(RigError::Breach(Breach::RecordDiffers { index })) if index == diverging_at
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            dispatcher.entered.is_empty(),
+            "a divergent record that was never on media was dispatched anyway"
+        );
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "a divergent record that was never on media was written anyway"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(
+        checked > 0,
+        "no crash point left effect 0 durable with effect 1's schedule not yet recovered"
+    );
+}
+
+/// Round 9: the capacity preflight only refused a `declared` *wider* than `self.effects`, so
+/// a *narrower* one still reached the write loop. Its early records agree with this rig's
+/// own truth — a shorter run's opening effects are a prefix of a longer one's, byte for
+/// byte — so the per-record check round 8 added does not fire until the declaration's own
+/// early `RunCompleted` collides with an effect index the real run still has open,
+/// mutating and dispatching every record in between first.
+///
+/// The fix widens the preflight from "not wider" to "the same shape": `resume_declaring`
+/// only ever means to audit history against a workload that agrees with this rig's own run
+/// everywhere but the one record [`Workload::diverging`] names, and a workload of a
+/// different length is not that.
+#[test]
+fn resume_declaring_refuses_a_narrower_workload_before_dispatching_anything() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let declared = Workload::new(SEED, 0, EFFECTS - 1);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Only `RunStarted` durable: every record the narrower declaration would write is
+        // fresh, so nothing but the per-record shape check can catch it.
+        if !matches!(
+            (evidence.attempted, evidence.recovered_it),
+            (Role::Start, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(matches!(outcome, Err(RigError::Workload)), "{outcome:?}");
+        assert!(
+            dispatcher.entered.is_empty(),
+            "a narrower declaration dispatched an effect before being refused"
+        );
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "a narrower declaration mutated the device before being refused"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(checked > 0, "no crash point left only RunStarted durable");
+}
+
+/// Round 10: round 8's per-record check runs inside the write loop, so a record that
+/// *agrees* with this rig's own truth is still written and, if it schedules an effect,
+/// dispatched — before the loop ever reaches the index where `declared` disagrees. Row 10's
+/// own promise is "no further execution and history untouched", for the whole declaration,
+/// not only for the one record that turns out to disagree.
+///
+/// The fix moves the check ahead of everything: every record `resume_as` would still need
+/// to write is compared against this rig's own truth in one pass, before the outstanding-
+/// effect redelivery and the write loop both run, so a disagreement anywhere in what is
+/// left of the run refuses before the first agreeing record in front of it is touched.
+#[test]
+fn resume_declaring_refuses_before_running_any_record_that_agrees_ahead_of_the_divergence() {
+    let harness = Harness::new(geometry());
+    let logs: RefCell<Vec<Vec<u16>>> = RefCell::new(Vec::new());
+    let Ok(runs) = harness.run(|session| {
+        let (outcome, entered) = drive(session);
+        logs.borrow_mut().push(entered);
+        outcome.map_err(|_| ())
+    }) else {
+        unreachable!("the fault-free run succeeds")
+    };
+    let logs = logs.into_inner();
+    let rig = rig();
+    let Some(diverging_at) = rig.workload(0).schedule_index(1) else {
+        unreachable!("a run of two effects schedules a second one")
+    };
+    let declared = rig.workload(0).diverging(1);
+
+    let mut checked = 0_usize;
+    for (run, entered) in runs.iter().zip(&logs) {
+        let Some(injection) = run.injection() else {
+            continue;
+        };
+        if injection.interruption == Interruption::Failure {
+            continue;
+        }
+        let mut device = device_after(run);
+        let Ok(evidence) = evidence(&rig, &mut device, entered, true) else {
+            continue;
+        };
+        // Only `RunStarted` durable: effect 0's schedule and completion — both of which
+        // agree with `declared`, since divergence is only at effect 1's schedule — are
+        // still ahead of the loop, in front of the record that actually disagrees.
+        if !matches!(
+            (evidence.attempted, evidence.recovered_it),
+            (Role::Start, true)
+        ) {
+            continue;
+        }
+        let mut page = [0_u8; Rig::PAGE_BYTES];
+        let mut dispatcher = Log::default();
+        let before = device.image().to_vec();
+        let outcome = {
+            let mut metered = Metered::new(&mut device);
+            rig.resume_declaring(0, declared, &mut metered, &mut dispatcher, &mut page)
+        };
+        assert!(
+            matches!(
+                outcome,
+                Err(RigError::Breach(Breach::RecordDiffers { index })) if index == diverging_at
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            dispatcher.entered.is_empty(),
+            "effect 0 was dispatched before the later divergence was caught"
+        );
+        assert_eq!(
+            device.image(),
+            before.as_slice(),
+            "effect 0's records were written before the later divergence was caught"
+        );
+        checked += 1;
+        break;
+    }
+    assert!(checked > 0, "no crash point left only RunStarted durable");
+}
+
+/// Round 11: the preflight above compares `declared.effects()` against `self.effects`, but
+/// never `declared`'s own run against the run `iteration` names. Two iterations of one plan
+/// share an effect count, so a `declared` sharing this rig's seed and *another* iteration's
+/// number can pass that check while still naming a bank installed for a different run.
+/// `recover_prefix`'s audit then checks `declared` against the bank's own header, which
+/// agrees — it is genuinely that other iteration's own workload — and, once the recovered
+/// prefix already covers the whole run, `resume_as`'s `recovered >= records` branch answers
+/// `Completed` before the per-record comparison against `self.workload(iteration)` is ever
+/// reached: a run that belongs to iteration 0 is reported as iteration 1's.
+///
+/// The fix widens the preflight once more: `declared`'s run must agree with
+/// `self.workload(iteration)`'s before recovery is read at all, so a declaration that
+/// belongs to one iteration cannot be presented as another's.
+#[test]
+fn resume_declaring_refuses_a_workload_for_another_iterations_run() {
+    let rig = rig();
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        rig.prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        let outcome = rig.iterate(
+            0,
+            &mut metered,
+            &mut Log::default(),
+            &mut NeverCut,
+            &mut page,
+        );
+        assert!(
+            matches!(outcome, Ok(Stop::Completed)),
+            "the fault-free iteration completes: {outcome:?}"
+        );
+    }
+
+    let declared = rig.workload(0);
+    let mut dispatcher = Log::default();
+    let before = device.image().to_vec();
+    let outcome = {
+        let mut metered = Metered::new(&mut device);
+        rig.resume_declaring(1, declared, &mut metered, &mut dispatcher, &mut page)
+    };
+    assert!(
+        matches!(outcome, Err(RigError::Workload)),
+        "a declaration for iteration 0's run was accepted as iteration 1's: {outcome:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched before being refused"
+    );
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "a mismatched iteration mutated the device before being refused"
+    );
+}
+
+/// Round 12: the fix above compared `Workload::run` against `self.workload(iteration).run()`.
+/// A run id is `SplitMix64::new(seed).at(iteration)`, an injective mix of one pre-mix word,
+/// `seed` plus `GAMMA` times `iteration` plus one — but that word is not injective over the
+/// pair of arguments together, so a workload built from a different seed at a different
+/// iteration can land on the identical pre-mix word and therefore the identical run id.
+/// Concretely, `seed` plus `GAMMA` at iteration zero sums to the same word as plain `seed` at
+/// iteration one. A device whose real history was written by a different rig entirely — one
+/// seeded `SEED` plus `GAMMA` rather than this file's `SEED` — at iteration zero therefore
+/// satisfies every check the old code ran against `resume_declaring(1, ..)`:
+/// `own_bank_journal`'s header-run comparison, because the header genuinely names that
+/// colliding run, and the old run-id comparison, for the identical reason.
+///
+/// The fix compares the seed and the iteration directly, against this rig's own seed and the
+/// `iteration` argument, which is exact rather than routed through a hash that was never
+/// claimed to be injective over two arguments at once.
+#[test]
+fn resume_declaring_refuses_a_workload_whose_run_id_collides_from_another_seed() {
+    // The same constant `plan::GAMMA` uses — not exported, so reproduced here to construct
+    // the exact cross-seed collision `Workload::run` is vulnerable to through a hash.
+    const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    let rig = rig();
+    let Ok(other) =
+        Rig::new::<FaultError>(geometry(), Plan::new(SEED.wrapping_add(GAMMA)), EFFECTS)
+    else {
+        unreachable!("the same geometry that holds two banks and a witness for `rig`")
+    };
+    assert_eq!(
+        other.workload(0).run(),
+        rig.workload(1).run(),
+        "the two rigs' seeds do not collide at (0, 1) as intended"
+    );
+
+    // The device's real history is written by `other` — a foreign rig, at iteration 0 — not
+    // by `rig` at all.
+    let mut device = Device::new(geometry());
+    let mut page = [0_u8; Rig::PAGE_BYTES];
+    {
+        let mut metered = Metered::new(&mut device);
+        other
+            .prepare(&mut metered, 0, &mut page)
+            .expect("a prepared part");
+        let outcome = other.iterate(
+            0,
+            &mut metered,
+            &mut Log::default(),
+            &mut NeverCut,
+            &mut page,
+        );
+        assert!(
+            matches!(outcome, Ok(Stop::Completed)),
+            "the fault-free iteration completes: {outcome:?}"
+        );
+    }
+
+    // `rig` — a different seed entirely — is asked to resume iteration 1 over that device,
+    // declaring `other`'s own iteration-0 workload. Its run id collides with `rig.workload(1)`,
+    // which is the whole point: `rig` never wrote a single byte to this device.
+    let declared = other.workload(0);
+    let mut dispatcher = Log::default();
+    let before = device.image().to_vec();
+    let outcome = {
+        let mut metered = Metered::new(&mut device);
+        rig.resume_declaring(1, declared, &mut metered, &mut dispatcher, &mut page)
+    };
+    assert!(
+        matches!(outcome, Err(RigError::Workload)),
+        "a cross-seed run-id collision let a foreign declaration through: {outcome:?}"
+    );
+    assert!(
+        dispatcher.entered.is_empty(),
+        "a mismatched iteration was dispatched before being refused"
+    );
+    assert_eq!(
+        device.image(),
+        before.as_slice(),
+        "a mismatched iteration mutated the device before being refused"
     );
 }

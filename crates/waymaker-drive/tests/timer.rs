@@ -13,10 +13,10 @@
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, KernelError, RecordKind, RecordRef, RunId};
-use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
+use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
+use waymaker_drive::demo::{DELAYED_BOUNDS, DOWNLOADED, Delayed, World};
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::Device;
@@ -80,10 +80,10 @@ fn boot(
 
 /// The kind byte of every record the journal holds.
 fn kinds(device: &mut Device) -> Vec<RecordKind> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -135,6 +135,40 @@ fn a_deadline_already_past_fires_in_the_same_boot() {
         "{progress:?}"
     );
     assert!(kinds(&mut device).contains(&RecordKind::TIMER_FIRED));
+}
+
+#[test]
+fn a_completed_delayed_run_remembers_what_it_downloaded() {
+    // `Delayed::downloaded()` is the workflow's own accessor over what `DOWNLOAD` answered,
+    // read back after the boot that produced it. `boot()` drops the workflow on return, so
+    // this test builds one by hand to keep it. `Delayed::default()` rather than `::new()`,
+    // for the same reason: both are one value, and a test should use each at least once.
+    let mut device = Device::new(geometry());
+    let mut world = world_at(DEADLINE + 1);
+    let mut workflow = Delayed::default();
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(
+            progress,
+            Ok(Progress::Finished {
+                conclusion: Conclusion::Completed,
+                ..
+            })
+        ),
+        "{progress:?}"
+    );
+    assert_eq!(workflow.downloaded(), DOWNLOADED);
 }
 
 #[test]
@@ -239,12 +273,12 @@ fn flip_the_clock_kind(device: &mut Device) {
     let Some(align) = ProgramAlign::new(4) else {
         unreachable!("4 is a power of two")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut *device);
     let mut page = [0_u8; 256];
     let at;
     let flipped = loop {
         let offset = recovery.offset();
-        let Some(step) = recovery.next(device, &mut page) else {
+        let Some(step) = recovery.next(&mut page) else {
             unreachable!("the journal holds a scheduled timer")
         };
         let Ok(record) = step else {
@@ -322,10 +356,10 @@ fn a_timer_and_an_activity_share_one_sequence_space() {
     let mut world = world_at(DEADLINE + 1);
     assert!(boot(&mut device, &mut world).is_ok());
 
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut sequences = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journal this test wrote is legal")
         };
@@ -576,14 +610,8 @@ impl Clocks for Ticking {
 }
 
 impl Activities for Ticking {
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
-        self.world.perform(intent, kind, input, out)
+    fn perform(&mut self, dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
+        self.world.perform(dispatch, out)
     }
 }
 
@@ -687,13 +715,7 @@ fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
     }
 
     impl Activities for Regressing {
-        fn perform(
-            &mut self,
-            _intent: DurableIntent,
-            _kind: ActivityKind,
-            _input: &[u8],
-            _out: &mut [u8],
-        ) -> Performed {
+        fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
             Performed::Pending
         }
     }

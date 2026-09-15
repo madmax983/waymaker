@@ -301,7 +301,7 @@ fn an_embedded_storage_driver_passes_the_whole_conformance_suite() {
     // run against, run against an `embedded-storage` adapter.
     let mut storage = ported();
     let Ok(region) = Region::whole_device(storage.geometry()) else {
-        unreachable!("sixteen erase blocks is more than three")
+        unreachable!("sixteen erase blocks is more than four")
     };
     let mut buffer = [0_u8; 64];
 

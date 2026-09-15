@@ -1,4 +1,3 @@
-#![cfg(not(feature = "without-facade"))]
 //! The two halves of design document §07, called out of order.
 //!
 //! [`Boundary::schedule`] hands the writer to the effect it committed, and
@@ -6,17 +5,18 @@
 //! place must be refused rather than left with a run §08 can never end, so both misuses are
 //! named errors and both are driven here.
 //!
-//! The ordinary path is `crates/waymaker-drive/tests/ota.rs`.
+//! The ordinary path is `crates/waymaker-facade-demo/tests/ota.rs`.
 
+use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, Outcome};
-use waymaker_drive::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_drive::{
-    Activities, Answered, Boundary, Bridge, Clocks, DriveError, Driver, DurableIntent, Handoff,
-    Identity, Performed, Scratch, Suspended, Workflow,
+    Activities, Answered, Boundary, CheckedDispatch, Clocks, DriveError, Driver, Handoff, Identity,
+    Performed, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::journal::{Answer, Journal as _};
+use waymaker_facade_demo::Bridge;
+use waymaker_facade_demo::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
@@ -57,13 +57,7 @@ fn reserve() -> Reserve {
 struct Idle;
 
 impl Activities for Idle {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
         Performed::Pending
     }
 }
@@ -197,9 +191,9 @@ fn a_caller_that_ends_the_run_with_an_effect_outstanding_is_refused_by_name() {
 
     assert_eq!(progress, Err(DriveError::EffectOutstanding));
     // No terminal record: the run really is unfinished, and history says so.
-    let mut recovery = waymaker_flash::recovery::Recovery::new(region());
+    let mut recovery = waymaker_flash::recovery::Recovery::new(region(), &mut device);
     let mut records = 0_usize;
-    while recovery.next(&mut device, &mut page).is_some() {
+    while recovery.next(&mut page).is_some() {
         records += 1;
     }
     assert_eq!(records, 2, "the run's record and the schedule record");
@@ -222,9 +216,9 @@ fn a_refused_misuse_writes_no_effect_record() {
         },
     );
 
-    let mut recovery = waymaker_flash::recovery::Recovery::new(region());
+    let mut recovery = waymaker_flash::recovery::Recovery::new(region(), &mut device);
     let mut records = 0_usize;
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         assert!(step.is_ok(), "the journal this boot wrote is legal");
         records += 1;
     }

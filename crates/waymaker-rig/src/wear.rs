@@ -410,14 +410,26 @@ impl PerEffect {
 
     /// The figure in hundredths, so a renderer can show two decimal places without a float.
     ///
-    /// Saturating in the multiply rather than wrapping: a total that large is a reading of
-    /// media rather than a count, and a wrapped figure would understate it — which is the
-    /// failure this whole type exists to prevent.
+    /// The multiply widens to `u64` and runs before the divide. This keeps the ratio correct
+    /// for a total above `u32::MAX / 100`. A multiply that saturates before the divide gives
+    /// the wrong ratio: for [`Wear::SATURATED`], it made `whole()` answer `1` and
+    /// `hundredths()` answer `0.01` for the same value. The result still saturates to
+    /// `u32::MAX` for a ratio too large to show in hundredths.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the branch below is the bound that makes the cast exact"
+    )]
     pub const fn hundredths(self) -> u32 {
-        match self.total.saturating_mul(100).checked_div(self.effects) {
-            Some(hundredths) => hundredths,
-            None => 0,
+        if self.effects == 0 {
+            // Unreachable: the constructor refuses a zero denominator.
+            return 0;
+        }
+        let scaled = self.total as u64 * 100 / self.effects as u64;
+        if scaled > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            scaled as u32
         }
     }
 

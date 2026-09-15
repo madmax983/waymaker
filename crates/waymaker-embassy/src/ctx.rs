@@ -25,12 +25,14 @@
 //! is *plumb* the task's waker through to [`ActivityDispatcher::poll_dispatch`], which is
 //! the one place that knows when the world will answer.
 //!
-//! Two paths therefore register nothing. A [`Halted`] run registers nothing because the
+//! Three paths therefore register nothing. A [`Halted`] run registers nothing because the
 //! boot is over: the caller that drove it looks at the journal next. A deadline that has
 //! not passed registers nothing because there is no in-boot sleep yet — [`Journal::wait`]
 //! is asked again on the next poll, and issue
 //! [#110](https://github.com/madmax983/waymaker/issues/110)'s in-boot sleep is where a
-//! hardware alarm arrives.
+//! hardware alarm arrives. An unserviceable activity kind registers nothing. No event can
+//! predict when a firmware update will arrive (issue
+//! [#111](https://github.com/madmax983/waymaker/issues/111)).
 
 use core::convert::Infallible;
 use core::future::Future;
@@ -85,6 +87,20 @@ enum Ending {
     Refused,
 }
 
+/// Why a run has no boundaries left.
+///
+/// One flag, owned by [`Ctx`]. Issue #107: `TerminalFuture` and `ContinueFuture` kept this
+/// flag in a field of their own. A dropped future took the flag with it. A second future
+/// could then re-decide the run. `Continued` is not an [`Ending`]: a continued run has no
+/// terminal record. [`Ctx::conclusion`] must not answer as though it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Closed {
+    /// The run ended. [`Ending`] says how.
+    Ended(Ending),
+    /// `continue_as_new` retired this run.
+    Continued,
+}
+
 /// Copies as much of `src` into `dst` as fits, and says how much that was.
 fn copy(src: &[u8], dst: &mut [u8]) -> usize {
     let taken = src.len().min(dst.len());
@@ -106,7 +122,12 @@ pub struct Ctx<'a, D: ActivityDispatcher, J: Journal> {
     dispatcher: &'a mut D,
     out: &'a mut [u8],
     payload: usize,
-    conclusion: Option<Ending>,
+    closed: Option<Closed>,
+    /// Set once a dispatcher answers [`Produced::Unserviceable`]. Shared for issue #107's
+    /// reason: a dropped `ActivityFuture` — cancelled by a `select!`, say — must not let a
+    /// fresh one for the same outstanding effect ask the dispatcher again this boot. `stage`
+    /// alone cannot say that, because a new future starts its own at [`Stage::Scheduling`].
+    unserviceable: bool,
 }
 
 impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
@@ -123,7 +144,8 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             dispatcher,
             out,
             payload: 0,
-            conclusion: None,
+            closed: None,
+            unserviceable: false,
         }
     }
 
@@ -141,7 +163,8 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             dispatcher: self.dispatcher,
             out: self.out,
             payload: &mut self.payload,
-            concluded: &self.conclusion,
+            concluded: &self.closed,
+            unserviceable: &mut self.unserviceable,
             kind,
             input,
             stage: Stage::Scheduling,
@@ -160,7 +183,8 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     pub const fn timer(&mut self, spec: TimerSpec) -> TimerFuture<'_, J> {
         TimerFuture {
             journal: self.journal,
-            concluded: &self.conclusion,
+            concluded: &self.closed,
+            unserviceable: &self.unserviceable,
             spec,
             ended: false,
         }
@@ -174,9 +198,9 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     pub const fn continue_as_new<'b>(&'b mut self, input: &'b [u8]) -> ContinueFuture<'b, J> {
         ContinueFuture {
             journal: self.journal,
-            concluded: &self.conclusion,
+            closed: &mut self.closed,
+            unserviceable: &self.unserviceable,
             input,
-            asked: false,
         }
     }
 
@@ -201,10 +225,10 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     fn ending<'b, E>(&'b mut self, bytes: &'b [u8], failed: bool) -> TerminalFuture<'b, E> {
         TerminalFuture {
             out: self.out,
-            conclusion: &mut self.conclusion,
+            closed: &mut self.closed,
+            unserviceable: &self.unserviceable,
             bytes,
             failed,
-            ended: false,
             error: PhantomData,
         }
     }
@@ -213,15 +237,19 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     ///
     /// A refused payload answers [`Conclusion::Refused`] and never [`None`]. The two are
     /// different runs: one did not finish, the other asked to finish with bytes the caller
-    /// cannot carry.
+    /// cannot carry. A continued run also answers [`None`]. It has no terminal record. A
+    /// caller reads this the same way as a run that has not reached a boundary yet.
     #[must_use]
     pub fn conclusion(&self) -> Option<Conclusion<'_>> {
-        match self.conclusion? {
-            Ending::Completed(len) => {
+        match self.closed? {
+            Closed::Ended(Ending::Completed(len)) => {
                 Some(Conclusion::Ended(Outcome::Completed(self.out.get(..len)?)))
             }
-            Ending::Failed(len) => Some(Conclusion::Ended(Outcome::Failed(self.out.get(..len)?))),
-            Ending::Refused => Some(Conclusion::Refused),
+            Closed::Ended(Ending::Failed(len)) => {
+                Some(Conclusion::Ended(Outcome::Failed(self.out.get(..len)?)))
+            }
+            Closed::Ended(Ending::Refused) => Some(Conclusion::Refused),
+            Closed::Continued => None,
         }
     }
 
@@ -231,6 +259,24 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         self.out.get(..self.payload).unwrap_or_default()
+    }
+
+    /// Whether a dispatcher has answered [`Produced::Unserviceable`] for a still-outstanding
+    /// effect this boot.
+    ///
+    /// Every future this `Ctx` builds already refuses once this is set — see
+    /// [`ActivityFuture`], [`TimerFuture`], [`ContinueFuture`] and [`TerminalFuture`]'s own
+    /// `poll` bodies. It does not follow that the *workflow* stalls: a caller that polled the
+    /// stalled future directly rather than through `.await` — a `select!` that dropped it for
+    /// another branch, say — can still have the enclosing `async fn` return its own `Result`
+    /// on its own, with no boundary reached and no conclusion recorded. A bridge from this
+    /// façade to a synchronous driver reads this before trusting a raw `Poll::Ready` for
+    /// exactly that reason: the effect is still outstanding under its committed identity, and
+    /// a bridge that read the workflow's bare return value there would report a conclusion
+    /// the driver's own bookkeeping disagrees with.
+    #[must_use]
+    pub const fn unserviceable(&self) -> bool {
+        self.unserviceable
     }
 }
 
@@ -258,7 +304,8 @@ pub struct ActivityFuture<'b, T, D: ActivityDispatcher, J: Journal> {
     dispatcher: &'b mut D,
     out: &'b mut [u8],
     payload: &'b mut usize,
-    concluded: &'b Option<Ending>,
+    concluded: &'b Option<Closed>,
+    unserviceable: &'b mut bool,
     kind: ActivityKind,
     input: &'b [u8],
     stage: Stage,
@@ -289,15 +336,14 @@ fn observed<T: Decode>(
     }
 }
 
-/// What the journal is told, for a length the world reported against `room`.
+/// What the journal is told, for a result or a failure of `len` bytes reported against
+/// `room`.
 ///
 /// A free function, for [`observed`]'s reason: it takes the buffer rather than `self`, so
-/// the journal borrow beside it stays disjoint.
-fn answered(produced: Produced, out: &[u8], room: usize) -> Answer<'_> {
-    let (len, completed) = match produced {
-        Produced::Completed(len) => (len, true),
-        Produced::Failed(len) => (len, false),
-    };
+/// the journal borrow beside it stays disjoint. It never sees
+/// [`Produced::Unserviceable`](crate::dispatch::Produced::Unserviceable). That answer stops
+/// the boot before this function runs. The code writes no record for it.
+fn answered(len: usize, completed: bool, out: &[u8], room: usize) -> Answer<'_> {
     if len > room {
         return Answer::Exhausted;
     }
@@ -321,7 +367,11 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
         // resolves, so an `async fn` stops there on its own; this is the same statement for
         // a caller that reaches a boundary without going through `.await`, and it is what
         // stops the recorded ending — which points into `out` — being overwritten.
-        if me.concluded.is_some() {
+        // A dropped-then-recreated future must not repeat a stopped boundary either: `stage`
+        // lives in this future alone, but the outstanding effect it would rediscover is the
+        // same one a dispatcher already answered `Unserviceable` for. This flag survives the
+        // drop because it lives in the `Ctx`, the way `closed` does for issue #107.
+        if me.concluded.is_some() || *me.unserviceable {
             return Poll::Pending;
         }
         loop {
@@ -360,7 +410,20 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                     let answer = match dispatched {
                         // The world asked to be tried again. Nothing is recorded, so the
                         // effect stays outstanding under the identity it was committed with.
+                        // `stage` does not move: an executor that polls again asks again.
                         Poll::Pending => return Poll::Pending,
+                        // This firmware cannot service `kind` at all. Not a retry: nothing
+                        // about `id` changes before a reboot (issue #111). The code records
+                        // nothing, and the effect stays outstanding under its committed
+                        // identity. `stage` moves to `Ended` so a spurious repoll of *this*
+                        // future never asks again, and `unserviceable` is set on the `Ctx`
+                        // so a dropped-then-recreated future cannot either. A reboot's fresh
+                        // `Ctx` starts over and tries the dispatcher again.
+                        Poll::Ready(Ok(Produced::Unserviceable)) => {
+                            me.stage = Stage::Ended;
+                            *me.unserviceable = true;
+                            return Poll::Pending;
+                        }
                         // The activity failed with nothing to record. It is recorded as a
                         // failure with no payload, so the run makes progress and every
                         // replay answers the same way. The error value stops here: a
@@ -370,7 +433,12 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                         // A length over the bound is recorded as a failure with no payload:
                         // a truncation replays a wrong answer for ever, and a refusal
                         // strands the run. Both shapes are bounded by the same figure.
-                        Poll::Ready(Ok(produced)) => answered(produced, me.out, room),
+                        Poll::Ready(Ok(Produced::Completed(len))) => {
+                            answered(len, true, me.out, room)
+                        }
+                        Poll::Ready(Ok(Produced::Failed(len))) => {
+                            answered(len, false, me.out, room)
+                        }
                     };
                     me.stage = Stage::Ended;
                     return match me.journal.resolve(answer) {
@@ -387,7 +455,13 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
 #[derive(Debug)]
 pub struct TimerFuture<'b, J: Journal> {
     journal: &'b mut J,
-    concluded: &'b Option<Ending>,
+    concluded: &'b Option<Closed>,
+    /// Set on the `Ctx` once a dispatcher has answered [`Produced::Unserviceable`] for a
+    /// still-outstanding effect. `waymaker-drive`'s boundary refuses a second boundary while
+    /// one effect is unresolved (`DriveError::EffectOutstanding`), so a timer future built
+    /// after that stop must not reach the journal at all -- it would turn a clean stall into
+    /// a hard boot error. Issue #111, round 3.
+    unserviceable: &'b bool,
     spec: TimerSpec,
     ended: bool,
 }
@@ -397,7 +471,7 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if me.ended || me.concluded.is_some() {
+        if me.ended || me.concluded.is_some() || *me.unserviceable {
             return Poll::Pending;
         }
         // The deadline is asked again on every poll until it passes. Ending here would make
@@ -417,12 +491,19 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 ///
 /// [`Infallible`] has no value, so the code after the `.await` is unreachable rather than
 /// merely unlikely. That is the shape of the operation: the run that asked is replaced.
+///
+/// It holds `closed` by `&mut`, not `&`. A dropped-then-repolled future must not ask the
+/// journal twice. The flag that stops it must survive the drop. So it lives in the `Ctx`,
+/// not here. Issue #107.
 #[derive(Debug)]
 pub struct ContinueFuture<'b, J: Journal> {
     journal: &'b mut J,
-    concluded: &'b Option<Ending>,
+    closed: &'b mut Option<Closed>,
+    /// See [`TimerFuture::unserviceable`]. A `continue_as_new` reaching the journal while an
+    /// effect is still outstanding meets the same hard `EffectOutstanding` refusal a timer
+    /// would.
+    unserviceable: &'b bool,
     input: &'b [u8],
-    asked: bool,
 }
 
 impl<J: Journal> Future for ContinueFuture<'_, J> {
@@ -430,9 +511,9 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if !me.asked && me.concluded.is_none() {
-            me.asked = true;
+        if me.closed.is_none() && !*me.unserviceable {
             let Halted = me.journal.continue_as_new(me.input);
+            *me.closed = Some(Closed::Continued);
         }
         Poll::Pending
     }
@@ -452,13 +533,25 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 /// terminal payload. §08 has no edge from a terminal record to another boundary either, so
 /// stopping here is the protocol rather than a guard over it. Codex round 2 found the
 /// version that resolved.
+///
+/// # Why `closed` is shared
+///
+/// It was a field of this future alone. Poll `complete`, then drop it. Poll `fail`. The
+/// second future has no memory of the first. It overwrites the first conclusion. The flag
+/// now lives in the `Ctx`. A new future cannot overwrite a dropped future's decision.
+/// Issue #107.
 #[derive(Debug)]
 pub struct TerminalFuture<'b, E> {
     out: &'b mut [u8],
-    conclusion: &'b mut Option<Ending>,
+    closed: &'b mut Option<Closed>,
+    /// See [`TimerFuture::unserviceable`]. This future records no journal call itself, but
+    /// recording a conclusion here while an effect is still outstanding would let
+    /// [`Ctx::conclusion`] report a run that ended while `waymaker-drive`'s boundary still
+    /// holds the effect pending -- the same `Ok(Outcome)`-while-`pending.is_some()` shape
+    /// its own `Context::conclude` refuses as `EffectOutstanding`.
+    unserviceable: &'b bool,
     bytes: &'b [u8],
     failed: bool,
-    ended: bool,
     error: PhantomData<fn() -> E>,
 }
 
@@ -467,18 +560,17 @@ impl<E> Future for TerminalFuture<'_, E> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if !me.ended {
-            me.ended = true;
+        if me.closed.is_none() && !*me.unserviceable {
             // Refused rather than truncated when it does not fit: a short terminal record
             // replays for ever. The refusal is recorded, so the caller cannot read it as a
             // run that never ended and complete it with nothing.
-            *me.conclusion = Some(if me.bytes.len() > me.out.len() {
+            *me.closed = Some(Closed::Ended(if me.bytes.len() > me.out.len() {
                 Ending::Refused
             } else if me.failed {
                 Ending::Failed(copy(me.bytes, me.out))
             } else {
                 Ending::Completed(copy(me.bytes, me.out))
-            });
+            }));
         }
         // The run is over. Nothing after this runs, so nothing can overwrite the buffer the
         // ending points into. The caller that drove the boot reads

@@ -98,16 +98,27 @@ fn the_oracle_accepts_exactly_the_recoveries_the_specification_permits() {
 
 #[test]
 fn the_oracles_third_line_agrees_with_the_model_about_dispatched_effects() {
+    // `state.ledger()` is scoped to `recovering_bank` — one run's media, the way a real
+    // single-bank harness run produces it — so the dispatch log compared against it has to be
+    // scoped the same way: an id dispatched from a bank a later swap retired is not part of
+    // *this* ledger's run at all, and handing it to `Recovery` would be asking the oracle a
+    // question about a record it was never told exists.
     let explored = explore(AGREEMENT, Guards::ENFORCED, CEILING).expect("the agreement bound");
     let mut with_effects = 0_usize;
     for state in explored.states() {
-        if state.dispatched().is_empty() {
+        let this_run: Vec<RecordId> = state
+            .dispatched()
+            .iter()
+            .filter(|id| state.bank_of(**id) == state.recovering_bank())
+            .copied()
+            .collect();
+        if this_run.is_empty() {
             continue;
         }
         with_effects += 1;
         let ledger = state.ledger();
         let history = Specified.recover(state);
-        let recovery = Recovery::new(&history).dispatched(state.dispatched());
+        let recovery = Recovery::new(&history).dispatched(&this_run);
         assert!(
             verify_oracle(&ledger, &recovery).is_ok(),
             "the oracle refuses the specified reader's history in {state:?}"
@@ -198,6 +209,46 @@ fn the_specification_is_strictly_stronger_than_the_oracle_where_they_differ() {
         oracle_is_weaker > 0,
         "the two never differ even with the append-only precondition removed, so this claim \
          is about nothing"
+    );
+}
+
+#[test]
+fn the_ledger_the_oracle_judges_never_has_a_gap_before_committed_history() {
+    // Issue #67's smaller item, closed without touching `verify_oracle`. Its prefix check
+    // runs against `Ledger::committed()`, which filters out records that never reached
+    // media — sound for the agreement tests above only if no ledger this crate ever hands it
+    // has a record with no bytes on media sitting *before* one that does, and until now the
+    // only thing saying so was `tests/machine.rs`'s theorem about `Journal`, a fact about a
+    // different type reached by a different test file. `waymaker_fault::verify_oracle`
+    // itself has no such check, because a writer under test may legitimately fail one
+    // record's write outright and carry on to the next — a case `crates/waymaker-fault/tests/harness.rs`'s
+    // `a_record_that_never_reached_media_does_not_occupy_a_position_in_history` drives on
+    // purpose, and the oracle has to accept it. So the fix is not a stricter oracle; it is
+    // this: the same claim, checked directly against the `Ledger` the agreement tests above
+    // actually build, rather than borrowed from a proof about `Journal` and trusted to still
+    // apply once it has passed through `state.ledger()`.
+    let explored = explore(AGREEMENT, Guards::ENFORCED, CEILING).expect("the agreement bound");
+    let mut checked = 0_usize;
+    for state in explored.states() {
+        let ledger = state.ledger();
+        let mut reached_a_gap = false;
+        for (id, durability) in ledger.records() {
+            if durability == waymaker_fault::Durability::Attempted {
+                reached_a_gap = true;
+            } else {
+                assert!(
+                    !reached_a_gap,
+                    "record {} reached media behind a record with nothing on media, in the \
+                     ledger built from {state:?}",
+                    id.0
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "no ledger this sweep built had any record on media, so this claim is about nothing"
     );
 }
 

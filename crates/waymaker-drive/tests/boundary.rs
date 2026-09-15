@@ -267,8 +267,8 @@ fn a_journal_whose_first_record_is_not_a_run_is_refused_as_malformed() {
     let mut device = Device::new(geometry());
     let mut page = [0_u8; 256];
     {
-        let mut scan = Recovery::new(region());
-        while scan.next(&mut device, &mut page).is_some() {}
+        let mut scan = Recovery::new(region(), &mut device);
+        while scan.next(&mut page).is_some() {}
         let Some(mut journal) = Journal::after(scan) else {
             unreachable!("an erased journal has an append point")
         };
@@ -281,10 +281,10 @@ fn a_journal_whose_first_record_is_not_a_run_is_refused_as_malformed() {
         let Ok(staged) = journal.stage(&mut device, &record, &mut page) else {
             unreachable!("the record fits the region")
         };
-        let Ok(sealable) = staged.payload_barrier(&mut device) else {
+        let Ok(sealable) = staged.payload_barrier() else {
             unreachable!("the model's barrier cannot fail")
         };
-        let Ok(_) = sealable.commit(&mut device) else {
+        let Ok(_) = sealable.commit() else {
             unreachable!("the model's program cannot fail here")
         };
     }
@@ -397,10 +397,10 @@ impl Workflow for Verbose {
 
 /// Every record the journal holds, by kind.
 fn kinds(device: &mut Device) -> Vec<&'static str> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };
@@ -629,10 +629,10 @@ fn a_result_buffer_narrower_than_the_declared_bound_is_refused_before_any_record
 
 /// Every record's payload length, in order.
 fn payloads(device: &mut Device) -> Vec<usize> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };
@@ -653,18 +653,18 @@ fn payloads(device: &mut Device) -> Vec<usize> {
 /// Appends `record` to the journal as it stands, whatever follows it.
 fn append_past_the_end(device: &mut Device, record: &RecordRef<'_>) {
     let mut page = [0_u8; 256];
-    let mut scan = Recovery::new(region());
-    while scan.next(device, &mut page).is_some() {}
+    let mut scan = Recovery::new(region(), device);
+    while scan.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(scan) else {
         unreachable!("the fixtures here end in erased media")
     };
     let Ok(staged) = journal.stage(device, record, &mut page) else {
         unreachable!("the record fits the region")
     };
-    let Ok(sealable) = staged.payload_barrier(device) else {
+    let Ok(sealable) = staged.payload_barrier() else {
         unreachable!("the model's barrier cannot fail")
     };
-    let Ok(_) = sealable.commit(device) else {
+    let Ok(_) = sealable.commit() else {
         unreachable!("the model's program cannot fail here")
     };
 }
@@ -784,8 +784,8 @@ fn a_read_that_failed_after_the_run_ended_is_reported_rather_than_taken_for_the_
     let mut device = a_completed_run();
     let mut roomy = [0_u8; 256];
     {
-        let mut scan = Recovery::new(region());
-        while scan.next(&mut device, &mut roomy).is_some() {}
+        let mut scan = Recovery::new(region(), &mut device);
+        while scan.next(&mut roomy).is_some() {}
         let Some(mut journal) = Journal::after(scan) else {
             unreachable!("the completed run ends in erased media")
         };
@@ -796,10 +796,10 @@ fn a_read_that_failed_after_the_run_ended_is_reported_rather_than_taken_for_the_
         let Ok(staged) = journal.stage(&mut device, &record, &mut roomy) else {
             unreachable!("the record fits the region")
         };
-        let Ok(sealable) = staged.payload_barrier(&mut device) else {
+        let Ok(sealable) = staged.payload_barrier() else {
             unreachable!("the model's barrier cannot fail")
         };
-        let Ok(_) = sealable.commit(&mut device) else {
+        let Ok(_) = sealable.commit() else {
             unreachable!("the model's program cannot fail here")
         };
     }

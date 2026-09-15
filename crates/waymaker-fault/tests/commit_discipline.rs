@@ -134,31 +134,36 @@ fn slot(index: u32) -> usize {
 /// The real thing: §07's two barriers per record, through the writer that enforces them.
 fn two_barrier_writer(session: &mut Session) -> Result<(), FaultError> {
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region());
-    while recovery.next(session, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region(), session);
+    while recovery.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly at its first byte")
     };
 
     for index in 0..RECORDS {
         let mut staging = [0_u8; PAGE];
-        let sealable = journal
-            .stage(session, &record(index), &mut staging)
-            .and_then(|staged| staged.payload_barrier(session))
-            .map_err(unwind)?;
+        let before = session.operations();
 
-        // The record is declared *here*, between the payload barrier and the seal, and that
-        // placement is the protocol rather than bookkeeping. §15's `Acknowledged` means "a
-        // barrier completed after every one of this record's writes", and the payload
-        // barrier completes after the frame body — so a record declared before it would be
-        // acknowledged by it, and the oracle would then require recovery to produce a
-        // record §07 says was never committed. The frame body is not a record for the same
-        // reason `tests/banks.rs` does not declare its bank header as one: a crash before
-        // the seal recovers the run without it, which is history the device is right to
-        // have no trace of.
-        session.begin_record(id(index));
-        sealable.commit(session).map_err(unwind)?;
-        session.end_record();
+        // The record is declared *before* any of its operations are attempted, from the
+        // operations `stage` and `payload_barrier` are pinned to spend (one program, one
+        // barrier) and the two `commit` is pinned to spend after them (one program, one
+        // barrier) — because `Sealable` holds `session` for the whole two-phase commit, so
+        // `session` cannot be reached to bracket the record live, and a call made only
+        // after the chain below succeeds would be a call a crash inside that chain also
+        // skips, disagreeing with the fault-free run at every one of the interesting crash
+        // points. §15's `Acknowledged` means "a barrier completed after every one of this
+        // record's writes", and the payload barrier completes after the frame body — so a
+        // record declared over it would be acknowledged by it, and the oracle would then
+        // require recovery to produce a record §07 says was never committed. The frame body
+        // is not a record for the same reason `tests/banks.rs` does not declare its bank
+        // header as one: a crash before the seal recovers the run without it, which is
+        // history the device is right to have no trace of.
+        session.mark_operations(id(index), (before + 2)..(before + 4));
+        journal
+            .stage(session, &record(index), &mut staging)
+            .and_then(waymaker_flash::Staged::payload_barrier)
+            .and_then(waymaker_flash::Sealable::commit)
+            .map_err(unwind)?;
     }
     Ok(())
 }
@@ -276,10 +281,10 @@ fn recover(image: &[u8]) -> (Vec<RecordId>, Option<Ending>) {
     let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
         unreachable!("an image of the device's own capacity restores")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; PAGE];
     let mut found = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         match step {
             Ok(RecordRef::EffectScheduled { seq, .. } | RecordRef::EffectCompleted { seq, .. }) => {
                 found.push(id(seq.0));
@@ -376,8 +381,8 @@ fn the_writer_reports_the_same_amplification_at_every_record() {
     // barriers, and the bytes of a padded frame and a seal.
     let mut device = Device::new(geometry());
     let mut page = [0_u8; PAGE];
-    let mut recovery = Recovery::new(region());
-    while recovery.next(&mut device, &mut page).is_some() {}
+    let mut recovery = Recovery::new(region(), &mut device);
+    while recovery.next(&mut page).is_some() {}
     let Some(mut journal) = Journal::after(recovery) else {
         unreachable!("an erased region ends cleanly")
     };
@@ -387,8 +392,8 @@ fn the_writer_reports_the_same_amplification_at_every_record() {
         let mut staging = [0_u8; PAGE];
         let Ok(written) = journal
             .stage(&mut device, &record(index), &mut staging)
-            .and_then(|staged| staged.payload_barrier(&mut device))
-            .and_then(|sealable| sealable.commit(&mut device))
+            .and_then(waymaker_flash::Staged::payload_barrier)
+            .and_then(waymaker_flash::Sealable::commit)
         else {
             unreachable!("a legal append")
         };

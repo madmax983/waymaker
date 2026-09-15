@@ -26,10 +26,11 @@
 use core::cell::Cell;
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
-use waymaker_core::{ActivityKind, KernelError, RecordKind, RunId};
+use waymaker_core::{KernelError, RecordKind, RunId};
 use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_drive::{
-    Activities, Clocks, Conclusion, DriveError, Driver, DurableIntent, Performed, Progress, Scratch,
+    Activities, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Performed, Progress,
+    Scratch,
 };
 use waymaker_embassy::clock::PersistentClock;
 use waymaker_fault::Device;
@@ -79,10 +80,10 @@ fn reserve() -> Reserve {
 
 /// The kind byte of every record the journal holds.
 fn kinds(device: &mut Device) -> Vec<RecordKind> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -233,14 +234,8 @@ impl<C: PersistentClock> Clocks for Board<C> {
 }
 
 impl<C> Activities for Board<C> {
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
-        self.world.perform(intent, kind, input, out)
+    fn perform(&mut self, dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
+        self.world.perform(dispatch, out)
     }
 }
 

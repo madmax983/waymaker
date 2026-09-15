@@ -16,6 +16,30 @@ use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 /// write `0xFF` and hope.
 pub const ERASED: u8 = 0xFF;
 
+/// Whether every byte of `bytes` is [`ERASED`], a word at a time.
+///
+/// [`Device::apply_erase`] and [`Device::erase_would_change`] are on the crash injector's
+/// hottest path — [`crate::Session::erase`] calls the first once per erase in every writer
+/// sequence the injector drives, at every length an interrupted erase can land at, so this
+/// runs over spans up to a whole erase block, over and over, for every crash point swept.
+/// A byte-at-a-time `iter().any(|&b| b != ERASED)` there pays a bounds check and a compare
+/// per byte for an answer usable in `usize`-sized chunks; re-erasing an already-erased
+/// block — the bank-prepare shape `apply_erase`'s own doc comment names as "not exotic" —
+/// is the case that scan cannot short-circuit out of; it has to read every byte to answer
+/// "no". Same technique `waymaker_conformance::suite::slice_is_erased` uses for the same
+/// reason, reimplemented rather than shared: that function is private to a crate two layers
+/// away from this one. Checked against the byte-at-a-time definition at every length and
+/// single-byte-mutation position around a word boundary in this module's tests, so a
+/// remainder handled short does not pass silently.
+fn slice_is_erased(bytes: &[u8]) -> bool {
+    const WORD: usize = size_of::<usize>();
+    let mut words = bytes.chunks_exact(WORD);
+    let words_erased = words.by_ref().all(|word| {
+        matches!(<[u8; WORD]>::try_from(word), Ok(word) if usize::from_ne_bytes(word) == usize::MAX)
+    });
+    words_erased && words.remainder().iter().all(|&byte| byte == ERASED)
+}
+
 /// What the model does when a program asks for a bit the media has already cleared.
 ///
 /// Real NOR silently drops it, which is why firmware bugs of this shape survive testing on
@@ -193,7 +217,7 @@ impl Device {
         else {
             return false;
         };
-        let changed = target.iter().any(|cell| *cell != ERASED);
+        let changed = !slice_is_erased(target);
         target.fill(ERASED);
         changed
     }
@@ -260,7 +284,7 @@ impl Device {
         else {
             return false;
         };
-        target.iter().any(|cell| *cell != ERASED)
+        !slice_is_erased(target)
     }
 
     /// The bit rule this device was built with.
@@ -312,5 +336,38 @@ impl StableStorage for Device {
     /// bytes.
     fn barrier(&mut self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ERASED, slice_is_erased};
+
+    /// `slice_is_erased` has to agree with "every byte is [`ERASED`]", at every length
+    /// around a word boundary and with the one non-erased byte at every position — inside a
+    /// whole word-sized chunk and inside whatever a word-at-a-time walk would leave as a
+    /// remainder. Pinned before `apply_erase` and `erase_would_change` stop scanning a byte
+    /// at a time, mirroring `waymaker_conformance::suite`'s own sweep of the same shape.
+    #[test]
+    fn slice_is_erased_agrees_with_the_byte_at_a_time_definition_at_every_length_and_position() {
+        const MAX_LEN: usize = 32;
+        let word = size_of::<usize>();
+        let widest = word * 3 + 1;
+        assert!(widest <= MAX_LEN, "word size outgrew this fixture");
+        for len in 0..=widest {
+            let all_erased = [ERASED; MAX_LEN];
+            assert!(
+                slice_is_erased(&all_erased[..len]),
+                "length {len} of all erased bytes"
+            );
+            for spoiled in 0..len {
+                let mut bytes = all_erased;
+                bytes[spoiled] = 0x00;
+                assert!(
+                    !slice_is_erased(&bytes[..len]),
+                    "length {len} spoiled at {spoiled}"
+                );
+            }
+        }
     }
 }

@@ -1,12 +1,12 @@
-#![cfg(not(feature = "without-facade"))]
 //! Design document §06's OTA example, over real media.
 //!
 //! Issue [#35](https://github.com/madmax983/waymaker/issues/35)'s two "done when"s, and
 //! issue [#38](https://github.com/madmax983/waymaker/issues/38)'s third — exercised by the
-//! crash rig, not only a happy-path run. The workflow is `waymaker_drive::ota::ota_update`
-//! — §06's example as an `async fn` — the façade is `waymaker-embassy`'s, the driver is
-//! this crate's, and the media is `waymaker-fault`'s model of NOR. So what is measured
-//! below is the protocol and not a fixture that agrees with it.
+//! crash rig, not only a happy-path run. The workflow is
+//! `waymaker_facade_demo::ota::ota_update` — §06's example as an `async fn` — the façade is
+//! `waymaker-embassy`'s, the driver is `waymaker-drive`'s, and the media is
+//! `waymaker-fault`'s model of NOR. So what is measured below is the protocol and not a
+//! fixture that agrees with it.
 //!
 //! The façade's own sequencing is `crates/waymaker-embassy/tests/ctx.rs`.
 
@@ -17,17 +17,18 @@ use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::demo::{BOUNDS as DEMO_BOUNDS, Pipeline, World as SyncWorld};
-use waymaker_drive::ota::{
-    BOUNDS, DOWNLOAD, Downloader, FLASH_IMAGE, HANDLE, Ota, URL, VERIFY_SIGNATURE, WORKFLOW_KIND,
-    WORKFLOW_VERSION, poll_ota,
-};
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, Identity, Performed, Progress,
-    Scratch, Suspended, Workflow,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
+    Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
 use waymaker_embassy::ctx::Ctx;
 use waymaker_embassy::dispatch::Produced;
+use waymaker_facade_demo::Bridge;
+use waymaker_facade_demo::ota::{
+    BOUNDS, CONTEXT_BYTES, DOWNLOAD, Downloader, FLASH_IMAGE, HANDLE, Ota, URL, VERIFY_SIGNATURE,
+    WORKFLOW_FUTURES, WORKFLOW_KIND, WORKFLOW_VERSION, poll_ota,
+};
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::{Bounds, Reserve};
@@ -66,10 +67,10 @@ fn reserve(bounds: Bounds) -> Reserve {
 
 /// Every record the journal holds, as a kind and its bytes.
 fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             unreachable!("the journals these tests write are legal")
         };
@@ -183,13 +184,7 @@ struct Unused {
 }
 
 impl Activities for Unused {
-    fn perform(
-        &mut self,
-        _intent: waymaker_drive::DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
         self.performed += 1;
         Performed::Pending
     }
@@ -415,11 +410,11 @@ fn continue_as_new_is_refused_by_a_driver_that_cannot_name_a_bank() {
 #[test]
 fn the_synchronous_driver_still_runs_a_workflow_that_names_no_facade_type() {
     // Issue #35's second "done when", as far as a test can put it: the reference workflow
-    // of issue #28 reaches the same end with the façade in the workspace. The structural
-    // half is not a test — it is the `drive-facadeless` pipeline stage, which builds this
-    // crate with `without-facade` and so compiles the driver, §06's boundary and §07's
-    // typestate with the façade edge deleted. The `ctx-facade` gate rule is the fast,
-    // local half of the same claim.
+    // of issue #28 reaches the same end with the façade in the workspace. Issue #106's
+    // crate split is the structural half — `waymaker-drive` names no dependency on
+    // `waymaker-embassy` in any table, so `cargo metadata` proves this rather than a build
+    // with a feature flag. The `ctx-facade` gate rule is the fast, local half of the same
+    // claim.
     let mut device = Device::new(geometry());
     let mut workflow = Pipeline::new();
     let mut world = SyncWorld::new();
@@ -553,14 +548,14 @@ fn the_context_measured_is_the_context_the_workflow_uses() {
     // `xtask` gates whatever `CONTEXT_BYTES` holds. So this reads the size back through the
     // type the workflow is actually driven with, which no substitution survives.
     assert_eq!(
-        waymaker_drive::ota::CONTEXT_BYTES,
-        size_of::<Ctx<'static, Downloader, waymaker_drive::Bridge<'static>>>(),
+        CONTEXT_BYTES,
+        size_of::<Ctx<'static, Downloader, Bridge<'static>>>(),
     );
 }
 
 #[test]
 fn the_generated_workflow_future_is_named_and_is_not_the_context() {
-    let futures = waymaker_drive::ota::WORKFLOW_FUTURES;
+    let futures = WORKFLOW_FUTURES;
     assert_eq!(futures.len(), 1);
     let (name, bytes) = futures[0];
     assert_eq!(name, "ota_update");
@@ -576,10 +571,10 @@ fn scheduled(image: &[u8]) -> Vec<u32> {
     let Some(mut device) = Device::restored(geometry(), image.to_vec()) else {
         unreachable!("the image is device-sized")
     };
-    let mut recovery = Recovery::new(region());
+    let mut recovery = Recovery::new(region(), &mut device);
     let mut page = [0_u8; 256];
     let mut out = Vec::new();
-    while let Some(step) = recovery.next(&mut device, &mut page) {
+    while let Some(step) = recovery.next(&mut page) {
         let Ok(record) = step else {
             break;
         };

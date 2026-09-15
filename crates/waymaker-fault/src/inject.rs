@@ -207,6 +207,10 @@ pub enum Interruption {
     /// needs the mark's barrier to have returned and a watchdog reset is the reset that does
     /// not return. That cell is a board's.
     ///
+    /// [`injections`] enumerates no point after the last operation. See that function's
+    /// documentation for why, and [`Harness::run_one`](crate::Harness::run_one) for how a
+    /// caller still asks the question.
+    ///
     /// [`FaultError::WatchdogReset`]: crate::FaultError::WatchdogReset
     Watchdog,
     /// The call returns an error and the writer carries on. Design document §12's "program
@@ -257,6 +261,29 @@ pub struct Injection {
 /// "Power loss before and after every barrier" falls out of the third bullet: *after* the
 /// barrier at `b` is `(b, Whole, PowerLoss)`, and *before* it is the previous operation's
 /// `Whole` entry, or `(0, None, PowerLoss)` when the barrier is first.
+///
+/// # Why there is no `Watchdog` point after the last operation
+///
+/// A core reset needs an operation to interrupt. There is no operation after the last one,
+/// so the enumeration has no point there.
+///
+/// This is a decision, not a gap. Read `(i, Whole, Watchdog)` on the last operation: the
+/// call always returns an error, so any code the writer runs after it never runs. There is
+/// no way, through this crate's model, to let that code run and *then* reset the core —
+/// doing so would need the model to interrupt code that is not a storage call, which is out
+/// of scope for a storage fault harness.
+///
+/// So "the writer finished, and then the core reset" is a world with nothing left for a
+/// reset to change: not the media, not the write sequence, not the ledger, and not what the
+/// writer did after its last storage call. That world already has a name — the fault-free
+/// run — and giving it a second one would count one crash point twice.
+///
+/// [`Harness::run_one`](crate::Harness::run_one) answers this question directly for a
+/// caller who asks it by hand: `(ops.len(), None, Watchdog)` returns the fault-free run.
+/// This function does not enumerate that point, so the sweep [`Harness::run`](crate::Harness::run)
+/// performs does not grow. See issue
+/// [#87](https://github.com/madmax983/waymaker/issues/87) and
+/// [ADR 0042](https://github.com/madmax983/waymaker/blob/main/docs/adr/0042-a-terminal-watchdog-reset-is-the-fault-free-run.md).
 #[must_use]
 pub fn injections(ops: &[Op], geometry: Geometry) -> Vec<Injection> {
     let mut points = vec![Injection {

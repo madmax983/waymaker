@@ -29,9 +29,16 @@
 //! is held to `INCREMENTAL_CODE_FLASH_BYTES`; `facade` is the configuration rung 0.4 ships
 //! and is held to `FACADE_CODE_FLASH_BYTES`, a ceiling of its own so that paying for the
 //! façade never widens the kernel's number. A per-feature row is reported with its
-//! incremental cost but not gated, because the design document sets no per-feature budget —
-//! it requires the cost to be *shown*. The base-branch diff is what makes an unbudgeted
-//! row's growth visible in review.
+//! incremental cost but not gated for *flash*, because the design document sets no
+//! per-feature flash budget — it requires the cost to be *shown*. The base-branch diff is
+//! what makes an unbudgeted row's growth visible in review.
+//!
+//! Runtime RAM does not split the same way. §04 states one hard ceiling for the device, not
+//! one per configuration, so [`SizeReport::runtime_ram_total`] composes the largest `Δram`
+//! of *every* row — a per-feature row's RAM counts against it too. [`completeness_shortfalls`]
+//! is what makes composing over "every row" sound against a document this process did not
+//! produce: it holds the document's row *set* to what [`matrix`] derives for the workspace,
+//! so a row cannot be silently dropped to compose a smaller total — issue #115.
 //!
 //! # §04's budgets, and what carries each
 //!
@@ -44,6 +51,7 @@
 //! memory, and issue [#39](https://github.com/madmax983/waymaker/issues/39) asks that a
 //! large future not be hidden behind a small context.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +75,15 @@ pub const ENGINE_FEATURE: &str = "engine";
 
 /// The probe feature that also links the Embassy façade.
 pub const FACADE_FEATURE: &str = "facade";
+
+/// The probe feature that links ADR 0010's five checksum candidates.
+///
+/// Independent of every layer: no `dep:` entry, so it needs no mirror and
+/// `check_probe_mirrors` does not iterate it. Issue #61.
+pub const CRC_CANDIDATES_FEATURE: &str = "crc-candidates";
+
+/// The row the checksum-candidate section is measured from.
+pub const CRC_CANDIDATES_ROW: &str = "crc-candidates";
 
 /// Where `cargo xtask size` writes the report it then gates and uploads.
 pub const REPORT_PATH: &str = "target/waymaker-size.json";
@@ -301,6 +318,74 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
     variants
 }
 
+/// Rows the document is missing, compared against what [`matrix`] derives for the
+/// workspace at `root`.
+///
+/// [`SizeReport::runtime_ram_total`] composes the largest `Δram` of *every* row the
+/// document carries, because a per-feature row's statics count against §04's one runtime
+/// ceiling the same as the engine's do. `--report` reads a document this process did not
+/// produce, so the row *set* is not taken at its word either: a row `matrix` would derive
+/// and the document lacks — by name, or by name with a different feature selection — is a
+/// wrong claim, not a smaller one. Issue #115.
+///
+/// Resolves `cargo metadata` for `root` and nothing else. No firmware is linked, which
+/// keeps `--report` usable without a build.
+///
+/// # Errors
+///
+/// If `root`'s workspace cannot be resolved or parsed.
+pub fn completeness_shortfalls(
+    root: &Path,
+    report: &SizeReport,
+) -> Result<Vec<BudgetShortfall>, SizeError> {
+    let metadata = crate::run_cargo_metadata(root)
+        .map_err(|err| SizeError::new(format!("could not resolve the workspace: {err}")))?;
+    let graph = PackageGraph::from_cargo_metadata(&metadata)
+        .map_err(|err| SizeError::new(format!("could not parse cargo metadata: {err}")))?;
+    Ok(missing_rows(&matrix(&graph), report.rows()))
+}
+
+/// [`completeness_shortfalls`]'s comparison, pulled out so a test can drive it against a
+/// fixed `expected` list rather than a live workspace.
+///
+/// A row of `rows` is missing when no row shares `expected`'s name *and* its exact feature
+/// set — a name reused with a narrowed selection is a row that was not really built with
+/// the feature the name claims, so its `Δram` would not be that feature's.
+///
+/// An empty `expected` is refused rather than read as "nothing to check": [`matrix`]
+/// derives no row at all for a workspace with no [`PROBE_PACKAGE`], and a document read
+/// against that workspace would otherwise pass vacuously — the same empty matrix
+/// [`measure_into`] already refuses to link.
+#[must_use]
+fn missing_rows(expected: &[Variant], rows: &[Row]) -> Vec<BudgetShortfall> {
+    if expected.is_empty() {
+        return vec![BudgetShortfall::Unmeasurable {
+            detail: format!(
+                "this workspace has no `{PROBE_PACKAGE}`, so `matrix` derives no row to hold the document's row set to"
+            ),
+        }];
+    }
+    expected
+        .iter()
+        .filter(|variant| {
+            !rows.iter().any(|row| {
+                row.name == variant.name
+                    && row.features.len() == variant.features.len()
+                    && variant
+                        .features
+                        .iter()
+                        .all(|feature| row.features.iter().any(|have| have == feature))
+            })
+        })
+        .map(|variant| BudgetShortfall::Unmeasurable {
+            detail: format!(
+                "the report has no row named `{}` with features {:?}, which `matrix` derives for this workspace",
+                variant.name, variant.features
+            ),
+        })
+        .collect()
+}
+
 /// The section sizes of one linked image.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SectionSizes {
@@ -508,6 +593,129 @@ fn identifier(rest: &str) -> Option<&str> {
     let continues =
         characters.all(|character| character.is_ascii_alphanumeric() || character == '_');
     (starts && continues).then_some(name)
+}
+
+/// One checksum candidate ADR 0010 weighed, measured as a symbol rather than typed by hand.
+///
+/// Design document §16's first deferred question is settled by
+/// [ADR 0010](../../../docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
+/// on numbers nothing in this repository reproduced. Issue #61 closes that gap:
+/// `waymaker-size-probe`'s `crc-candidates` feature links all five loops into one image,
+/// and each row here is one candidate's own symbol in it. Reported, never gated — ADR 0010
+/// is a comparison between candidates, not a cost this firmware pays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumCandidate {
+    /// The candidate's name, as ADR 0010's table names it.
+    pub name: String,
+    /// Whether Waymaker ships this candidate.
+    pub shipped: bool,
+    /// `.text` bytes: the loop body.
+    pub text: u64,
+    /// `.rodata` bytes: a lookup table. Zero for a bitwise loop.
+    pub rodata: u64,
+}
+
+/// One candidate: its report name, whether it ships, its function's identifier, and its
+/// table's identifier where it has one.
+///
+/// The identifiers are `crates/waymaker-size-probe/src/checksum_candidates.rs`'s, which
+/// copies each body from an already-tested one — the two shipped algorithms from
+/// `waymaker-flash/src/crc.rs`, and the three rejected candidates from
+/// `waymaker-flash/tests/integrity.rs`.
+const CHECKSUM_CANDIDATES: &[(&str, bool, &str, Option<&str>)] = &[
+    (
+        "crc32-iso-hdlc-bitwise",
+        true,
+        "crc32_iso_hdlc_bitwise_candidate",
+        None,
+    ),
+    ("crc32c-bitwise", false, "crc32c_bitwise_candidate", None),
+    (
+        "crc32c-nibble-table",
+        false,
+        "crc32c_nibble_table_candidate",
+        Some("CRC32C_NIBBLE_TABLE_CANDIDATE"),
+    ),
+    (
+        "crc32c-byte-table",
+        false,
+        "crc32c_byte_table_candidate",
+        Some("CRC32C_BYTE_TABLE_CANDIDATE"),
+    ),
+    (
+        "crc16-ccitt-false-bitwise",
+        true,
+        "crc16_ccitt_false_bitwise_candidate",
+        None,
+    ),
+];
+
+/// Whether `mangled` names the item `identifier`, declared in `crate_name`.
+///
+/// A length-prefixed substring search — [`identifier`]'s own technique for reading one out
+/// of a `v0` path — rather than a full demangler. Every identifier
+/// [`CHECKSUM_CANDIDATES`] names is written to be unique on its own, so this cannot match
+/// the wrong body by chance: nothing else in a `crc-candidates` image is a fold table or a
+/// checksum loop named after one.
+#[must_use]
+fn names_item(mangled: &str, crate_name: &str, identifier: &str) -> bool {
+    defining_crate(mangled) == Some(crate_name)
+        && mangled.contains(&format!("{}{identifier}", identifier.len()))
+}
+
+/// `identifier`'s own size in `symbols`, read out of `crate_name`'s code.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if no symbol names `identifier`, or more than one does — both mean
+/// the identifier cannot be attributed to one body.
+fn candidate_symbol_bytes(
+    symbols: &[elf::Symbol],
+    crate_name: &str,
+    identifier: &str,
+) -> Result<u64, SizeError> {
+    let mut found = symbols
+        .iter()
+        .filter(|symbol| symbol.size > 0 && names_item(&symbol.name, crate_name, identifier));
+    let Some(first) = found.next() else {
+        return Err(SizeError::new(format!(
+            "no symbol names `{identifier}`; the crc-candidates image did not retain it"
+        )));
+    };
+    if found.next().is_some() {
+        return Err(SizeError::new(format!(
+            "more than one symbol names `{identifier}`, so its size cannot be attributed to one body"
+        )));
+    }
+    Ok(first.size)
+}
+
+/// Every checksum candidate's size, read out of one `crc-candidates` image.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if a candidate's function or table cannot be found by name, or is
+/// not uniquely named.
+pub fn checksum_candidate_sizes(
+    symbols: &[elf::Symbol],
+) -> Result<Vec<ChecksumCandidate>, SizeError> {
+    let crate_name = probe_crate_name();
+    CHECKSUM_CANDIDATES
+        .iter()
+        .map(|&(name, shipped, function, table)| {
+            let text = candidate_symbol_bytes(symbols, &crate_name, function)?;
+            let rodata = table
+                .map(|table| candidate_symbol_bytes(symbols, &crate_name, table))
+                .transpose()?
+                .unwrap_or(0);
+            Ok(ChecksumCandidate {
+                name: name.to_owned(),
+                shipped,
+                text,
+                rodata,
+            })
+        })
+        .collect()
 }
 
 /// How many of the image's stored bytes the symbol table attributes to `crate_name`.
@@ -747,17 +955,17 @@ impl RuntimeRam {
     ///
     /// Host sizes. A `thumbv6m` pointer is narrower, so every figure here is an upper bound
     /// on the target's, and gating it can fail early but never late. The exact check on the
-    /// target is `waymaker_core::assert_context_size!`, which the `drive-firmware` stage
-    /// compiles.
+    /// target is `waymaker_core::assert_context_size!`, which the `facade-demo-firmware`
+    /// stage compiles.
     #[must_use]
     pub fn measured() -> Option<Self> {
         Some(Self {
-            context: waymaker_drive::ota::CONTEXT_BYTES as u64,
+            context: waymaker_facade_demo::ota::CONTEXT_BYTES as u64,
             // Every example's registry, chained: §04 asks each generated future to be
             // reported, and a second example is a second row rather than a second section.
-            workflow_futures: waymaker_drive::ota::WORKFLOW_FUTURES
+            workflow_futures: waymaker_facade_demo::ota::WORKFLOW_FUTURES
                 .iter()
-                .chain(waymaker_drive::provisioning::WORKFLOW_FUTURES.iter())
+                .chain(waymaker_facade_demo::provisioning::WORKFLOW_FUTURES.iter())
                 .map(|(name, size)| ((*name).to_owned(), *size as u64))
                 .collect(),
         })
@@ -887,12 +1095,37 @@ impl fmt::Display for BudgetShortfall {
     }
 }
 
+/// Why the gate failed, or `None` if `shortfalls` is empty.
+///
+/// [`SizeReport::shortfall_report`] calls this with the document's own shortfalls. A
+/// caller with more than the document's own — [`completeness_shortfalls`]'s, for one —
+/// calls it with both lists combined, so the two read as one report rather than two.
+#[must_use]
+pub fn render_shortfall_report(shortfalls: &[BudgetShortfall]) -> Option<String> {
+    if shortfalls.is_empty() {
+        return None;
+    }
+    let mut message = vec![format!(
+        "{} budget(s) exceeded, measured on {FIRMWARE_TARGET} with the release-size profile:",
+        shortfalls.len()
+    )];
+    for shortfall in shortfalls {
+        message.push(format!("\n  {shortfall}"));
+    }
+    message.push(
+        "\n\nThe budgets are design document \u{a7}04. They are gates rather than claims: a change that needs more space needs the table changed in waymaker_core::budget, in the same pull request, with a reason."
+            .to_owned(),
+    );
+    Some(message.concat())
+}
+
 /// The measured size of every image in the matrix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizeReport {
     rows: Vec<Row>,
     kernel_state: Option<KernelState>,
     runtime: Option<RuntimeRam>,
+    checksum_candidates: Option<Vec<ChecksumCandidate>>,
 }
 
 impl SizeReport {
@@ -907,7 +1140,31 @@ impl SizeReport {
             rows,
             kernel_state,
             runtime,
+            checksum_candidates: None,
         }
+    }
+
+    /// Attaches ADR 0010's checksum-candidate measurement to an existing report.
+    ///
+    /// A builder rather than a fourth [`Self::new`] parameter, so every report built before
+    /// issue #61 existed — every call site in this file's own tests — keeps compiling
+    /// unchanged.
+    #[must_use]
+    pub fn with_checksum_candidates(
+        mut self,
+        checksum_candidates: Option<Vec<ChecksumCandidate>>,
+    ) -> Self {
+        self.checksum_candidates = checksum_candidates;
+        self
+    }
+
+    /// ADR 0010's checksum candidates, where this checkout could take the reading.
+    ///
+    /// `None` for a checkout whose probe declares no `crc-candidates` feature, for
+    /// [`Self::kernel_state`]'s reason.
+    #[must_use]
+    pub fn checksum_candidates(&self) -> Option<&[ChecksumCandidate]> {
+        self.checksum_candidates.as_deref()
     }
 
     /// Every measured row, in matrix order.
@@ -936,14 +1193,24 @@ impl SizeReport {
 
     /// Design document §04's runtime RAM sentence, composed.
     ///
-    /// The caller's scratch page, the kernel state registry, the context, and whatever
-    /// statics the gated rows own. `None` when a term could not be read, because a total
-    /// with a term missing is a smaller number than the truth and would pass.
+    /// Adds the caller's scratch page, the kernel state registry, the context, and the
+    /// statics term. `None` when a term could not be read, because a total with a term
+    /// missing is smaller than the truth and would pass.
     ///
-    /// The statics term is the *largest* of the rows rather than their sum: the rows are
-    /// separate images of the same firmware, and a device runs one of them. Every row, not
-    /// only the gated ones — a per-feature row is a configuration somebody ships, and taking
-    /// the largest is the direction that fails closed.
+    /// The statics term is the *largest* `Δram` of *every* row, gated or not — a
+    /// per-feature row is a configuration somebody ships, and a device runs one of them,
+    /// so its own statics count against the one hard runtime-RAM ceiling the same as the
+    /// engine's do. Taking the largest is the direction that fails closed.
+    ///
+    /// This trusts the row *set* the document carries — that every row [`matrix`] derives
+    /// for this workspace is in it. `--report` reads a document this process did not write,
+    /// and before issue #115 nothing checked that: a document that omitted the row with the
+    /// largest `Δram` composed a smaller, wrong total, and could pass a budget a complete
+    /// document would fail. [`completeness_shortfalls`] is the check that closes it, by
+    /// comparing the document against a freshly resolved [`matrix`] rather than by dropping
+    /// rows from this sum — dropping rows here would also stop gating a real per-feature
+    /// configuration's RAM, which is the ceiling this term exists to hold every shippable
+    /// configuration to.
     #[must_use]
     pub fn runtime_ram_total(&self) -> Option<u64> {
         let kernel_state = self.kernel_state.as_ref()?;
@@ -1162,6 +1429,22 @@ impl SizeReport {
             // the budget for "core + flash adapter", and issue #72 is that the probe's own
             // arithmetic had grown to more than a third of what was being gated.
             let layers = Self::layers_of(row, baseline);
+            // The whole-image delta saturates, so a row that links *less* than the
+            // baseline displays `Δflash` 0 while `probe` keeps its sign and `layers`
+            // keeps its growth: `probe` + `layers` no longer reconciles with
+            // `Δflash`, and the rendered row contradicts the table's own legend. A
+            // row that links less is a measurement fault rather than a negative
+            // cost — [`SectionSizes::saturating_delta`]'s reason — so it is refused
+            // rather than rendered.
+            if row.sizes.flash < baseline.sizes.flash {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "`{}` links {} B less flash than the baseline, which the saturating image delta reads as 0 while `probe` keeps its sign; the row cannot reconcile, so it is not a measurement",
+                        row.name,
+                        baseline.sizes.flash - row.sizes.flash,
+                    ),
+                });
+            }
             // A gated row links the kernel and the flash adapter, which cannot cost
             // nothing — the baseline's own zero is refused above for that reason. Two
             // routes reach this one, and both are faults rather than results: the linker
@@ -1197,13 +1480,124 @@ impl SizeReport {
         }
 
         shortfalls.extend(self.runtime_shortfalls());
+        shortfalls.extend(self.checksum_candidate_shortfalls());
+        shortfalls
+    }
+
+    /// ADR 0010's five candidates, checked for existence rather than for a ceiling.
+    ///
+    /// Issue #61 asks this section not to be gated against design document §04's budget: it
+    /// is a comparison between candidates, not a cost this firmware pays. What it must not
+    /// do is go quiet — an empty, duplicated, missing, unknown, wrongly-`shipped`, or
+    /// zero-byte candidate is a measurement that did not happen, the same rule every other
+    /// section in this file holds to — and a `None` section is refused unconditionally, the
+    /// way [`Self::runtime_shortfalls`] refuses a missing `runtime` section, rather than read
+    /// as "nothing to check here". `measure_into` never produces `None` here for the
+    /// checkout `xtask` was built from — a checkout with the feature that fails to measure
+    /// fails the whole report instead — so the only way this method meets `None` is a
+    /// `--report` document with the section removed or nulled out after the fact, which is
+    /// exactly the case this refuses.
+    fn checksum_candidate_shortfalls(&self) -> Vec<BudgetShortfall> {
+        let mut shortfalls = Vec::new();
+        let Some(candidates) = self.checksum_candidates.as_ref() else {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report has no checksum-candidate section, so ADR 0010's five candidates were not read".to_owned(),
+            });
+            return shortfalls;
+        };
+
+        if candidates.is_empty() {
+            shortfalls.push(BudgetShortfall::Unmeasurable {
+                detail: "the report declares the `crc-candidates` feature but names no candidate; ADR 0010 measured five".to_owned(),
+            });
+            return shortfalls;
+        }
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidates
+                .iter()
+                .take(index)
+                .any(|earlier| earlier.name == candidate.name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names the checksum candidate `{}` twice",
+                        candidate.name
+                    ),
+                });
+            }
+            // `.rodata` is legitimately zero for three of the five: a bitwise loop has no
+            // table. `.text` is not — every candidate is a loop, and a loop compiles to
+            // some code.
+            if candidate.text == 0 {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{}` measures 0 B of `.text`, which no checksum loop does",
+                        candidate.name
+                    ),
+                });
+            }
+            if !CHECKSUM_CANDIDATES
+                .iter()
+                .any(|&(name, ..)| name == candidate.name)
+            {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names a checksum candidate `{}`, which ADR 0010 never measured",
+                        candidate.name
+                    ),
+                });
+            }
+        }
+
+        // A report can name every candidate it has correctly and still be missing most of
+        // ADR 0010's table — `--report` reads a document this process did not produce, and
+        // a section with one valid entry passed every check above it until this one.
+        for &(name, shipped, _function, table) in CHECKSUM_CANDIDATES {
+            let Some(candidate) = candidates.iter().find(|candidate| candidate.name == name) else {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the report names no checksum candidate `{name}`; ADR 0010 measured it"
+                    ),
+                });
+                continue;
+            };
+            if candidate.shipped != shipped {
+                shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` is marked shipped: {}, but ADR 0010 says shipped: {shipped}",
+                        candidate.shipped
+                    ),
+                });
+            }
+            // The two table candidates are the ones ADR 0010's decision turns on — a 0 B
+            // reading here is the one number the whole section exists to report, missing.
+            // And the other three are bitwise loops with no table at all, so a nonzero
+            // reading there is not a smaller table, it is a wrong one.
+            match (table.is_some(), candidate.rodata) {
+                (true, 0) => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures 0 B of `.rodata`, but ADR 0010's table names a lookup table for it"
+                    ),
+                }),
+                (false, rodata) if rodata != 0 => shortfalls.push(BudgetShortfall::Unmeasurable {
+                    detail: format!(
+                        "the checksum candidate `{name}` measures {rodata} B of `.rodata`, but it is a bitwise loop with no table at all"
+                    ),
+                }),
+                _ => {}
+            }
+        }
+
         shortfalls
     }
 
     /// The rows a gated report must carry, and that they are the images their ceilings name.
     ///
     /// `--report` gates a document this process did not produce, so neither the presence of
-    /// a row nor its `gated` flag nor its name is taken at its word.
+    /// a row nor its `gated` flag nor its name is taken at its word. The two gated rows are
+    /// pinned here; every row, gated or not, is pinned against the workspace itself by
+    /// [`completeness_shortfalls`].
     fn gated_row_shortfalls(&self) -> Vec<BudgetShortfall> {
         let mut shortfalls = Vec::new();
         for (row, why) in [
@@ -1345,22 +1739,7 @@ impl SizeReport {
     /// Why the gate failed, or `None` if it did not.
     #[must_use]
     pub fn shortfall_report(&self) -> Option<String> {
-        let shortfalls = self.shortfalls();
-        if shortfalls.is_empty() {
-            return None;
-        }
-        let mut message = vec![format!(
-            "{} budget(s) exceeded, measured on {FIRMWARE_TARGET} with the release-size profile:",
-            shortfalls.len()
-        )];
-        for shortfall in &shortfalls {
-            message.push(format!("\n  {shortfall}"));
-        }
-        message.push(
-            "\n\nThe budgets are design document \u{a7}04. They are gates rather than claims: a change that needs more space needs the table changed in waymaker_core::budget, in the same pull request, with a reason."
-                .to_owned(),
-        );
-        Some(message.concat())
+        render_shortfall_report(&self.shortfalls())
     }
 
     /// A table with one row per image, its section deltas, and what it cost over its base.
@@ -1437,6 +1816,7 @@ impl SizeReport {
             ),
         ));
         table.push(self.workflow_future_lines());
+        table.push(self.checksum_candidate_lines());
         for notice in self.notices() {
             table.push(format!("\nnotice: {notice}\n"));
         }
@@ -1454,7 +1834,7 @@ impl SizeReport {
             |total| format!("{total} B of {RUNTIME_RAM_BUDGET_BYTES} B"),
         );
         format!(
-            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the drive-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
+            "runtime RAM: {composed} — a {SCRATCH_PAGE_BYTES} B caller-owned scratch page, {} B of kernel state, {} B of context, and the largest \u{394}ram of any row, gated or not — a per-feature row's own statics count against this one ceiling too. Sized for the host, which is an upper bound on the target; the exact check for {FIRMWARE_TARGET} is waymaker_core::assert_context_size!, which the facade-demo-firmware stage compiles. Three of the four terms are stack-resident, and what is still unaccounted is the *depth* of the call chain: a deeper one moves no writable section and no type size, and accounting for it needs a call graph. The generated workflow future is stack-resident too and is excluded on purpose, by \u{a7}04 — it is in the section below.\n",
             self.kernel_state.as_ref().map_or(0, |state| state.total),
             runtime.context,
         )
@@ -1476,6 +1856,56 @@ impl SizeReport {
             lines.push(format!("  {name:<24}  {size:>9} B\n"));
         }
         lines.concat()
+    }
+
+    /// ADR 0010's five checksum candidates, in a section of their own.
+    ///
+    /// Not gated, for [`Self::checksum_candidate_shortfalls`]'s reason. Empty for a
+    /// checkout whose probe declares no `crc-candidates` feature.
+    fn checksum_candidate_lines(&self) -> String {
+        let Some(candidates) = self.checksum_candidates.as_ref() else {
+            return String::new();
+        };
+        let mut lines = vec![format!(
+            "\nchecksum candidates: design document \u{a7}16's first deferred question, settled by ADR 0010 and measured rather than typed in by hand. Informational, not gated against any budget above.\n  {:<28} {:>9} {:>9}\n",
+            "candidate", "text", "rodata"
+        )];
+        for candidate in candidates {
+            lines.push(format!(
+                "  {:<28} {:>7} B {:>7} B{}\n",
+                candidate.name,
+                candidate.text,
+                candidate.rodata,
+                if candidate.shipped { "  shipped" } else { "" },
+            ));
+        }
+        lines.concat()
+    }
+
+    /// [`RuntimeRam`] as [`Self::to_json`] writes it.
+    ///
+    /// A method of its own rather than inline in [`Self::to_json`], which clippy's line
+    /// budget refuses with this section folded in.
+    fn runtime_json(&self) -> Value {
+        self.runtime.as_ref().map_or(Value::Null, |runtime| {
+            let futures: Vec<Value> = runtime
+                .workflow_futures
+                .iter()
+                .map(|(name, size)| {
+                    let mut entry = Map::new();
+                    entry.insert("name".to_owned(), Value::from(name.clone()));
+                    entry.insert("size".to_owned(), Value::from(*size));
+                    Value::Object(entry)
+                })
+                .collect();
+            let mut object = Map::new();
+            object.insert("context".to_owned(), Value::from(runtime.context));
+            object.insert("workflow_futures".to_owned(), Value::Array(futures));
+            if let Some(total) = self.runtime_ram_total() {
+                object.insert("total".to_owned(), Value::from(total));
+            }
+            Value::Object(object)
+        })
     }
 
     /// The report as JSON, for the CI artifact and for the base-branch diff.
@@ -1536,25 +1966,8 @@ impl SizeReport {
             Value::Object(object)
         });
 
-        let runtime = self.runtime.as_ref().map_or(Value::Null, |runtime| {
-            let futures: Vec<Value> = runtime
-                .workflow_futures
-                .iter()
-                .map(|(name, size)| {
-                    let mut entry = Map::new();
-                    entry.insert("name".to_owned(), Value::from(name.clone()));
-                    entry.insert("size".to_owned(), Value::from(*size));
-                    Value::Object(entry)
-                })
-                .collect();
-            let mut object = Map::new();
-            object.insert("context".to_owned(), Value::from(runtime.context));
-            object.insert("workflow_futures".to_owned(), Value::Array(futures));
-            if let Some(total) = self.runtime_ram_total() {
-                object.insert("total".to_owned(), Value::from(total));
-            }
-            Value::Object(object)
-        });
+        let runtime = self.runtime_json();
+        let checksum_candidates = checksum_candidates_json(self.checksum_candidates.as_deref());
 
         let mut budgets = Map::new();
         budgets.insert(
@@ -1588,6 +2001,7 @@ impl SizeReport {
         document.insert("budgets".to_owned(), Value::Object(budgets));
         document.insert("kernel_state".to_owned(), kernel_state);
         document.insert("runtime".to_owned(), runtime);
+        document.insert("checksum_candidates".to_owned(), checksum_candidates);
         document.insert("rows".to_owned(), Value::Array(rows));
 
         format!("{:#}\n", Value::Object(document))
@@ -1681,6 +2095,7 @@ impl SizeReport {
             rows,
             kernel_state: parse_kernel_state(&document)?,
             runtime: parse_runtime(&document)?,
+            checksum_candidates: parse_checksum_candidates(&document)?,
         })
     }
 }
@@ -1767,6 +2182,65 @@ fn parse_runtime(document: &Value) -> Result<Option<RuntimeRam>, SizeError> {
         context: number(runtime, "context")?,
         workflow_futures,
     }))
+}
+
+/// [`ChecksumCandidate`]s as [`SizeReport::to_json`] writes them.
+///
+/// A function of its own rather than inline in [`SizeReport::to_json`], which clippy's line
+/// budget refuses with this section folded in.
+fn checksum_candidates_json(candidates: Option<&[ChecksumCandidate]>) -> Value {
+    candidates.map_or(Value::Null, |candidates| {
+        Value::Array(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    let mut entry = Map::new();
+                    entry.insert("name".to_owned(), Value::from(candidate.name.clone()));
+                    entry.insert("shipped".to_owned(), Value::from(candidate.shipped));
+                    entry.insert("text".to_owned(), Value::from(candidate.text));
+                    entry.insert("rodata".to_owned(), Value::from(candidate.rodata));
+                    Value::Object(entry)
+                })
+                .collect(),
+        )
+    })
+}
+
+/// The checksum-candidate section of a report, or `None` where the document has none.
+///
+/// Absent and `null` both read as `None`, [`parse_runtime`]'s reason: a report taken before
+/// issue #61 existed, or of a checkout whose probe declares no `crc-candidates` feature,
+/// says nothing about it rather than nothing.
+fn parse_checksum_candidates(
+    document: &Value,
+) -> Result<Option<Vec<ChecksumCandidate>>, SizeError> {
+    let Some(candidates) = document
+        .get("checksum_candidates")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    candidates
+        .as_array()
+        .ok_or_else(|| SizeError::new("the size report's `checksum_candidates` is not an array"))?
+        .iter()
+        .map(|entry| {
+            Ok(ChecksumCandidate {
+                name: entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| SizeError::new("a checksum candidate has no `name`"))?
+                    .to_owned(),
+                shipped: entry
+                    .get("shipped")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| SizeError::new("a checksum candidate has no `shipped` flag"))?,
+                text: number(entry, "text")?,
+                rodata: number(entry, "rodata")?,
+            })
+        })
+        .collect::<Result<Vec<ChecksumCandidate>, SizeError>>()
+        .map(Some)
 }
 
 /// Rule: no two rows of a report carry one name.
@@ -2203,31 +2677,9 @@ pub fn measure_into(
     let mut rows = Vec::with_capacity(variants.len());
     for variant in variants {
         let image = build_variant(root, build_dir, &variant)?;
-        let bytes = std::fs::read(&image).map_err(|err| {
-            SizeError::new(format!(
-                "could not read the linked image at {}: {err}",
-                image.display()
-            ))
-        })?;
-        let machine = elf::machine(&bytes)
-            .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
-        if machine != elf::EM_ARM {
-            return Err(SizeError::new(format!(
-                "{} is for machine {machine:#x}, not ARM ({:#x}); the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}, and a host image parses cleanly and measures plausibly",
-                image.display(),
-                elf::EM_ARM
-            )));
-        }
-        let sections = elf::sections(&bytes)
-            .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+        let (sections, symbols) = linked_image(&image)?;
         check_symbols_are_not_measured(&sections).map_err(|err| {
             SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
-        })?;
-        let symbols = elf::symbols(&bytes).map_err(|err| {
-            SizeError::new(format!(
-                "could not read the symbols of {}: {err}",
-                image.display()
-            ))
         })?;
         rows.push(Row {
             name: variant.name,
@@ -2239,7 +2691,103 @@ pub fn measure_into(
         });
     }
 
-    Ok(SizeReport::new(rows, kernel_state, runtime))
+    // Only for the checkout `xtask` was built from, [`KernelState::measured`]'s own
+    // reason and its own signal: `CHECKSUM_CANDIDATES` names identifiers this binary's
+    // source declares, so reading them out of a *base-branch* image is reading this
+    // binary's expectations against another commit's code. A rename on either side would
+    // turn a base-branch worktree's checksum-candidate section into a hard error — and
+    // since that section carries no row `diff` ever reads, failing the base measurement
+    // over it would cost every other row's comparison for a section nobody compares.
+    let checksum_candidates = if kernel_state.is_some() || runtime.is_some() {
+        Some(measure_checksum_candidates(root, build_dir, &graph)?)
+    } else {
+        None
+    };
+
+    Ok(SizeReport::new(rows, kernel_state, runtime).with_checksum_candidates(checksum_candidates))
+}
+
+/// Reads and validates one linked image: its sections and its symbols.
+///
+/// Shared by the matrix loop above and [`measure_checksum_candidates`], which both read an
+/// image the same way and differ only in what they do with it.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if the image cannot be read, is not built for ARM, or its symbol
+/// table cannot be read.
+fn linked_image(image: &Path) -> Result<(Vec<Section>, Vec<elf::Symbol>), SizeError> {
+    let bytes = std::fs::read(image).map_err(|err| {
+        SizeError::new(format!(
+            "could not read the linked image at {}: {err}",
+            image.display()
+        ))
+    })?;
+    let machine = elf::machine(&bytes)
+        .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+    if machine != elf::EM_ARM {
+        return Err(SizeError::new(format!(
+            "{} is for machine {machine:#x}, not ARM ({:#x}); the budgets in design document \u{a7}04 are stated for {FIRMWARE_TARGET}, and a host image parses cleanly and measures plausibly",
+            image.display(),
+            elf::EM_ARM
+        )));
+    }
+    let sections = elf::sections(&bytes)
+        .map_err(|err| SizeError::new(format!("could not read {}: {err}", image.display())))?;
+    let symbols = elf::symbols(&bytes).map_err(|err| {
+        SizeError::new(format!(
+            "could not read the symbols of {}: {err}",
+            image.display()
+        ))
+    })?;
+    Ok((sections, symbols))
+}
+
+/// ADR 0010's five checksum candidates, measured rather than typed by hand.
+///
+/// Only ever called for the checkout `xtask` was built from — [`measure_into`] skips this
+/// entirely for a base-branch worktree, because the identifiers this function searches for
+/// are compiled into *this* binary from *this* checkout's source, and matching them
+/// against another commit's image is a comparison that means nothing and can fail on a
+/// rename neither side made wrong. So a caller reaching this function has already
+/// committed to "this checkout ought to have the section," and an undeclared feature here
+/// is a real regression — the probe's `Cargo.toml` and this file's own
+/// [`CHECKSUM_CANDIDATES`] table have drifted apart — refused rather than read as "not
+/// measured", the same way every other missing figure in this report is.
+///
+/// # Errors
+///
+/// Returns [`SizeError`] if the checkout's probe declares no [`CRC_CANDIDATES_FEATURE`],
+/// or if the image cannot be built, read, or attributed candidate by candidate.
+fn measure_checksum_candidates(
+    root: &Path,
+    build_dir: &Path,
+    graph: &PackageGraph,
+) -> Result<Vec<ChecksumCandidate>, SizeError> {
+    let declared = graph.find(PROBE_PACKAGE).is_some_and(|package| {
+        package
+            .features
+            .iter()
+            .any(|feature| feature == CRC_CANDIDATES_FEATURE)
+    });
+    if !declared {
+        return Err(SizeError::new(format!(
+            "`{PROBE_PACKAGE}` declares no `{CRC_CANDIDATES_FEATURE}` feature, so ADR 0010's checksum candidates cannot be measured on the checkout `xtask` was built from"
+        )));
+    }
+
+    let variant = Variant {
+        name: CRC_CANDIDATES_ROW.to_owned(),
+        features: vec![PROBE_FEATURE.to_owned(), CRC_CANDIDATES_FEATURE.to_owned()],
+        measured_against: BASELINE_ROW.to_owned(),
+        gated: false,
+    };
+    let image = build_variant(root, build_dir, &variant)?;
+    let (sections, symbols) = linked_image(&image)?;
+    check_symbols_are_not_measured(&sections).map_err(|err| {
+        SizeError::new(format!("{} cannot be attributed: {err}", image.display()))
+    })?;
+    checksum_candidate_sizes(&symbols)
 }
 
 /// Links one image and returns the path to it.
@@ -2631,6 +3179,9 @@ enum Block {
 
 /// Every function of the layers that a caller outside the crate can reach.
 ///
+/// Judges each `impl <Trait> for <Type>` against the fixed roots in
+/// `EXTERNAL_PATH_ROOTS`.
+///
 /// `pub fn` is not the whole answer, and assuming it was left a hole big enough to drive a
 /// storage backend through: a method of a `trait`, and a method of an `impl Trait for
 /// Type`, carry no `pub` at all — the trait's visibility is what makes them callable. A
@@ -2639,10 +3190,65 @@ enum Block {
 ///
 /// Scanned rather than parsed, like every other rule here, and `#[cfg(test)]` modules are
 /// skipped by brace depth: a test helper is not code the firmware links.
+///
+/// # A floor, not a proof
+///
+/// A real dependency, such as `serde`, may not be on the fixed list. Then a private trait
+/// can hide a live external impl of the same name. [`public_functions_reachable`] closes
+/// this gap using the real dependency graph. Use this function only when no graph is
+/// available. Issue [#141](https://github.com/madmax983/waymaker/issues/141).
 #[must_use]
 pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
+    scan_public_functions(sources, |_crate_name| {
+        EXTERNAL_PATH_ROOTS
+            .iter()
+            .map(|root| (*root).to_owned())
+            .collect()
+    })
+}
+
+/// Every function of the layers that a caller outside the crate can reach.
+///
+/// Judges each `impl <Trait> for <Type>` against `graph`'s real dependency names, as well
+/// as the fixed roots in `EXTERNAL_PATH_ROOTS`. A private trait can no longer hide a live
+/// impl of a trait the crate really depends on — `impl serde::Serialize for Bank`, say,
+/// beside a local, unrelated `trait Serialize`. Issue
+/// [#141](https://github.com/madmax983/waymaker/issues/141).
+#[must_use]
+pub fn public_functions_reachable(
+    sources: &[LayerSource],
+    graph: &PackageGraph,
+) -> Vec<PublicFunction> {
+    scan_public_functions(sources, |crate_name| external_path_roots(graph, crate_name))
+}
+
+/// The scan both [`public_functions`] and [`public_functions_reachable`] run, differing
+/// only in what `external_roots_for` says a crate's dependency names are.
+fn scan_public_functions(
+    sources: &[LayerSource],
+    external_roots_for: impl Fn(&str) -> HashSet<String>,
+) -> Vec<PublicFunction> {
     let mut found = Vec::new();
     for source in sources {
+        // A trait can live in one file. Its `impl` can live in another. Collect the
+        // crate's private trait names first, before any `impl` in the crate is read.
+        let private_traits = private_trait_names(sources, &source.crate_name);
+        let external_roots = external_roots_for(&source.crate_name);
+        // A module this file declares can shadow a dependency of the same name at
+        // the point it is declared. Drop such a name from this file's own roots,
+        // so an impl of it still checks against private trait names. Per file,
+        // like `imported_external_names` below — not crate-wide, or a shadow in
+        // one file would hide a real external impl reachable from another.
+        let shadowed = local_module_names(&source.contents);
+        let external_roots: HashSet<String> =
+            external_roots.difference(&shadowed).cloned().collect();
+        // A file that imports a name from an external root settles that name for
+        // itself, whatever a private trait of the same name elsewhere in the crate
+        // says. `use` is scoped per file, so this reads only this file's own
+        // imports. See `imported_external_names`.
+        let private_traits =
+            &private_traits - &imported_external_names(&source.contents, &external_roots);
+
         let mut depth: i32 = 0;
         let mut test_module: Option<i32> = None;
         let mut pending_test_attribute = false;
@@ -2689,7 +3295,8 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     // rather than above it. Review of issue #35 landed exactly that and
                     // watched nine surface pins and `size-probe-reach` stay green, so it is
                     // closed in the reader they share rather than in one rule.
-                    let declared_here = declaration_kind(classified);
+                    let declared_here =
+                        declaration_kind(classified, &private_traits, &external_roots);
                     let inline = declared_here.is_some() && opens > 0;
                     // The member's *own* prefix, which is what follows the block's opening
                     // brace — not the whole line before the `fn` keyword. Testing that the
@@ -2713,7 +3320,7 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
                     }
                 }
 
-                if let Some(kind) = declaration_kind(classified) {
+                if let Some(kind) = declaration_kind(classified, &private_traits, &external_roots) {
                     pending = Some(kind);
                 }
                 if opens > 0 {
@@ -2750,26 +3357,309 @@ pub fn public_functions(sources: &[LayerSource]) -> Vec<PublicFunction> {
 /// its own, and classifying that bare `{` would read every method of the impl as an
 /// ordinary private one and quietly drop them from the reach rule.
 ///
+/// A bare `trait` or a `pub(crate) trait` reads as [`Block::Other`]. So does an `impl` of
+/// one. `waymaker-size-probe` is a separate crate. It has no path to either. This is issue
+/// #49: `check_probe_reach` demanded a call the probe could not make. `private_traits`
+/// names every non-public trait already found in this crate, from [`private_trait_names`].
+///
 /// `None` for every other line, so that a block nobody declared — a `mod`, a function body
 /// — is pushed as [`Block::Other`] and the stack still mirrors the brace depth.
-fn declaration_kind(line: &str) -> Option<Block> {
-    let declaration = line.strip_prefix("pub ").unwrap_or(line);
-    let declaration = declaration
-        .split_once("(crate)")
-        .map_or(declaration, |(_, rest)| rest.trim_start());
-    if declaration.starts_with("trait ") {
-        return Some(Block::Trait);
+///
+/// `external_roots` is the set of path roots that can never name a trait this crate
+/// declares — see [`external_path_roots`].
+fn declaration_kind(
+    line: &str,
+    private_traits: &HashSet<String>,
+    external_roots: &HashSet<String>,
+) -> Option<Block> {
+    if let Some((_, public)) = trait_declaration(line) {
+        return Some(if public { Block::Trait } else { Block::Other });
     }
-    if declaration.starts_with("impl") {
+    if line.starts_with("impl") {
         // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
-        // makes its unmarked methods callable from outside.
-        return Some(if declaration.contains(" for ") {
-            Block::TraitImpl
-        } else {
-            Block::Other
+        // makes its unmarked methods callable from outside, and only while `Storage` is
+        // itself a trait the probe has a path to.
+        return Some(match impl_trait_name(line, external_roots) {
+            Some((name, true)) if private_traits.contains(name) => Block::Other,
+            Some(_) => Block::TraitImpl,
+            None => Block::Other,
         });
     }
     None
+}
+
+/// The name a `trait` declaration names. Also whether it is `pub`.
+///
+/// A `pub` trait is reachable from a separate crate. Every restricted form —
+/// `pub(crate)`, `pub(super)`, `pub(in a::path)`, or fully private — is not. Reads
+/// the line that declares the trait, the same line [`declaration_kind`] classifies a
+/// block from. Returns `None` for a line with no trait declaration.
+fn trait_declaration(line: &str) -> Option<(&str, bool)> {
+    let public = declares_public(line);
+    let rest = skip_restricted_visibility(line.strip_prefix("pub ").unwrap_or(line));
+    let name = rest
+        .strip_prefix("trait ")?
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .find(|token| !token.is_empty())?;
+    Some((name, public))
+}
+
+/// `line` with a leading `pub(...)` restricted-visibility clause removed.
+///
+/// Covers `pub(crate)`, `pub(super)`, and `pub(in a::path)` alike, balanced across a
+/// nested parenthesis — a path can carry one of its own. Returns `line` unchanged if
+/// it has no leading `pub(...)`.
+fn skip_restricted_visibility(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix("pub(") else {
+        return line;
+    };
+    let mut depth: u32 = 1;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest
+                        .get(index.saturating_add(1)..)
+                        .unwrap_or("")
+                        .trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+/// The names of every non-public trait a crate declares — a bare `trait` or a
+/// `pub(crate) trait`. A separate crate has no path to any of these.
+///
+/// `size-probe-reach` needs this list before it can classify an `impl <Trait> for
+/// <Type>`. A trait's methods are as reachable as the trait itself. The trait can live
+/// in one file of the crate and the impl in another. Reads `source::code_only` and
+/// `source::without_test_modules` first, the same lexical pass most rules in this
+/// workspace use. A trait named inside a comment, a string, or a `#[cfg(test)]`
+/// module is then never mistaken for a shipped declaration.
+///
+/// A floor, not a proof: two traits sharing one name in a crate collapse into one
+/// entry here, public or not. Naming a private trait after a public one in the same
+/// crate is a review question, not a case this set can tell apart.
+fn private_trait_names(sources: &[LayerSource], crate_name: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for source in sources
+        .iter()
+        .filter(|source| source.crate_name == crate_name)
+    {
+        let code = crate::source::without_test_modules(&crate::source::code_only(&source.contents));
+        for line in code.lines() {
+            let classified = without_leading_attributes(line.trim());
+            if let Some((name, false)) = trait_declaration(classified) {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// The trait name an `impl <Trait> for <Type>` line names. Also whether that name can
+/// resolve to a trait this crate declares. Returns `None` for an inherent `impl` with
+/// no `for`.
+///
+/// `line` is the item's declaration line, the same line [`declaration_kind`] reads.
+/// Two things are stripped before the name is read. First, the impl's own generic
+/// parameters — `impl<T: Copy> Storage<T> for Bank<T>` — as one balanced `<...>`
+/// group, since a bound can carry a nested `<...>` of its own. Second, the trait's
+/// own generic arguments, so `Storage<T>` names `Storage`.
+///
+/// A path names its last segment: `crate::sealed::Sealed` and `sealed::Sealed` both
+/// name `Sealed`. The second field is `false` only when the path's first segment is
+/// in `external_roots` — `core::fmt::Debug` names an external trait, and its last
+/// segment must never be checked against this crate's own private trait names, a
+/// private trait happening to share that name is a different trait, in a different
+/// crate. Every other qualified path — `crate::`, `self::`, `super::`, or a bare
+/// relative path such as `sealed::Sealed` — can still name a trait this crate itself
+/// declares, so its last segment is checked.
+///
+/// Two more things are read from the path itself, matching the "a raw identifier is
+/// the same identifier" convention this codebase already applies elsewhere (issues
+/// #68/#90). A leading `::` — `impl ::core::fmt::Debug for Bank` — is absolute: Rust
+/// resolves it through the extern prelude alone, never through a local module or
+/// import, so such a path is never local, whatever `external_roots` or a local
+/// module of the same name says. And a leading `r#` on any segment — `r#type`, for a
+/// dependency renamed to a Rust keyword — names the same identifier as the bare
+/// spelling, so it is stripped before either segment is read.
+fn impl_trait_name<'a>(line: &'a str, external_roots: &HashSet<String>) -> Option<(&'a str, bool)> {
+    let (before, _after) = line.split_once(" for ")?;
+    let before = before.strip_prefix("impl").unwrap_or(before);
+    let before = skip_leading_generic_params(before);
+    let path = before.split('<').next().unwrap_or(before);
+    let absolute = path.trim_start().starts_with("::");
+
+    let mut segments = path
+        .split("::")
+        .map(str::trim)
+        .map(|segment| segment.strip_prefix("r#").unwrap_or(segment))
+        .filter(|segment| !segment.is_empty());
+    let first = segments.next()?;
+    let mut name = first;
+    let mut qualified = false;
+    for segment in segments {
+        name = segment;
+        qualified = true;
+    }
+    let local = !absolute && (!qualified || !external_roots.contains(first));
+    Some((name, local))
+}
+
+/// Path roots `crate_name` can never declare a module or a trait under: the fixed
+/// names in [`EXTERNAL_PATH_ROOTS`], plus every crate `crate_name` really depends
+/// on, read from `graph`.
+///
+/// A qualified trait path starting with one of these is always a foreign trait, so
+/// its name is never checked against this crate's own private trait names. Every
+/// other root — `crate`, `self`, `super`, or a bare relative path such as `sealed` —
+/// can still resolve to a trait this crate declares itself.
+///
+/// This reads declared dependency names, not resolved ones. A manifest name enters
+/// the extern prelude even when this build does not enable it. So a declared name
+/// needs no matching package in `graph`.
+///
+/// A dependency's crate-root name replaces each `-` with `_`. Cargo names its
+/// extern-prelude entries the same way. A renamed dependency (`package = "..."`)
+/// uses its local name, not its package name — the two can differ. This closes
+/// issue [#141](https://github.com/madmax983/waymaker/issues/141): a private trait
+/// can no longer hide a live impl of a real dependency's trait.
+///
+/// This does not know about a local module of the same name as a dependency — see
+/// [`local_module_names`], which every caller of this function also consults, per
+/// file, before using what this returns.
+fn external_path_roots(graph: &PackageGraph, crate_name: &str) -> HashSet<String> {
+    let mut roots: HashSet<String> = EXTERNAL_PATH_ROOTS
+        .iter()
+        .map(|root| (*root).to_owned())
+        .collect();
+    if let Some(package) = graph.find(crate_name) {
+        roots.extend(package.manifest_deps.iter().map(|dependency| {
+            dependency
+                .rename
+                .as_deref()
+                .unwrap_or(&dependency.name)
+                .replace('-', "_")
+        }));
+    }
+    roots
+}
+
+/// The names of every module `source` declares — inline or out-of-line, at any
+/// nesting depth.
+///
+/// A dependency name is not always the external crate: `source` could declare its
+/// own `mod serde { .. }`, and Rust resolves a path through that module's own
+/// scope to the local one, not to the dependency. [`scan_public_functions`] drops
+/// such a name from this file's own external roots, so an impl of it keeps
+/// checking against private trait names, the same answer a dependency this
+/// function does not know about would get.
+///
+/// Per file, like [`imported_external_names`] — not crate-wide, or a module in
+/// one file would hide a real external impl reachable from another (Codex found
+/// this on this pull request's own review, of an earlier, crate-wide version).
+/// Parsed with [`crate::parse::declared_module_names`], not scanned: nesting a
+/// `mod` inside another is exactly the shape a line scanner miscounts. A file
+/// that fails to parse contributes no name, the safe direction.
+///
+/// A floor, not a proof: per file is not per lexical scope. A `use crate::x as
+/// serde;` local alias reusing a dependency's name shadows it too, in the scope
+/// it is declared, and this function does not see it — issue
+/// [#180](https://github.com/madmax983/waymaker/issues/180).
+fn local_module_names(source: &str) -> HashSet<String> {
+    crate::parse::declared_module_names(source)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// The names `source`'s own `use` declarations bring in from a root in
+/// `external_roots` — the alias a rename gives it, or the item's own name.
+///
+/// `use` is scoped to the file that wrote it, unlike [`private_trait_names`],
+/// which reads the whole crate. An unqualified `impl <Name> for <Type>` cannot be
+/// told from a local trait by name alone. A name this file imports from an
+/// external root settles it for this file, whatever a same-named private trait
+/// elsewhere in the crate says. Codex found this on this pull request's own
+/// review.
+///
+/// Parsed with [`crate::parse::use_aliases`], not scanned: a `use` item can group,
+/// nest and rename in ways a line scanner reads wrong (issue #51). A file that
+/// fails to parse contributes no name, the safe direction — its unqualified impls
+/// still fall back to the crate-wide private-trait check, exactly as before this
+/// function existed.
+///
+/// An absolute import — `use ::serde::Serialize;` — is credited whatever
+/// `external_roots` says: a leading `::` resolves through the extern prelude
+/// alone, so a program that compiles at all can only have named a real crate
+/// root there, immune to any local shadow. Codex found this on this pull
+/// request's own review, after the same fix already existed for `impl` paths.
+///
+/// A floor, not a proof, in one further way issue
+/// [#180](https://github.com/madmax983/waymaker/issues/180) tracks. `use_aliases`
+/// flattens every inline module's imports into one set for the whole file, so an
+/// import nested in one module can settle a name for an unrelated impl elsewhere
+/// in the same file.
+fn imported_external_names(source: &str, external_roots: &HashSet<String>) -> HashSet<String> {
+    crate::parse::use_aliases(source)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|alias| {
+            alias
+                .target
+                .first()
+                .is_some_and(|first| alias.absolute || external_roots.contains(first))
+        })
+        .map(|alias| alias.local)
+        .collect()
+}
+
+/// Path roots no crate in this workspace can declare a module or a trait under,
+/// whatever its own dependencies are — the three names every crate's implicit
+/// prelude carries.
+///
+/// Used alone by [`public_functions`], for a caller with no dependency graph in
+/// hand. [`external_path_roots`] adds a crate's real dependencies to this floor.
+const EXTERNAL_PATH_ROOTS: &[&str] = &["core", "std", "alloc"];
+
+/// Removes one leading `<...>` group from `text`, balanced across any nested pair.
+///
+/// Returns `text` unchanged if it has no leading `<`. A `>` that closes a return
+/// type — `Fn() -> u32` in a bound — closes no bracket and is not counted.
+fn skip_leading_generic_params(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix('<') else {
+        return trimmed;
+    };
+    let mut depth: u32 = 1;
+    let mut previous: Option<char> = None;
+    for (index, character) in rest.char_indices() {
+        match character {
+            '<' => depth = depth.saturating_add(1),
+            '>' if previous == Some('-') => {}
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest
+                        .get(index.saturating_add(1)..)
+                        .unwrap_or("")
+                        .trim_start();
+                }
+            }
+            _ => {}
+        }
+        previous = Some(character);
+    }
+    // Unbalanced: the header spans lines. `public_functions`'s own `pending` state
+    // handles the line that opens the block instead. Report no trait name here.
+    // Under-reporting is the safe direction.
+    ""
 }
 
 /// `line` with any leading attributes removed.
@@ -2780,52 +3670,222 @@ fn declaration_kind(line: &str) -> Option<Block> {
 /// round 3 found it, in the same one-line form round 1's finding was about.
 ///
 /// Brackets are matched rather than counted to the first `]`, so `#[cfg(all(a, b))]` is one
-/// attribute — and a bracket inside an *ordinary* string literal is not a bracket, so
-/// `#[expect(lint, reason = "]")]` is one too. Codex round 4 found the version that read
-/// every `]` as syntax and left the classifier standing on `")]` rather than on the item.
+/// attribute. A bracket or a quote inside a literal is not syntax. The scan uses one rule
+/// per literal type. An ordinary string ends at the next unescaped `"`. A raw string opens
+/// with an optional `b` or `c`, then `r`, zero or more `#`, then `"`; it ends at a `"`
+/// followed by that same number of `#`. A character literal holds one character, or one
+/// escape, between two `'` marks. This tells a character literal from a lifetime, so
+/// `impl<'a>` still reads as a lifetime. Round 4 found the ordinary-string gap. Round 6
+/// found the raw-string gap: issue #108.
 ///
-/// Two literal forms are outside it, and both leave the item **unclassified** rather than
-/// reporting a private function as public — the direction that under-reports. A `']'`
-/// *character* literal, because telling one from the lifetime in
-/// `#[foo(bar = "x")] impl<'a> …` needs a tokeniser rather than a scan. And a *raw* string,
-/// because `"` both opens and closes here: `#[doc = r#"a"]b"#]` is read as ending at the
-/// quote inside it. Codex round 6 found that one, and it is issue #108.
-///
-/// Three rounds have now landed on this function, each closing one construct and leaving
-/// the next. What closes the class is lexing the attribute rather than scanning it, which
-/// is #108's own point; this reads what a reviewer can check by eye.
+/// The scan may meet an unclosed bracket, string, raw string, or character literal. Then it
+/// leaves `line` unchanged. The item below stays unclassified, never reported as public.
+/// Under-reporting is the safe direction.
 pub(crate) fn without_leading_attributes(line: &str) -> &str {
     let mut rest = line.trim_start();
     while let Some(after) = rest.strip_prefix("#[") {
-        let mut depth = 1_u32;
-        let mut quoted = false;
-        let mut escaped = false;
-        let mut end = None;
-        for (index, character) in after.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match character {
-                '\\' if quoted => escaped = true,
-                '"' => quoted = !quoted,
-                '[' if !quoted => depth = depth.saturating_add(1),
-                ']' if !quoted => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        end = Some(index.saturating_add(1));
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(end) = end.and_then(|end| after.get(end..)) else {
+        let Some(end) = attribute_body_end(after) else {
             return rest;
         };
-        rest = end.trim_start();
+        rest = after.get(end..).unwrap_or("").trim_start();
     }
     rest
+}
+
+/// Byte offset in `body` just past an attribute body's closing `]`, given the text after
+/// its opening `#[`.
+///
+/// `None` when a bracket, string, raw string or character literal never closes — the
+/// caller then leaves the line as it found it.
+fn attribute_body_end(body: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = body.char_indices().collect();
+    let mut depth = 1_u32;
+    let mut index = 0_usize;
+    let mut after_ident = false;
+    while let Some(&(byte, character)) = chars.get(index) {
+        match character {
+            '"' => {
+                index = skip_ordinary_string(&chars, index)?;
+                after_ident = false;
+                continue;
+            }
+            '/' => {
+                if let Some(next) = block_comment_end(&chars, index) {
+                    index = next;
+                    after_ident = false;
+                    continue;
+                }
+            }
+            'b' | 'c' | 'r' if !after_ident => {
+                if let Some((quote, hashes)) = raw_string_open(&chars, index) {
+                    index = skip_raw_string(&chars, quote, hashes)?;
+                    after_ident = false;
+                    continue;
+                }
+            }
+            '\'' => {
+                if let Some(next) = char_literal_end(&chars, index) {
+                    index = next;
+                    after_ident = false;
+                    continue;
+                }
+            }
+            '[' => depth = depth.saturating_add(1),
+            ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(byte.saturating_add(1));
+                }
+            }
+            _ => {}
+        }
+        after_ident = character.is_alphanumeric() || character == '_';
+        index = index.saturating_add(1);
+    }
+    None
+}
+
+/// Index in `chars` just past a block comment's closing `*/`, if `chars[start]` opens one.
+///
+/// A raw string or a character literal read out of Rust source often quotes example
+/// syntax in a comment — `/* r#"x" */` — and that example is not a real literal. Skipping
+/// the whole comment first keeps its contents from being read as one. Nested block
+/// comments close on their own inner `*/` first, matching the language: `/* /* */ */`
+/// closes at the outer pair.
+fn block_comment_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    if chars.get(start)?.1 != '/' || chars.get(start.saturating_add(1))?.1 != '*' {
+        return None;
+    }
+    let mut depth = 1_u32;
+    let mut index = start.saturating_add(2);
+    while depth > 0 {
+        let next = chars
+            .get(index.saturating_add(1))
+            .map(|&(_, character)| character);
+        match (chars.get(index)?.1, next) {
+            ('/', Some('*')) => {
+                depth = depth.saturating_add(1);
+                index = index.saturating_add(2);
+            }
+            ('*', Some('/')) => {
+                depth = depth.saturating_sub(1);
+                index = index.saturating_add(2);
+            }
+            _ => index = index.saturating_add(1),
+        }
+    }
+    Some(index)
+}
+
+/// Index in `chars` just past an ordinary string's closing `"`.
+///
+/// `open` is the index of the opening `"`. `\` protects the character after it, the same
+/// rule an ordinary string uses and a raw string never does.
+fn skip_ordinary_string(chars: &[(usize, char)], open: usize) -> Option<usize> {
+    let mut index = open.saturating_add(1);
+    loop {
+        match chars.get(index)?.1 {
+            '\\' => index = index.saturating_add(2),
+            '"' => return Some(index.saturating_add(1)),
+            _ => index = index.saturating_add(1),
+        }
+    }
+}
+
+/// Whether a raw string opens at `chars[start]`: an optional `b` or `c`, then `r`, then
+/// zero or more `#`, then `"`.
+///
+/// Returns the opening `"`'s index and the hash count. `start` must not follow an
+/// identifier character, which the caller checks: `r`, `b` or `c` inside a word is not a
+/// prefix.
+fn raw_string_open(chars: &[(usize, char)], start: usize) -> Option<(usize, usize)> {
+    let mut index = start;
+    if matches!(chars.get(index)?.1, 'b' | 'c') {
+        index = index.saturating_add(1);
+    }
+    if chars.get(index)?.1 != 'r' {
+        return None;
+    }
+    index = index.saturating_add(1);
+    let mut hashes = 0_usize;
+    while chars
+        .get(index)
+        .is_some_and(|&(_, character)| character == '#')
+    {
+        hashes = hashes.saturating_add(1);
+        index = index.saturating_add(1);
+    }
+    (chars.get(index)?.1 == '"').then_some((index, hashes))
+}
+
+/// Index in `chars` just past a raw string's closing `"` and its matching `#` run.
+///
+/// `quote` is the opening `"`'s index and `hashes` is the count after it.
+///
+/// The string closes at the first `"` followed by the same number of `#`. The Rust
+/// compiler uses this same rule. A raw string opened with two `#` may still hold a bare
+/// `"#`, one `#`, as plain content.
+fn skip_raw_string(chars: &[(usize, char)], quote: usize, hashes: usize) -> Option<usize> {
+    let mut index = quote.saturating_add(1);
+    loop {
+        if chars.get(index)?.1 == '"' {
+            let mut close = index.saturating_add(1);
+            let mut matched = 0_usize;
+            while matched < hashes && chars.get(close).is_some_and(|&(_, c)| c == '#') {
+                matched = matched.saturating_add(1);
+                close = close.saturating_add(1);
+            }
+            if matched == hashes {
+                return Some(close);
+            }
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+/// Index in `chars` just past a character literal's closing `'`, if `chars[quote]` opens
+/// one.
+///
+/// Returns `None` for a lifetime. `'a` is a character literal only if a plain `'` closes
+/// it. A `\` takes its escaped value next: two hex digits after `\x`, a `{...}` code
+/// point after `\u`, or one character for anything else, `\'` included. So `'\''`, an
+/// escaped quote, and `'\x41'`, a hex escape, each read as one whole literal, with the
+/// real closing `'` past the escape rather than inside it. This tells a character literal
+/// (`'a'`) from a lifetime (`impl<'a>`), with no token boundary to read either one by.
+fn char_literal_end(chars: &[(usize, char)], quote: usize) -> Option<usize> {
+    let mut index = quote.saturating_add(1);
+    let first = chars.get(index)?.1;
+    if first == '\'' {
+        return None;
+    }
+    index = index.saturating_add(1);
+    if first == '\\' {
+        let escaped = chars.get(index)?.1;
+        index = index.saturating_add(1);
+        index = match escaped {
+            'x' => index.saturating_add(2),
+            'u' => skip_unicode_escape_body(chars, index)?,
+            _ => index,
+        };
+    }
+    (chars.get(index)?.1 == '\'').then_some(index.saturating_add(1))
+}
+
+/// Index in `chars` just past a `\u{...}` escape's braced code point, given the index
+/// right after the `u`.
+///
+/// `None` if no `{` follows, or the `}` never comes. A code point is six hex digits at
+/// most, but `_` may separate any of them, so the width is not fixed — only the closing
+/// `}` marks the end.
+fn skip_unicode_escape_body(chars: &[(usize, char)], start: usize) -> Option<usize> {
+    if chars.get(start)?.1 != '{' {
+        return Some(start);
+    }
+    let mut index = start.saturating_add(1);
+    while chars.get(index)?.1 != '}' {
+        index = index.saturating_add(1);
+    }
+    Some(index.saturating_add(1))
 }
 
 /// Whether a declaration's prefix marks it `pub`, and not `pub(crate)`.
@@ -2885,8 +3945,12 @@ fn function_name(line: &str) -> Option<&str> {
 /// call graph. What it does catch, mechanically and every time, is the case that arrives
 /// silently: a layer gains a function and nobody wires the probe up to it.
 #[must_use]
-pub fn check_probe_reach(sources: &[LayerSource], probe: Option<&str>) -> Vec<Violation> {
-    let functions = public_functions(sources);
+pub fn check_probe_reach(
+    sources: &[LayerSource],
+    graph: &PackageGraph,
+    probe: Option<&str>,
+) -> Vec<Violation> {
+    let functions = public_functions_reachable(sources, graph);
     if functions.is_empty() {
         return Vec::new();
     }
@@ -3261,7 +4325,7 @@ mod tests {
     use super::*;
     use crate::elf::tests_support::{Class, ElfBuilder, SectionSpec};
     use crate::elf::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE};
-    use crate::graph::{Package, PackageGraph};
+    use crate::graph::{DepKind, Package, PackageGraph};
 
     fn workspace(core_features: &[&str], embassy_features: &[&str]) -> PackageGraph {
         PackageGraph::new(vec![
@@ -3622,6 +4686,7 @@ mod tests {
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()))
     }
 
     /// A report within every budget whose one workflow future is `bytes` wide.
@@ -3634,6 +4699,7 @@ mod tests {
                 workflow_futures: vec![("ota_update".to_owned(), bytes)],
             }),
         )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()))
     }
 
     /// Both gated rows at one figure. The façade image contains the engine one, so the two
@@ -3873,7 +4939,8 @@ mod tests {
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
-        );
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
         assert!(
             over_as_an_image.shortfalls().is_empty(),
             "{:?}",
@@ -4197,6 +5264,117 @@ mod tests {
             .runtime_ram_total()
             .expect("composable");
         assert_eq!(with_statics, base + 8);
+    }
+
+    #[test]
+    fn a_per_feature_rows_large_ram_raises_the_runtime_ram_total() {
+        // A per-feature row is a configuration somebody ships, and \u{a7}04 states one hard
+        // runtime-RAM ceiling for the device, not one per configuration — so an ungated
+        // row's `\u{394}ram` has to count against it the same as a gated row's does.
+        let default = default_row(1_024, 0);
+        let huge = feature_row_with_ram(
+            "waymaker-core/serde",
+            &default,
+            0,
+            RUNTIME_RAM_BUDGET_BYTES + 1_000,
+        );
+        let report = SizeReport::new(
+            vec![baseline_row(), default, facade_row(1_024, 0), huge],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(
+            report.runtime_ram_total(),
+            Some(SCRATCH_PAGE_BYTES + 104 + 56 + RUNTIME_RAM_BUDGET_BYTES + 1_000),
+        );
+    }
+
+    #[test]
+    fn a_document_missing_a_row_the_matrix_derives_is_caught() {
+        // Issue #115. `runtime_ram_total` composes every row, so a document that omitted
+        // the row with the largest `\u{394}ram` used to compose a smaller, wrong total and
+        // could pass a budget a complete document would fail. `missing_rows` is the check
+        // that closes it: the row set itself is held to what `matrix` derives.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy").with_features(&["postcard"]),
+            Package::new(PROBE_PACKAGE).with_features(&[
+                PROBE_FEATURE,
+                ENGINE_FEATURE,
+                FACADE_FEATURE,
+                "embassy-postcard",
+            ]),
+        ]);
+        let expected = matrix(&graph);
+        assert!(
+            expected
+                .iter()
+                .any(|variant| variant.name == "waymaker-embassy/postcard"),
+            "{expected:?}"
+        );
+
+        let complete = vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)];
+        let rows: Vec<Row> = expected
+            .iter()
+            .filter(|variant| !complete.iter().any(|row| row.name == variant.name))
+            .map(|variant| {
+                let mut row = feature_row(&variant.name, &default_row(1_024, 0), 8);
+                row.features = variant.features.clone();
+                row
+            })
+            .chain(complete.clone())
+            .collect();
+        assert!(missing_rows(&expected, &rows).is_empty(), "{rows:?}");
+
+        let incomplete: Vec<Row> = rows
+            .into_iter()
+            .filter(|row| row.name != "waymaker-embassy/postcard")
+            .collect();
+        let shortfalls = missing_rows(&expected, &incomplete);
+        assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+        assert!(
+            rendered(&shortfalls).contains("waymaker-embassy/postcard"),
+            "{shortfalls:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_with_the_right_name_and_the_wrong_features_is_also_caught() {
+        // Reusing a row's name with a narrowed feature selection is a row that was not
+        // really built with the feature the name claims, so `missing_rows` compares the
+        // feature set too, not only the name.
+        let expected = [Variant {
+            name: "waymaker-core/serde".to_owned(),
+            features: vec![
+                PROBE_FEATURE.to_owned(),
+                ENGINE_FEATURE.to_owned(),
+                "waymaker-core/serde".to_owned(),
+            ],
+            measured_against: DEFAULT_ROW.to_owned(),
+            gated: false,
+        }];
+        let mut narrowed = feature_row("waymaker-core/serde", &default_row(1_024, 0), 8);
+        narrowed.features = vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()];
+        let shortfalls = missing_rows(&expected, std::slice::from_ref(&narrowed));
+        assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    }
+
+    #[test]
+    fn a_workspace_with_no_probe_does_not_let_an_old_report_pass() {
+        // `matrix` derives no row at all for a workspace with no probe, and an empty
+        // `expected` read as "nothing to check" would let a document from before the probe
+        // was removed pass vacuously — even one that looks complete for the workspace it
+        // was really measured against.
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core")]);
+        assert!(matrix(&graph).is_empty());
+        let rows = vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)];
+        let shortfalls = missing_rows(&matrix(&graph), &rows);
+        assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+        assert!(
+            rendered(&shortfalls).contains(PROBE_PACKAGE),
+            "{shortfalls:?}"
+        );
     }
 
     #[test]
@@ -4525,6 +5703,396 @@ mod tests {
         assert!(change.contains("not compared"), "{change}");
     }
 
+    /// A symbol shaped like one `checksum_candidates.rs` really produces, at a given size.
+    fn candidate_symbol(identifier: &str, size: u64) -> crate::elf::Symbol {
+        symbol(
+            &format!(
+                "_RNvNtCs1_19waymaker_size_probe19checksum_candidates{}{identifier}",
+                identifier.len()
+            ),
+            0x1000,
+            size,
+            1,
+        )
+    }
+
+    /// The five real identifiers, each a plausible size.
+    fn candidate_symbols() -> Vec<crate::elf::Symbol> {
+        vec![
+            candidate_symbol("crc32_iso_hdlc_bitwise_candidate", 52),
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+            candidate_symbol("crc32c_nibble_table_candidate", 76),
+            candidate_symbol("CRC32C_NIBBLE_TABLE_CANDIDATE", 64),
+            candidate_symbol("crc32c_byte_table_candidate", 44),
+            candidate_symbol("CRC32C_BYTE_TABLE_CANDIDATE", 1_024),
+            candidate_symbol("crc16_ccitt_false_bitwise_candidate", 60),
+        ]
+    }
+
+    /// Five candidates of known size, [`fixture_kernel_state`]'s reason.
+    fn fixture_checksum_candidates() -> Vec<ChecksumCandidate> {
+        checksum_candidate_sizes(&candidate_symbols()).expect("the fixture symbols are complete")
+    }
+
+    #[test]
+    fn names_item_finds_a_probe_symbol_by_its_plain_identifier() {
+        let mangled =
+            "_RNvNtCs1_19waymaker_size_probe19checksum_candidates24crc32c_bitwise_candidate";
+        assert!(names_item(
+            mangled,
+            "waymaker_size_probe",
+            "crc32c_bitwise_candidate"
+        ));
+        // A different candidate's name is not a match, even though both share a crate and
+        // a module: the length prefix has to agree with the identifier that follows it.
+        assert!(!names_item(
+            mangled,
+            "waymaker_size_probe",
+            "crc32c_byte_table_candidate"
+        ));
+        // A symbol from another crate names nothing here, whatever it is called.
+        assert!(!names_item(
+            "_RNvCs1_14waymaker_flash5frame",
+            "waymaker_size_probe",
+            "frame"
+        ));
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_reads_the_one_matching_symbol() {
+        let symbols = candidate_symbols();
+        assert_eq!(
+            candidate_symbol_bytes(
+                &symbols,
+                "waymaker_size_probe",
+                "crc32c_byte_table_candidate"
+            )
+            .expect("the symbol exists"),
+            44
+        );
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_refuses_a_name_the_image_never_retained() {
+        let error = candidate_symbol_bytes(&[], "waymaker_size_probe", "crc32c_bitwise_candidate")
+            .expect_err("an empty image names nothing");
+        assert!(error.to_string().contains("crc32c_bitwise_candidate"));
+    }
+
+    #[test]
+    fn candidate_symbol_bytes_refuses_an_identifier_that_is_not_unique() {
+        let symbols = vec![
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+            candidate_symbol("crc32c_bitwise_candidate", 52),
+        ];
+        let error =
+            candidate_symbol_bytes(&symbols, "waymaker_size_probe", "crc32c_bitwise_candidate")
+                .expect_err("two symbols of one name cannot be attributed to one body");
+        assert!(error.to_string().contains("more than one"));
+    }
+
+    #[test]
+    fn checksum_candidate_sizes_reads_all_five_by_name() {
+        let candidates = fixture_checksum_candidates();
+        assert_eq!(candidates.len(), 5);
+
+        let by_name = |name: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.name == name)
+                .unwrap_or_else(|| panic!("no candidate named `{name}`"))
+        };
+
+        let bitwise = by_name("crc32-iso-hdlc-bitwise");
+        assert_eq!(
+            (bitwise.text, bitwise.rodata, bitwise.shipped),
+            (52, 0, true)
+        );
+
+        let rejected = by_name("crc32c-bitwise");
+        assert_eq!(
+            (rejected.text, rejected.rodata, rejected.shipped),
+            (52, 0, false)
+        );
+
+        let nibble = by_name("crc32c-nibble-table");
+        assert_eq!(
+            (nibble.text, nibble.rodata, nibble.shipped),
+            (76, 64, false)
+        );
+
+        let byte = by_name("crc32c-byte-table");
+        assert_eq!((byte.text, byte.rodata, byte.shipped), (44, 1_024, false));
+
+        let crc16 = by_name("crc16-ccitt-false-bitwise");
+        assert_eq!((crc16.text, crc16.rodata, crc16.shipped), (60, 0, true));
+    }
+
+    #[test]
+    fn checksum_candidate_sizes_refuses_an_image_missing_a_candidate() {
+        let symbols: Vec<crate::elf::Symbol> = candidate_symbols()
+            .into_iter()
+            .filter(|symbol| !symbol.name.contains("crc16_ccitt_false_bitwise_candidate"))
+            .collect();
+        let error = checksum_candidate_sizes(&symbols)
+            .expect_err("a missing candidate must fail the measurement rather than read as 0 B");
+        assert!(
+            error
+                .to_string()
+                .contains("crc16_ccitt_false_bitwise_candidate")
+        );
+    }
+
+    #[test]
+    fn measure_checksum_candidates_refuses_a_checkout_with_no_crc_candidates_feature() {
+        // Codex review on PR #133: `measure_into` only ever calls this function for the
+        // checkout `xtask` was built from — a base-branch worktree is skipped one level up,
+        // before this is reached at all (see `a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image`
+        // in `xtask/tests/size_budgets.rs`, which drives that guard against the real
+        // workspace). So a call that lands here with the feature undeclared is not "this
+        // checkout predates issue #61" — it is `size.rs`'s own `CHECKSUM_CANDIDATES` table
+        // and the probe's `Cargo.toml` having drifted apart, and has to fail loudly rather
+        // than silently report nothing.
+        //
+        // `probe_graph()` declares `engine`, `facade` and `probe` but not `crc-candidates`.
+        // The refusal has to come before `build_variant` is ever reached, which is what a
+        // bogus path proves: a caller that tried to build it anyway would fail on the path
+        // rather than on the feature, and this asserts the feature message instead.
+        let bogus = Path::new("/does/not/exist/waymaker-size-checksum-candidates-fixture");
+        let error = measure_checksum_candidates(bogus, bogus, &probe_graph())
+            .expect_err("a checkout with no `crc-candidates` feature must not be read as `None`");
+        assert!(
+            error.to_string().contains(CRC_CANDIDATES_FEATURE),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidate_section_is_not_a_pass() {
+        // Codex review on PR #133: a `--report` document with the section removed or
+        // nulled out must not silently pass just because `None` reads as "nothing to
+        // check" — that is exactly how a stripped section would bypass every check above.
+        // `measure_into` never produces this shape for the checkout `xtask` was built
+        // from: a checkout with the feature that fails to measure fails the whole
+        // report, for [`KernelState::measured`]'s reason. So a `None` reaching
+        // `shortfalls` is always either a document from before issue #61 (which
+        // `shortfall_report` is never actually run against — see
+        // `a_base_branch_shaped_measurement_never_attempts_the_checksum_candidates_image`
+        // in `xtask/tests/size_budgets.rs`) or a stripped one, and both are refused
+        // alike.
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(report.checksum_candidates(), None);
+        let message = rendered(&report.shortfalls());
+        assert!(
+            message.contains("no checksum-candidate section"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_checksum_candidate_section_is_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(Vec::new()));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("names no candidate"), "{message}");
+    }
+
+    #[test]
+    fn two_checksum_candidates_under_one_name_are_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("twice"), "{message}");
+    }
+
+    #[test]
+    fn a_checksum_candidate_that_measures_no_text_is_not_a_pass() {
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 0,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-bitwise"), "{message}");
+        assert!(message.contains("0 B"), "{message}");
+    }
+
+    #[test]
+    fn a_section_missing_four_of_the_five_candidates_is_not_a_pass() {
+        // Codex review on PR #133: a nonempty section with one valid, uniquely-named,
+        // nonzero candidate passed every check above. ADR 0010 measured five, and a
+        // report naming only one is a measurement that mostly did not happen.
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
+            ChecksumCandidate {
+                name: "crc32c-bitwise".to_owned(),
+                shipped: false,
+                text: 52,
+                rodata: 0,
+            },
+        ]));
+        let message = rendered(&report.shortfalls());
+        for missing in [
+            "crc32-iso-hdlc-bitwise",
+            "crc32c-nibble-table",
+            "crc32c-byte-table",
+            "crc16-ccitt-false-bitwise",
+        ] {
+            assert!(message.contains(missing), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_checksum_candidate_adr_0010_never_named_is_not_a_pass() {
+        // A renamed, substituted, or invented candidate must be refused by name, not
+        // waved through because it happens to be unique and nonzero.
+        let mut candidates = fixture_checksum_candidates();
+        candidates.push(ChecksumCandidate {
+            name: "crc32-koopman".to_owned(),
+            shipped: false,
+            text: 52,
+            rodata: 0,
+        });
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-koopman"), "{message}");
+    }
+
+    #[test]
+    fn a_checksum_candidate_with_the_wrong_shipped_flag_is_not_a_pass() {
+        // ADR 0010 says exactly two of the five ship. A report that flipped the flag on
+        // one is not the measurement it claims to be.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32-iso-hdlc-bitwise" {
+                candidate.shipped = false;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32-iso-hdlc-bitwise"), "{message}");
+        assert!(message.contains("shipped"), "{message}");
+    }
+
+    #[test]
+    fn a_table_candidate_that_measures_no_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the `.text` check alone let a truncated report set
+        // `rodata: 0` on either table candidate — dropping the 64 B / 1024 B figures ADR
+        // 0010's decision turns on — and still pass.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-nibble-table" {
+                candidate.rodata = 0;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-nibble-table"), "{message}");
+        assert!(message.contains("0 B of `.rodata`"), "{message}");
+    }
+
+    #[test]
+    fn a_bitwise_candidate_with_nonzero_rodata_is_not_a_pass() {
+        // Codex review on PR #133: the table-candidate check only ran one way. A report
+        // that claimed `.rodata` for a bitwise loop — which has no table at all — must be
+        // refused just as loudly as one that dropped a real table's figure.
+        let mut candidates = fixture_checksum_candidates();
+        for candidate in &mut candidates {
+            if candidate.name == "crc32c-bitwise" {
+                candidate.rodata = 64;
+            }
+        }
+        let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
+        let message = rendered(&report.shortfalls());
+        assert!(message.contains("crc32c-bitwise"), "{message}");
+        assert!(message.contains("no table at all"), "{message}");
+    }
+
+    #[test]
+    fn checksum_candidates_are_reported_and_charged_to_no_budget() {
+        let report = full_report(1_024, 0, 1_024, 0)
+            .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        assert!(report.shortfalls().is_empty(), "{:?}", report.shortfalls());
+
+        let table = report.render();
+        assert!(table.contains("checksum candidates"), "{table}");
+        assert!(table.contains("crc32c-byte-table"), "{table}");
+        assert!(table.contains("1024"), "{table}");
+        assert!(table.contains("shipped"), "{table}");
+        assert!(table.contains("ADR 0010"), "{table}");
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidates_renders_no_section_for_them() {
+        let table = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        )
+        .render();
+        assert!(!table.contains("checksum candidates"), "{table}");
+    }
+
+    #[test]
+    fn the_checksum_candidate_section_survives_a_json_round_trip() {
+        let original = full_report(512, 32, 700, 32)
+            .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        let json = original.to_json();
+        let parsed = SizeReport::from_json(&json).expect("the report should round-trip");
+        assert_eq!(parsed.checksum_candidates(), original.checksum_candidates());
+    }
+
+    #[test]
+    fn a_report_with_no_checksum_candidates_key_is_read_as_none() {
+        // A report written before issue #61 existed has no `checksum_candidates` key at
+        // all, not a `null` one — and it must still read, the same way an older report with
+        // no `runtime` key does.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 32, 700, 32).to_json())
+                .expect("the report should be JSON");
+        document
+            .as_object_mut()
+            .expect("a report is an object")
+            .remove("checksum_candidates");
+        let parsed = SizeReport::from_json(&document.to_string())
+            .expect("a report with no checksum-candidates key should still read");
+        assert_eq!(parsed.checksum_candidates(), None);
+    }
+
+    #[test]
+    fn a_malformed_checksum_candidate_is_refused_rather_than_silently_dropped() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 32, 700, 32).to_json())
+                .expect("the report should be JSON");
+        document
+            .as_object_mut()
+            .expect("a report is an object")
+            .insert(
+                "checksum_candidates".to_owned(),
+                serde_json::json!([{"name": "crc32c-bitwise"}]),
+            );
+        let refusal = SizeReport::from_json(&document.to_string())
+            .expect_err("a candidate with no `shipped` flag must not be read");
+        assert!(refusal.to_string().contains("shipped"), "{refusal}");
+    }
+
     #[test]
     fn a_report_within_every_budget_has_no_shortfalls() {
         assert!(report(1_024, 64).shortfalls().is_empty());
@@ -4766,6 +6334,43 @@ mod tests {
     }
 
     #[test]
+    fn a_gated_row_that_links_less_than_the_baseline_is_not_a_measurement() {
+        // A shrinking probe with growing layers reads `probe` negative, `layers`
+        // positive, and the saturating whole-image delta 0: `probe` + `layers` no
+        // longer reconciles with `Δflash`, so the row is a measurement fault rather
+        // than a negative cost.
+        let base = baseline_sizes();
+        let row = Row::new(
+            DEFAULT_ROW,
+            &[PROBE_FEATURE, ENGINE_FEATURE],
+            BASELINE_ROW,
+            SectionSizes {
+                text: base.text - 5,
+                flash: base.flash - 5,
+                ..base
+            },
+            BASELINE_PROBE_FLASH - 8,
+            true,
+        );
+        let report = SizeReport::new(
+            vec![baseline_row(), row],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        );
+        assert_eq!(report.probe_delta_signed_of(DEFAULT_ROW), Some(-8));
+        assert_eq!(report.layers_flash_of(DEFAULT_ROW), Some(3));
+        assert_eq!(
+            report.delta_of(DEFAULT_ROW).map(|delta| delta.flash),
+            Some(0)
+        );
+        assert!(
+            rendered(&report.shortfalls()).contains("cannot reconcile"),
+            "{:?}",
+            report.shortfalls()
+        );
+    }
+
+    #[test]
     fn a_report_with_two_rows_of_one_name_is_rejected_rather_than_gated_on_the_first() {
         // Every figure in a report is looked up by name, so a second `default` row would
         // be gated on the first one's numbers whatever it held. `--report` reads a
@@ -4782,6 +6387,18 @@ mod tests {
 
     /// A feature row costing `flash_over_default` more than the `default` row it sits on.
     fn feature_row(name: &str, default: &Row, flash_over_default: u64) -> Row {
+        feature_row_with_ram(name, default, flash_over_default, 0)
+    }
+
+    /// A feature row costing `flash_over_default` more flash and `ram_over_default` more RAM
+    /// than the `default` row it sits on. Ungated, like every per-feature row [`matrix`]
+    /// derives.
+    fn feature_row_with_ram(
+        name: &str,
+        default: &Row,
+        flash_over_default: u64,
+        ram_over_default: u64,
+    ) -> Row {
         Row::new(
             name,
             &[PROBE_FEATURE, ENGINE_FEATURE, name],
@@ -4789,6 +6406,8 @@ mod tests {
             SectionSizes {
                 flash: default.sizes.flash + flash_over_default,
                 text: default.sizes.text + flash_over_default,
+                bss: default.sizes.bss + ram_over_default,
+                ram: default.sizes.ram + ram_over_default,
                 ..default.sizes
             },
             default.probe_flash,
@@ -4812,7 +6431,8 @@ mod tests {
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
-        );
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
         assert!(report.shortfalls().is_empty());
         assert!(report.render().contains("waymaker-core/serde"));
     }
@@ -5639,7 +7259,7 @@ mod tests {
     }
 
     fn reach_violations(sources: &[LayerSource], probe: &str) -> String {
-        check_probe_reach(sources, Some(probe))
+        check_probe_reach(sources, &PackageGraph::default(), Some(probe))
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -5665,6 +7285,7 @@ mod tests {
         assert!(
             check_probe_reach(
                 &kernel("pub fn advance() {}\n"),
+                &PackageGraph::default(),
                 Some("fn probe() { waymaker_core::advance(); }\n"),
             )
             .is_empty()
@@ -5730,6 +7351,582 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["seal", "erase", "erase"]);
+    }
+
+    #[test]
+    fn a_private_traits_methods_are_not_required_of_the_probe() {
+        // Issue #49. A bare `trait` has no path from another crate. The probe cannot
+        // call it. The gate must not ask for a call nothing can make.
+        let functions = public_functions(&kernel(
+            "trait Internal {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_crate_traits_methods_are_not_required_of_the_probe() {
+        // `pub(crate)` keeps the trait inside its own crate. The probe is a separate
+        // crate, so it has no path to the trait either.
+        let functions = public_functions(&kernel(
+            "pub(crate) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_public_traits_methods_are_still_required_of_the_probe() {
+        let functions = public_functions(&kernel(
+            "pub trait Storage {\n\
+            \x20   fn seal(&self);\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal"]);
+    }
+
+    #[test]
+    fn an_impl_of_a_private_trait_is_not_required_of_the_probe() {
+        // The trait and its impl can sit in different files of one crate.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Internal {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Internal for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_impl_of_a_public_trait_is_still_required_of_the_probe() {
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "pub trait Storage {\n    fn seal(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Storage for Bank {\n    fn seal(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["seal", "seal"]);
+    }
+
+    #[test]
+    fn a_path_qualified_impl_of_a_private_trait_is_not_required_of_the_probe() {
+        // A qualified path names the trait too: `crate::sealed::Sealed` names
+        // `Sealed`, not `crate`. Taking the first token instead reads a common
+        // sealed-trait idiom as an unrelated public name and demands the call back.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl crate::sealed::Sealed for Bank {\n    fn hidden(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_path_qualified_impl_of_an_external_trait_is_still_required_of_the_probe() {
+        // No local declaration named `core` exists, so the trait is external and
+        // stays reachable — the same as an unqualified external trait always was.
+        let functions = public_functions(&kernel(
+            "impl core::fmt::Debug for Bank {\n\
+            \x20   fn fmt(&self) {}\n\
+             }\n",
+        ));
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_return_arrow_inside_a_generic_bound_does_not_close_the_bracket_early() {
+        // `Fn() -> u32`'s `>` is not a generic close. Counting it as one truncates
+        // the scan before the real trait name and reads garbage in its place —
+        // garbage that then fails to match the private name and is misread as
+        // reachable. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Internal {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents:
+                    "impl<F: Fn() -> u32> Internal for Bank<F> {\n    fn hidden(&self) {}\n}\n"
+                        .to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_qualified_external_trait_is_not_hidden_by_a_same_named_private_trait() {
+        // A private trait and an external one can share a name. The qualified
+        // path to the external trait must not be judged by that collision.
+        // Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Debug {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl core::fmt::Debug for Bank {\n    fn fmt(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_real_dependency_is_not_hidden_by_a_same_named_private_trait() {
+        // `serde` is not on the fixed `EXTERNAL_PATH_ROOTS` list. Without the real
+        // dependency graph, a private trait named `Serialize` hides the live
+        // `impl serde::Serialize for Bank` and understates the size report. Issue #141.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["serialize"]);
+    }
+
+    #[test]
+    fn public_functions_alone_still_hides_an_impl_of_an_unlisted_dependency() {
+        // `public_functions` has no graph to consult, so a caller with no graph in hand
+        // keeps the old, narrower floor. Only `public_functions_reachable` closes #141.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        assert!(public_functions(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_real_dependency_check_probe_reach_requires_the_call() {
+        // The gate itself, end to end: `check_probe_reach` goes through
+        // `public_functions_reachable`, so a probe that never calls `serialize` is
+        // still reported even though the crate's own `Serialize` trait is private.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let violations = check_probe_reach(&sources, &graph, Some("fn probe() {}\n"));
+        let message = violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message.contains("serialize"), "{message}");
+    }
+
+    #[test]
+    fn a_hyphenated_dependency_name_is_read_as_its_underscored_root() {
+        // Cargo spells the package `embassy-time`. Rust source spells the root
+        // `embassy_time`. A private trait under the underscored name must not hide
+        // a live impl of the dependency's trait.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("embassy-time", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Timer {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl embassy_time::Timer for Bank {\n    fn now(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["now"]);
+    }
+
+    #[test]
+    fn a_renamed_dependency_is_read_by_its_local_name_not_its_package_name() {
+        // `foo = { package = "bar" }` in the manifest is `impl foo::Trait`, not
+        // `impl bar::Trait`, in source. Checking the package name instead would
+        // leave the real root unrecognized as external.
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core").with_renamed_dependency(
+            "bar",
+            "foo",
+            DepKind::Normal,
+        )]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Trait {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl foo::Trait for Bank {\n    fn run(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["run"]);
+    }
+
+    #[test]
+    fn a_dependency_name_shadowed_by_a_local_module_keeps_checking_private_traits() {
+        // A file can declare its own `mod serde { .. }` and implement its trait in
+        // the same scope. Rust then resolves `serde::Serialize` there to the local
+        // trait, not the dependency's. Treating `serde` as always-external here
+        // would demand a call the probe structurally cannot make — issue #49's
+        // failure, the one #141's own fix must not reintroduce. Codex found this
+        // on this pull request's own review.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "mod serde {\n\
+                       \x20   pub(crate) trait Serialize {\n\
+                       \x20       fn hidden(&self);\n\
+                       \x20   }\n\
+                       }\n\
+                       \n\
+                       impl serde::Serialize for Bank {\n    fn hidden(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_module_shadow_in_one_file_does_not_hide_a_real_external_impl_in_another() {
+        // `lib.rs` declares its own `mod serde { .. }`, which shadows `serde`
+        // only within `lib.rs`'s own scope — a sibling file does not inherit it.
+        // `bank.rs` has no such declaration, so its `impl serde::Serialize for
+        // Bank` still names the real dependency and must stay reachable. Codex
+        // found this on this pull request's own review, of an earlier,
+        // crate-wide version of the module-shadow guard.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "mod serde {\n\
+                           \x20   pub(crate) trait Serialize {\n\
+                           \x20       fn hidden(&self);\n\
+                           \x20   }\n\
+                           }\n"
+                .to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl serde::Serialize for Bank {\n    fn hidden(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["hidden"]);
+    }
+
+    #[test]
+    fn an_absolute_path_is_never_local_even_behind_a_shadowing_module() {
+        // `impl ::core::fmt::Debug` resolves through the extern prelude alone,
+        // never through a local `mod core { .. }` in the same file — a leading
+        // `::` opts out of every local scope. Codex found this on this pull
+        // request's own review.
+        let functions = public_functions_reachable(
+            &kernel(
+                "mod core {\n\
+                 \x20   pub(crate) trait Debug {\n\
+                 \x20       fn hidden(&self);\n\
+                 \x20   }\n\
+                 }\n\
+                 \n\
+                 impl ::core::fmt::Debug for Bank {\n    fn fmt(&self) {}\n}\n",
+            ),
+            &PackageGraph::default(),
+        );
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_dependency_renamed_to_a_keyword_is_read_by_its_raw_spelling() {
+        // Cargo accepts `type = { package = "dep" }`; Rust source must then
+        // spell the crate `r#type`. `r#type` and `type` are the same
+        // identifier, the same convention this codebase already applies to
+        // `extern crate r#alloc;` (issues #68/#90). Codex found this on this
+        // pull request's own review.
+        let graph = PackageGraph::new(vec![Package::new("waymaker-core").with_renamed_dependency(
+            "dep",
+            "type",
+            DepKind::Normal,
+        )]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Trait {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl r#type::Trait for Bank {\n    fn run(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["run"]);
+    }
+
+    #[test]
+    fn an_absolute_import_is_credited_despite_a_local_module_shadow() {
+        // `lib.rs` declares its own `mod serde { .. }`, shadowing `serde` in
+        // its own scope. `use ::serde::Serialize;` opts out of that shadow
+        // with a leading `::`, so the unqualified `impl Serialize for Bank`
+        // that follows still names the real dependency's trait. Codex found
+        // this on this pull request's own review, after the same fix already
+        // existed for `impl` paths.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "mod serde {\n\
+                       \x20   pub(crate) trait Serialize {\n\
+                       \x20       fn hidden(&self);\n\
+                       \x20   }\n\
+                       }\n\
+                       \n\
+                       use ::serde::Serialize;\n\
+                       \n\
+                       impl Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["serialize"]);
+    }
+
+    #[test]
+    fn an_imported_external_trait_is_not_hidden_by_a_same_named_private_trait_elsewhere() {
+        // One file declares its own private `trait Serialize`. A different file
+        // imports the real `serde::Serialize` and implements it unqualified.
+        // Aggregating trait names crate-wide, as `private_trait_names` does,
+        // cannot tell the two apart by name alone — this file's own import must
+        // win for its own `impl`. Codex found this on this pull request's own
+        // review.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "use serde::Serialize;\n\n\
+                           impl Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["serialize"]);
+    }
+
+    #[test]
+    fn a_trait_declared_only_inside_a_block_comment_is_not_counted_as_private() {
+        // A hand-rolled `//`-only comment skip leaves a block-commented trait
+        // declaration counted as real. That hides a live impl of an unrelated
+        // trait sharing its name. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "/*\ntrait Display {\n    fn hidden(&self);\n}\n*/\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Display for Bank {\n    fn fmt(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["fmt"]);
+    }
+
+    #[test]
+    fn a_relative_module_path_to_a_private_trait_is_not_required_of_the_probe() {
+        // `sealed::Sealed`, with no `crate`/`self`/`super` prefix, is still a path
+        // this crate can declare a trait under. Codex found this on PR #136.
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/sealed.rs".to_owned(),
+                contents: "pub(crate) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl sealed::Sealed for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_super_traits_methods_are_not_required_of_the_probe() {
+        // `pub(super)` restricts a trait to its parent module. A separate crate has
+        // no path to it either. Codex found this on PR #136.
+        let functions = public_functions(&kernel(
+            "pub(super) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_pub_in_path_traits_methods_are_not_required_of_the_probe() {
+        let functions = public_functions(&kernel(
+            "pub(in crate::internal) trait Sealed {\n\
+            \x20   fn hidden(&self);\n\
+             }\n",
+        ));
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_impl_of_a_pub_super_trait_is_not_required_of_the_probe() {
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "pub(super) trait Sealed {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "impl Sealed for Bank {\n    fn hidden(&self) {}\n}\n".to_owned(),
+            },
+        ];
+        let functions = public_functions(&sources);
+        assert!(functions.is_empty(), "{functions:?}");
     }
 
     #[test]
@@ -5872,7 +8069,12 @@ mod tests {
             "fn probe() { let f = seal(); }\n",
         ] {
             assert!(
-                check_probe_reach(&kernel("pub fn seal() {}\n"), Some(probe)).is_empty(),
+                check_probe_reach(
+                    &kernel("pub fn seal() {}\n"),
+                    &PackageGraph::default(),
+                    Some(probe)
+                )
+                .is_empty(),
                 "{probe} should count as a call"
             );
         }
@@ -5907,12 +8109,23 @@ mod tests {
     #[test]
     fn a_workspace_whose_layers_have_no_public_functions_yet_has_nothing_to_reach() {
         // Rung 0.0. The rule must be silent rather than demanding the probe call nothing.
-        assert!(check_probe_reach(&kernel("//! Docs only.\n"), Some("")).is_empty());
+        assert!(
+            check_probe_reach(
+                &kernel("//! Docs only.\n"),
+                &PackageGraph::default(),
+                Some("")
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn a_probe_with_no_source_cannot_be_shown_to_reach_anything() {
-        let violations = check_probe_reach(&kernel("pub fn advance() {}\n"), None);
+        let violations = check_probe_reach(
+            &kernel("pub fn advance() {}\n"),
+            &PackageGraph::default(),
+            None,
+        );
         assert!(!violations.is_empty());
     }
 
