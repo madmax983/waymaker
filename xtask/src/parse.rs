@@ -5036,7 +5036,7 @@ fn path_could_reach_target<'a>(
         segments,
         stack,
         scope,
-        None,
+        &[],
         block_items,
         scope,
         block_eligible,
@@ -5146,7 +5146,7 @@ fn try_alias_candidates<'a>(
     rest: &[String],
     stack: &[&'a [syn::Item]],
     scope: usize,
-    entered: Option<&'a [syn::Item]>,
+    entered: &[&'a [syn::Item]],
     block_items: &[&'a syn::Item],
     innermost_scope: usize,
     next_block_eligible: bool,
@@ -5299,7 +5299,7 @@ fn try_block_module_candidates<'a>(
             remaining.to_vec(),
             stack,
             scope,
-            Some(module_items),
+            &[module_items],
             block_items,
             innermost_scope,
             false,
@@ -5332,7 +5332,7 @@ fn try_block_local_candidates<'a>(
     rest: &[String],
     stack: &[&'a [syn::Item]],
     scope: usize,
-    entered: Option<&'a [syn::Item]>,
+    entered: &[&'a [syn::Item]],
     innermost_scope: usize,
     block_eligible: bool,
     target: &str,
@@ -5393,7 +5393,7 @@ fn segments_could_reach_target<'a>(
     mut segments: Vec<String>,
     stack: &[&'a [syn::Item]],
     mut scope: usize,
-    entered: Option<&'a [syn::Item]>,
+    entered: &[&'a [syn::Item]],
     block_items: &[&'a syn::Item],
     innermost_scope: usize,
     block_eligible: bool,
@@ -5410,25 +5410,29 @@ fn segments_could_reach_target<'a>(
     };
     *budget = spent;
 
-    // `super` steps back out of a module entered by name (issue #169's plain
-    // relative descent) to the scope that named it. `scope` is already that
-    // scope, unmoved, because descent by name never touches it — so
-    // escaping is one token, not a further decrement the way a `super`
-    // consumed on the lexical ancestor stack needs: `consume_scope_prefix`
-    // would refuse to move `scope` at all here on a device with only one
-    // nesting level, since `*scope > 0` is its own floor, leaving `super`
-    // unstripped and compared as an ordinary segment. One entered module
-    // only, since `scope` cannot say which of several nested parents a
-    // second `super` would need (issue #197, Codex review of the PR:
-    // `consume_self_prefix` only strips `self`, so a `super` left
-    // unconsumed here reported a target the path never really reaches).
-    let entered = if entered.is_some() && segments.first().map(String::as_str) == Some("super") {
-        segments.remove(0);
-        None
-    } else {
-        entered
-    };
-    let items: &'a [syn::Item] = if let Some(entered_items) = entered {
+    // `super` steps back out of the *innermost* module entered by name
+    // (issue #169's plain relative descent) to its immediate parent — another
+    // entered module, if descent has nested more than one deep, or the scope
+    // that named the outermost one once `entered` empties. `entered` is a
+    // stack for exactly this reason: descent pushes onto it rather than
+    // replacing it, so popping one level here still leaves an intermediate
+    // module's own items in view for a further hop, the way real Rust's own
+    // ancestor chain does (issue #197, Codex review of the PR, second round
+    // on this exact escape: the first fix modelled `entered` as a single
+    // `Option`, so a `super` inside a module nested two deep escaped straight
+    // to the outermost lexical scope, skipping the immediate parent module
+    // `super` actually names — confirmed against real `rustc`).
+    let mut popped_entered;
+    let entered: &[&'a [syn::Item]] =
+        if !entered.is_empty() && segments.first().map(String::as_str) == Some("super") {
+            segments.remove(0);
+            popped_entered = entered.to_vec();
+            popped_entered.pop();
+            &popped_entered
+        } else {
+            entered
+        };
+    let items: &'a [syn::Item] = if let Some(&entered_items) = entered.last() {
         consume_self_prefix(&mut segments);
         entered_items
     } else {
@@ -5439,7 +5443,7 @@ fn segments_could_reach_target<'a>(
     // module entered by name, and still at the scope the search started from.
     // `super`/`self` above may have just moved `scope` past it, so this reads the
     // state after consuming a prefix.
-    let block_applies = block_eligible && entered.is_none() && scope == innermost_scope;
+    let block_applies = block_eligible && entered.is_empty() && scope == innermost_scope;
 
     let Some(first) = segments.first().cloned() else {
         return false;
@@ -5541,7 +5545,7 @@ fn try_module_scope_candidates<'a>(
     segments: &[String],
     stack: &[&'a [syn::Item]],
     scope: usize,
-    entered: Option<&'a [syn::Item]>,
+    entered: &[&'a [syn::Item]],
     block_items: &[&'a syn::Item],
     innermost_scope: usize,
     target: &str,
@@ -5580,11 +5584,19 @@ fn try_module_scope_candidates<'a>(
             .collect();
         claimed |= !modules.is_empty();
         for module_items in modules {
+            // Push onto `entered` rather than replacing it: `items` may
+            // already be an entered module's own items — `traits::deeper`
+            // descending past `traits` — and a nested `super` needs that
+            // intermediate module still on the stack to escape back to,
+            // not just the lexical scope every module ancestor ultimately
+            // bottoms out at.
+            let mut extended = entered.to_vec();
+            extended.push(module_items);
             if segments_could_reach_target(
                 remaining.clone(),
                 stack,
                 scope,
-                Some(module_items),
+                &extended,
                 block_items,
                 innermost_scope,
                 false,
@@ -15649,6 +15661,70 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_super_qualified_alias_target_reached_through_nested_module_descent_still_counts() {
+        // Codex review of PR #204, a second round on the same escape: the
+        // first fix modelled `entered` as a single `Option`, so a `super`
+        // inside a module nested *two* deep escaped straight to the
+        // outermost lexical scope, skipping the immediate parent module it
+        // actually names. Confirmed against real `rustc`: `a::b::Marker`,
+        // whose own target is `super::X` inside `mod b`, and whose own `X`
+        // is `super::CheckedDispatch` inside `mod a`, really does construct
+        // `CheckedDispatch` — each `super` names its own immediate parent,
+        // not the file's own top level.
+        let counts = struct_literal_counts(
+            "mod a {\n\
+             \x20   pub type X = super::CheckedDispatch;\n\
+             \x20   pub mod b {\n\
+             \x20       pub type Marker = super::X;\n\
+             \x20   }\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = a::b::Marker;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_super_qualified_alias_target_reached_through_nested_module_descent_that_resolves_elsewhere_does_not_count()
+     {
+        // The control for the test above: with `a`'s own `X` aliasing
+        // something other than `CheckedDispatch`, the identical two-level
+        // `super::`-escape chain resolves to that other name instead, so it
+        // must not count — closing the gap above must not turn into an
+        // over-count of every nested `super::`-qualified chain regardless
+        // of what it really reaches.
+        let counts = struct_literal_counts(
+            "mod a {\n\
+             \x20   pub type X = super::Decoy;\n\
+             \x20   pub mod b {\n\
+             \x20       pub type Marker = super::X;\n\
+             \x20   }\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = a::b::Marker;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 
     #[test]

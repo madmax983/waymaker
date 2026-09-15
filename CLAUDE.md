@@ -5852,5 +5852,25 @@ alias or module already does, because neither one alone is unconditional.
 `a_conditional_block_local_alias_still_lets_module_scope_through`, are the ninth's
 regression; `an_unconditional_inner_block_alias_shadows_an_outer_block_one` and its
 control, `a_conditional_inner_block_alias_still_lets_the_outer_one_through`, are the
-tenth's. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
-rule id.
+tenth's.
+
+A further round found an eleventh, and it is a second look at the seventh's own fix
+rather than a new class of gap: `entered` had been modelled as a single `Option`, so a
+`super` inside a module nested *two* deep — `mod a { type X = super::CheckedDispatch;
+mod b { type Marker = super::X; } }` — escaped straight to the file's own top level
+the moment it popped one level, skipping the immediate parent module (`a`) it actually
+names, confirmed against real `rustc`: a live cfg-gated alias to `a::b::Marker` really
+constructs `CheckedDispatch`, but the search resolved the inner `super::X` against the
+root, found nothing there named `X`, and missed the construction — the seventh's own
+documented residual, "one entered module only," restated for the case that residual
+had named as out of reach. `entered` is now a stack, `&[&'a [syn::Item]]`, pushed onto
+by every module-descent hop rather than replaced by it, so `super` pops exactly one
+level and leaves any further-out entered module still in view for the hop after — the
+deterministic resolver keeps its own single-`Option` shape and its own matching
+residual, since this search is a backstop over it and widening what only the backstop
+can find still counts every real construction.
+`a_super_qualified_alias_target_reached_through_nested_module_descent_still_counts`
+and its control,
+`a_super_qualified_alias_target_reached_through_nested_module_descent_that_resolves_elsewhere_does_not_count`,
+are the regression. No new ADR: nothing here moves a must-not-own cell, a dependency
+edge, or a rule id.
