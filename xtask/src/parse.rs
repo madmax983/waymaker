@@ -1740,19 +1740,39 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
 /// wholly unmatched closing tag or one belonging to something opened *inside* the
 /// hidden element it is scanning, neither of which should unwind anything.
 ///
-/// An opening tag that is neither void nor self-closing is pushed; a closing tag
-/// pops only when it matches the current top exactly, the same "close only what
-/// actually opened" discipline every other tracked stack in this module already
-/// follows — an out-of-order or wholly unmatched close leaves `ancestors` alone
-/// rather than guessing which entry, if any, it was meant to end.
-fn track_ordinary_ancestor(span: &str, ancestors: &mut Vec<String>) {
+/// A closing tag truncates the whole stack through its match rather than only
+/// popping the top (Codex, round 59, "Truncate ordinary ancestors on matching outer
+/// closes"): `<div><span></div><em hidden>ignored</span>decision-id headline</em>`
+/// has `</div>` close both `span` and `div` at once, per HTML5's "any other end tag"
+/// stack-popping algorithm — checking only `ancestors.last()` left the never-closed
+/// `span` recorded forever, so the later, genuinely stray `</span>` (its own
+/// ancestor already closed out from under it) matched `ancestors` as if it were
+/// still real evidence, wrongly force-closing the hidden `em`.
+///
+/// An opening tag is pushed unless it is void, or self-closing *and* the innermost
+/// open foreign-content frame [`honors_self_closing_now`] (Codex, round 59, "Ignore
+/// self-closing slashes on ordinary HTML ancestors"): HTML5 only honors a trailing
+/// `/` as bodyless syntax inside foreign content (SVG/MathML) — `<span/>` in
+/// ordinary HTML is a real, open `span` with the slash ignored, exactly the same
+/// distinction [`is_foreign_content_root`] and [`ends_with_self_closing_slash`]'s
+/// other callers already draw, so `<span/><em hidden>ignored</span>All 6 recovery
+/// invariants</em>` needs `span` recorded to let its later, real close unwind `em`.
+fn track_ordinary_ancestor(
+    span: &str,
+    foreign_content: &[ForeignFrame],
+    ancestors: &mut Vec<String>,
+) {
     let name = markup_tag_name(span).to_ascii_lowercase();
     if span.starts_with("</") {
-        if ancestors.last().is_some_and(|open| *open == name) {
-            ancestors.pop();
+        if ancestors.contains(&name) {
+            while ancestors.pop().as_deref() != Some(name.as_str()) {}
         }
-    } else if !ends_with_self_closing_slash(span) && !is_void_element(&name) {
-        ancestors.push(name);
+    } else {
+        let self_closing_in_foreign_content =
+            ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content);
+        if !is_void_element(&name) && !self_closing_in_foreign_content {
+            ancestors.push(name);
+        }
     }
 }
 
@@ -2064,7 +2084,7 @@ fn track_non_rendering_html(
                 // this, an inline `<span>` opened outside any hidden element was
                 // invisible to the ancestor-unwind check in the nesting arm above,
                 // since only the block-level scan ever recorded one.
-                track_ordinary_ancestor(html, ancestors);
+                track_ordinary_ancestor(html, foreign_content, ancestors);
                 false
             }
         }
@@ -3036,11 +3056,11 @@ fn advance_past_cdata(
 ) -> Option<usize> {
     if let Some(offset) = line.get(cursor..).and_then(|rest| rest.find("]]>")) {
         let payload_end = cursor + offset;
-        spans.push(VisibleHtmlSpan::Text(cursor..payload_end));
+        spans.push(VisibleHtmlSpan::RawText(cursor..payload_end));
         *in_cdata = false;
         return Some(payload_end + "]]>".len());
     }
-    spans.push(VisibleHtmlSpan::Text(cursor..line.len()));
+    spans.push(VisibleHtmlSpan::RawText(cursor..line.len()));
     None
 }
 
@@ -3203,17 +3223,17 @@ fn advance_via_hiding_marker(
                 spans.push(VisibleHtmlSpan::Break);
             }
             track_foreign_content_depth(span, nested.foreign_content);
-            track_ordinary_ancestor(span, nested.ancestors);
+            track_ordinary_ancestor(span, nested.foreign_content, nested.ancestors);
             Some(end)
         }
         Some(HidingMarker::Cdata(open_start, payload_start, payload_end, close_end)) => {
             spans.push(VisibleHtmlSpan::Text(cursor..open_start));
-            spans.push(VisibleHtmlSpan::Text(payload_start..payload_end));
+            spans.push(VisibleHtmlSpan::RawText(payload_start..payload_end));
             Some(close_end)
         }
         Some(HidingMarker::CdataOpen(open_start, payload_start)) => {
             spans.push(VisibleHtmlSpan::Text(cursor..open_start));
-            spans.push(VisibleHtmlSpan::Text(payload_start..line.len()));
+            spans.push(VisibleHtmlSpan::RawText(payload_start..line.len()));
             *open_construct.in_cdata = true;
             None
         }
@@ -3223,8 +3243,18 @@ fn advance_via_hiding_marker(
 /// One visible byte range of an `Event::Html` line, or a forced line break a stripped
 /// block tag's own markup leaves behind — see [`visible_html_ranges`].
 enum VisibleHtmlSpan {
-    /// A visible byte range into the original line.
+    /// A visible byte range into the original line, decoded for character references
+    /// before a reader sees it — ordinary HTML text content, the way a browser renders
+    /// it.
     Text(std::ops::Range<usize>),
+    /// A foreign-content CDATA section's own payload (Codex, pull request #138, round
+    /// 59, "Preserve character references inside foreign CDATA"): visible the same way
+    /// [`Text`](VisibleHtmlSpan::Text) is, but never decoded — HTML5's CDATA section
+    /// tokenizer state emits every byte between `<![CDATA[` and `]]>` literally, with
+    /// no character-reference processing at all, unlike ordinary text content. `All
+    /// &#54; recovery invariants` inside one renders exactly that way, the literal
+    /// six-character sequence `&#54;` and all, never as `All 6 recovery invariants`.
+    RawText(std::ops::Range<usize>),
     /// A line break a browser renders here that no byte range can carry, because no
     /// byte of the source is one.
     Break,
@@ -3247,6 +3277,7 @@ fn append_visible_html(out: &mut String, html: &str, spans: Vec<VisibleHtmlSpan>
             VisibleHtmlSpan::Text(range) => {
                 out.push_str(&decode_character_references(&html[range]));
             }
+            VisibleHtmlSpan::RawText(range) => out.push_str(&html[range]),
             VisibleHtmlSpan::Break => {
                 if !out.is_empty() && !out.ends_with('\n') {
                     out.push('\n');
@@ -6008,7 +6039,7 @@ fn hide_non_rendering_in_html_line(
             // to step past.
             Some(HidingMarker::Markup(start, end)) => {
                 track_foreign_content_depth(&html[start..end], foreign_content);
-                track_ordinary_ancestor(&html[start..end], ancestors);
+                track_ordinary_ancestor(&html[start..end], foreign_content, ancestors);
                 cursor = end;
             }
             // A CDATA section's payload is real, reader-visible text, exactly like

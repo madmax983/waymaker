@@ -7407,6 +7407,50 @@ mod tests {
     }
 
     #[test]
+    fn a_headline_encoded_inside_foreign_cdata_still_stays_hidden() {
+        // Codex, pull request #138, round 59, finding "Preserve character references
+        // inside foreign CDATA": HTML5's CDATA section tokenizer state emits every
+        // byte between `<![CDATA[` and `]]>` literally, with no character-reference
+        // processing at all — `<svg><text><![CDATA[All &#54; recovery
+        // invariants]]></text></svg>` renders the literal six-character sequence
+        // `&#54;`, never the digit `6`, unlike ordinary HTML text content, which a
+        // browser does resolve entities in. `append_visible_html` decoded every
+        // `VisibleHtmlSpan::Text` span unconditionally, CDATA payloads included
+        // (both push it the same way), so an encoded headline inside one decoded
+        // back to its real, exact text and satisfied a check for a phrase no reader
+        // ever actually sees rendered.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        assert!(second.headline.starts_with('R'));
+        let encoded_headline = format!("&#82;{}", &second.headline[1..]);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                // Removes the *whole* original heading, headline text and id
+                // alike (Codex, pull request #138, round 59) — not only the id's
+                // own parenthetical, the way every earlier round's test in this
+                // module does: `check_settled_decisions` checks a decision's id
+                // and headline as two independent substrings, so a test that left
+                // the real, unencoded headline text sitting untouched in its own
+                // original heading would find it there regardless of whatever
+                // this test's own encoded copy decodes to, exercising nothing.
+                let without_heading = adr.contents.replace(
+                    &format!("### {} ({})", second.headline, second.id),
+                    "### (elsewhere)",
+                );
+                adr.contents = format!(
+                    "{without_heading}\n<div>\n<svg><text><![CDATA[{} {}]]></text></svg>\n</div>\n",
+                    second.id, encoded_headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_multiline_self_closing_script_in_svg_still_counts() {
         // Codex, pull request #138, round 57, finding "Honor multiline
         // self-closing scripts in SVG": SVG honors a self-closing slash on a
@@ -7464,6 +7508,112 @@ mod tests {
                     .replace(&format!("({})", first.id), "(elsewhere)");
                 adr.contents = format!(
                     "{without_heading_id}\n<span><em hidden>ignored</span>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_stray_close_left_by_a_truncated_ancestor_stays_hidden() {
+        // Codex, pull request #138, round 59, finding "Truncate ordinary ancestors
+        // on matching outer closes": `<div><span></div><em hidden>ignored</span>
+        // decision-id headline</em>` has `</div>` close both `span` and `div` at
+        // once, per HTML5's "any other end tag" stack-popping algorithm — `span`
+        // never gets its own close. `track_ordinary_ancestor` only ever popped its
+        // stack's own top on a match, so after `</div>` (not `ancestors.last()`,
+        // which was `span`) nothing popped and both `div` and `span` stayed
+        // recorded as genuinely open forever. The later, truly stray `</span>` —
+        // its real ancestor already closed out from under it — then matched
+        // `ancestors` as if it were positive evidence of a real, still-open
+        // element, wrongly force-closing the hidden `em` and exposing the id and
+        // headline that follow it, still really inside `em` until its own actual
+        // close.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span></div><em hidden>ignored</span>{} {}</em>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_ordinary_span_still_counts() {
+        // Codex, pull request #138, round 59, finding "Ignore self-closing slashes
+        // on ordinary HTML ancestors": HTML5 only honors a trailing `/` as bodyless
+        // syntax inside foreign content (SVG/MathML) — `<span/><em
+        // hidden>ignored</span>decision-id headline</em>` has an ordinary,
+        // non-foreign `<span/>` whose slash a browser ignores entirely, leaving a
+        // real, open `span` that its later `</span>` genuinely closes, force-closing
+        // the hidden `em` along with it (the same "any other end tag" unwind the
+        // other round-59 finding above tests) and exposing the id and headline
+        // that follow. `track_ordinary_ancestor` treated any self-closing-looking
+        // markup as bodyless regardless of namespace, so `span` was never recorded
+        // at all, leaving the later `</span>` with nothing to match and `em`
+        // latched hidden through its own real, later close.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span/><em hidden>ignored</span>{} {}</em>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_doctype_with_a_quoted_greater_than_sign_still_counts() {
+        // Codex, pull request #138, round 59, finding "Keep quoted greater-than
+        // signs inside DOCTYPE declarations" — investigated and does not
+        // reproduce. The claim was that a real HTML5 tokenizer keeps scanning past
+        // a `>` inside a quoted DOCTYPE public/system identifier, so
+        // `<!DOCTYPE html SYSTEM "x>decision-id headline">` would suppress the
+        // whole declaration through its real closing `>`. The opposite is true:
+        // per the WHATWG HTML parsing spec's own "DOCTYPE public/system identifier
+        // (quoted) state" definitions, a `>` reached there is the
+        // "abrupt-doctype-public-identifier"/"abrupt-doctype-system-identifier"
+        // parse error, which — "abrupt" is the operative word — ends the DOCTYPE
+        // token immediately, right there, exactly the way this module's existing
+        // bogus-comment-style handling (round 55, "no quote tracking whenever the
+        // byte after `<` is `!` or `?`") already treats every `<!...>` construct.
+        // So the id and headline after the first `>` are correctly ordinary,
+        // visible text — kept as a permanent guard with no code change.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<!DOCTYPE html SYSTEM \"x>{} {}\">\n",
                     first.id, first.headline
                 );
             }
