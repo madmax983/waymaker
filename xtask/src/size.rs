@@ -8193,6 +8193,39 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_whose_root_is_shadowed_by_a_local_module_in_the_same_scope_still_resolves_local() {
+        // `use serde as local_serde;` names whatever `serde` resolves to in this
+        // same scope, and a local `mod serde { .. }` there wins over the
+        // dependency — the same rule this file's own name resolution follows for
+        // every other path. Adversarial review of issue #180 found the alias
+        // branch skipping this check.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "mod serde {\n\
+                       \x20   pub(crate) trait Trait {\n\
+                       \x20       fn hidden(&self);\n\
+                       \x20   }\n\
+                       }\n\
+                       \n\
+                       use serde as local_serde;\n\
+                       \n\
+                       impl local_serde::Trait for Bank {\n    fn hidden(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        // A local `mod serde` in this same scope shadows the `serde` dependency for
+        // the `use serde as local_serde;` alias too, so `local_serde::Trait` names
+        // the crate's own private trait and its impl should stay hidden — matching
+        // the already-passing `a_local_alias_that_reuses_an_external_roots_name_shadows_it_in_its_own_scope`
+        // test above, just with the shadowing `mod` and the aliasing `use` reversed.
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
     fn a_trait_declared_only_inside_a_block_comment_is_not_counted_as_private() {
         // A hand-rolled `//`-only comment skip leaves a block-commented trait
         // declaration counted as real. That hides a live impl of an unrelated

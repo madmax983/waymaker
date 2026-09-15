@@ -1046,11 +1046,23 @@ fn resolve_impl_trait_path(
     let scope_refs: Vec<&syn::Item> = scope.iter().collect();
     if let Some((mut resolved, absolute)) = resolve_local_alias_chain(&scope_refs, &first) {
         resolved.extend(segments.into_iter().skip(1));
+        // Real Rust resolves a `use` item's own right-hand side the same way any
+        // path is resolved: a local item first, the extern prelude only once none
+        // exists. So `use serde as wire;` beside a `mod serde { .. }` in this same
+        // scope names that module, not the dependency — the alias forwards the
+        // shadow rather than escaping it. Checked only once, against the chain's
+        // landing segment: a shadow on an *intermediate* hop cannot arise, since
+        // Rust refuses two same-named items in one scope (E0255), so an alias
+        // chain that reached that name found no such module there to begin with.
+        let shadowed = !absolute
+            && resolved
+                .first()
+                .is_some_and(|root| own_modules(scope).iter().any(|(name, _)| name == root));
         return ImplTraitPath {
             line,
             segments: resolved,
             absolute,
-            shadowed: false,
+            shadowed,
         };
     }
     let shadowed = own_modules(scope).iter().any(|(name, _)| *name == first);
