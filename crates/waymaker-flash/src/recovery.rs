@@ -550,12 +550,45 @@ pub enum RecoveryError<E> {
 /// its bytes. Taking `storage` once, at [`new`](Self::new), makes that not a thing a caller
 /// can write: there is one device for the scan's whole life, because there is one field.
 ///
-/// # Why it is not `Copy`
+/// # Why it is not `Copy` or `Clone`
 ///
-/// A position, and a copied position is two readers of one journal that each believe they
-/// are the only one. `Clone` is not derived either, now that a copy would also be a second
-/// exclusive borrow of one device — the same reason [`crate::append::Journal`] gives up
-/// `Clone` for two writers over one offset.
+/// A recovery is a position, and a copied position is two readers of one journal that each
+/// believe they are the only one — now a second exclusive borrow of one device, since issue
+/// #84 bound `storage` to the type itself.
+///
+/// It is also the one thing a position buys a writer over: [`Journal::after`](crate::append::Journal::after)
+/// takes a recovery by value, not by reference, so that one scan cannot hand out two writers
+/// at one offset. A derived `Clone` used to defeat that: `Journal::after(recovery.clone())`
+/// made two writers from one scan, each ready to program its frame over the other's — see
+/// issue [#77](https://github.com/madmax983/waymaker/issues/77).
+///
+/// A caller that wants two writers must run two scans. Each scan is its own [`Recovery`]
+/// over the same [`JournalRegion`] and the same device, built and pumped from scratch. A
+/// clone copied one scan's answer; it did not read the device again — and since issue #84,
+/// it could not have, because two clones would each believe they held the only borrow of
+/// `storage`.
+///
+/// ```
+/// # use waymaker_flash::append::Journal;
+/// # use waymaker_flash::recovery::Recovery;
+/// fn one_writer_from_one_scan<S>(recovery: Recovery<'_, S>) -> Option<Journal> {
+///     Journal::after(recovery)
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// # use waymaker_flash::append::Journal;
+/// # use waymaker_flash::recovery::Recovery;
+/// fn two_writers_from_one_scan<S>(
+///     recovery: Recovery<'_, S>,
+/// ) -> (Option<Journal>, Option<Journal>) {
+///     (Journal::after(recovery.clone()), Journal::after(recovery))
+/// }
+/// ```
+///
+/// The two differ in one call. The first compiles, which is what stops the second from
+/// failing for some unrelated reason, and the second names `E0599`, so it fails for "no
+/// method named `clone`" specifically rather than for a typo.
 ///
 /// # Why the integrity check is a type parameter
 ///

@@ -922,7 +922,7 @@ this table is how you find out what a red build is telling you.
 | `wire-format` | Design document §09's frozen v1 format stops being the one that was reviewed, in any of its three halves. The *numbers* half: a row of `docs::WIRE_FORMAT_CONSTANTS` — twenty of them: the three magics, the two format-version numbers, the frame's header, trailer and check widths, the seal's pattern width and its mask, the erased byte, the widest payload, the four record-body widths, and the bank header's prefix, trailer and seal widths — is not declared, is declared twice, or is declared with another literal, in the file its row names. The literal rather than the value, because a rule that evaluated `HEADER_BYTES + TRAILER_BYTES` would be a second implementation of the arithmetic it checks. The *numbering* half: `waymaker-core`'s record module numbers a `RecordKind` differently from `docs::WIRE_FORMAT_RECORD_KINDS`, declares none of them, or declares one the table does not name — both directions, because a kind renumbered and a kind added are the same failure from two ends. A renumbering is the format break nothing else here can see: the encoder takes a kind's number from `RecordRef::kind` and the decoder matches the same constants, so swapping two leaves every round trip, every property test and every crash sweep green and makes every journal a shipped device wrote unreadable. The *specification* half: [`docs/format/wire-format-v1.md`](docs/format/wire-format-v1.md) is missing, or no line of it states a frozen constant beside its value or a record beside its number — one line rather than the whole document, because a bare `contains("1")` cannot fail for any document and `contains("4")` cannot fail for this one; or `CLAUDE.md` stops linking it or stops naming the corpus, or [ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md) is missing or unaccepted. The *corpus* half: [`crates/waymaker-flash/tests/corpus/v1`](crates/waymaker-flash/tests/corpus/v1/README.md) is empty, or a file of it is missing, is another length, carries another digest, or is not named by `docs::WIRE_FORMAT_CORPUS_FILES` — which is what makes "a case is added, never regenerated" a build failure rather than a sentence in a README. What it cannot see is a *width* behind a name already on the list — a `deadline` narrowed to a `u32` changes no constant and no kind number — which is the corpus's and `crates/waymaker-flash/tests/frame.rs`'s golden frames'; and it pins three files — `frame.rs`, `bank.rs` and `record.rs` — which is the limit `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one they pin, met three times. [ADR 0037](docs/adr/0037-the-wire-format-is-frozen-at-v1-and-migration-is-a-new-bank.md). |
 | `integrity-check` | `waymaker-flash`'s checksum module stops using one of `source::INTEGRITY_CHECK_PARAMETERS` — a polynomial or an initial value — the right number of times inside the function that owns it; or it or one of its submodules grows an array — a `const`, `static`, `type` alias or local — outside `#[cfg(test)]`; or it is gone, so the pin checks nothing. Or the *binding* drifts: `waymaker-flash/src/integrity.rs` is gone; the integrity trait or the shipped `impl` is renamed, missing, or declared twice — a decoy above the real one is what a first-match scan reads; a seal in `source::SEAL_BINDINGS` stops returning the width §09's frame spends on it; or the shipped method body is anything but one unqualified call to the function that owns its algorithm, `fast::crc32(bytes)` included. Or the *routing* drifts, in any of the four files that have one. In `waymaker-flash/src/frame.rs`: a body pinned by `source::SEALING_FUNCTIONS` stops computing the seals its row names exactly once, or the file names `crc16` or `crc32` anywhere outside `input_digest` — the one documented exception, because a `const fn` cannot go through a trait method — or `decode_with` and `frame_len_of_with` stop verifying a header through `verify_header_with`, or the scan's `next` stops walking with `decode_with`. The rows are *derived* rather than whitelisted: a function generic over the check that no row pins is a body that can compute a seal and is pinned by nothing, and the scan that finds them reads joined signatures and generic `impl` blocks, because a `where` clause and a method in `impl<C: IntegrityCheck>` each escaped a one-line scan. The same in `waymaker-flash/src/bank.rs`, whose five sealing bodies each reach the seals their row in `source::BANK_SEALING_FUNCTIONS` names. And in `waymaker-flash/src/append.rs`, which is the writer: its `stage` must reach the codec through `frame::encode_with::<C>` — one call covers both the frame and its commit seal, because the seal is derived from the check the codec just computed — and it may name neither a checksum function nor a seal method. Without it, `frame::encode` in place of the generic sibling would seal every appended record with the shipped check whatever the recovery that positioned the writer verified with, which is a journal one half of a firmware can read. And in `waymaker-flash/src/recovery.rs`, which computes no seal at all: its two steps must reach the codec through `frame::decode_with::<C>` and `frame::frame_len_of_with::<C>`, and the file may name neither a checksum function nor a seal method — `Recovery<C>`'s parameter is a promise that a journal is verified with the algorithm that sealed it, and dropping both turbofishes passed every rule and every test before this existed. And in `waymaker-flash/src/swap.rs`, which installs a bank: its `stage` must reach the bank codec through `bank::encode_header_with::<C>`, `bank::seal_for_with::<C>` and `bank::encode_seal_with::<C>`, and the file may name neither a checksum function nor a seal method — a device whose two banks were sealed by two algorithms is a device only half of which boots. A trait nothing is obliged to call is a swap point that selects nothing. A firmware that sealed its banks with one algorithm and its records with another could read back neither half with the other's reader. [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md), and one rule id because it is one decision. [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) settles §16's first deferred question with measurements: the polynomial is free (52 B either way), the table is not (64 B for a nibble table, 1024 B for a byte table against an 8 KiB budget). A changed polynomial passes every round-trip test here and fails against every zlib in the world. |
 | `storage-contract` | The public function surface of `waymaker-flash`'s storage module differs from `source::STORAGE_CONTRACT_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. Design document §05 says a host or browser adapter "must not expand the firmware traits to accommodate host conveniences", and §12 is the trait it means: a `read_all`, a `flush`, a `write_at` or a `capacity()` shortcut would each break no layering rule, need no dependency, and turn a four-operation contract every port must implement into a surface only a host can afford. The pin compares names, so a widened offset or a validator that stopped validating is still a reviewer's job. |
-| `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. |
+| `recovery-surface` | The storage-backed recovery reader's public function surface differs from `source::RECOVERY_SURFACE`, in either direction — or the module is gone, so the pin checks nothing. §02 decision 2's "no `Journal::get(id)` and no in-memory event index" is a rule about the reader that touches media as much as about the cursor: a `seek`, a `resume_at` or a `read_all` would each break no layering rule and turn a forward scan whose RAM is one caller-owned page into one that seeks or holds history. One name is load-bearing for a second reason. `append_offset` is the only way an offset leaves the module and it answers `Some` only for a scan that ran to erased media; a second accessor returning the stopping offset regardless points at cells a program cycle has already cleared, and on NOR that bank never boots again. `waymaker-fault`'s sweep demonstrates that mutation rather than arguing it. Since issue [#77](https://github.com/madmax983/waymaker/issues/77), the rule also fires when `Recovery` is `Clone` — a derive, a derive behind a `cfg_attr`, or a handwritten `impl`, resolved through the file's `use` aliases — because `Journal::after` takes a recovery by value so that one scan cannot hand out two writers at one offset, and a clone hands out two writers from one scan anyway; and it fires when the file declares no `Recovery` struct at all, rather than reading a rename as a clean pass. |
 | `commit-discipline` | The two-barrier writer's public function surface differs from `source::APPEND_SURFACE`; or the typestate that makes design document §07's order unrepresentable comes apart — the staged frame grows a second method or the word `program`, the sealable frame grows anything but `commit`, the sealable frame is constructed anywhere but inside `payload_barrier`, or that barrier stops calling `storage.barrier` exactly once. Issue [#24](https://github.com/madmax983/waymaker/issues/24) asks that "it is not possible to program a seal without the intervening payload barrier having returned", and a `compile_fail` doctest in the crate proves that of the code as it stands. This is what stops it being given back: a `Staged::commit`, a `Journal::write` that did all four steps in one call, or a second constructor for `Sealable` would each break no other rule and turn a protocol into a convention. What it cannot see is whether the barrier is a real one — that is §12's contract and `waymaker-conformance`'s across-reset witness. |
 | `capacity-reserve` | §10's capacity reserve gains a public function `source::CAPACITY_SURFACE` does not list, in either direction — or the gate comes apart: `source::CAPACITY_GATE` declares no inherent `impl`, declares `stage` other than exactly once, or its `stage` does not *open* with `source::CAPACITY_ADMISSION_CALL` and go on to `source::CAPACITY_DELEGATION`. §10 says "the runtime never overwrites committed history to make room", and every way of giving that back is an *addition*: a `Reserved::stage_unchecked`, a `Reserved::into_journal` handing the ungated writer back, a `Reserve::none()`, or a `Reserve::for_bytes(tail)` taking the figure from its caller rather than from a `BankLayout` — which is the sharpest of the four, because a reserve is only a promise because a layout vouched for it. The order half is the other word §10 uses: scheduling fails **early**, and issue #25 asks that the failure "produce no mutation at all". §12 says a failed program may still have changed media, so the only refusal that changes nothing is one taken before the device is called. The decision must therefore be the body's **first** statement, not merely one that precedes the delegation — review of this change wrote an admission inside `if false`, inside a closure nobody calls, and guarded so that only `RunStarted` reached it, and watched a rule that only checked the order stay green on all three. The blocks are read for the named type rather than by finding the first `fn stage` in the file, because the surface half counts only *public* functions and a private decoy carrying the pinned call stood in for the real one. What it cannot see is the arithmetic: a `tail_bytes` that quietly stopped counting the outcome record is `crates/waymaker-flash/tests/capacity.rs`'s, where `a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding` drives the wrong reserve and watches a run reach a state it can never leave. |
 | `swap-discipline` | §10's bank swap gains a public function `source::SWAP_SURFACE` does not list, in either direction — or its step order comes apart: a state in `source::SWAP_TYPESTATE` declares anything but the one method its row names, `Staged` names `program`, a value in `source::SWAP_CONSTRUCTIONS` is built anywhere but inside the body its row names, `payload_barrier` stops taking `source::SWAP_BARRIER_CALL`, or a row of `source::SWAP_ERASE_CALLS` stops erasing exactly the bank it names, before a barrier, without naming the other one. Issue [#26](https://github.com/madmax983/waymaker/issues/26) states §10 as seven steps and two recovery rules — "a crash before step 5 recovers the old run, a crash after step 6 recovers the new run" — and every one of those is a statement about *where the barriers are*. A `Prepared::commit` skipping the header, a `Staged::seal_now` skipping the payload barrier, an `Installed` built anywhere but in `commit`, or a `Swap::install(bank)` taking the bank to erase from its caller would each break no other rule and turn a protocol into a convention. The erase rows are the sharpest: which bank a swap clears is derived from the authority the device booted, and a `prepare` that erased the *retiring* bank is a device clearing the run it is executing. What it cannot see is whether the barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset witness, nor whether the crash windows behave — that is `crates/waymaker-fault/tests/swap.rs`, at every crash point of all seven steps. |
@@ -1060,6 +1060,14 @@ Stated so that nobody mistakes silence for coverage:
   a sibling module adds the method with the rule silent, and so would a
   `trait RecoveryExt: ...` with a blanket impl. The same shape as the two bullets around this
   one, and stated for the same reason.
+- **A `Recovery` rebuilt by hand from its own public readings.** `region`, `offset` and
+  `ending` are all public accessors, so code inside `recovery.rs` — the one file this half
+  of `recovery-surface` reads — can read a scan's whole state and hand it to a struct
+  literal `Recovery { region, offset, ending, check: PhantomData }` without deriving
+  `Clone` or naming it in an `impl` anywhere. That is a duplicate exactly as dangerous as
+  the one issue #77 closed, reached by a route this pin does not scan for. It needs field
+  visibility, so it is unreachable from any other file in the workspace — the same scope
+  the bullet above states for a method on a sibling type.
 - **That the header length is computed by the check the caller chose.** The
   `integrity-check` routing pin requires `stage` to call `frame::frame_len_of_with::<C>`, and
   no test can observe the difference: a recovery whose header length came from the *shipped*
@@ -3572,6 +3580,966 @@ to catch exactly that never even consulted. `Impossible::SealedBeforeAnyHistoryO
 the fix, refused in `reconstructed` the same way as the existing `RecordIdDeclaredTwice` and
 `NextIdReissuesAResident` checks; `reconstruction_refuses_a_sealed_bank_with_sealed_once_left_false`
 in `tests/refinement.rs` is the regression, verified to fail against the old code.
+
+Issue #77 closed a gap in issue #23's own anti-bricking argument. `Journal::after` takes a
+`Recovery` by value so that one scan cannot hand out two writers at one offset — but
+`Recovery` derived `Clone`, and `Journal::after(recovery.clone())` was one scan handing out
+two writers anyway, each ready to program its frame over the other's. `Recovery` is no
+longer `Clone`: a caller that wants two writers now has to run two scans, each its own
+`Recovery` built and pumped from scratch. A compiling doctest and a `compile_fail,E0599`
+twin hold the shape the way issue #24's typestate doctests do, and `recovery-surface` grew
+a second half: it fires on a `Clone` derived on `Recovery`, on one derived behind a
+`cfg_attr`, on one reached through a renamed derive macro, on a handwritten `impl`, and on
+a rename of `Recovery` itself — read as "this pin is checking nothing" rather than as a
+clean pass, the way every other surface pin here already treats a missing module. Review
+of this change found the first three by trying them against the real file, which is why
+all five are swept rather than argued. `waymaker-fault`'s and `waymaker-flash`'s own tests
+never called `.clone()` on a `Recovery`, so nothing needed to change beside the type and
+the three places that documented it — `recovery.rs`'s own doc and `append.rs`'s two.
+Sixteen further review rounds hardened `recovery-surface`'s Clone-detection scanner
+against a raw identifier, a `super`-qualified or capped alias, a bare macro invocation at
+any nesting depth (item, statement, or an out-of-line submodule reached through a
+function-body `#[path]` declaration), a chained trait alias, a local type alias on a
+self-type, and a parenthesized self-type — each verified against the real crate with an
+actual compiling bypass before being closed. Rounds 15 and 16 closed five more of the same
+shape, each again verified against a real, compiling bypass before being closed: an `impl`
+declared as a local item inside a function body, which `collect_trait_implementors` did not
+descend into; a `mod` declared one control-flow block deeper than a function's own
+statements, which `child_modules`' function-body descent still could not see; a `#[path]`
+reached only through a `cfg_attr`, which the old scan read as no `#[path]` at all and fell
+back to a harmless natural sibling; a parenthesized type-alias target (`type R =
+(super::Recovery);`), the alias-declaration side of the parenthesizing round 14 had already
+closed on the self-type side; and a self-type reached through a type-position macro
+invocation, which `declares_item_macro` now flags alongside the item- and
+statement-position macros it already caught. Round 17 found three more. A local `type`
+alias declared inside the same function body as the `impl` that names it was invisible to
+`collect_type_aliases`, which read only `Item::Mod` even though `collect_trait_implementors`
+had descended into function bodies since round 15 — so `collect_type_aliases` gained the
+same descent, into a free function, an `impl` block's own methods and associated consts, a
+trait's default method bodies and default associated consts, and a `const`/`static`
+initializer, all via a shared `nested_body_items` the trait-implementor scan now uses too,
+closing a `const _: () = { impl Clone for super::Recovery { .. } }; };` reaching neither
+scanner at all. And round 16's own fix had a bug: it put a `cfg_attr`-nested `path` target
+into the *same* flat candidate list as the natural `name.rs`/`name/mod.rs` pair, so a real,
+legal layout — both files present, for two different builds — made the exact-one resolver
+misreport the workspace as `Ambiguous`. `ChildModule::candidates` is now grouped rather than
+flat: each group (the natural pair, or one `cfg_attr` target) resolves independently to at
+most one file, and every group's resolution is scanned rather than requiring exactly one
+across the whole thing — ambiguous only when rustc itself would reject one group, never
+because two different builds legally pick two different files. Round 18 found two more, both
+the same shape as round 17's `const`/`static` finding one level over. `collect_child_modules`
+— the module-tree walk that discovers an out-of-line child file at all, which round 17 left
+with its own Fn/Impl/Trait descent rather than the shared `nested_body_items` because it has
+to carry a `test_gated` flag `nested_body_items` throws away — still read only those three
+item shapes, so a `mod` declared inside a `const`/`static` initializer's own block, an enum
+variant's discriminant, or a type alias's array-length expression was never even reached: the
+child file existed on disk and nothing scanned it, which is a more severe gap than an
+unresolved self-type inside a file that was reached. And `nested_body_items` itself — the
+Clone-detection scanners' shared descent — covered `Item::Const`/`Item::Static` since round 17
+but not `Item::Enum`'s discriminants or `Item::Type`'s own type, so an `impl Clone for
+super::Recovery` buried in either shape reached neither `collect_type_aliases` nor
+`collect_trait_implementors`. Both are fixed the same way: `collect_child_modules` gained its
+own `Const`/`Static`/`Enum`/`Type` arms (each verified against a real, compiling bypass — a
+`mod` behind `#[path]` inside a `const _: () = { .. };`, reached and flagged, where round 17's
+own fix left it unreached), and `nested_body_items` gained `Enum` and `Type` arms via a new
+shared `type_items` helper, mirroring `block_items`/`expr_items`. Round 19 found the same
+type-bearing shape one level over: a struct's own field types can each carry a buried block —
+`struct Holder { field: [(); { impl Clone for super::Recovery { .. }; 0 }] }` — exactly the
+way a type alias's own type can, and neither `nested_body_items` nor `collect_child_modules`
+read `Item::Struct` at all. Both gained a `Struct` arm, the latter through a new
+`struct_field_bodies` helper (mirroring `impl_member_bodies`/`trait_member_bodies`) split out
+to keep `collect_child_modules` under this file's own line-count lint, each field's `#[cfg(test)]`
+gate carried onward the same way an enum variant's already was.
+
+Round 20 found two more, one of the same type-bearing shape and one of a different kind
+entirely. The same shape: an enum variant's own *fields*, not only its discriminant, can
+each carry a buried block too (`enum E { V([(); { impl Clone for super::Recovery { .. };
+0 }]) }`), so both `nested_body_items`'s enum arm and `collect_child_modules`'s gained a walk
+over each variant's fields alongside its discriminant, the latter through a new
+`enum_variant_bodies` helper mirroring `struct_field_bodies`. The different kind was a false
+*positive* rather than one of this scanner's usual false negatives: `trait_implementors`
+built one alias table for an entire file by recursing `collect_item_aliases` and
+`collect_type_aliases` through every inline module and flattening everything into one shared
+table, so an unrelated nested module's own `use core::clone::Clone as C;` — which real Rust
+scopes strictly to that `mod { .. }` block, never letting it leak to a sibling scope or its
+parent — could resolve an unrelated, identically-named alias used by a completely different
+`impl` elsewhere in the file, rejecting a `Recovery` that implemented neither `Clone` nor
+anything resolving to it. `collect_type_aliases` no longer recurses into `Item::Mod` at all;
+a new `module_scope_aliases` builds a table from one module's own direct `use` and type-alias
+declarations only, and `collect_trait_implementors`'s own `Item::Mod` arm now calls it afresh
+for each nested module instead of inheriting the caller's table — matching that a `mod { .. }`
+block is a real scope boundary in Rust while a function, `impl`, `const`, `enum`, `struct` or
+`type` body is not, so `nested_body_items`'s descent into those still inherits whatever table
+the caller passes down.
+
+Round 21 found two more, both closing an asymmetry round 20's own fix left standing rather
+than opening a new one. Plain-path type aliases had reached any nesting depth
+`nested_body_items` covers since round 17 — a local `type R = super::Recovery;` inside a
+function body — but the parallel `use`-alias table only ever read a scope's own direct items,
+never descending into a body: `fn install() { use core::clone::Clone as C; impl C for
+Recovery { .. } }` is legal Rust exactly like round 17's local type alias, and resolved `C` to
+nothing. And every prior round that walked a function or method descended only into its
+*body* — never its own parameter types or return type, which can carry a buried block exactly
+the way a type alias's, a struct field's, or an enum variant field's own type already could
+(`fn hidden(_: [(); { impl Clone for super::Recovery { .. }; 0 }]) {}`). A new
+`fn_signature_type_items` walks a signature's inputs and output with `type_items`, used
+everywhere a function or method's body already was — `nested_body_items`'s `Fn`/`Impl`/`Trait`
+arms, `impl_member_bodies`, `trait_member_bodies` (now producing an entry for a trait method
+with no default body too, since its signature is parsed either way), and
+`collect_child_modules`'s own `Fn` arm.
+
+Round 22 then found that round 21's own fix for the `use`-alias gap had reintroduced round
+20's exact false positive one level down. Giving the `use`-alias table the same nested-body
+descent the type-alias half already had meant recursing into *every* function body in a
+scope and accumulating all of their aliases into one table shared across every other item in
+that same scope — so an unrelated function's own local `use core::clone::Clone as C;` could
+resolve an unrelated `impl C for Recovery` in a *different* function, or at the module's own
+top level, exactly the shape of false positive round 20 closed for `mod` blocks. The fix
+redesigns how a body's own local aliases are threaded rather than patching the symptom:
+`collect_type_aliases` and the round-21 `use`-alias walk are both retired, replaced by
+`direct_scope_aliases` — one flat item list's own directly-declared `use` and `type` aliases,
+with no recursion into anything, module or body alike — and `collect_trait_implementors`
+itself now computes a *fresh* extension of the ambient table from each item's own
+`nested_body_items`, immediately before recursing into that one item alone, so no two
+sibling items (two functions, two impl blocks, one of each) ever share an extension.
+`module_scope_aliases` is now a thin wrapper over `direct_scope_aliases`, used only for file
+scope and each nested module's own fresh table, matching round 20's original design. Round
+22 also found two findings of its own established shape: a `union`'s own field types can
+carry a buried block exactly the way a struct's or an enum variant's already could, closed
+the same way with a new `union_field_bodies` mirroring `struct_field_bodies`; and a function
+signature's own generics — a type parameter's bounds and default, and a `where` clause
+predicate's bounded type and bounds — can carry one too, closed by a new `generics_items`
+chained into `fn_signature_type_items` alongside its parameter and return types.
+
+Round 23 found three more, and the deepest of the three closed a gap round 22's own
+redesign left standing at a finer grain than the module or item boundary it was drawn
+at. `collect_trait_implementors` still computed each item's own alias extension from
+its *whole* body flattened by `nested_body_items` — every item reachable through
+control flow, however deeply nested — so `use self::Harmless as C;` at module scope,
+followed by `fn install() { if false { use core::clone::Clone as C; } impl C for
+Recovery {} }`, resolved the harmless `impl` through the inner `use`, even though that
+`use` is scoped only to the `if false { .. }` block it is declared in. The fix replaces
+the whole flatten-then-extend design with one that walks exactly one `syn::Block` at a
+time: `nested_body_items` is retired, along with the `BlockItemVisitor` it and
+`block_items`/`expr_items`/`type_items`/`generics_items` shared; a new
+`DirectChildBlockVisitor` captures blocks instead of items, stopping at each one rather
+than flattening through it (and at a nested item's own boundary, which is handled
+separately), giving `direct_blocks_in_expr`/`direct_blocks_in_type`/
+`direct_blocks_in_generics`/`direct_blocks_in_signature` and
+`direct_child_blocks_of_block`. `collect_trait_implementors_in_item_body` finds every
+scope-root block an item's signature, body, initializer or member types can carry, and
+`collect_trait_implementors_in_block` walks one block's own direct items to build that
+block's own scope, then recurses into every block nested directly in one of its own
+statements — one level at a time, in real Rust's own order — so a sibling block's
+aliases are never on a table it did not declare them in, while a body still correctly
+inherits its enclosing scope (a body is not a Rust scope boundary the way `mod { .. }`
+is). The second: `impl T for X { type A = [(); { impl Clone for Recovery { .. }; 0 }];
+}` buries a non-local `impl` inside an associated type's own type exactly the way a
+type alias's, a struct field's, an enum variant field's, or a union field's type
+already could, and the fallback for an `impl` block's own members — in both the
+handwritten-implementation scan and `impl_member_bodies`, the module-tree scan's
+identical case — dropped `ImplItem::Type` on the floor instead of walking it with
+`type_items`. The third: `impl Clone for <() as Alias>::Target`, where a reached file
+defines `trait Alias { type Target; }` and binds `Target` to `Recovery`, is legal Rust
+whose self-type is a projected associated type — `syn`'s `Type::Path` stores the
+qualified self and the trait separately from `path`, which here is only `Target`, so
+resolving `path` alone through the alias table missed that rustc normalizes the
+projection to `Recovery`. This scan does not resolve trait bindings, so a self-type
+carrying a `qself` now fails closed to `UNRESOLVED_DERIVE` the same way a
+`super`-qualified path already does, rather than silently comparing the unqualified
+associated-type name.
+
+Round 24 found three more. `Item::Impl`, `Item::Trait`, `Item::Enum`, `Item::Type`,
+`Item::Struct` and `Item::Union` each declare their own `syn::Generics` — a type
+parameter's bounds and default, and a `where` clause predicate — and round 22's
+`generics_items` had only ever been chained into a function or method *signature*'s
+own generics; none of the six item kinds' own generics were read at all, so `struct
+Holder<T = Wrapper<{ impl Clone for Recovery { .. }; 0 }>>(T);` reached neither
+`collect_trait_implementors_in_item_body` nor `collect_child_modules`. Both gained a
+`direct_blocks_in_generics`/`generics_items` pass over each item's own `.generics`
+alongside its existing member-body pass — `collect_child_modules` needed a new
+`nested_item_bodies_for_child_modules` split out to keep that function under this
+file's own line-count lint once the six new passes joined it. The second is round 23's
+projected-associated-type finding one hop earlier: `type R = <() as Alias>::Target;`,
+after a reached file binds `Target` to `Recovery`, is legal Rust whose target is the
+same kind of projection a self-type can be — but `direct_scope_aliases`'s `Item::Type`
+arm read `target.path` and discarded `target.qself`, so `R` resolved to the unqualified
+name `Target` instead of to `Recovery` or to `UNRESOLVED_DERIVE`; a `type` alias whose
+target carries a `qself` now stores `UNRESOLVED_DERIVE` as its own target, so any
+self-type chased through it fails closed the same way. The third is a structural gap
+in `extend_with_local_scope` itself: it appended a body's own local aliases to the
+ambient table rather than having a local one *shadow* an ambient one of the same
+name, so `use core::clone::Clone as C;` at module scope beside a function body's own
+`use self::Harmless as C;` before `impl C for Recovery {}` left both bindings on the
+table — real Rust resolves the impl to the block-local `Harmless` and the ambient
+`Clone` is unreachable inside that block, but `every_resolution` still found it and
+rejected a `Recovery` that never implements `Clone`. The fix drops every ambient alias
+whose local name is redeclared in the new scope before adding the new ones, so a
+shadowed name resolves only through its innermost declaration.
+
+Round 25 found four more, one of them in round 24's own fix. The first: round 24's
+shadowing fix dropped an ambient alias whenever *any* local declaration of the same
+name existed, including one behind `#[cfg(any())]`, which never compiles — module scope
+importing `use core::clone::Clone as C;` beside a function body's `#[cfg(any())] use
+self::Harmless as C;` never actually shadows the ambient binding in the only
+configuration that ships, but the unconditional version dropped it anyway and missed
+that `impl C for Recovery` still resolves to `Clone`. Only a local declaration with no
+`#[cfg(..)]` at all (checked with `has_any_cfg`, not `has_cfg_test`) now shadows the
+ambient alias it redeclares; a conditionally-declared one is added alongside the
+ambient binding instead, keeping both candidates reachable the same way this scan
+already reads past any other unevaluated `cfg`. The second: `impl crate::C for
+Recovery` can name a crate-root `use core::clone::Clone as C;` in `lib.rs`, a file this
+per-file scan never reads, but `lookup_candidate` stripped a leading `crate` the same
+way it correctly strips a leading `self`, silently resolving `C` against *this* file's
+own table instead of failing closed. The first fix for it treated *every*
+`crate`-qualified path as unresolved, and review of that fix found it rejecting
+`waymaker-embassy/src/wiring.rs`'s own `use crate::dispatch::ActivityDispatcher;` — an
+ordinary, unaliased import this codebase uses throughout — because `ctx-facade`'s
+future-detection scan shares this same machinery. The corrected fix is narrower: only a
+*bare*, two-segment `crate::NAME` fails closed to `UNRESOLVED_DERIVE`, since that shape
+alone asks to look `NAME` up in a table this scan does not have; a longer
+`crate::a::b::NAME` is a path to another module's own real declaration and falls
+through to the ordinary "no matching alias, take the last segment" branch every other
+unresolvable multi-segment path already uses. The third: `const N: [(); { impl Clone
+for Recovery { .. }; 0 }] = [];` buries a non-local `impl` inside an associated const's
+own *declared type* exactly the way its initializer already could, and every const-like
+arm — `ImplItem::Const`, `TraitItem::Const`, `Item::Const`, `Item::Static` — walked only
+the initializer expression, never the type ascription; a trait const with no default
+value used to contribute nothing at all; now every one contributes its type regardless,
+matching how a method's signature is already read whether or not it has a default body.
+The fourth: `impl Marker<{ impl Clone for Recovery { .. }; 0 }> for Holder {}` is legal
+Rust with `non_local_definitions` allowed — the impl header's own trait path and self
+type can each bury a block through a const generic argument exactly the way the impl's
+own generic *declarations* already could, and neither was read; a new
+`direct_blocks_in_path`/`path_items` pair mirrors the existing type-walking helpers for
+this shape. `collect_trait_implementors_in_item_body`'s `Item::Impl` arm needed a split
+into `impl_member_scope_roots`/`trait_member_scope_roots` to stay under this file's own
+line-count lint once the header roots joined it.
+
+Round 26 found four more. The first: `extern "C" { fn hidden(_: [(); { impl Clone for
+Recovery { .. }; 0 }]); }` is legal Rust, and `Item::ForeignMod` reached this scan's
+fallback arm entirely — a foreign function's own signature and a foreign static's own
+declared type, either of which can bury an impl the same way an ordinary signature or
+declared type already could, were never walked at all. Both
+`collect_trait_implementors_in_item_body` and the module-tree walk's
+`nested_item_bodies_for_child_modules` gained a `ForeignMod` arm, the latter split into
+its own `foreign_mod_bodies` to stay under this file's line-count lint; verifying it
+against the real crate needed a standalone `rustc` file rather than a `waymaker-flash`
+build, because an `extern` block requires an `unsafe extern` block since edition 2024
+and this crate's `#![forbid(unsafe_code)]` refuses one regardless of where it is
+written, so the shape cannot appear anywhere in this crate's own tree even though the
+scanner has to handle it as general Rust syntax. The second: `trait Outer { type A<T>
+where T: Marker<{ impl Clone for Recovery { .. }; 0 }>; }` is a GAT-shaped associated
+type *declaration* in a trait, as opposed to an impl's associated type, which round 23
+already covers — `TraitItem::Type` fell through both scanners' wildcard arms, so its own
+generics (whose `where` clause bounds can bury a block), its own trait bounds, and its
+default type were never visited. The third: `trait Outer: Marker<{ impl Clone for
+Recovery { .. }; 0 }> {}` — a trait's own supertrait bound list was never walked by
+either scanner, only its generics and selected members, so a supertrait bound's own
+const generic argument could bury an impl invisibly; a new
+`direct_blocks_in_bounds`/`bound_items` pair mirrors the existing generics-walking
+helpers for a `Punctuated<TypeParamBound, Token![+]>`, shared by the trait's own
+supertraits and by the second finding's associated-type bounds. The fourth was a false
+positive rather than a false negative: `enum_variant_bodies` gated every field of a
+variant by the *variant's* own `#[cfg(test)]` alone, unlike `struct_field_bodies` and
+`union_field_bodies`, which each also gate a field by its own attribute — so a field
+carrying its own `#[cfg(test)]` inside an otherwise-ungated variant was read as
+reachable in production, and a legitimate test-only reimplementation buried in such a
+field's type was wrongly reported as a production `Clone` impl. Each field is now its
+own `(bool, Vec<&syn::Item>)` entry gated by `variant_gated || has_cfg_test(field)`,
+matching the two sibling helpers; the discriminant, having no per-part gate of its own
+to combine with, keeps its single entry at the variant's own gate.
+
+Round 27 found two more. The first: `impl T for X { type A<U: Marker<{ impl Clone for
+Recovery { .. }; 0 }>> = (); }` is legal Rust — a generic associated-type
+*implementation*'s own type-parameter bound can bury a block through a const generic
+argument, matching the trait's own declared bound for coherence, exactly the way an
+impl's own generic *declarations* already could since round 24 — and both
+`impl_member_scope_roots`'s and `impl_member_bodies`'s `ImplItem::Type` arms read only
+`assoc_type.ty`, never `assoc_type.generics`. Both gained a
+`direct_blocks_in_generics`/`generics_items` pass over the associated type's own
+generics alongside its existing type pass. The second was a false positive in
+`declares_item_macro` rather than a false negative in the Clone scan: its visitor
+checked `#[cfg(test)]` only on the enclosing `syn::Item`, so `#[cfg(test)] fn helper()
+{ generate_clone!(); }` inside an otherwise-production `impl` or `trait` block was
+still reached by the default descent into the *member*, because `syn::visit::Visit`
+dispatches a member through `visit_impl_item`/`visit_trait_item` rather than through
+`visit_item` again — the one override this visitor had. A macro that only ever
+compiles under `#[cfg(test)]` therefore failed the whole file closed over code that
+ships with nothing generated at all. The visitor gained `visit_impl_item` and
+`visit_trait_item` overrides, mirroring its existing `visit_item` one, backed by a new
+`trait_item_attrs` alongside the existing `impl_item_attrs`.
+
+Round 28 found three more. The first was the same macro-visitor gap one subitem
+further: `#[cfg(test)] field: generate_type!()` on a production struct's field, an
+enum variant, and a foreign item each carry their own gate the visitor still walked
+past, since `syn::visit::Visit` dispatches each of those through its own method
+(`visit_field`, `visit_variant`, `visit_foreign_item`) rather than through any of the
+three overrides round 27 added. All three gained the same `has_cfg_test`-and-return
+guard, the last backed by a new `foreign_item_attrs`. The second: `type Identity<T> =
+T; type R = Identity<super::Recovery>; impl Clone for R { .. }` is legal Rust whose
+alias target names a real generic alias with an argument substituted in —
+`direct_scope_aliases`'s `Item::Type` arm read only the target path's segment
+identifiers, discarding `<super::Recovery>`, so `R` resolved to `Identity`'s own
+declared target, `T`, rather than to the type actually substituted in, and the alias
+was silently accepted as not `Clone` instead of failing closed. This module does not
+perform generic substitution — that is real type-checking, not parsing — so an alias
+target carrying a generic argument anywhere along its path now fails closed to
+`UNRESOLVED_DERIVE`, the same way a projected associated type already does. The
+third: `mod traits { pub use core::clone::Clone as C; } impl traits::C for
+super::Recovery { .. }` is legal Rust, and the qualified trait path `traits::C` had
+no alias to resolve against at all — `every_resolution` only ever looked up a single
+segment as a candidate, so the ordinary identifier `traits` fell through to the "no
+matching alias, take the last segment" branch and reported the bare, still-aliased
+name `C` rather than `Clone`. A new `direct_scope_module_aliases` registers
+`traits::C` as a synthetic alias for whatever `C` resolves to inside `traits`' own
+scope (one level of qualification only, matching how deep this round's finding
+reaches), folded into `module_scope_aliases` alongside the existing
+`direct_scope_aliases`; a new `qualified_candidate` — `lookup_candidate`'s two-segment
+twin, both built over an extracted `strip_self_prefix` — is tried before the plain
+single-segment lookup at every hop, branching over both rather than stopping at the
+first the way this scan's other duplicate-candidate cases already do.
+
+Round 29 found three more, two of them the derive-side and file-boundary twins of
+round 28's own findings. The first: `struct_derives` collected its aliases with a
+hand-rolled loop over `Item::Use` alone, predating `module_scope_aliases` itself, so it
+read neither a plain-path `type` alias (`type Klon = core::clone::Clone;
+#[derive(Klon)]`, resolved for every other caller since round 13) nor an alias exported
+one level through an inline module's own name (`mod traits { pub use
+core::clone::Clone as C; } #[derive(traits::C)]`, round 28's own fix for a handwritten
+`impl`). It now reads `module_scope_aliases` like every other caller, gaining both for
+free. The second: a production-reachable child file, or an inline module nested
+anywhere the module tree reaches, is free to declare its own, wholly unrelated `struct
+Recovery` and hand it a `Clone` impl with nothing to do with the pinned type — real
+Rust name resolution has the unqualified `Recovery` written there mean the *local*
+declaration, exactly as `struct_derives` already reads only a *top-level* declaration
+in the pinned type's own file as the one that counts for a derive, but the
+handwritten-impl scan read both as the same bare name and rejected a file that never
+gave two writers to anything. A new `shadow_aliases_for_local_types` registers a
+synthetic, self-referential alias for every struct, enum or union directly declared in
+a scope, resolving to a new sentinel, `LOCAL_SHADOWED_TYPE`, rather than to its own
+name; `trait_implementors_for_pinned_type` — `trait_implementors`'s refinement for this
+one caller, so `future_trait_implementors`'s unrelated scan is untouched — folds it into
+every nested inline module's own scope unconditionally, and into the scanned file's own
+top level whenever that file is not the one the pinned type is actually declared in,
+because a child file reached through `mod name;` is exactly as nested, from the whole
+tree's point of view, as `mod name { .. }` would have been had its contents been
+written inline. The third: `mod traits;`, with its content in a sibling file this
+per-file scan never opens, had no alias for a qualified `traits::C` to resolve against
+at all — round 28 closed this same gap for an *inline* `mod traits { .. }`, whose
+content is right here in the same file to read, but an out-of-line module's content
+lives somewhere this scan cannot see, so the honest answer is the same fail-closed one
+a `super`-qualified path already gets rather than a guess. A new
+`direct_scope_opaque_module_aliases` registers every out-of-line `mod name;` as a
+synthetic alias to `UNRESOLVED_DERIVE`, folded into `module_scope_aliases` alongside the
+other two; and `every_resolution` gained a matching guard so that sentinel propagates
+through a further hop (`traits::C` resolving one hop to `["<unresolved derive>", "C"]`)
+rather than letting the tail segment silently survive as the harmless-looking `"C"` —
+the same shape of gap the `LOCAL_SHADOWED_TYPE` sentinel needed its own propagation
+guard for, added beside it on the same review round.
+
+Round 30 found two more, both the same shape one level deeper than round 29's own
+fixes. The first: a function is just as free to declare its own local `struct
+Recovery` as an inline module is — `fn install() { struct Recovery; impl Clone for
+Recovery { .. } }` is legal Rust whose unqualified `Recovery` means the block-local
+declaration — but `extend_with_local_scope`, the function that threads a block's own
+local aliases into the ambient table, only ever called `direct_scope_aliases`, which
+reads `use` and `type` items alone; a block-local struct, enum or union never earned
+the `LOCAL_SHADOWED_TYPE` marker `shadow_aliases_for_local_types` registers for the
+identical shape at module scope, so it was rejected as though it implemented `Clone`
+for the pinned type. `extend_with_local_scope` now takes the same `shadow_locals` flag
+every other caller in this chain already threads, and — when set — folds
+`shadow_aliases_for_local_types` into both the block's own local aliases and the set
+that unconditionally shadows an ambient one of the same name, exactly as a block-local
+`use` or `type` alias already does. The second: `mod traits { pub use
+core::clone::Clone as C; } use traits::*; #[derive(C)] struct Recovery;` is legal
+Rust, and `collect_tree_aliases` deliberately drops `UseTree::Glob` — this scan does
+not perform name resolution, so it has no way to know what a glob import actually
+brings into scope, and issue #51's own "what is not checked" already states that
+limit for every scanner in this module. Silently treating `C` as an ordinary,
+unaliased identifier let it resolve to the harmless-looking bare name `C` instead of
+`Clone`, rather than to the fail-closed answer a `super`-qualified path already gets.
+A new `GLOB_IMPORT_MARKER` sentinel, registered by `glob_marker_alias` for any scope
+whose directly declared `use` items name a glob anywhere in their tree (mirroring
+`collect_tree_aliases`'s own recursive walk through a `UseTree::Group`), makes
+`every_resolution`'s "no matching alias" fallback fail closed to `UNRESOLVED_DERIVE`
+rather than trust the bare name whenever it is present. Both fixes are threaded only
+through `shadow_locals`-gated callers — `trait_implementors_for_pinned_type` and
+`struct_derives` — so `trait_implementors`'s unrelated `future_trait_implementors`
+scan, which asks no such question about a *specific* pinned type, is untouched by
+either.
+
+Round 31 found two more. The first is round 28's own qualified-alias fix one module
+deeper: `mod traits { pub mod nested { pub use core::clone::Clone as C; } } impl
+traits::nested::C for super::Recovery { .. }` is legal Rust, and
+`direct_scope_module_aliases` only ever read a directly nested module's own *direct*
+aliases — never a module nested inside that one — so `traits::nested::C` had nothing to
+resolve against and fell through to the harmless-looking bare name `C`.
+`direct_scope_module_aliases` is now recursive, chaining a nested module's own direct
+aliases with the aliases every module nested inside *that* one contributes, and
+prefixing every one of them with the current module's own name — building a qualified
+name of arbitrary depth rather than one level. `every_resolution`'s own qualified-lookup
+half needed the matching generalization: `qualified_candidate`, which only ever tried a
+fixed two-segment join, is now `qualified_candidates`, trying every prefix length from
+longest to shortest so a path qualified through any number of nested modules has a
+candidate to match against. The second is not an invocation at all, syntactically: an
+**attribute** macro. `declares_item_macro` had flagged an item-, statement- or
+type-position macro *invocation* since round 16, but never asked whether an item
+carried an attribute macro at all — `#[a_transform] struct Anything;` compiles today,
+and unlike a derive, an attribute macro may rewrite the item it decorates or splice an
+unrelated item in beside it, so nothing here could say it does not expand to `struct
+Anything; impl Clone for Recovery { .. }`. Verified against a real, compiling two-crate
+example — a `proc_macro_attribute` that injects exactly that impl beside an unrelated
+struct — rather than only against `syn`'s parse of the shape, since a real attribute
+macro is what makes the finding a live one rather than a hypothetical. The fix reads
+every attribute the visitor's existing traversal already reaches, at any nesting depth,
+through `syn`'s own generated callback for every attribute node rather than a case added
+at each place one can appear, and asks of each one whether it is a builtin the compiler
+interprets itself or a namespace rustc treats as opaque to a named tool — `cfg_attr`
+included, read at any depth for the same reason `collect_derive_names_from_meta`'s own
+recursion is — with anything else read the same way an item-, statement- or
+type-position macro invocation already is.
+
+Round 32 found two more, on the pull request's own merge of a substantial upstream
+drift: `future_trait_implementors` had independently been rewritten on `main` to a
+lexical-scope `resolve_segments` (issues #109 and #169, PRs #160 and #176) while this
+branch built `every_resolution` and its sentinels on the older, shared alias-list
+design — the merge kept both as fully independent implementations rather than
+re-deriving either against the other's architecture, `future_trait_implementors`
+restored to `resolve_segments` verbatim and this branch's `trait_implementors`/
+`trait_implementors_for_pinned_type`/`collect_trait_implementors` left as their own
+functions. The first finding is the same macro-visitor gap as round 27's and round 28's,
+one shape further: `fn helper() { #[cfg(test)] generate_clone!(); }` is legal Rust whose
+macro statement never exists in a shipped build, but `visit_stmt_macro` read only the
+fact that a `StmtMacro` node was reached, never its own `attrs` — `syn::visit::Visit`
+dispatches a statement-level macro through this method rather than back through
+`visit_item`, the same way a field, a variant or a foreign item already needed its own
+override. The second is round 25's own `crate::`-qualification fix one segment deeper,
+and the merge is what made the full fix possible: `impl crate::traits::C for
+super::Recovery { .. }`, naming a crate-root `mod traits { pub use core::clone::Clone
+as C; }` two segments down, resolved to the bare, harmless-looking name `C` exactly the
+way a bare `crate::C` used to, because round 25 closed only that bare, two-segment
+shape — reasoning that a longer `crate::a::b::NAME` was another module's own real
+declaration, and that failing closed on it broadly rejected `waymaker-embassy/src/
+wiring.rs`'s own ordinary `use crate::dispatch::ActivityDispatcher;` when
+`every_resolution` was still `future_trait_implementors`'s scan too. That sharing had
+just ended in this same round's merge, so the reasoning no longer held: `wiring.rs` is
+a file `recovery-surface`'s own scan never reaches, and nothing in `waymaker-flash`
+names a trait or a derive through a multi-segment `crate::` path today.
+`every_resolution` now fails closed on a `crate`-qualified path of any length, not only
+the bare one.
+
+Round 33 found three more, none of them in the alias-resolution machinery the merge had
+just split apart. The first is in `module_tree` itself, one layer below the alias scan:
+an unconditional `mod clone_impl;` whose resolved file opens with its own
+`#![cfg(test)]` inner attribute is exactly as test-only as one the parent gated with
+`#[cfg(test)] mod clone_impl;` — the attribute lands on the module the `mod` item names
+either way, only spelled where the module's own file can carry it instead of where it
+is declared — but `module_tree` classified a visited file from the *parent's* own
+gating alone and never read the file's own top-level attribute, so a `Clone` impl or a
+macro invocation that exists only under a file-level `#![cfg(test)]` was walked as
+production-reachable and rejected code that never ships. A new
+`crate::parse::crate_root_is_cfg_test_gated` parses a file and reads `has_cfg_test` on
+its own `syn::File::attrs`, and `module_tree` ORs that into the gating a child inherits
+alongside the parent's, so gating now compounds down the tree from either source. The
+second is in `push_resolved_names`: `#[derive(MakeClone)] struct Recovery;`, where
+`MakeClone` is a procedural derive macro, is legal Rust whose expansion this module
+cannot see — a derive macro is not bound to generate an implementation only for the
+trait its own name suggests, so it could expand to `impl Clone for Recovery` beside
+whatever else it derives — and recording the resolved name literally let it through as
+an ordinary, harmless-looking derive that simply is not `"Clone"`. Every name
+`every_resolution` produces is now filtered through `DERIVABLE_BUILTIN_TRAITS`, the nine
+traits `derive` can name without a third-party macro; anything else, `UNRESOLVED_DERIVE`
+and `LOCAL_SHADOWED_TYPE` included, is recorded as `UNRESOLVED_DERIVE` and fails closed
+the same way an alias this scan gave up chasing already does. The third closes the last
+of four positions a macro invocation can occupy: `declares_item_macro` flagged one at
+item, statement and type position, but never *expression* position, and `const _: () =
+make_clone!();` is legal Rust whose macro sits there — a block is a legal expression and
+Rust's block grammar admits item statements inside one, the same construct round 15
+already found reaching an `impl` through a function body, so an arbitrary macro can
+expand to `{ impl Clone for Recovery { .. }; }` and still type as `()`. A new
+`visit_expr_macro` override flags one there too, but only when the invoked path is not
+one of `is_known_safe_expression_macro`'s roughly thirty compiler-builtin or
+standard-library macros — `assert!`, `matches!`, `write!` and the rest — whose expansion
+is fixed and fully specified by the reference and never emits a freestanding item, since
+`waymaker-flash` itself calls several of them in expression position throughout its own
+production code and flagging every invocation there would reject the file this rule
+exists to protect. All three were verified against real compilation: the first by
+injecting a scratch `#[cfg(test)]`-gated child file with a real `Clone` impl into
+`waymaker-flash`'s own `recovery` module and building it, the second and third by a
+standalone two-crate `rustc` example each, since a real derive macro and a real
+function-like macro cannot be added to `waymaker-flash` without an external dependency
+the layering forbids.
+
+Round 34 found two more, both in the exact hand-off round 33 had just drawn: what
+`every_resolution` does when a path cannot be substituted rather than merely chased
+through an alias table. The first is the absolute-path twin of round 32's own
+`crate::`-qualification fix: `impl ::dep::C for Recovery { .. }`, where `extern crate
+self as dep;` makes `dep` name this very crate and `pub use core::clone::Clone as C;`
+sits at its root, is legal Rust that implements `Clone` for `Recovery` — but a leading
+`::` had always been read as a signal to trust the last segment as a plain, unaliased
+name, so `every_resolution` never consulted this file's own alias table even when that
+table already had `C` bound to `Clone` right here. `every_resolution` now fails closed
+on every absolute path, the same way a `crate`-qualified one already does, because an
+absolute path reaches the extern prelude and this per-file scan has no crate-level view
+of what a self-reference there might rename. The second is round 28's own alias-target
+finding one hop later: `type Identity<T> = T; impl Clone for Identity<Recovery> { .. }`
+implements `Clone` for `Recovery` itself, because substituting `Recovery` for `T` makes
+`Identity<Recovery>` the type `Recovery` — but the self-type scan reads only the
+segment identifier (`Identity`), discarding the generic argument that decides what the
+substitution actually produces, so it followed `Identity` to its own declared target,
+`T`, and reported an implementor named `T` rather than `Recovery`. `every_resolution`
+now fails closed whenever a segment that carries a generic argument is also a locally
+aliased name — excluding a `LOCAL_SHADOWED_TYPE` entry, which names a struct, enum or
+union declared right in this file and so is never a substitution risk, only a real
+generic type using its own real name; without that exclusion the fix would have
+rejected every ordinary generic type declared and implemented in the same file, which a
+negative test now holds open. Both were verified against real compilation:
+`extern crate self as dep;` and the re-export it reaches, and the generic alias with
+`Recovery` substituted in for it, were each injected into `waymaker-flash`'s own crate
+root and `recovery` module and built, with `check-layering` catching both before the
+injection was reverted — no external dependency was needed for either, unlike round
+33's two macro findings.
+
+Round 35 found two more, both against the fixes round 33 had just landed rather than
+against the alias-resolution machinery rounds 32 and 34 touched. The first is in
+`has_cfg_test` itself: it matched only the bare `#[cfg(test)]` spelling, so
+`#![cfg(any(test))]` and `#![cfg(all(test, feature = "x"))]` — both guaranteed false
+whenever `test` is, exactly as test-only as the bare form — fell through
+`parse_args::<syn::Ident>()` unparsed and answered `false`, leaving a file gated either
+way still walked as production-reachable. A new `meta_requires_test` recognizes both
+compounds recursively — an `all(..)` naming `test` among its conjuncts can never hold
+without it, and an `any(..)` every one of whose branches is itself test-only can only be
+satisfied under test — while deliberately leaving `#[cfg(any(test, other))]` alone,
+since it is satisfiable under `other` with no test anywhere and treating it as test-only
+would hide production-reachable code from every one of `has_cfg_test`'s 72 call sites,
+not only `recovery-surface`'s. The second is the gap round 33's own `visit_expr_macro`
+left in place while closing the position it was written for: naming a macro as safe
+vouches for nothing about its *arguments*, which `syn` never parses into structured
+syntax at all — they are an opaque token stream — so `#[allow(non_local_definitions)]
+const _: () = assert!({ impl Clone for super::Recovery { .. } true });` puts a real,
+globally-applying `impl` inside `assert!`'s own condition, invisible to a visitor that
+only ever asked whether the macro's *name* was one of the roughly thirty it trusts. A
+new `token_stream_contains_a_brace_group` refuses the one thing every whitelisted
+macro's grammar shares rather than reparsing each one's own — `assert!`, `matches!` and
+`write!` each take a different shape, one of them a pattern rather than an expression at
+all — since only a brace-delimited group can open a block and only a block can carry an
+item statement, so a whitelisted macro's tokens are trusted only when they carry no
+brace group anywhere, at any depth. Both were verified against real compilation: the
+`any`/`all` compounds were each injected as a genuinely test-gated child file into
+`waymaker-flash`'s own `recovery` module, built under both a production and a `cfg(test)`
+configuration to confirm the impl really exists only under the second and that
+`check-layering` correctly reports nothing for either — a negative result being the
+point, since a false accusation of a legitimate test-only impl is exactly what round 33
+introduced and this closes; and the `assert!`-hidden impl was injected unconditionally,
+confirmed to compile in a plain production build, and confirmed caught by
+`check-layering` before the injection was reverted.
+
+Round 36 found two more, both on the very fixes round 35 had just landed, and neither in
+`has_cfg_test` or the brace-group scan themselves. The first is a whitelist bypass a
+name-only check could never close: `use crate::make_clone as assert; const _: () =
+assert!();` is legal Rust whose `assert!` invocation is not `core::assert!` at all — a
+local `use` rebinds a name in the macro namespace exactly as it would in the value or
+type namespace — but `is_known_safe_expression_macro` matched the spelled name alone, so
+a locally-imported macro wearing a whitelisted name walked past the one check meant to
+catch an unexpandable one. Resolving *which* invocation a given `use` shadows would need
+the same scope-stack machinery `resolve_segments` and `every_resolution` each carry for
+their own callers, which this visitor does not have, so the fix is coarser on purpose: a
+new `shadowed_expression_macro_names` collects every local name a `use` binds to one of
+the thirty whitelisted names anywhere in the file — file scope, a nested module, or a
+function body, since `use` is legal in all three — and poisons that name for the *whole*
+file rather than only the scope the shadowing `use` sits in, which can only reject more
+than a precise version would, never less. The second is the mirror image of round 32's
+own statement-macro fix, one shape further: a macro used as a *tail* expression still
+carries its own attributes on the `ExprMacro` node — `fn helper() { #[cfg(test)]
+make_clone!() }` is legal Rust whose macro is removed from every non-test build exactly
+like a gated statement already is — but `visit_expr_macro` read only the macro's path,
+never `node.attrs`, so a test-gated expression-position invocation failed the whole file
+closed over a macro that never ships. Both were verified against real compilation. The
+shadowing case needed a macro genuinely reachable by path from outside the scanned file
+to avoid also tripping the pre-existing, unconditional ban on a macro *declaration*
+found in the same file: `#[macro_export] macro_rules! round36_make_clone` at the crate
+root, aliased to `assert` and invoked from a `recovery` child file, was shown to produce
+a real, globally-applying impl by declaring a second, ordinary `impl Clone for Recovery`
+beside it and watching rustc refuse the conflict — the sharpest proof available that the
+first one is real — before `check-layering` was confirmed to catch it and the injection
+reverted. The tail-expression case reused the same cross-file macro, this time gated
+`#[cfg(test)]` at the call site, confirmed to compile to nothing in a production build
+and to a real impl under `cargo test`, with `check-layering` confirmed to report nothing
+for either configuration.
+
+Round 37 found two more, one in each half of round 36's own review. The first is round
+32's own qualified-alias reach one hop further: `direct_scope_module_aliases` copied a
+nested module's own alias *target* straight onto the qualified entry it registers for
+the outer scope, which is right for an ordinary re-export and wrong for a chained one —
+`mod traits { pub use core::clone::Clone as C; pub use self::C as D; } impl traits::D
+for Recovery { .. }` names `self::C`, which is `C` in `traits`' own scope, exactly the
+chained re-export `every_resolution`'s own doc comment already describes resolving
+within a single file's alias table — but the qualified alias `traits::D` carried
+`self::C` unresolved out to the *outer* scope, whose own table has only the qualified
+`traits::C`, never the bare `C` `traits` would resolve it through, so the second hop
+fell through to the harmless-looking last segment, `C`. The fix factors
+`every_resolution`'s own hop-chasing BFS out of its path-specific pre-checks into a new
+`resolve_segment_chain`, taking an already-extracted segment list rather than a
+`syn::Path`, and `direct_scope_module_aliases` now runs a nested module's own alias
+target through it — against that same nested scope, before qualifying — rather than
+handing an unresolved reference to a table with no way to finish resolving it. The
+second is `has_cfg_test`'s own outer filter one spelling further: `#![cfg_attr(not(test),
+cfg(test))]` is exactly as test-only as a bare `#![cfg(test)]`, because rustc's rewrite
+of a `cfg_attr` leaves nothing else it could mean — `cfg(test)` in every build where
+`not(test)` holds (every non-test one, excluding the file) and no attribute at all in
+every build where it does not (every test one, where the guarded `cfg(test)` would have
+excluded nothing anyway) — but `has_cfg_test` read only an attribute whose own path was
+`cfg`, so a `cfg_attr`-spelled equivalent never reached the predicate at all. A new
+`attribute_requires_test` reads the whole attribute, `cfg_attr` included, recursing into
+its own injected items; a new `meta_holds_without_test` is `meta_requires_test`'s dual —
+guaranteed *true* whenever `test` is false, needed because a `cfg_attr`'s own condition
+has to be shown to hold in exactly the builds its guarded `cfg` would have excluded, and
+the two functions call each other for `not(..)`, the connective whose truth table is the
+other's. Both were verified against real compilation: the chained export was injected as
+a real, doubly-nested re-export chain in `waymaker-flash`'s own `recovery` module,
+confirmed to compile (visibility warnings only) and confirmed caught by `check-layering`
+before reverting; and the `cfg_attr` compound was injected the same way round 35's own
+compounds were, confirmed by a duplicate-impl conflict to produce a real `Clone` impl
+only under `cargo test`, and confirmed cleared by `check-layering` in both
+configurations.
+
+Round 38 found a gap in the scan's own reach rather than in its alias-chasing: a `Clone`
+implementation for the pinned type need not live anywhere `recovery.rs`'s own `mod`
+declarations reach at all. `impl Clone for crate::recovery::Recovery { .. }` in
+`append.rs`, say, is legal Rust the crate root reaches directly through its own `pub mod
+append;` and `recovery.rs` never reaches by any path — `check_recovery_is_not_clone`
+walked the module tree rooted at `recovery.rs` itself, so the whole rest of the crate,
+every sibling file `lib.rs` declares independently, was outside the scan regardless of
+what it implemented. `waymaker-flash`'s single-writer invariant is a property of the
+*crate*, not of one module's own descendants, and `Journal::after`'s by-value `Recovery`
+is defeated exactly the same way from either. The fix walks from
+`RECOVERY_ADAPTER_ROOT_PATH` — the crate root — instead, so the reachable set is every
+production source `waymaker-flash` actually ships, `recovery.rs`'s own descendants
+included, rather than only the latter. Resolving that walk needed a real bug in
+`child_modules` fixed first: `mod` resolution had only ever been exercised from a
+non-root file before, and a crate root resolves a `mod` declared in it exactly the way
+`mod.rs` does — beside itself, never under a `lib/` subdirectory — which nothing had
+ever taught the function, so a first attempt reported every top-level module of
+`waymaker-flash` as unresolvable. `lib.rs` and `main.rs` are now recognized as crate
+roots the same way `mod.rs` already was, verified with a scratch fixture before the
+walk was ever pointed at them. What the wider reach does *not* do is loosen who counts
+as a match: `every_resolution`'s existing fail-closed handling of a `crate::`-qualified
+self type — any length, since round 32 — means a genuine `impl Clone for
+crate::recovery::Recovery` fails closed to `UNRESOLVED_DERIVE` rather than resolving
+cleanly to the pinned name, and an *unrelated* type's own `crate::`-qualified `Clone`
+impl elsewhere in the crate would fail exactly the same conservative way — but an
+unrelated type named the ordinary, relative way real code in this crate names its own
+self-type does not, so the widened scan gains no new false positive against a
+production `Clone` impl that never mentions `Recovery` at all. Every existing
+`recovery-surface` fixture was single-file and had never needed a crate root beside it,
+so all forty-odd of them needed a synthetic `lib.rs` declaring `pub mod recovery;` added
+alongside — folded into the two shared helpers where a test used them, and by hand into
+the half-dozen that built their own source lists directly. Verified against the real
+crate by injecting `impl Clone for crate::recovery::Recovery<'_, u8> { fn clone(&self)
+-> Self { unreachable!() } }` into `append.rs` — a file `recovery.rs`'s own tree never
+reaches and the crate root reaches directly — confirmed to compile under
+`cargo build -p waymaker-flash --no-default-features`, confirmed to be missed by
+`check-layering` before this fix and caught by it after, and reverted cleanly.
+
+Round 39 found three more, all on the same commit round 38 was found on. The first is
+`KNOWN_SAFE_EXPRESSION_MACROS`'s own asymmetry: `include_str!` and `include_bytes!` can
+only ever produce a string or byte-string literal, but `include!` splices the *named
+file's own tokens* in as Rust source, and `token_stream_contains_a_brace_group`'s brace
+scan reads only the invocation's own arguments — a single string literal for
+`include!("clone.inc")`, with no brace anywhere in it. The file that string names is
+never opened by this per-file scan, the same blind spot an out-of-line `mod name;` has,
+so `const _: () = include!("clone.inc");` in a production-reachable file, where
+`clone.inc` holds `{ impl Clone for Recovery { .. }; 0 }`, walked past the whitelist
+unseen. `include` is no longer on it; no source in this workspace calls it bare in
+expression position, so nothing accepted loses anything. The second is
+`direct_scope_module_aliases`'s own qualification one shape further: `mod traits { mod
+nested { pub use core::clone::Clone as C; } pub use nested::*; } impl traits::C for
+Recovery { .. }` is legal Rust — `traits`' own glob re-exports `nested::C` as
+`traits::C` — but the synthetic scope this function builds for a nested module is
+assembled only from that module's own explicit aliases and its nested modules' own
+*qualified* aliases, never from a glob any of them declares, so `traits::C` had nothing
+registered to resolve against and fell through to the harmless-looking bare name `C`.
+A glob anywhere in a nested module's own scope — its own direct glob, or one a deeper
+nested module already reduced to its own qualified marker — is now re-registered one
+level of qualification up as a `"name::*"` marker, and `resolve_segment_chain`'s own
+"no matching alias" fallback checks every qualifying prefix of the segments it could
+not otherwise resolve against that marker, not only the bare, unqualified case round 30
+already covered. The third is `push_resolved_names`'s own trust boundary: `use
+custom::Debug; #[derive(Debug)] struct Recovery;` is legal Rust whose `Debug` is not
+`core::fmt::Debug` at all — an ordinary `use` shadows the prelude name exactly as a
+`use .. as` rename would, and a third-party crate is free to name a procedural derive
+macro `Debug` on purpose — but `every_resolution` chases the alias to
+`["custom", "Debug"]`, finds no further alias for `custom`, and the same "take the last
+segment" fallback reports the string `"Debug"` again, indistinguishable by name alone
+from the literal builtin. `push_resolved_names` now also asks whether the derive path's
+own first segment, as written, was ever the local side of an alias at all; if it was,
+none of the eight non-`Clone` builtin names is trusted from that resolution, whatever
+string the fallback produced. `Clone` stays exempt, because resolving *to* it through an
+alias is round 13's own intended detection rather than something to distrust. All three
+were verified against real compilation: the `include!` gap needed no separate included
+file to demonstrate, since removing the name from the whitelist is what the invocation
+alone now trips; the glob re-export was injected as a real nested-module chain reaching
+`Recovery` in `waymaker-flash`'s own `recovery` module, confirmed to compile (visibility
+warnings only) and confirmed caught by `check-layering` before reverting; and the
+shadowed-builtin-derive finding, needing a real external proc-macro crate this
+workspace's layering forbids adding, was verified with a standalone two-crate example — a
+`#[proc_macro_derive(Debug)]` that emits `impl Clone for Recovery` — and shown live by
+calling `.clone()` on the derived type and watching the macro's own `unreachable!()`
+panic fire, the sharpest proof available that the import really does shadow the prelude
+derive.
+
+Round 40 found two more, both on the same commit round 39 was found on. The first is
+`struct_derives`'s own narrow scope: it validates only the *pinned* type's own derive
+list, in the one file that declares it, but a procedural derive macro is not obliged to
+emit an implementation only for the trait its own name suggests, or only for the type
+it is attached to — a derive macro receives the whole item as input and is free to emit
+whatever tokens it likes, so `#[derive(Evil)] struct Helper;` anywhere in a
+production-reachable file, naming a struct with nothing to do with `Recovery` at all,
+can expand to `impl Clone for crate::recovery::Recovery` exactly as freely as a derive
+on `Recovery` itself. A new `unresolved_derive_elsewhere` walks every other struct,
+enum and union a file declares — at module scope and at any depth of inline-module
+nesting, mirroring `collect_trait_implementors`'s own module-boundary alias threading —
+and asks the same question `push_resolved_names` already asks of the pinned type's own
+list, with the same fail-closed answer for a name this scan cannot vouch for. A
+block-local struct, enum or union is a narrower residual this round leaves open, noted
+in the function's own doc rather than chased here. The second is
+`token_stream_hides_a_possible_item`'s (formerly `token_stream_contains_a_brace_group`)
+own brace scan one macro deeper: `#[allow(non_local_definitions)] const _: () =
+assert!(evil!());`, where `evil!` is an ordinary, unrecognized macro that expands to
+`{ impl Clone for Recovery { .. } true }`, carries no brace anywhere in `assert!`'s own
+tokens at all — only `evil`, `!` and an empty `(..)` group — because the brace the
+check was built to catch sits one level down, in `evil!`'s own expansion, which is
+exactly as opaque to `syn` as the outer, whitelisted macro's is. The function now also
+refuses any further macro invocation nested in a whitelisted macro's own tokens, at any
+depth: an identifier immediately followed by `!` and a delimited group, whichever
+delimiter it uses. Both were verified against real compilation, and neither could be
+demonstrated inside `waymaker-flash` itself without the same external-dependency
+problem round 33 first ran into: the derive finding was shown with a standalone
+two-crate example — a `#[proc_macro_derive(Evil)]` invoked on an unrelated `Helper`
+that emits `impl Clone for Recovery` — confirmed live by calling `.clone()` on
+`Recovery` and watching the macro's own `unreachable!()` fire; the nested-macro finding
+was shown with a single-file `rustc` compile of `assert!(evil!())`, `evil!` declared
+locally as an ordinary `macro_rules!`, confirmed live the same way.
+
+Round 41 found a false *positive* rather than another way through: `trait Clone { fn
+conjure() -> Self; } impl Clone for Recovery { .. }` is legal Rust whose `Clone` is a
+local, unrelated trait — Rust resolves an unqualified name to the nearest declaration
+in scope, and a trait declared right here shadows `core::clone::Clone` for every
+unqualified reference inside this same scope exactly as a local struct, enum or union
+already shadows an imported type (round 29's own finding). `shadow_aliases_for_local_
+types` registered a self-referential shadow for the first three but never for a trait
+declaration, so a bare `Clone` resolved as though no local declaration existed at all
+and was rejected as implementing the real trait it plainly does not — the `super::`
+self-type behind it then failed closed on its own unrelated grounds, compounding a
+harmless file into a reported violation. `LOCAL_SHADOWED_TYPE` needed no new sentinel
+and no change to `resolve_segment_chain`'s own handling of it: a trait declaration is
+already in the *type* namespace a struct, enum or union name occupies, which is what
+the sentinel's name has always meant, so this is a shadow declaration this function had
+simply never asked about `Item::Trait`. A fully qualified `impl core::clone::Clone for
+Recovery` sitting in the very same scope is unaffected, because a qualified path never
+consults the bare-name shadow at all — the same way Rust's own resolution bypasses
+local shadowing once a path is qualified. Verified against the real crate: the exact
+local-trait-and-impl pair was injected into `waymaker-flash`'s own `recovery` module,
+confirmed to compile, confirmed to be a false positive under `check-layering` before
+this fix and cleared by it after.
+
+Round 42 found the residual `unresolved_derive_elsewhere`'s own doc comment had named
+when round 40 landed it: "a block-local struct, enum or union (declared inside a
+function body) is not walked". `#[derive(Evil)] struct Helper;` inside a production
+function reaches neither `declares_item_macro`'s trust of the outer `derive` attribute
+nor that module-scoped walk, so a procedural derive on a block-local item can emit a
+non-local `impl Clone for crate::recovery::Recovery` exactly as freely as one on a
+struct declared at module scope. The fix shares rather than duplicates the block-descent
+machinery `collect_trait_implementors_in_block` already carries for a handwritten
+`impl`: the roots computation `collect_trait_implementors_in_item_body` used to inline —
+every scope-root block a function's signature and body, a method, a trait's default
+method, a const or static initializer, or a field, variant or generic bound's own type
+can hide — is now `scope_root_blocks_of_item`, called by both the Clone-impl scan and a
+new derive-checking twin, `any_unresolved_derive_in_item_body`. A new
+`any_unresolved_derive_in_block` walks one block at a time exactly the way
+`collect_trait_implementors_in_block` does, so a block-local `use` or `type` alias
+resolves a nested derive's name under its own lexical scope rather than a sibling
+block's, and `any_unresolved_derive_in_scope` calls it for every item its own loop
+reaches — Struct, Enum and Union's own field types included, since those can bury a
+further block the identical way a function body can. Verified against real
+compilation: a standalone two-crate example, an `evil_macro` proc-macro crate whose
+`#[derive(Evil)]` ignores the item it decorates and emits a hardcoded
+`impl Clone for Recovery` instead, compiled cleanly with the derive placed on a
+block-local struct inside an ordinary function — and, placed beside a second, explicit
+`impl Clone for Recovery`, produced rustc's own `E0119` conflicting-implementation
+error, the sharpest proof available that the injected impl is real. A real derive macro
+cannot be added to `waymaker-flash` itself without an external dependency the layering
+forbids, matching round 33's own two findings of this shape.
+
+Round 43 found three more on the same commit, none of them in the block-descent
+machinery round 42 had just landed. The first is in `has_cfg_test` itself, shared by
+every rule in this file that reads whether an item is test-gated: rounds 35 through 37
+widened a single attribute's own recursive predicate to recognize `#[cfg(any(test))]`,
+`#[cfg(all(test, feature = "x"))]` and a `cfg_attr`-spelled equivalent, but every one of
+those rounds still combined several attributes on one item with `.any()` — sound only
+in the direction it was built for, since a single attribute proving an item test-only is
+enough to prove the whole item test-only, but several `#[cfg(..)]` attributes on one
+item are conjunctive, exactly like `all(..)`'s own arguments, and a per-attribute answer
+cannot see a combination that is test-only only because two attributes *correlate*
+through a flag neither one alone pins down. `#[cfg(any(test, feature = "x"))]
+#[cfg(not(feature = "x"))]` is exactly that: read together the two admit only `test &&
+!x`, which requires `test`, but neither attribute alone does. The fix replaces the
+per-node recursive rule with `Cfg`, a small formula type every attribute's own
+condition is parsed into, joined with `Cfg::All` across the whole attribute list, and
+answered by `Cfg::requires_test` through *exhaustive enumeration* over the distinct
+named flags the combination actually contains (capped at twenty, past which the scan
+gives up rather than paying for `2^n` assignments) — a flag occurring twice, once under
+`any` and once negated under a sibling attribute, is now the same variable held to the
+same value in every assignment tried, which is what a recursive per-node rule
+structurally cannot express no matter how many connectives it special-cases. The second
+is `every_resolution`'s own hand-off one case further: `extern crate self as dep; pub
+use core::clone::Clone as C;` at the crate root, reached from a sibling file with `impl
+dep::C for crate::recovery::Recovery { .. }`, makes `dep::C` name `Clone` — but `dep` is
+declared nowhere the sibling's own per-file alias table reads, the identical residual
+round 34's absolute-path fix left open one shape narrower, so `dep::C` matched no alias
+at all and fell through to trusting its own last segment, `C`. `resolve_segment_chain`
+now fails closed on any qualified (multi-segment) path that matches no alias on its very
+first hop — the path exactly as the source wrote it, before any local alias this scan
+can see has had a chance to explain it — while a path already substituted through at
+least one local alias keeps trusting its own last segment once no further one applies,
+which is what lets an ordinary `use core::clone::Clone as C;` still resolve at all. The
+third is `trait_implementors_for_pinned_type`'s own exemption for the pinned file:
+round 29 skipped *every* top-level shadow there to keep `Recovery`'s own declaration
+from shadowing itself, but that also dropped round 41's trait shadow for an unrelated
+local declaration sharing the searched name — `recovery.rs` itself declaring `trait
+Clone { .. }` beside `impl Clone for Recovery { .. }` implements only that local trait,
+but with the whole top level unshadowed the bare `Clone` resolved past it to the real
+`core::clone::Clone` and rejected code that never implements it. Only the entry named
+`Recovery` is dropped from the pinned file's own shadow list now, so every other local
+declaration there shadows the way round 29 and round 41 already say one must. All three
+were verified against real compilation: the `cfg` conjunction against the full existing
+test suite, which stayed green on every earlier round's own regression case under the
+new exhaustive evaluator; the self-crate alias by injecting `extern crate self as
+round43_dep; pub use core::clone::Clone as Round43C;` and a sibling `impl
+round43_dep::Round43C for crate::recovery::Recovery<'_, u8> { .. }` into
+`waymaker-flash` itself, confirmed to compile and confirmed caught by `check-layering`
+before reverting; and the pinned-file shadow by a standalone `rustc` compile showing a
+local `trait Clone` and its impl on an unrelated `Recovery` leave no real
+`core::clone::Clone` impl behind (`r.clone()` fails to resolve at all), the same
+underlying Rust fact round 41's own fix rests on.
+
+Round 44 found one more on the same commit, and it turned out to already be closed:
+`#[derive(custom::Debug)]`, where `custom` exports a procedural derive macro named
+`Debug` that could emit anything, is legal Rust `push_resolved_names`'s own
+`locally_rebound` check does not catch — that check asks only whether the derive path's
+first segment was ever handed to a *local* alias, and an unaliased, directly qualified
+path like `custom::Debug` never is, so round 39's fix (built for a *renamed* import
+resolving to the same bare name) never applied. Before round 43's fix to
+`resolve_segment_chain`, `custom::Debug` matched no alias at all and fell through to
+trusting its own last segment, the harmless-looking string `"Debug"`, indistinguishable
+from the real builtin. Round 43's fix already closes it from underneath, for the
+identical reason it closes the self-crate-alias case above: an unaliased, qualified
+path unresolved on its own first hop now resolves to `UNRESOLVED_DERIVE` rather than its
+last segment, so `push_resolved_names` never reaches the builtin-name check with a
+trustable string at all. Verified by neutralizing round 43's fix alone and confirming
+the new regression test fails against the unpatched fallback, then passes once restored
+— no code change beyond the test.
+
+Round 45 found two more on the same commit, both genuine code changes this time. The
+first is `push_resolved_names`'s own `Clone` exemption: `use evil::Clone; #[derive(Clone)]
+struct Helper;` is round 39's exact bypass — an explicitly imported procedural derive
+macro sharing a name with a real builtin — with `Clone` itself as the shadowed name
+rather than `Debug`. The unconditional `name == "Clone"` clause trusted a resolution
+of `Clone` regardless of `locally_rebound`, reasoning that resolving *to* `Clone`
+through an alias was the intended detection round 13's own `Klon` test relies on — but
+that reasoning proves too much: it also trusts a `Clone`-named import that was never
+`core::clone::Clone` at all. `Clone` needs no exemption of its own — it is already the
+first entry of `DERIVABLE_BUILTIN_TRAITS` — so removing the separate clause folds it
+into the same `!locally_rebound` guard the other eight names already have. Round 13's
+own `Klon` case (`locally_rebound` is `true` there) now reports `UNRESOLVED_DERIVE`
+instead of the literal name `Clone`, which still names the pinned type's own violation
+— the fail-closed message names `Clone` by text too — and still flags an unrelated
+struct's derive through the same alias as worth a human's review. The second is the
+reverse gap in `meta_is_unresolved_attribute_macro`: it read every injected attribute of
+a `cfg_attr` without asking whether the `cfg_attr`'s own condition could hold in a
+production build at all, so `#[cfg_attr(test, Evil)]` on an otherwise ordinary
+production item — which only ever injects `Evil` under `cfg(test)`, with rustc removing
+the whole attribute in every other build — was read as though the injected attribute
+might apply in production and rejected valid, test-only instrumentation. `Cfg::
+requires_test`, the same predicate round 43's `has_cfg_test` fix built, now decides
+whether the `cfg_attr`'s own condition is provably test-only before recursing into what
+it injects; a condition this scan cannot prove test-only still reads its injected
+attributes exactly as before. Verified against real compilation throughout: the `Clone`
+exemption with a standalone two-crate example — a `#[proc_macro_derive(Clone)]` that
+emits a hardcoded `impl Clone for Recovery`, imported as `use evil::Clone;` and invoked
+on an unrelated `Helper` — compiled cleanly, and conflicted (`E0119`) against an
+explicit second `impl Clone for Recovery`, confirming the injected impl is real; the
+`cfg_attr` fix by injecting `#[cfg_attr(test, round45_a_transform)]` into
+`waymaker-flash` itself, confirmed caught by `check-layering` before the fix and cleared
+by it after, reverted cleanly.
+
+Round 46 found two more of the same shape round 45 had just closed for one caller, left
+open in a second. The first: `collect_derive_names_from_meta` — the derive-list twin of
+`meta_is_unresolved_attribute_macro`, and unrelated to it in code even though both walk a
+`cfg_attr`'s own injected attributes — still recursed into every `derive(..)` a `cfg_attr`
+injects regardless of the condition, so `#[cfg_attr(test, derive(Clone))]` on `Recovery`
+read as an unconditional `Clone` derive and `recovery-surface` rejected a crate whose
+production build never carries one at all. The fix is the identical check round 45 gave
+the attribute-macro scan, given to the derive scan too: `Cfg::requires_test` on the
+`cfg_attr`'s own first argument, skipping the recursion when it is provably true. The
+second is sharper, in `declares_item_macro`'s own `MacroVisitor`: every gate it carries —
+one per node reachable through an item, a member, a field, a variant or a foreign item —
+asked `has_cfg_test` of that one node's own attributes alone, discarding what an
+*enclosing* node's own `cfg` had already narrowed down. `#[cfg(any(test, feature = "x"))]
+mod parent { #[cfg(not(feature = "x"))] fn helper() { evil!(); } }` can never include
+`helper` in a non-test build — the two conditions correlate through the shared flag
+exactly the way round 43's `has_cfg_test` fix closed for several attributes on *one*
+item — but neither `parent`'s own condition (satisfiable under `feature = "x"` with no
+test) nor `helper`'s (satisfiable under `!x` the same way) requires `test` alone, so a
+visitor that reduced every level to its own separate boolean read past both and reached
+`evil!()`. `MacroVisitor` gains `enclosing_cfg`, a `Cfg` accumulated with `Cfg::All` as
+the walk descends through `visit_item`, `visit_impl_item`, `visit_trait_item`,
+`visit_field`, `visit_variant` and `visit_foreign_item` and restored on the way back out;
+`visit_stmt_macro` and `visit_expr_macro` ask the combination too, since a macro
+statement's or expression's own gate is checked against everything that has to hold for
+it to be *reached* rather than against its own attributes in isolation. `attrs_cfg` is
+the `Cfg` half of `has_cfg_test` split out so a caller can combine it with an enclosing
+scope's own formula before asking, which `has_cfg_test` alone — answering only a bare
+`bool` — could not do. Both were verified against real compilation: the derive fix by
+injecting `#[cfg_attr(test, derive(Clone))]` onto the real `Recovery` struct in
+`waymaker-flash` itself, confirmed caught by `check-layering` before the fix (via the
+regression test's own neutralization) and cleared by it after, reverted cleanly; the
+visitor fix could not be injected into the real crate without either a genuinely
+undefined macro breaking `check-layering`'s own `cargo build` step (round 42's pitfall)
+or a `macro_rules!` declaration that would itself trip the unconditional item-macro check
+regardless of the nested-cfg gating under test, so it was verified by neutralizing the
+fix in place — dropping `enclosing_cfg` from the combination — and confirming the
+regression test fails exactly at the correlated-conditions case while its positive twin
+(two conditions that do not correlate) stays green throughout.
+
+Round 47 was found merging this branch with `main` rather than by a further Codex review
+round: `main` had independently gained issue #95's redelivery work in the meantime, and
+`waymaker-flash/src/frame.rs`'s new `redeliverable_kind` calls `matches!(decoded,
+RecordRef::EffectCompleted { .. } | RecordRef::EffectFailed { .. } |
+RecordRef::TimerFired { .. })` — real, shipping production code that `check-layering`
+failed on the merged tree. `matches!`'s second argument is a *pattern*, and
+`token_stream_hides_a_possible_item` read the brace after each qualified variant name as
+though it might open a block, exactly as it would for `assert!({ .. })`'s own condition —
+but a pattern's own `{ .. }` can only ever hold the rest-pattern, never a statement,
+because Rust's pattern grammar has no bare block anywhere in it. A brace group
+immediately qualified by `path::` and containing nothing but `..` no longer counts as
+hiding an item on its own; `is_opaque_variant_pattern_brace` is the two-part check —
+requiring the `::` before the identifier rules out a keyword that really can open a block
+directly (`loop {`, `unsafe {`), since no keyword can itself be a path segment before
+`::`, and requiring the contents to be bare `..` rules out a named field, whose *value* —
+in a struct literal, though never in a pattern — could still be an arbitrary block this
+function has no business trusting. Closing only that qualified, `..`-only shape is
+deliberate rather than an oversight: a bare, unqualified `Foo { .. }` and a named-field
+pattern both still fail closed exactly as before, and
+`a_matches_macro_over_an_unqualified_variant_pattern_is_still_rejected` is the regression
+that pins the narrower residual open on purpose, beside
+`a_matches_macro_over_a_qualified_variant_pattern_is_not_reported`'s positive case,
+verified via neutralization to fail exactly where the fix is removed. The real fix was
+verified against real compilation directly, since `frame.rs`'s own `redeliverable_kind`
+is the live case: `check-layering` failed on the merged tree before this fix and passed
+after it, with no injection or reversion needed because the finding was already sitting
+in the tree the merge produced.
 
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
