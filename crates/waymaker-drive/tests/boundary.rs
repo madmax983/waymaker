@@ -310,8 +310,8 @@ fn a_journal_whose_first_record_is_not_a_run_is_refused_as_malformed() {
 #[test]
 fn a_driver_reports_the_region_and_the_run_it_was_built_for() {
     let driver: Driver = Driver::new(region(), RUN, reserve());
-    assert_eq!(driver.region(), region());
-    assert_eq!(driver.run(), RUN);
+    assert_eq!(driver.region(), Some(region()));
+    assert_eq!(driver.run(), Some(RUN));
 }
 
 #[test]

@@ -831,6 +831,76 @@ pub fn decode_header(bytes: &[u8]) -> Result<BankHeader<'_>, DecodeError> {
 ///
 /// As [`decode_header`].
 pub fn decode_header_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<BankHeader<'_>, DecodeError> {
+    let prefix = verify_header_prefix_with::<C>(bytes)?;
+    let covered = HEADER_PREFIX_BYTES.saturating_add(prefix.input_len);
+    let (Some(sealed), Some(trailer)) = (
+        bytes.get(..covered),
+        bytes
+            .get(covered..)
+            .and_then(<[u8]>::first_chunk::<HEADER_TRAILER_BYTES>),
+    ) else {
+        return Err(DecodeError::Truncated);
+    };
+    if C::frame_check(sealed) != u32::from_le_bytes(*trailer) {
+        return Err(DecodeError::IntegrityFailed);
+    }
+
+    let Some(align) = program_align(prefix.shift) else {
+        return Err(DecodeError::MalformedRecord);
+    };
+    let Some(input) = sealed.get(HEADER_PREFIX_BYTES..) else {
+        // Unreachable: `sealed` is `covered` bytes long and `covered >= HEADER_PREFIX_BYTES`.
+        // Spelled as a refusal rather than an `unwrap` because the workspace denies both,
+        // and a decoder walking bytes off a damaged device is the last place to make an
+        // exception.
+        return Err(DecodeError::Truncated);
+    };
+
+    Ok(BankHeader {
+        run: RunId(prefix.run),
+        align,
+        workflow_kind: prefix.workflow_kind,
+        workflow_version: prefix.workflow_version,
+        input_schema: prefix.input_schema,
+        input,
+    })
+}
+
+/// A bank header's own checksum-protected prefix, once it has held.
+///
+/// Private on purpose: [`BankHeader`] is what a caller gets, and a partly-verified prefix is
+/// a value nothing outside this module has a use for. What *is* public is the one number a
+/// reader with a page smaller than the header needs — see [`header_len_of`].
+#[derive(Clone, Copy)]
+struct VerifiedHeaderPrefix {
+    run: u64,
+    shift: u8,
+    workflow_kind: u16,
+    workflow_version: u16,
+    input_schema: u16,
+    input_len: usize,
+}
+
+/// Reads the [`HEADER_PREFIX_BYTES`]-byte prefix at the front of `bytes` and verifies it
+/// against `C`.
+///
+/// The one place a header prefix's own seal is computed. [`decode_header_with`] and
+/// [`header_len_of_with`] both come through here rather than each destructuring the prefix
+/// for themselves, because two readers of one prefix is exactly the drift §09's frozen
+/// layout exists to rule out — the same reason [`crate::frame`]'s own `verify_header_with`
+/// exists for a record frame's header.
+///
+/// # Errors
+///
+/// [`DecodeError::Truncated`] when `bytes` is shorter than [`HEADER_PREFIX_BYTES`],
+/// [`DecodeError::IntegrityFailed`] when the magic or the prefix's own checksum does not
+/// hold, and [`DecodeError::UnsupportedFormatVersion`] for a version this firmware does not
+/// read — in that order, which is the order [`decode_header_with`] requires: the prefix
+/// layout is frozen across format versions, so its checksum is meaningful before its
+/// version is known.
+fn verify_header_prefix_with<C: IntegrityCheck>(
+    bytes: &[u8],
+) -> Result<VerifiedHeaderPrefix, DecodeError> {
     let Some(prefix) = bytes.first_chunk::<HEADER_PREFIX_BYTES>() else {
         return Err(DecodeError::Truncated);
     };
@@ -894,41 +964,50 @@ pub fn decode_header_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<BankHeader<
         return Err(DecodeError::UnsupportedFormatVersion);
     }
 
-    let input_len = usize::from(u16::from_le_bytes([len_low, len_high]));
-    let covered = HEADER_PREFIX_BYTES.saturating_add(input_len);
-    let (Some(sealed), Some(trailer)) = (
-        bytes.get(..covered),
-        bytes
-            .get(covered..)
-            .and_then(<[u8]>::first_chunk::<HEADER_TRAILER_BYTES>),
-    ) else {
-        return Err(DecodeError::Truncated);
-    };
-    if C::frame_check(sealed) != u32::from_le_bytes(*trailer) {
-        return Err(DecodeError::IntegrityFailed);
-    }
-
-    let Some(align) = program_align(shift) else {
-        return Err(DecodeError::MalformedRecord);
-    };
-    let Some(input) = sealed.get(HEADER_PREFIX_BYTES..) else {
-        // Unreachable: `sealed` is `covered` bytes long and `covered >= HEADER_PREFIX_BYTES`.
-        // Spelled as a refusal rather than an `unwrap` because the workspace denies both,
-        // and a decoder walking bytes off a damaged device is the last place to make an
-        // exception.
-        return Err(DecodeError::Truncated);
-    };
-
-    Ok(BankHeader {
-        run: RunId(u64::from_le_bytes([
-            run0, run1, run2, run3, run4, run5, run6, run7,
-        ])),
-        align,
+    Ok(VerifiedHeaderPrefix {
+        run: u64::from_le_bytes([run0, run1, run2, run3, run4, run5, run6, run7]),
+        shift,
         workflow_kind: u16::from_le_bytes([kind_low, kind_high]),
         workflow_version: u16::from_le_bytes([version_low, version_high]),
         input_schema: u16::from_le_bytes([schema_low, schema_high]),
-        input,
+        input_len: usize::from(u16::from_le_bytes([len_low, len_high])),
     })
+}
+
+/// How long the header at the front of `bytes` is, before padding, once its own
+/// checksum-protected prefix says so — without needing the rest of the header present at
+/// all.
+///
+/// [`decode_header`]'s own [`DecodeError::Truncated`] only fires once the *whole* header is
+/// missing, which is no help to a caller trying to learn how much room a header needs from a
+/// buffer that does not yet hold it — [`crate::frame::frame_len_of`] is this same shape one
+/// module over, for a record rather than a bank header.
+///
+/// # Errors
+///
+/// [`DecodeError::Truncated`] when `bytes` is shorter than [`HEADER_PREFIX_BYTES`],
+/// [`DecodeError::IntegrityFailed`] when the magic or the prefix's own checksum does not
+/// hold, and [`DecodeError::UnsupportedFormatVersion`] for a version this firmware does not
+/// read. A header that fails one of these is not a header this length is a fact about, so
+/// none of them hands back a number.
+#[inline]
+pub fn header_len_of(bytes: &[u8]) -> Result<usize, DecodeError> {
+    header_len_of_with::<Catalogued>(bytes)
+}
+
+/// As [`header_len_of`], verified against `C`.
+///
+/// [`header_len_of`] is this at `C = Catalogued`.
+///
+/// # Errors
+///
+/// As [`header_len_of`].
+pub fn header_len_of_with<C: IntegrityCheck>(bytes: &[u8]) -> Result<usize, DecodeError> {
+    let prefix = verify_header_prefix_with::<C>(bytes)?;
+    // Bounded by `MAX_RUN_INPUT_BYTES`, so this cannot overflow on any target this crate
+    // builds for; `saturating_add` says so without depending on it.
+    let covered = HEADER_PREFIX_BYTES.saturating_add(prefix.input_len);
+    Ok(covered.saturating_add(HEADER_TRAILER_BYTES))
 }
 
 /// The `program_shift` byte for `align`.
