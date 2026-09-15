@@ -3565,6 +3565,37 @@ through `shadow_locals`-gated callers — `trait_implementors_for_pinned_type` a
 scan, which asks no such question about a *specific* pinned type, is untouched by
 either.
 
+Round 31 found two more. The first is round 28's own qualified-alias fix one module
+deeper: `mod traits { pub mod nested { pub use core::clone::Clone as C; } } impl
+traits::nested::C for super::Recovery { .. }` is legal Rust, and
+`direct_scope_module_aliases` only ever read a directly nested module's own *direct*
+aliases — never a module nested inside that one — so `traits::nested::C` had nothing to
+resolve against and fell through to the harmless-looking bare name `C`.
+`direct_scope_module_aliases` is now recursive, chaining a nested module's own direct
+aliases with the aliases every module nested inside *that* one contributes, and
+prefixing every one of them with the current module's own name — building a qualified
+name of arbitrary depth rather than one level. `every_resolution`'s own qualified-lookup
+half needed the matching generalization: `qualified_candidate`, which only ever tried a
+fixed two-segment join, is now `qualified_candidates`, trying every prefix length from
+longest to shortest so a path qualified through any number of nested modules has a
+candidate to match against. The second is not an invocation at all, syntactically: an
+**attribute** macro. `declares_item_macro` had flagged an item-, statement- or
+type-position macro *invocation* since round 16, but never asked whether an item
+carried an attribute macro at all — `#[a_transform] struct Anything;` compiles today,
+and unlike a derive, an attribute macro may rewrite the item it decorates or splice an
+unrelated item in beside it, so nothing here could say it does not expand to `struct
+Anything; impl Clone for Recovery { .. }`. Verified against a real, compiling two-crate
+example — a `proc_macro_attribute` that injects exactly that impl beside an unrelated
+struct — rather than only against `syn`'s parse of the shape, since a real attribute
+macro is what makes the finding a live one rather than a hypothetical. The fix reads
+every attribute the visitor's existing traversal already reaches, at any nesting depth,
+through `syn`'s own generated callback for every attribute node rather than a case added
+at each place one can appear, and asks of each one whether it is a builtin the compiler
+interprets itself or a namespace rustc treats as opaque to a named tool — `cfg_attr`
+included, read at any depth for the same reason `collect_derive_names_from_meta`'s own
+recursion is — with anything else read the same way an item-, statement- or
+type-position macro invocation already is.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

@@ -12836,6 +12836,149 @@ mod tests {
     }
 
     #[test]
+    fn a_derive_reached_through_a_doubly_nested_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 31: `mod traits { pub
+        // mod nested { pub use core::clone::Clone as C; } } #[derive(traits::nested::C)]
+        // pub struct Recovery;` is legal Rust, and round 28's `direct_scope_module_aliases`
+        // only ever read a directly nested module's own *direct* aliases — never a
+        // module nested inside that one — so `traits::nested::C` had nothing to
+        // resolve against and fell through to the bare, harmless-looking name `C`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "mod traits {\n",
+            "    pub mod nested {\n",
+            "        pub use core::clone::Clone as C;\n",
+            "    }\n",
+            "}\n",
+            "#[derive(traits::nested::C, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_handwritten_clone_reached_through_a_doubly_nested_modules_qualified_alias_is_rejected() {
+        // The handwritten-impl half of the same finding.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub mod nested {\n",
+                "        pub use core::clone::Clone as C;\n",
+                "    }\n",
+                "}\n",
+                "impl traits::nested::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_reached_file_carrying_an_attribute_macro_this_scan_cannot_expand_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 31: `declares_item_macro`
+        // flagged an item-, statement- or type-position macro *invocation*, but never
+        // asked whether an item carried an attribute macro at all. Unlike a derive, an
+        // attribute macro may rewrite the item it decorates or splice an unrelated item
+        // in beside it — `#[a_transform] struct Anything;` could expand to anything,
+        // `impl Clone for Recovery` included, and nothing here could say otherwise.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[a_transform]\n", "struct Anything;\n",).to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_attribute_macro_reached_only_through_a_cfg_attr_is_rejected() {
+        // The `cfg_attr` half of the same finding: `#[cfg_attr(unix, a_transform)]` is
+        // legal Rust whose second argument is an attribute macro this scan cannot expand,
+        // exactly as a bare `#[a_transform]` is — `meta_is_unresolved_attribute_macro`
+        // has to look past the `cfg_attr` wrapper the same way this scan already does to
+        // find a derive or a `cfg` hidden the same way.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[cfg_attr(unix, a_transform)]\n", "struct Anything;\n",).to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn ordinary_builtin_attributes_are_not_reported_as_macros() {
+        // The negative case: a file that carries only the builtin attributes this
+        // workspace actually uses must not be rejected by round 31's fix, or every
+        // reached file in the real crate would fail closed over its own doc comments,
+        // `#[derive(..)]`, `#[must_use]`, `#[repr(..)]` and the rest.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "//! Module doc.\n",
+                "#[derive(Debug)]\n",
+                "#[repr(transparent)]\n",
+                "#[must_use]\n",
+                "#[non_exhaustive]\n",
+                "pub struct Anything(u8);\n",
+                "#[cfg_attr(test, allow(dead_code))]\n",
+                "#[inline]\n",
+                "fn helper() {}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

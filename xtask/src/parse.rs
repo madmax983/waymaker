@@ -466,23 +466,37 @@ fn strip_self_prefix(segments: &[String]) -> &[String] {
     }
 }
 
-/// [`lookup_candidate`]'s two-segment twin: the joined name a qualified path through
-/// a directly nested inline module has to match against
-/// [`direct_scope_module_aliases`]'s synthetic `mod_name::exported_name` aliases,
-/// and what follows it. `None` when fewer than two segments remain after stripping a
-/// leading `self`, the same way [`lookup_candidate`] answers `None` only when none
-/// remain at all.
+/// [`lookup_candidate`]'s multi-segment twin: every joined-prefix name a qualified path
+/// through nested inline modules could match against
+/// [`direct_scope_module_aliases`]'s synthetic `mod_name::exported_name` (or
+/// `outer::inner::exported_name`, for a module nested inside a module) aliases, longest
+/// prefix first, each paired with what follows it. Empty when fewer than two segments
+/// remain after stripping a leading `self`, the same way [`lookup_candidate`] answers
+/// [`None`] only when none remain at all.
 ///
 /// Found by Codex review of this change (PR #143), round 28: `traits::C` is an
 /// ordinary identifier (`traits`) followed by another, and [`lookup_candidate`] alone
 /// only ever looks up the first — so a path qualified by a sibling module's own name
 /// had no alias to match against at all, and fell through to reporting the bare,
-/// still-aliased last segment.
-fn qualified_candidate(segments: &[String]) -> Option<(String, &[String])> {
-    match strip_self_prefix(segments) {
-        [first, second, tail @ ..] => Some((format!("{first}::{second}"), tail)),
-        _ => None,
+/// still-aliased last segment. Round 31 found the fixed two-segment join was itself too
+/// narrow: `traits::nested::C`, qualified through a module nested *inside* another
+/// nested module, joins its first three segments rather than two, and
+/// `direct_scope_module_aliases` gained a matching recursive registration on the same
+/// round — every prefix length is tried now, rather than only the shortest that could
+/// possibly qualify a directly nested module's own export.
+fn qualified_candidates(segments: &[String]) -> Vec<(String, &[String])> {
+    let stripped = strip_self_prefix(segments);
+    let mut candidates = Vec::new();
+    if stripped.len() < 2 {
+        return candidates;
     }
+    for split in (2..=stripped.len()).rev() {
+        let Some((prefix, tail)) = stripped.get(..split).zip(stripped.get(split..)) else {
+            continue;
+        };
+        candidates.push((prefix.join("::"), tail));
+    }
+    candidates
 }
 
 /// Sentinel a derive-path resolution emits in place of a name it could not pin down,
@@ -593,7 +607,7 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
             // out-of-line `mod name;` registered as a synthetic alias to this same
             // sentinel — can still carry a trailing tail (`traits::C` resolving one hop
             // to `["<unresolved derive>", "C"]`). Without this guard the tail survives:
-            // it matches neither `qualified_candidate` nor `lookup_candidate`, so the
+            // it matches neither `qualified_candidates` nor `lookup_candidate`, so the
             // "no matching alias, take the last segment" branch below silently reports
             // the harmless-looking `"C"` rather than propagating that the hop it went
             // through could not be resolved at all.
@@ -637,18 +651,21 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
             if current.is_empty() {
                 continue;
             }
-            // Round 28: a qualified two-segment candidate is tried *before* the
-            // plain single-segment one, because `traits::C` — where `traits` is a
+            // Round 28: a qualified candidate is tried *before* the plain
+            // single-segment one, because `traits::C` — where `traits` is a
             // sibling inline module registering `C` as one of its own aliases via
             // `direct_scope_module_aliases` — has to be looked up as the joined
             // name `traits::C`, not as the bare identifier `traits` (which no
-            // ordinary `use` or `type` alias is ever named after). Both are tried
-            // rather than the first alone, exactly as this function already tries
-            // every alias sharing one local name: a plain single-segment alias and
-            // a qualified one could both exist for unrelated reasons, and either
-            // resolving to the trait being searched for is enough.
+            // ordinary `use` or `type` alias is ever named after). Round 31
+            // generalized this to every prefix length, longest first, for a path
+            // qualified through more than one level of nested inline module
+            // (`traits::nested::C`) — see `qualified_candidates`. Every one is
+            // tried rather than the first alone, exactly as this function already
+            // tries every alias sharing one local name: a plain single-segment
+            // alias and a qualified one could both exist for unrelated reasons,
+            // and either resolving to the trait being searched for is enough.
             let mut matched = false;
-            if let Some((joined, tail)) = qualified_candidate(&current) {
+            for (joined, tail) in qualified_candidates(&current) {
                 for alias in aliases.iter().filter(|alias| alias.local == joined) {
                     matched = true;
                     if finished.len() + next.len() >= MAX_CANDIDATES {
@@ -986,8 +1003,9 @@ fn shadow_aliases_for_local_types<'a>(
     aliases
 }
 
-/// Every alias reachable through one level of qualification by a directly nested
-/// inline module's own name.
+/// Every alias reachable through one or more levels of qualification by a directly
+/// nested inline module's own name, recursing into a module nested inside that module
+/// in turn.
 ///
 /// Found by Codex review of this change (PR #143), round 28: `mod traits { pub use
 /// core::clone::Clone as C; } impl traits::C for super::Recovery { .. }` is legal
@@ -998,8 +1016,20 @@ fn shadow_aliases_for_local_types<'a>(
 /// bare, still-aliased name `C` rather than the real trait. This registers `traits::C`
 /// as a synthetic alias for whatever `C` itself resolves to inside `traits`' own
 /// scope, so a path qualified by a sibling module's name can be looked up the same
-/// way an unqualified one already is. One level only: a module nested inside `traits`
-/// is not walked, matching how deep this round's own finding reaches.
+/// way an unqualified one already is.
+///
+/// Round 31 found that stopping at one level was itself the same shape of gap: `mod
+/// traits { pub mod nested { pub use core::clone::Clone as C; } }
+/// #[derive(traits::nested::C)] pub struct Recovery;` is legal Rust, and this function
+/// read only `traits`' own *direct* aliases, never `traits::nested`'s — so
+/// `traits::nested::C` had nothing to resolve against either, one level further out
+/// than round 28 closed. It now recurses into each nested module's own content the
+/// same way, and prefixes whatever comes back — a direct alias, or one already
+/// qualified by a module nested inside this one — with this module's own name, so a
+/// path qualified through any number of nested inline modules resolves the same way a
+/// single level already did. [`qualified_candidates`] is the matching generalization
+/// on the lookup side: a fixed two-segment join could never have matched a
+/// three-or-more-segment registration this recursion produces.
 fn direct_scope_module_aliases<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
 ) -> Vec<UseAlias> {
@@ -1015,7 +1045,11 @@ fn direct_scope_module_aliases<'a>(
             continue;
         };
         let name = ident_name(&module.ident);
-        for alias in direct_scope_aliases(nested) {
+        let nested_items: Vec<&syn::Item> = nested.iter().collect();
+        let qualified = direct_scope_aliases(nested_items.iter().copied())
+            .into_iter()
+            .chain(direct_scope_module_aliases(nested_items.iter().copied()));
+        for alias in qualified {
             aliases.push(UseAlias {
                 local: format!("{name}::{}", alias.local),
                 target: alias.target,
@@ -1663,6 +1697,17 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
 /// invocation, because the macro doing the expanding does not have to be declared in the
 /// file it expands into.
 ///
+/// A fourth shape is not an invocation at all, syntactically, and round 31 found it: an
+/// **attribute** macro. `#[a_transform] struct Anything;` compiles today with nothing
+/// here able to say what it expands to — unlike a derive, an attribute macro may rewrite
+/// or replace the very item it decorates, or splice an unrelated item in beside it, so
+/// `#[a_transform] struct Anything;` could just as well expand to `struct Anything; impl
+/// Clone for Recovery { .. }`. `visit_attribute` reaches every attribute the visitor's
+/// existing traversal reaches — file level, item level, and every member, field, variant
+/// and foreign item beneath a level `has_cfg_test` has not already excluded — and
+/// `meta_is_unresolved_attribute_macro` is what tells a builtin the compiler interprets
+/// itself, and a namespace rustc treats as opaque to a named tool, from everything else.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
@@ -1742,12 +1787,128 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         fn visit_type_macro(&mut self, _node: &'ast syn::TypeMacro) {
             self.found = true;
         }
+
+        // Round 31: every attribute the traversal above still reaches — because
+        // nothing upstream of it has already excluded the item, member, field,
+        // variant or foreign item it sits on — might be an attribute macro this
+        // module cannot expand, and `visit_attribute` is where `syn`'s own generated
+        // traversal calls back for every one of them, at any nesting depth, without
+        // a case added here for each new place an attribute can appear.
+        fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+            if meta_is_unresolved_attribute_macro(&attr.meta) {
+                self.found = true;
+            }
+            syn::visit::visit_attribute(self, attr);
+        }
     }
 
     let file = parse_rust(contents)?;
     let mut visitor = MacroVisitor { found: false };
     visitor.visit_file(&file);
     Ok(visitor.found)
+}
+
+/// Whether `meta` names an attribute [`declares_item_macro`] cannot rule out as a macro
+/// invocation: not a builtin the compiler interprets itself, not an attribute in a
+/// namespace rustc treats as opaque to any tool but the one it names, and not a
+/// `#[cfg_attr(.., ..)]` whose own arguments — read at any depth, for
+/// [`collect_derive_names_from_meta`]'s reason — are every one of those two.
+///
+/// A `cfg_attr` this module cannot parse into a condition and its arguments answers
+/// `true`, matching [`attr_introduces_cfg`]'s own rule for the identical shape of
+/// unreadable content: a `cfg_attr` this scan cannot read is not evidence that everything
+/// it names is safe.
+fn meta_is_unresolved_attribute_macro(meta: &syn::Meta) -> bool {
+    if path_is_ident(meta.path(), "cfg_attr") {
+        let syn::Meta::List(list) = meta else {
+            return true;
+        };
+        let Ok(metas) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return true;
+        };
+        return metas.iter().skip(1).any(meta_is_unresolved_attribute_macro);
+    }
+    !is_known_safe_attribute_path(meta.path())
+}
+
+/// Whether `path` is a builtin attribute the compiler interprets itself, or names a
+/// namespace rustc treats as opaque to a tool of its own rather than expanding — the two
+/// shapes an attribute can take without being a macro invocation this module cannot see
+/// through. `path.segments` is empty for no attribute `syn` can produce, so an empty path
+/// answers `false` rather than assuming safety of something that cannot occur.
+///
+/// The builtin list is every attribute the reference gives the compiler itself, so a
+/// crate that starts using one it does not use today does not newly fail this rule; the
+/// tool list is `rustfmt`, `clippy`, `rust_analyzer` and `miri` — the tool namespaces the
+/// reference names — plus `diagnostic`, which the reference documents as a namespace
+/// reserved for the compiler's own diagnostics rather than for any external tool, but
+/// which behaves the same way here: neither expands to new code.
+fn is_known_safe_attribute_path(path: &syn::Path) -> bool {
+    const KNOWN_TOOLS: &[&str] = &["clippy", "diagnostic", "miri", "rust_analyzer", "rustfmt"];
+    const BUILTIN: &[&str] = &[
+        "allow",
+        "automatically_derived",
+        "bench",
+        "cfg",
+        "cfg_attr",
+        "cold",
+        "crate_name",
+        "crate_type",
+        "debugger_visualizer",
+        "deny",
+        "deprecated",
+        "derive",
+        "doc",
+        "expect",
+        "export_name",
+        "feature",
+        "forbid",
+        "global_allocator",
+        "ignore",
+        "inline",
+        "instruction_set",
+        "link",
+        "link_name",
+        "link_ordinal",
+        "link_section",
+        "macro_export",
+        "macro_use",
+        "must_use",
+        "naked",
+        "no_builtins",
+        "no_implicit_prelude",
+        "no_link",
+        "no_main",
+        "no_mangle",
+        "no_std",
+        "non_exhaustive",
+        "panic_handler",
+        "path",
+        "proc_macro",
+        "proc_macro_attribute",
+        "proc_macro_derive",
+        "recursion_limit",
+        "repr",
+        "should_panic",
+        "start",
+        "target_feature",
+        "test",
+        "track_caller",
+        "type_length_limit",
+        "used",
+        "warn",
+        "windows_subsystem",
+    ];
+    let Some(first) = path.segments.first() else {
+        return false;
+    };
+    let first_name = ident_name(&first.ident);
+    if path.segments.len() == 1 {
+        return BUILTIN.contains(&first_name.as_str());
+    }
+    KNOWN_TOOLS.contains(&first_name.as_str())
 }
 
 /// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition, including one
