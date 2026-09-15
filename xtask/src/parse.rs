@@ -4751,43 +4751,13 @@ pub fn struct_literal_counts(
         }
 
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            // A block-local alias is innermost, so it is tried first — and only for a
-            // bare, single-segment path, the only shape a function-local `type`/`use`
-            // alias is ever written against; a multi-segment path and module descent stay
-            // `resolve_segments`'s own job over the file's item-slice stack.
-            let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
-                .then(|| node.path.segments.first())
-                .flatten()
-                .map(|segment| ident_name(&segment.ident));
-            let local = first
-                .as_ref()
-                .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
-            let resolved = match local {
-                // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
-                // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
-                Some((segments, true)) => segments,
-                // Ran out of block-local aliases: the leftover head may itself be a
-                // module-level alias — `resolve_segments_from` is a no-op if it is not.
-                Some((segments, false)) => {
-                    resolve_segments_from(segments, &self.stack, &self.shadow)
-                }
-                None => resolve_segments(&node.path, &self.stack, &self.shadow),
-            };
-            let resolves_to_name = resolved
-                .last()
-                .is_some_and(|last| last.as_str() == self.name);
-            // Issue #185: a name declared more than once, live under more than one
-            // unevaluated `cfg`, is not something the deterministic resolution above
-            // can pick correctly between. Ask separately whether *some* live
-            // declaration could reach `self.name`, so an ambiguous alias is never
-            // silently outvoted by another declaration sharing its name.
-            let reachable_another_way = !resolves_to_name
-                && first.as_deref().is_some_and(|first| {
-                    self.stack.last().is_some_and(|scope| {
-                        alias_could_reach_target(first, &self.block_items, scope, &self.name)
-                    })
-                });
-            if resolves_to_name || reachable_another_way {
+            if literal_path_resolves_to(
+                node,
+                &self.stack,
+                &self.block_items,
+                &self.shadow,
+                &self.name,
+            ) {
                 self.count = self.count.saturating_add(1);
             }
             syn::visit::visit_expr_struct(self, node);
@@ -4831,6 +4801,51 @@ pub fn struct_literal_counts(
         total: total.count,
         inside: inside_count,
     })
+}
+
+/// Whether `node`'s path resolves to `name`, split out of
+/// [`struct_literal_counts`]'s own `visit_expr_struct` to keep that function under this
+/// file's `too_many_lines` lint — no behaviour change, only a name.
+///
+/// A block-local alias is innermost, so it is tried first — and only for a bare,
+/// single-segment path, the only shape a function-local `type`/`use` alias is ever written
+/// against; a multi-segment path and module descent stay `resolve_segments`'s own job over
+/// the file's item-slice stack.
+fn literal_path_resolves_to(
+    node: &syn::ExprStruct,
+    stack: &[&[syn::Item]],
+    block_items: &[&syn::Item],
+    shadow: &[String],
+    name: &str,
+) -> bool {
+    let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
+        .then(|| node.path.segments.first())
+        .flatten()
+        .map(|segment| ident_name(&segment.ident));
+    let local = first
+        .as_ref()
+        .and_then(|first| resolve_local_alias_chain(block_items, first));
+    let resolved = match local {
+        // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
+        // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
+        Some((segments, true)) => segments,
+        // Ran out of block-local aliases: the leftover head may itself be a
+        // module-level alias — `resolve_segments_from` is a no-op if it is not.
+        Some((segments, false)) => resolve_segments_from(segments, stack, shadow),
+        None => resolve_segments(&node.path, stack, shadow),
+    };
+    let resolves_to_name = resolved.last().is_some_and(|last| last.as_str() == name);
+    // Issue #185: a name declared more than once, live under more than one unevaluated
+    // `cfg`, is not something the deterministic resolution above can pick correctly
+    // between. Ask separately whether *some* live declaration could reach `name`, so an
+    // ambiguous alias is never silently outvoted by another declaration sharing its name.
+    let reachable_another_way = !resolves_to_name
+        && first.as_deref().is_some_and(|first| {
+            stack
+                .last()
+                .is_some_and(|scope| alias_could_reach_target(first, block_items, scope, name))
+        });
+    resolves_to_name || reachable_another_way
 }
 
 /// Whether `name` — a bare, single-segment identifier, as written in source and before

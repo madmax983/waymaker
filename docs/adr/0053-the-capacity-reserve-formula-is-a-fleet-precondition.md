@@ -24,12 +24,16 @@ admitted by firmware that already has it.
 
 A device may run firmware A, whose reserve leaves less room than firmware B's reserve later
 needs. Firmware A admits a schedule at its own boundary. The device is upgraded to firmware
-B. That schedule's outcome write tears. Firmware B's recovery cannot tell firmware A's
-schedule from its own — it reads bytes and a seal, not a formula — so it ignores the torn
-attempt and redelivers, the same as ADR 0052 always does. But the room firmware A actually
-left is firmware A's promise, not firmware B's. If firmware B's reserve asks for more,
-firmware B's own retry refuses with `Refusal::NearCapacity` — on every later boot, because
-the reserve is recomputed the same way each time.
+B. That schedule's outcome write tears.
+
+Firmware B's recovery reads bytes and a seal, not a formula. It cannot tell firmware A's
+schedule from its own. So it ignores the torn attempt and redelivers, the same as ADR 0052
+always does. But the room firmware A actually left is firmware A's own promise, not
+firmware B's.
+
+Suppose firmware B's reserve asks for more room. Then firmware B's own retry refuses with
+`Refusal::NearCapacity`. The reserve is recomputed the same way on every boot, so the
+refusal repeats on every later boot too.
 
 Nothing here is specific to `redelivery_slack`. Any future change that makes `Reserve`
 reserve more is exposed the same way, for the same reason: the formula is a policy, not a
