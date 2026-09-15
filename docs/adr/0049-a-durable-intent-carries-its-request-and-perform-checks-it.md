@@ -305,6 +305,31 @@ a new issue rather than a fourth round here.
 `a_custom_derive_in_the_effect_protocol_file_is_reported` are the regressions, confirmed RED
 against the unpatched rule.
 
+**A fourth round found two more real gaps in that same check, both left open.** An attribute
+macro on a trait member is invisible to `unaudited_attributes`, which visits `syn::Item` and
+`syn::ImplItem` but never `syn::TraitItem`; and a `use malicious::Forge as Clone;` import
+shadows the allowlisted derive name `Clone` with no way for a name-only comparison to tell.
+Per this project's own review-depth guidance, both are tracked in issue
+[#186](https://github.com/madmax983/waymaker/issues/186) rather than fixed in this change.
+
+**The same round found a real, fixable bug back in the alias-scoping mechanism instead.**
+`resolve_local_alias_chain` correctly stops at the end of a block's own aliases — a block-local
+`type Inner = Outer;` beside a *module*-level `type Outer = Foo;` — but the caller took that
+partial chain as final rather than feeding it on to `resolve_segments`'s own module-level
+lookup, so `Inner {}` was resolved only as far as `Outer`. `resolve_local_alias_chain` now
+reports whether its own chain ended on an absolute alias (already fully resolved, mirroring
+`resolve_segments`'s leading-colon short-circuit) or simply ran out of block-local names — in
+which case the leftover head is resolved again through `resolve_segments_from`, the
+module-lookup half of `resolve_segments` split out for reuse, a no-op when the name is not
+itself a module-level alias. `a_function_local_alias_of_a_module_level_alias_still_resolves`
+and `a_checked_dispatch_built_through_a_local_alias_of_a_module_level_alias_is_reported` are
+the regressions, confirmed RED against the unpatched caller. A second finding in the same
+round — two mutually exclusive `#[cfg(..)]`-gated `type` aliases sharing one name, where
+`own_aliases` skips only `#[cfg(test)]` and lets whichever is declared last win regardless of
+which a real build compiles — is not fixed: it is the pre-existing, accepted "`cfg` is not
+evaluated" limitation this file's own module documentation already states for every scanner
+in this family, named here rather than chased as a new gap.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch

@@ -13154,6 +13154,28 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checked_dispatch_built_through_a_local_alias_of_a_module_level_alias_is_reported() {
+        // Codex, issue #92's post-merge review: `type Outer<'a> = CheckedDispatch<'a>;` at
+        // module scope, with a helper's own body declaring `type Inner<'a> = Outer<'a>;`.
+        // `resolve_local_alias_chain` correctly stops at `Outer` — a block only ever
+        // searches its own aliases — but the caller used to treat that as the final answer
+        // instead of feeding it on to the module-level resolver, so `Inner { .. }` was never
+        // counted as `CheckedDispatch`.
+        let source = tests_support::clean_effect_module()
+            + "type Outer<'a> = CheckedDispatch<'a>;\n\
+               pub(crate) fn forge(intent: DurableIntent) -> Outer<'static> {\n\
+               \x20   type Inner<'a> = Outer<'a>;\n\
+               \x20   Inner { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_checked_dispatch_built_through_a_parenthesized_type_alias_is_reported() {
         // Codex, issue #92's sixth round: `(CheckedDispatch<'a>)` is valid Rust on a `type`
         // alias's right-hand side — `#[allow(unused_parens)]` lets it through `-D warnings`

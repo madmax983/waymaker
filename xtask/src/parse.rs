@@ -414,7 +414,15 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 /// body is not descended into by name the way [`resolve_segments`] does for a file's own
 /// sibling modules (issue #169) — not tested, and not needed for the shapes a function-local
 /// alias is actually written in.
-fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<Vec<String>> {
+/// Returns `Some((segments, absolute))` when `name` chains through at least one block-local
+/// alias, where `absolute` says whether the chain ended on a `use ::a::b as c;`-style
+/// absolute alias (in which case `segments` is fully resolved) or simply ran out of
+/// block-local aliases to try next (in which case `segments`' first element may itself be a
+/// *module*-level alias, still to be resolved — issue #92, Codex's post-merge review: the
+/// caller used to treat a block-local chain's leftover head as final rather than feeding it
+/// on to the module resolver, so `type Inner = Outer;` beside a module-level
+/// `type Outer = Foo;` left `Inner {}` resolved only as far as `Outer`).
+fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<(Vec<String>, bool)> {
     // `own_aliases`, not `collect_item_aliases`: a block's own declarations are exactly
     // one scope, the same as a module's, and reading through a `mod` nested in this block
     // would let that inner module's private alias shadow the outer, real one (Codex
@@ -423,6 +431,7 @@ fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<Vec<Str
     let aliases = own_aliases(items.iter().copied());
     let mut segments = vec![name.to_owned()];
     let mut resolved_any = false;
+    let mut absolute = false;
     let bound = aliases.len().saturating_add(1);
     for _ in 0..=bound {
         let Some(first) = segments.first().cloned() else {
@@ -442,10 +451,11 @@ fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<Vec<Str
         // Same short-circuit as `resolve_segments`'s own absolute-alias check: past this
         // point the path names the extern prelude directly, not another block-local name.
         if alias.absolute {
+            absolute = true;
             break;
         }
     }
-    resolved_any.then_some(segments)
+    resolved_any.then_some((segments, absolute))
 }
 
 /// The `use` bindings `items` declares directly, at its own level only.
@@ -709,7 +719,7 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 /// there is nothing left to resolve inside it, so descending would only
 /// throw the name away.
 fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
-    let mut segments: Vec<String> = path
+    let segments: Vec<String> = path
         .segments
         .iter()
         .map(|segment| ident_name(&segment.ident))
@@ -717,6 +727,15 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
     if path.leading_colon.is_some() {
         return segments;
     }
+    resolve_segments_from(segments, stack)
+}
+
+/// [`resolve_segments`]'s own resolution loop, over a segment list that is already known to
+/// be relative — reused by [`struct_literal_counts`] to continue resolving a block-local
+/// alias chain's leftover head against the enclosing module stack, since a name a block's own
+/// aliases could not finish resolving may itself be a module-level alias (issue #92, Codex's
+/// post-merge review).
+fn resolve_segments_from(mut segments: Vec<String>, stack: &[&[syn::Item]]) -> Vec<String> {
     let mut scope = stack.len().saturating_sub(1);
     // `None` while resolution is still on the lexical ancestor stack;
     // `Some(items)` once it has stepped into a sibling module by name
@@ -1509,7 +1528,15 @@ pub fn struct_literal_counts(
                 .flatten()
                 .map(|segment| ident_name(&segment.ident))
                 .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
-            let resolved = local.unwrap_or_else(|| resolve_segments(&node.path, &self.stack));
+            let resolved = match local {
+                // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
+                // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
+                Some((segments, true)) => segments,
+                // Ran out of block-local aliases: the leftover head may itself be a
+                // module-level alias — `resolve_segments_from` is a no-op if it is not.
+                Some((segments, false)) => resolve_segments_from(segments, &self.stack),
+                None => resolve_segments(&node.path, &self.stack),
+            };
             if resolved
                 .last()
                 .is_some_and(|last| last.as_str() == self.name)
@@ -2733,6 +2760,27 @@ mod raw_identifier_tests {
              fn other() -> u8 {\n\
              \x20   type Unchecked = Bar;\n\
              \x20   let _ = Unchecked {};\n\
+             \x20   0\n\
+             }",
+            "Foo",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_function_local_alias_of_a_module_level_alias_still_resolves() {
+        // Codex, issue #92's post-merge review: a block-local `type Inner = Outer;` where
+        // `Outer` is itself a *module-level* alias for `Foo`. `resolve_local_alias_chain`
+        // only searches the block's own aliases, so it correctly stops at `Outer` — but the
+        // caller used to take that partial result as final instead of feeding it back
+        // through the module-level resolver, so `Inner {}` was never counted as `Foo`.
+        let counts = struct_literal_counts(
+            "type Outer = Foo;\n\
+             fn forge() -> u8 {\n\
+             \x20   type Inner = Outer;\n\
+             \x20   let _ = Inner {};\n\
              \x20   0\n\
              }",
             "Foo",
