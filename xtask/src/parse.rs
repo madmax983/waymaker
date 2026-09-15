@@ -5291,7 +5291,9 @@ struct LiveDeclaration<'a> {
 /// and [`live_block_declarations`] both key their shadowing rule on: real Rust
 /// refuses two items of one name in one scope together (`E0428`/`E0255`)
 /// whichever kinds they are, so a `mod X` and a `type X = ..` in the same
-/// scope collide exactly as two aliases would.
+/// scope collide exactly as two aliases would — but only when they share a
+/// namespace; see [`is_namespace_unambiguous`] for the case this predicate
+/// alone cannot tell apart.
 fn declares_name(item: &syn::Item, first: &str) -> bool {
     match item {
         syn::Item::Mod(module) => ident_name(&module.ident) == first,
@@ -5299,6 +5301,27 @@ fn declares_name(item: &syn::Item, first: &str) -> bool {
             .iter()
             .any(|alias| alias.local == first),
     }
+}
+
+/// Whether `item`'s own namespace is knowable without name resolution. A
+/// `mod` or a `type` alias is always in the type namespace, so two of
+/// either sharing one name in one scope are a real `E0428`/`E0255` — but a
+/// `use` item can import a value, a type or a trait, and this scanner has
+/// no way to tell which. `use values::traits;` importing a *value* named
+/// `traits` does not collide with `mod traits { .. }` at all — confirmed
+/// against real `rustc` — so a `use` must never be treated as the one
+/// unconditional declaration that shadows a `mod`/`type` of the same name,
+/// nor as something a `mod`/`type` shadows (Codex review of PR #204:
+/// `live_named_items_in_scope`'s shadowing rule, and `preferred_alias`'s
+/// own pick, had both applied to a `use` exactly as they do to a `mod` or
+/// a `type`, so an unconditional value import could make the fail-closed
+/// scan skip a same-named module entirely — a missed count, the danger
+/// this whole mechanism exists to close). A `use` is therefore always kept
+/// as an independently live candidate rather than guessed about, the same
+/// residual [what is not checked](../../CLAUDE.md#what-is-not-checked)
+/// already states for a same-spelled alias across namespaces.
+const fn is_namespace_unambiguous(item: &syn::Item) -> bool {
+    matches!(item, syn::Item::Mod(_) | syn::Item::Type(_))
 }
 
 /// Picks which of `items`' own `use`/`type` aliases named `first` is the
@@ -5314,11 +5337,17 @@ fn declares_name(item: &syn::Item, first: &str) -> bool {
 /// regard for which one a real build could ever have, so an unconditional
 /// alias declared *after* a `#[cfg]`-gated duplicate of the same name was
 /// silently outvoted by a declaration that can never coexist with it).
-/// Only when no unconditional declaration exists does `prefer_last` decide
-/// between several `cfg`-gated candidates, matching each caller's own prior
-/// tie-break exactly — genuinely ambiguous under a `cfg` this scanner
-/// cannot evaluate, and left to `path_could_reach_target`'s own separate,
-/// fail-closed search to catch what this single pick still might miss.
+/// Only a namespace-unambiguous (`mod`/`type`, see
+/// [`is_namespace_unambiguous`]) unconditional declaration short-circuits
+/// the pick this way — a `use` can never be shown to collide with anything,
+/// so an unconditional `use` is not treated as an exclusive winner here
+/// either, and falls back to `prefer_last`'s own tie-break exactly as a
+/// conditional one would (Codex review of PR #204). When no such winner
+/// exists, `prefer_last` decides between every candidate, matching each
+/// caller's own prior tie-break exactly — genuinely ambiguous under a
+/// `cfg` this scanner cannot evaluate, or across a namespace it does not
+/// track, and left to `path_could_reach_target`'s own separate, fail-closed
+/// search to catch what this single pick still might miss.
 fn preferred_alias<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     first: &str,
@@ -5331,7 +5360,7 @@ fn preferred_alias<'a>(
         .collect();
     let chosen = candidates
         .iter()
-        .find(|item| !has_any_cfg(item_attrs(item)))
+        .find(|item| is_namespace_unambiguous(item) && !has_any_cfg(item_attrs(item)))
         .copied()
         .or_else(|| {
             if prefer_last {
@@ -5362,7 +5391,17 @@ fn preferred_alias<'a>(
 /// unconditional declaration textually *before* a same-scope conditional
 /// duplicate let an order-dependent walk add the duplicate before ever
 /// reaching the unconditional one). The second element is `true` exactly
-/// when an unconditional match was found.
+/// when a namespace-unambiguous unconditional match was found.
+///
+/// Only a namespace-unambiguous match — a `mod` or a `type` alias, see
+/// [`is_namespace_unambiguous`] — can be *that* unconditional winner, and
+/// only a namespace-unambiguous match is ever excluded by one: a `use` can
+/// import a value, so this scanner cannot show a `use` collides with
+/// anything, and keeps every `use` match live regardless (Codex review of
+/// PR #204: an unconditional `use` of a name real Rust never lets collide
+/// with a same-named `mod` had made this function's own first version
+/// exclude that `mod` anyway — a missed count, the direction this whole
+/// mechanism exists to close).
 fn live_named_items_in_scope<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     matches: impl Fn(&syn::Item) -> bool,
@@ -5371,8 +5410,22 @@ fn live_named_items_in_scope<'a>(
         .into_iter()
         .filter(|item| !has_cfg_test(item_attrs(item)) && matches(item))
         .collect();
-    match matching.iter().find(|item| !has_any_cfg(item_attrs(item))) {
-        Some(&unconditional) => (vec![unconditional], true),
+    let unambiguous_unconditional = matching
+        .iter()
+        .find(|item| is_namespace_unambiguous(item) && !has_any_cfg(item_attrs(item)))
+        .copied();
+    match unambiguous_unconditional {
+        Some(winner) => {
+            let live: Vec<&'a syn::Item> = core::iter::once(winner)
+                .chain(
+                    matching
+                        .iter()
+                        .copied()
+                        .filter(|item| !is_namespace_unambiguous(item)),
+                )
+                .collect();
+            (live, true)
+        }
         None => (matching, false),
     }
 }
@@ -16031,6 +16084,59 @@ mod cfg_alias_ambiguity_tests {
              \x20   0\n\
              }",
             "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_value_use_does_not_shadow_a_same_named_module() {
+        // Codex review of PR #204: `declares_name` and `preferred_alias`
+        // had both applied the E0428/E0255 shadowing rule to a `use` item
+        // exactly as they do to a `mod`/`type`, but a `use` can import a
+        // *value* — `use values::traits;` importing a function named
+        // `traits` does not collide with `mod traits { .. }` at all,
+        // confirmed against real `rustc`: the two coexist in one scope
+        // with no error, unlike two same-namespace declarations of one
+        // name. An unconditional value import must never make the
+        // fail-closed scan skip a same-named module's own construction.
+        let counts = struct_literal_counts(
+            "mod values {\n\
+             \x20   pub fn traits() -> u8 { 0 }\n\
+             }\n\
+             use values::traits;\n\
+             mod traits {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   traits()\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_value_use_does_not_count_an_unrelated_name() {
+        // The control for the test above: the same value import and
+        // module, asked about a name the module never constructs.
+        let counts = struct_literal_counts(
+            "mod values {\n\
+             \x20   pub fn traits() -> u8 { 0 }\n\
+             }\n\
+             use values::traits;\n\
+             mod traits {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   traits()\n\
+             }",
+            "SomethingElse",
             FnScope::None,
         )
         .expect("the fixture parses");

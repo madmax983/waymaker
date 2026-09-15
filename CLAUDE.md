@@ -5977,3 +5977,31 @@ separate, fail-closed search to catch what one deterministic pick still might mi
 are the regression, both RED against the pre-fix code — the first by coincidence of
 ordering once `preferred_alias` did not yet exist, the second unconditionally. No new
 ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a fifteenth, and it is a different class from the fourteenth's
+own two findings: not a missing branch under an unevaluated `cfg`, but a namespace this
+scanner has no way to read. `declares_name` and `preferred_alias` both treated a `use`
+item exactly as they treat a `mod` or a `type` alias, but a `use` can import a *value*,
+and real Rust lets a value share a name with a module with no collision at all —
+confirmed against real `rustc`: `use values::traits;`, importing a function named
+`traits`, compiles cleanly beside `mod traits { .. }` in the same scope, where two
+`type` aliases or two `mod`s of one name would be a real `E0428`/`E0255`. So an
+unconditional value import was wrongly read as the scope's one live declaration of
+`traits`, and `live_named_items_in_scope` excluded the module entirely — a missed
+count, the fourteenth round's own danger direction, reached through a route the
+fourteenth round's own fix had not closed. `is_namespace_unambiguous` is the fix: only
+a `mod` or a `type` alias is ever provably in the type namespace, so only one of those
+may now be the unconditional winner `live_named_items_in_scope` treats as exclusive,
+and only one of those may be excluded by such a winner — a `use` match is always kept
+as an independently live candidate, the same residual [what is not
+checked](#what-is-not-checked) already states for a same-spelled alias across
+namespaces, restored here rather than silently narrowed away by the fourteenth round's
+own exclusion logic. `preferred_alias` takes the identical guard, so its own single
+deterministic pick cannot be short-circuited by an unconditional `use` either — a
+weaker requirement than the backstop's, since callers built on it already carry the
+documented live/live-ambiguity residual, but left inconsistent with a stale doc comment
+otherwise. `an_unconditional_value_use_does_not_shadow_a_same_named_module` and its
+control, `an_unconditional_value_use_does_not_count_an_unrelated_name`, are the
+regression, confirmed RED against the pre-fix code (`total: 0` against an expected `1`)
+before this fix landed. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
