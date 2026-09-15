@@ -3421,6 +3421,36 @@ fn block_if_statement_count(block: &syn::Block) -> usize {
     block_if_stmts(block).len()
 }
 
+/// Every top-level `match` *statement* `block` declares directly, in source order —
+/// [`block_if_stmts`]'s own twin one syntax further over: a `match` needs no trailing
+/// semicolon to stand as a statement either, the same handful of expression forms `rustc`
+/// accepts bare in statement position `block_while_stmts` already names.
+fn block_match_stmts(block: &syn::Block) -> Vec<&syn::ExprMatch> {
+    block_non_tail_stmts(block)
+        .into_iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Expr(expr, _) = stmt else {
+                return None;
+            };
+            let syn::Expr::Match(match_expr) = strip_parens(expr) else {
+                return None;
+            };
+            Some(match_expr)
+        })
+        .collect()
+}
+
+/// [`block_match_stmts`]'s own statement count — `evaluate_block`'s `rest.len()` invariant's
+/// fourth missing term. Codex's finding: `{ let mut x: u8 = 100 + n; match x { 100 => x = 0,
+/// 101 => x = 1, _ => x -= 100 }; x }` names a block whose statements are a `let` and a
+/// top-level `match` with no trailing semicolon carried into its own arms' own mutations —
+/// the identical shape `block_if_statement_count` was added for, one syntax further over:
+/// nothing on either side of the invariant ever counted the match statement, so a block
+/// holding one refused outright regardless of which arm running it would have taken.
+fn block_match_statement_count(block: &syn::Block) -> usize {
+    block_match_stmts(block).len()
+}
+
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
 /// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
 /// [`item_const_exprs`] makes for a `const`.
@@ -4886,40 +4916,56 @@ fn resolve_block_sequential(
             syn::Stmt::Expr(expr, _) => expr,
             syn::Stmt::Macro(_) => return None,
         };
-        // A `while` loop and a bare, unlabelled `{ .. }` block statement each need no
-        // trailing semicolon, and each opens a nested lexical scope of its own — a `let`
-        // inside either must not survive past its own closing brace. A labelled block
-        // (`'a: { .. }`) is refused below rather than specially handled, since a
-        // `break 'a value;` inside it can produce a value from a control-flow path this
-        // scan does not trace.
-        if let syn::Expr::While(while_expr) = strip_parens(expr) {
-            evaluate_while_loop(while_expr, resolve, local_types, resolved)?;
-            continue;
-        }
-        if let syn::Expr::Block(nested) = strip_parens(expr) {
-            if nested.label.is_none() {
-                let mut nested_snapshot = ShadowSnapshot::new();
-                resolve_block_sequential(
-                    &production_stmts(&nested.block),
-                    resolve,
-                    local_types,
-                    resolved,
-                    &mut nested_snapshot,
-                )?;
-                restore_shadow_snapshot(local_types, resolved, nested_snapshot);
-                continue;
-            }
-        }
-        // An `if`/`else` statement needs no trailing semicolon either, and each branch it
-        // can take opens a nested lexical scope of its own the identical way a `while` body
-        // or a bare block statement does.
-        if let syn::Expr::If(if_expr) = strip_parens(expr) {
-            evaluate_if_statement(if_expr, resolve, local_types, resolved)?;
-            continue;
-        }
-        resolve_mutation_statement(expr, resolve, &*local_types, resolved)?;
+        resolve_statement_expr(expr, resolve, local_types, resolved)?;
     }
     Some(())
+}
+
+/// A single, statement-position expression — never a value — dispatched to whichever of
+/// this scan's recognised shapes it is: a `while` loop, a bare unlabelled `{ .. }` block, an
+/// `if`/`else`, a top-level `match`, or (the fallback) a plain or compound assignment.
+/// Factored out of [`resolve_block_sequential`]'s own per-statement loop so a match arm's own
+/// body — [`evaluate_match_statement`]'s, which is a single `syn::Expr` rather than a `Vec` of
+/// statements a block already gives — can be interpreted through the identical dispatch,
+/// rather than duplicating it.
+///
+/// A `while` loop and a bare, unlabelled `{ .. }` block statement each need no trailing
+/// semicolon, and each opens a nested lexical scope of its own — a `let` inside either must
+/// not survive past its own closing brace. A labelled block (`'a: { .. }`) is refused rather
+/// than specially handled, since a `break 'a value;` inside it can produce a value from a
+/// control-flow path this scan does not trace. An `if`/`else` and a `match` need no trailing
+/// semicolon either, and each branch or arm either can take opens a nested lexical scope of
+/// its own the identical way.
+fn resolve_statement_expr(
+    expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    if let syn::Expr::While(while_expr) = strip_parens(expr) {
+        return evaluate_while_loop(while_expr, resolve, local_types, resolved);
+    }
+    if let syn::Expr::Block(nested) = strip_parens(expr) {
+        if nested.label.is_none() {
+            let mut nested_snapshot = ShadowSnapshot::new();
+            resolve_block_sequential(
+                &production_stmts(&nested.block),
+                resolve,
+                local_types,
+                resolved,
+                &mut nested_snapshot,
+            )?;
+            restore_shadow_snapshot(local_types, resolved, nested_snapshot);
+            return Some(());
+        }
+    }
+    if let syn::Expr::If(if_expr) = strip_parens(expr) {
+        return evaluate_if_statement(if_expr, resolve, local_types, resolved);
+    }
+    if let syn::Expr::Match(match_expr) = strip_parens(expr) {
+        return evaluate_match_statement(match_expr, resolve, local_types, resolved);
+    }
+    resolve_mutation_statement(expr, resolve, &*local_types, resolved)
 }
 
 /// A plain `x = EXPR;` or compound `x OP= EXPR;` statement — [`resolve_block_sequential`]'s
@@ -5092,6 +5138,9 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // but not yet a *value* — `production_stmts` never excluded it, and nothing before this
     // counted it either, so `rest` always came up one statement short of every other term
     // here and the whole block refused before a later assignment to `NAME` ever ran.
+    // `block_match_statement_count` is `block_if_statement_count`'s own twin one more syntax
+    // over: a top-level `match` statement binds no name at the outer scope either, and was
+    // counted by neither side of this sum until now.
     if rest.len()
         != const_item_count
             + block_let_statement_count(block)
@@ -5101,6 +5150,7 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
             + block_if_statement_count(block)
             + block_let_else_statement_count(block)
             + block_uninitialized_let_statement_count(block)
+            + block_match_statement_count(block)
             + ignored_lets
     {
         return None;
@@ -6608,6 +6658,159 @@ fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<
         return None;
     }
     evaluate_tuple_match(expr_match, tuple, resolve)
+}
+
+/// `expr_match`'s own arm, run as a *statement* rather than resolved as a value —
+/// [`evaluate_if_statement`]'s own reasoning, applied to the other conditional construct a
+/// hand-written mutation ladder can be spelled with: the scrutinee and each arm's pattern
+/// (and guard) are decided through a resolver that sees this scope's own current locals, and
+/// the first matching arm's *body* is interpreted through [`resolve_statement_expr`] — the
+/// identical sequential dispatch a `while` body, an `if` branch or a bare nested block
+/// already goes through — rather than evaluated as a value.
+///
+/// Codex's finding: `{ let mut x: u8 = 100 + n; match x { 100 => x = 0, 101 => x = 1, _ => x
+/// -= 100 }; x }` names a top-level `match` whose own arms are mutations, not values —
+/// `resolve_block_sequential`'s per-statement dispatch named `While`, `Block`, `If` and the
+/// mutation fallback, but never `Match`, so the whole statement fell to
+/// `resolve_mutation_statement`, which declines a bare `match` outright (it names no
+/// assignment target) and refuses the entire block regardless of which arm running it would
+/// have taken.
+///
+/// The arm body's own resolver falls back to the *outer* `resolve` parameter, not to the
+/// scope-aware resolver built here for the scrutinee and guard — the identical split
+/// [`evaluate_if_statement`]'s own plain-condition branch already makes, since
+/// [`resolve_statement_expr`]'s own recursive machinery re-derives a resolved-locals-aware
+/// resolver at each level directly from `local_types`/`resolved`, and only the arm's own
+/// bound pattern name (not yet in either map) needs supplying here at all.
+/// [`evaluate_match_statement`]'s own guard check, factored out so the arm loop stays under
+/// this crate's own line-count lint: resolves an arm's guard with the arm's own bound name (if
+/// any) standing in for `scrutinee` — the identical substitution the arm body itself gets —
+/// and reports whether the guard let the arm through. `Some(true)` runs the arm's body,
+/// `Some(false)` tries the next arm, and `None` propagates the guard's own "could not resolve
+/// this at all" the same way the caller's own `?` already does for every other step.
+fn match_statement_guard_permits(
+    guard_expr: &syn::Expr,
+    scrutinee: i128,
+    is_bound: &impl Fn(&syn::Path) -> bool,
+    bound_unsigned_value: bool,
+    bound_width_value: Option<&str>,
+    condition_resolve: &Resolve<'_>,
+) -> Option<bool> {
+    let guard_value = |path: &syn::Path| -> Option<i128> {
+        if is_bound(path) {
+            return Some(scrutinee);
+        }
+        (condition_resolve.value)(path)
+    };
+    let guard_unsigned = |path: &syn::Path| -> bool {
+        if is_bound(path) {
+            return bound_unsigned_value;
+        }
+        (condition_resolve.unsigned)(path)
+    };
+    let guard_width = |path: &syn::Path| -> Option<&str> {
+        if is_bound(path) {
+            return bound_width_value;
+        }
+        (condition_resolve.width)(path)
+    };
+    let guard_resolve = Resolve {
+        value: &guard_value,
+        unsigned: &guard_unsigned,
+        width: &guard_width,
+    };
+    Some(literal_or_const_value(guard_expr, &guard_resolve)? != 0)
+}
+
+fn evaluate_match_statement(
+    expr_match: &syn::ExprMatch,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    let condition_resolve_value = |path: &syn::Path| {
+        path.get_ident()
+            .map(ident_name)
+            .and_then(|candidate| resolved.get(&candidate).copied())
+            .or_else(|| (resolve.value)(path))
+    };
+    let condition_resolve_unsigned = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.unsigned)(path),
+            |candidate| {
+                local_types
+                    .get(&candidate)
+                    .is_some_and(|name| is_unsigned_type_name(name))
+            },
+        )
+    };
+    let condition_resolve_width = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.width)(path),
+            |candidate| local_types.get(&candidate).map(String::as_str),
+        )
+    };
+    let condition_resolve = Resolve {
+        value: &condition_resolve_value,
+        unsigned: &condition_resolve_unsigned,
+        width: &condition_resolve_width,
+    };
+    let scrutinee = literal_or_const_value(&expr_match.expr, &condition_resolve)?;
+    for arm in expr_match
+        .arms
+        .iter()
+        .filter(|arm| !has_cfg_test(&arm.attrs))
+    {
+        if !match_arm_matches_constant(&arm.pat, scrutinee, &condition_resolve)? {
+            continue;
+        }
+        let bound = pattern_bindings(&arm.pat, &condition_resolve);
+        let is_bound = |path: &syn::Path| -> bool {
+            path.get_ident().is_some_and(|ident| bound.contains(&ident))
+        };
+        let bound_unsigned_value =
+            !bound.is_empty() && is_definitely_unsigned(&expr_match.expr, &condition_resolve);
+        let bound_width_value = (!bound.is_empty())
+            .then(|| expr_declared_width(&expr_match.expr, &condition_resolve))
+            .flatten();
+        if let Some((_, guard_expr)) = arm.guard.as_ref() {
+            if !match_statement_guard_permits(
+                guard_expr,
+                scrutinee,
+                &is_bound,
+                bound_unsigned_value,
+                bound_width_value.as_deref(),
+                &condition_resolve,
+            )? {
+                continue;
+            }
+        }
+        let body_value = |path: &syn::Path| -> Option<i128> {
+            if is_bound(path) {
+                return Some(scrutinee);
+            }
+            (resolve.value)(path)
+        };
+        let body_unsigned = |path: &syn::Path| -> bool {
+            if is_bound(path) {
+                return bound_unsigned_value;
+            }
+            (resolve.unsigned)(path)
+        };
+        let body_width = |path: &syn::Path| -> Option<&str> {
+            if is_bound(path) {
+                return bound_width_value.as_deref();
+            }
+            (resolve.width)(path)
+        };
+        let body_resolve = Resolve {
+            value: &body_value,
+            unsigned: &body_unsigned,
+            width: &body_width,
+        };
+        return resolve_statement_expr(&arm.body, &body_resolve, local_types, resolved);
+    }
+    None
 }
 
 /// [`evaluate_match`]'s own tuple-scrutinee half: `scrutinee`'s own elements, each resolved
