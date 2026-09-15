@@ -21881,6 +21881,84 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_whose_while_body_shadows_a_mutated_local_is_reported() {
+        // Codex's finding: `const Pn: u8 = { let mut x = 1u8; while x > 0 { x -= 1; let x =
+        // 1u8; let _ = x; } n };` shadows the outer, mutated `x` with a fresh `let x = 1u8;`
+        // *inside* the loop body — a name whose lexical scope ends at the body's own closing
+        // brace, so Rust decrements the outer `x` to 0 on the first iteration, evaluates the
+        // (unrelated) shadow, drops it, and finds the outer `x` still 0 on the next
+        // condition check: one iteration, result `n`. `evaluate_while_loop` used to share
+        // `resolved`/`local_types` across iterations with nothing undoing the body's own
+        // `let`s afterward, so the shadow's `1` permanently overwrote the outer `x`'s `0`,
+        // the condition stayed true forever, and the loop hit its own iteration cap and
+        // refused — hiding a dense `0..14` table behind an unresolved constant. Verified
+        // against real rustc: `make(n)` is the identity for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 1u8; while x > 0 {{ x -= 1; let x = \
+                 1u8; let _ = x; }} {n} }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_while_body_that_shadows_a_mutated_local(nibble: \
+             u32) -> u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        \
+             P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        \
+             P5 => 5,\n        P6 => 6,\n        P7 => 7,\n        P8 => 8,\n        \
+             P9 => 9,\n        P10 => 10,\n        P11 => 11,\n        P12 => 12,\n        \
+             P13 => 13,\n        P14 => 14,\n        _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_computed_by_a_nested_block_statement_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 100; { x -= 100; } x };` names a
+        // block whose statements are a `let` and a bare, unlabelled nested `{ .. }` block —
+        // the identical gap `block_while_statement_count` was added for, one syntax over:
+        // nothing on either side of `evaluate_block`'s own statement-count invariant ever
+        // counted the nested block statement, so a block holding one refused outright
+        // regardless of what running it would have computed. Verified against real rustc:
+        // `x -= 100 - n` inside the nested block leaves `x == n`, so `P0` through `P14`
+        // fold to the dense `0..14` sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8; {{ x -= 100 - {n}; }} x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_nested_block_statement(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_while_loop_whose_condition_never_folds_to_false_is_refused_rather_than_hung() {
         // `evaluate_while_loop`'s own bound: an unbounded interpreter over arbitrary source
         // would make a crate whose constant never terminates able to hang this gate, so a

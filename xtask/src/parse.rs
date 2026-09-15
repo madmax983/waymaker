@@ -3164,6 +3164,37 @@ fn block_while_statement_count(block: &syn::Block) -> usize {
     block_while_stmts(block).len()
 }
 
+/// Every bare, unlabelled `{ .. }` block statement `block` declares directly, in source
+/// order — [`block_while_stmts`]'s own nested-scope twin. A labelled block is excluded, the
+/// same way [`resolve_block_sequential`]'s own arm is: a `break 'a value;` inside one can
+/// produce a value from a control-flow path this scan does not trace.
+fn block_nested_block_stmts(block: &syn::Block) -> Vec<&syn::Block> {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| !stmt_is_cfg_test(stmt))
+        .filter_map(|stmt| {
+            let syn::Stmt::Expr(expr, _) = stmt else {
+                return None;
+            };
+            let syn::Expr::Block(nested) = strip_parens(expr) else {
+                return None;
+            };
+            nested.label.is_none().then_some(&nested.block)
+        })
+        .collect()
+}
+
+/// [`block_nested_block_stmts`]'s own statement count — `evaluate_block`'s `rest.len()`
+/// invariant's other missing term. Codex's finding: `{ let mut x = 100; { x -= 100; } x }`
+/// names a block whose statements are a `let` and a bare nested block — the identical shape
+/// `block_while_statement_count` was added for, one syntax over: nothing on either side of
+/// the invariant ever counted a nested block statement, so a block holding one refused
+/// outright regardless of what running it would have computed.
+fn block_nested_block_statement_count(block: &syn::Block) -> usize {
+    block_nested_block_stmts(block).len()
+}
+
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
 /// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
 /// [`item_const_exprs`] makes for a `const`.
@@ -3914,10 +3945,24 @@ fn resolve_sequential_let(
     resolve: &Resolve<'_>,
     local_types: &mut std::collections::HashMap<String, String>,
     resolved: &mut std::collections::HashMap<String, i128>,
+    shadow_snapshot: &mut ShadowSnapshot,
 ) {
     let ascribed_type = stmt_let_type(local, init, resolve);
     let mut bound_names = Vec::new();
     for (name, expr) in destructured_binding(&local.pat, &init.expr) {
+        // Codex's finding, met here: a name this statement binds may already answer for an
+        // *outer* scope — the body of a loop this statement sits inside, most sharply — and
+        // that outer answer is what has to come back once this call's own scope ends, not
+        // whatever the last shadow inside it left behind. Captured once per name, before
+        // either map changes for it, so a second shadow of the same name later in this same
+        // call sees the entry already there and leaves it alone: the value one level up is
+        // the value the *first* shadow overwrote, and every later scope must reveal that one.
+        shadow_snapshot.entry(name.clone()).or_insert_with(|| {
+            (
+                resolved.get(&name).copied(),
+                local_types.get(&name).cloned(),
+            )
+        });
         let scoped_resolve_value = |path: &syn::Path| {
             path.get_ident()
                 .map(ident_name)
@@ -3986,6 +4031,28 @@ const MAX_WHILE_LOOP_ITERATIONS: u32 = 4096;
 /// `evaluate_block`, would otherwise resolve the rest of the block from a `resolved` map the
 /// loop never actually finished mutating, which is a wrong answer rather than an unresolved
 /// one.
+///
+/// Codex's finding: a name the body's own `let` statements bind directly is that body's
+/// own lexical scope, which ends when the body does — but `resolve_block_sequential` was
+/// handed the *outer* `resolved`/`local_types` maps directly, with nothing to end that
+/// scope at the body's own closing brace. A body that shadows an outer mutable local (`let
+/// mut x = 1u8; while x > 0 { x -= 1; let x = 1u8; let _ = x; }`) left the shadow's value
+/// sitting in `resolved` under the *outer* name after the statement that declared it should
+/// have gone out of scope, so every later iteration's condition read the shadow instead of
+/// the mutation right before it — turning a loop real Rust runs once into one this function
+/// could never see converge.
+///
+/// A snapshot taken once *before* the whole body runs and restored once after is not this
+/// fix, and was tried and rejected: it cannot tell a shadow's overwrite apart from a
+/// mutation's, since both write through the identical map entry, so restoring to the
+/// pre-body value undoes the mutation (`x -= 1`) as well as the shadow — the reproduction
+/// above needs the mutation to survive and the shadow not to. What is threaded through
+/// [`resolve_block_sequential`] and [`resolve_sequential_let`] instead is a `shadow_snapshot`
+/// map that each `let` statement writes to, once per name, only the *first* time that name
+/// is bound during this one call — capturing the value a mutation earlier in this same body
+/// left behind, immediately before the shadow overwrites it. Restoring from that map after
+/// the body returns reveals exactly that value, however many times the name was re-shadowed
+/// afterward, and a name no statement in the body ever binds is never in it at all.
 fn evaluate_while_loop(
     while_expr: &syn::ExprWhile,
     resolve: &Resolve<'_>,
@@ -4024,9 +4091,56 @@ fn evaluate_while_loop(
         if condition == 0 {
             return Some(());
         }
-        resolve_block_sequential(&while_expr.body, resolve, local_types, resolved)?;
+        let mut shadow_snapshot = std::collections::HashMap::new();
+        resolve_block_sequential(
+            &while_expr.body,
+            resolve,
+            local_types,
+            resolved,
+            &mut shadow_snapshot,
+        )?;
+        restore_shadow_snapshot(local_types, resolved, shadow_snapshot);
     }
     None
+}
+
+/// `resolve_block_sequential`'s own `shadow_snapshot` — every name a `let` statement in the
+/// walked block binds, mapped to the `(value, type)` it answered with the moment *before*
+/// this call's first shadow of that name, so a caller whose own scope ends where the call's
+/// block does — [`evaluate_while_loop`]'s body, or a bare nested block statement — can undo
+/// exactly that block's own `let`s once its lexical scope ends. A name no `let` in the block
+/// binds is never a key here, which is what lets [`evaluate_block`]'s own top-level call
+/// discard this map entirely: nothing it could name would ever need undoing.
+type ShadowSnapshot = std::collections::HashMap<String, (Option<i128>, Option<String>)>;
+
+/// Undoes exactly what `shadow_snapshot` recorded: every name in it goes back to the value
+/// and type it held immediately before the block that produced this snapshot shadowed it —
+/// removed outright if it held none, the standing a name only that block's own `let`s ever
+/// introduced already has. Factored out because [`evaluate_while_loop`] applies this once
+/// per iteration and a bare nested block statement applies it once for the one time it runs.
+fn restore_shadow_snapshot(
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+    shadow_snapshot: ShadowSnapshot,
+) {
+    for (name, (value, ty)) in shadow_snapshot {
+        match value {
+            Some(value) => {
+                resolved.insert(name.clone(), value);
+            }
+            None => {
+                resolved.remove(&name);
+            }
+        }
+        match ty {
+            Some(ty) => {
+                local_types.insert(name, ty);
+            }
+            None => {
+                local_types.remove(&name);
+            }
+        }
+    }
 }
 
 fn resolve_block_sequential(
@@ -4034,6 +4148,7 @@ fn resolve_block_sequential(
     resolve: &Resolve<'_>,
     local_types: &mut std::collections::HashMap<String, String>,
     resolved: &mut std::collections::HashMap<String, i128>,
+    shadow_snapshot: &mut ShadowSnapshot,
 ) -> Option<()> {
     for stmt in &block.stmts {
         if stmt_is_cfg_test(stmt) {
@@ -4046,7 +4161,7 @@ fn resolve_block_sequential(
             if init.diverge.is_some() {
                 continue;
             }
-            resolve_sequential_let(local, init, resolve, local_types, resolved);
+            resolve_sequential_let(local, init, resolve, local_types, resolved, shadow_snapshot);
             continue;
         }
         let syn::Stmt::Expr(expr, semi) = stmt else {
@@ -4065,6 +4180,27 @@ fn resolve_block_sequential(
         if let syn::Expr::While(while_expr) = strip_parens(expr) {
             evaluate_while_loop(while_expr, resolve, local_types, resolved)?;
             continue;
+        }
+        // Codex's finding: a bare `{ .. }` block statement needs no trailing semicolon
+        // either, and is a nested lexical scope of its own the identical way a `while`
+        // body is — a `let` inside it must not survive past its own closing brace. A
+        // labelled block (`'a: { .. }`) is excluded, since a `break 'a value;` inside it
+        // can produce a value from a control-flow path this scan does not trace; an
+        // unlabelled one only ever falls through, so running its statements in order and
+        // then restoring what it shadowed is the whole of what it does.
+        if let syn::Expr::Block(nested) = strip_parens(expr) {
+            if nested.label.is_none() {
+                let mut nested_snapshot = ShadowSnapshot::new();
+                resolve_block_sequential(
+                    &nested.block,
+                    resolve,
+                    local_types,
+                    resolved,
+                    &mut nested_snapshot,
+                )?;
+                restore_shadow_snapshot(local_types, resolved, nested_snapshot);
+                continue;
+            }
         }
         if semi.is_none() {
             continue;
@@ -4181,11 +4317,15 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // binds no new name either, and until it was added here `rest` counted a loop statement
     // that neither side of this sum accounted for at all, refusing the whole block regardless
     // of whether `resolve_block_sequential` below could actually run the loop.
+    // `block_nested_block_statement_count` is the identical gap one syntax over: a bare
+    // `{ .. }` statement binds no name at the outer scope either, and was counted by neither
+    // side of this sum until now.
     if rest.len()
         != const_item_count
             + block_let_statement_count(block)
             + block_mutation_statement_count(block)
             + block_while_statement_count(block)
+            + block_nested_block_statement_count(block)
             + ignored_lets
     {
         return None;
@@ -4199,7 +4339,18 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // order-independent fixed point (correct for `const` items alone) has no room for, so
     // the two statement kinds are walked together afterward, in the order they actually
     // execute.
-    resolve_block_sequential(block, resolve, &mut local_types, &mut resolved)?;
+    //
+    // The shadow snapshot is discarded here on purpose: `block` is this call's own whole
+    // scope, so a shadow it introduces is meant to stay in effect for `tail_expr` below,
+    // which sits inside the same block. Only a re-executed nested scope — a `while` body,
+    // in `evaluate_while_loop` — needs the snapshot back to undo it once that scope ends.
+    resolve_block_sequential(
+        block,
+        resolve,
+        &mut local_types,
+        &mut resolved,
+        &mut ShadowSnapshot::new(),
+    )?;
     let block_resolve_value = |path: &syn::Path| {
         path.get_ident()
             .map(ident_name)
