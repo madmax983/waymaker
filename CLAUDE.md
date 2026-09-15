@@ -5810,5 +5810,19 @@ nested parents a second `super` would need, and a deeper chain is left the same 
 `resolve_segments_from` — the deterministic resolver sharing this exact limitation — already
 has. `a_super_qualified_alias_target_reached_through_module_descent_does_not_count` and its
 control, `a_super_qualified_alias_target_that_really_reaches_the_target_still_counts`, are
-the regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+the regression.
+
+A further round found an eighth, and it is a missed count again: module descent only ever
+read the *enclosing scope's* own items — `items`, from `stack`/`entered` — never
+`block_items`, so a `mod` declared directly inside a function body was invisible to it,
+even though a block-local *alias* of the same name was already tried right beside it.
+Confirmed against real `rustc`: a block-local `mod` really is qualifiable from within its
+own body. `own_modules` is generalized to take any `&syn::Item` iterator, the way
+`own_aliases` already was (issue #92's post-merge review), so
+`try_block_local_candidates` can search `block_items` for a same-named `mod` the moment a
+block-local alias branch does not pan out — mirroring the outer scope's own
+alias-then-module order, and unable to rule either out under an unevaluated `cfg` any more
+than two aliases can rule each other out. `a_block_local_module_is_searched_for_a_qualified_path_head`
+and its control, `a_block_local_module_does_not_count_an_unrelated_name`, are the
+regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
 rule id.

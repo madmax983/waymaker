@@ -997,9 +997,11 @@ fn own_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAli
 /// resolving there. An out-of-line declaration (`mod name;`) has no body
 /// here to step into, and a `#[cfg(test)]` module is skipped — the same
 /// reason `own_aliases` skips one (issue #51).
-fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
+fn own_modules<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+) -> Vec<(String, &'a [syn::Item])> {
     items
-        .iter()
+        .into_iter()
         .filter(|item| !has_cfg_test(item_attrs(item)))
         .filter_map(|item| match item {
             syn::Item::Mod(module) => module
@@ -5207,6 +5209,122 @@ fn try_alias_candidates<'a>(
     false
 }
 
+/// [`segments_could_reach_target`]'s block-local module search — split out to
+/// stay under this file's own line-count lint. `None` when no block-local
+/// module is named `first`, so the caller can tell "nothing claimed this
+/// name" apart from "something claimed it and none of the branches reached
+/// `target`" — the same distinction [`try_alias_candidates`]'s own empty
+/// candidate list already lets a caller read from `resolved_elsewhere`.
+#[allow(clippy::too_many_arguments)]
+fn try_block_module_candidates<'a>(
+    block_items: &[&'a syn::Item],
+    first: &str,
+    remaining: &[String],
+    stack: &[&'a [syn::Item]],
+    scope: usize,
+    innermost_scope: usize,
+    target: &str,
+    budget: &mut usize,
+    cache: &mut AliasLookupCache<'a>,
+) -> Option<bool> {
+    let block_modules: Vec<&'a [syn::Item]> = own_modules(block_items.iter().copied())
+        .into_iter()
+        .filter(|(name, _)| name == first)
+        .map(|(_, module_items)| module_items)
+        .collect();
+    if block_modules.is_empty() {
+        return None;
+    }
+    Some(block_modules.into_iter().any(|module_items| {
+        segments_could_reach_target(
+            remaining.to_vec(),
+            stack,
+            scope,
+            Some(module_items),
+            block_items,
+            innermost_scope,
+            false,
+            false,
+            target,
+            budget,
+            cache,
+        )
+    }))
+}
+
+/// [`segments_could_reach_target`]'s own block-local search — split out to
+/// stay under this file's own line-count lint. Tries a block-local alias
+/// named `first`, then — since neither rules the other out under an
+/// unevaluated `cfg` — a block-local `mod` of the same name.
+///
+/// `Some(true)` once either reaches `target`; `Some(false)` when at least
+/// one candidate of either kind exists but none reaches it, so the caller
+/// still marks `first` as claimed; `None` when nothing block-local names
+/// `first` at all. A block-local alias's own target stays `block_eligible`,
+/// since it can itself chain through a further block-local hop — see
+/// [`segments_could_reach_target`]'s own docs.
+#[allow(clippy::too_many_arguments)]
+fn try_block_local_candidates<'a>(
+    block_items: &[&'a syn::Item],
+    first: &str,
+    rest: &[String],
+    stack: &[&'a [syn::Item]],
+    scope: usize,
+    entered: Option<&'a [syn::Item]>,
+    innermost_scope: usize,
+    block_eligible: bool,
+    target: &str,
+    budget: &mut usize,
+    cache: &mut AliasLookupCache<'a>,
+) -> Option<bool> {
+    let block_candidates: Vec<UseAlias> = own_aliases(block_items.iter().copied())
+        .into_iter()
+        .filter(|candidate| candidate.local == first)
+        .collect();
+    let mut claimed = !block_candidates.is_empty();
+    if try_alias_candidates(
+        block_candidates,
+        rest,
+        stack,
+        scope,
+        entered,
+        block_items,
+        innermost_scope,
+        block_eligible,
+        target,
+        budget,
+        cache,
+    ) {
+        return Some(true);
+    }
+    // A `mod` declared directly inside a function body is legal Rust,
+    // qualifiable from within that same body — confirmed against real
+    // `rustc` — and visible only here, the same reach a block-local alias
+    // has (issue #197, Codex review of the PR: module descent read only
+    // the enclosing scope's own items, so a block-local `mod` was invisible
+    // to it even though a block-local alias of the same name was already
+    // tried). A one-segment path names an item, not a module to step into.
+    if !rest.is_empty() {
+        if let Some(reached) = try_block_module_candidates(
+            block_items,
+            first,
+            rest,
+            stack,
+            scope,
+            innermost_scope,
+            target,
+            budget,
+            cache,
+        ) {
+            claimed = true;
+            if reached {
+                return Some(true);
+            }
+        }
+    }
+    claimed.then_some(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn segments_could_reach_target<'a>(
     mut segments: Vec<String>,
@@ -5279,31 +5397,27 @@ fn segments_could_reach_target<'a>(
     // though the module descent below had already shown it does not).
     let mut resolved_elsewhere = false;
 
-    // Block-local aliases are not cached: `block_items` has no one contiguous
-    // scope to key a cache entry on, and it is small — one construction site's
-    // own enclosing blocks. Not shadow-gated — see this function's own docs. A
-    // block-local alias's own target stays `block_eligible`, since it can chain
-    // through a further block-local hop.
+    // Block-local aliases and modules are not cached: `block_items` has no
+    // one contiguous scope to key a cache entry on, and it is small — one
+    // construction site's own enclosing blocks. Not shadow-gated — see this
+    // function's own docs.
     if block_applies {
-        let block_candidates: Vec<UseAlias> = own_aliases(block_items.iter().copied())
-            .into_iter()
-            .filter(|candidate| candidate.local == first)
-            .collect();
-        resolved_elsewhere |= !block_candidates.is_empty();
-        if try_alias_candidates(
-            block_candidates,
+        match try_block_local_candidates(
+            block_items,
+            &first,
             rest,
             stack,
             scope,
             entered,
-            block_items,
             innermost_scope,
             block_eligible,
             target,
             budget,
             cache,
         ) {
-            return true;
+            Some(true) => return true,
+            Some(false) => resolved_elsewhere = true,
+            None => {}
         }
     }
 
@@ -15419,6 +15533,54 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_module_is_searched_for_a_qualified_path_head() {
+        // Codex review of PR #204: module descent only ever read the
+        // enclosing scope's own items — never `block_items` — so a `mod`
+        // declared directly inside a function body was invisible to it,
+        // even though a block-local alias of the same name was already
+        // tried. Confirmed against real `rustc`: a block-local `mod` really
+        // can be qualified from within its own function.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   mod traits {\n\
+             \x20       pub type Marker = CheckedDispatch;\n\
+             \x20   }\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   use decoy as traits;\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_module_does_not_count_an_unrelated_name() {
+        // The control for the test above: the same block-local module,
+        // asked about a name it never constructs.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   mod traits {\n\
+             \x20       pub type Marker = CheckedDispatch;\n\
+             \x20   }\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   use decoy as traits;\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "Unrelated",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 }
 
