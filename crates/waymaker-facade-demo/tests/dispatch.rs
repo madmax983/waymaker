@@ -58,13 +58,6 @@ const URL: &[u8] = b"fw://a";
 /// media and the scan still passed. A name that fits is a scan that can fail.
 const DOWNLOAD_NAME: &str = "dl";
 
-/// A payload no test expects to find on media.
-///
-/// `Wired::run` writes this only on a path `Context::conclude` never reads: an outstanding
-/// effect always answers `DriveError::EffectOutstanding` first. See `Wired::run`'s own
-/// comment.
-const UNREACHED: &[u8] = &[254];
-
 /// A four-byte result bound under an eight-byte terminal bound.
 ///
 /// The two differ on purpose: the context buffer is the wider of them, so "wider than the
@@ -201,30 +194,32 @@ impl Workflow for Wired {
     }
 
     fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-        let ended = {
+        let (ended, suspended) = {
             let mut bridge = Bridge::over(boundary);
             let mut ctx = Ctx::new(&mut bridge, &mut self.table, &mut self.out);
             let polled = {
                 let mut future = pin!(work(&mut ctx));
                 future.as_mut().poll(&mut Task::from_waker(Waker::noop()))
             };
-            match (ctx.conclusion(), polled) {
+            let ended = match (ctx.conclusion(), polled) {
                 (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => Some(bytes.len()),
                 (Some(Conclusion::Ended(Outcome::Failed(_)) | Conclusion::Refused), _)
                 | (None, Poll::Pending) => None,
                 (None, Poll::Ready(_)) => Some(0),
-            }
+            };
+            // Read after `ctx`'s last use: the same `Suspended` the boundary returned, not
+            // a fresh one -- see `facade`'s module doc.
+            (ended, bridge.take_suspended())
         };
         let Some(len) = ended else {
             // `work` always ends the run, and its payload always fits. This arm was once
             // unreachable for that reason. Issue #111 opened it: an unserviceable kind can
             // now leave `ctx.conclusion()` at `None` with the world never stalling at all.
-            // This bridge has no real `Suspended` to answer with on that path, so it
-            // answers `Ok(Outcome::Failed(UNREACHED))`. `Context::conclude` reads its own
-            // `pending` field before it reads this value. An outstanding effect there
-            // answers `DriveError::EffectOutstanding` instead. `UNREACHED` never reaches
-            // media either way.
-            return Ok(Outcome::Failed(UNREACHED));
+            // `suspended` is the real value whenever a boundary call produced one; a
+            // dispatcher still working produces none, so this falls back to the one
+            // `Suspended` named for that, the same way `ota.rs`'s own bridge does -- see
+            // `Suspended::awaiting_dispatch`.
+            return Err(suspended.unwrap_or_else(Suspended::awaiting_dispatch));
         };
         Ok(Outcome::Completed(self.out.get(..len).unwrap_or_default()))
     }
@@ -648,18 +643,26 @@ const NO_ROWS: &[Activity<World, Offline>] = &[];
 #[test]
 fn a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_left_outstanding() {
     // Boot 1, over real media. No row answers `DOWNLOAD`. The schedule record commits, and
-    // nothing else does. `Wired::run` has no real `Suspended` for a stall the dispatcher
-    // never reports back to the driver, so it cannot answer `Progress::Waiting` here. The
-    // driver's own `pending` check answers `EffectOutstanding` instead. What matters is on
-    // media, not in this return value.
+    // nothing else does. `Wired::run` reads the real `Suspended` the bridge kept from the
+    // boundary's own last call -- here, none, because the stall never reached a boundary
+    // call at all -- and falls back to `Suspended::awaiting_dispatch`, the same way
+    // `ota.rs`'s own bridge does. The driver's own `pending` check sees the effect
+    // outstanding and a real suspension rather than a workflow outcome, so the boot answers
+    // `Progress::Waiting` cleanly rather than `DriveError::EffectOutstanding`.
     let mut device = Device::new(geometry());
     let mut stranded = Wired::with_rows(World::default(), NO_ROWS);
 
     let progress = boot(&mut device, &mut stranded);
 
-    assert!(
-        matches!(progress, Err(DriveError::EffectOutstanding)),
-        "{progress:?}"
+    assert_eq!(
+        progress,
+        Ok(Progress::Waiting {
+            id: EffectId {
+                run: RUN,
+                seq: EffectSeq(0),
+            },
+        }),
+        "boot 1 stalls cleanly rather than erroring: {progress:?}"
     );
     assert!(stranded.world().dispatched.is_empty(), "no row ran");
     assert_eq!(

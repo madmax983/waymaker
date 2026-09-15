@@ -92,16 +92,15 @@ the same claim over real media: a table with no row commits a schedule record an
 nothing else; a second boot, over the same device, with a table that has the row, redelivers
 and completes it.
 
-That second test surfaces a rough edge worth naming rather than hiding. Its own `Wired::run`
-bridges the async façade through `waymaker-drive`'s synchronous `Boundary`, and that bridge
-has no way to build a real `Suspended` for a stall the async dispatcher never reports back to
-the driver. So the first boot's `Driver::boot` answers `Err(DriveError::EffectOutstanding)`
-rather than `Ok(Progress::Waiting)` — a driver-level refusal rather than the wait a real
-caller would want to see. What the test actually proves does not rest on that return value:
-the journal on real media holds a schedule record and nothing else, and the second boot's
-redelivery and completion are what settle the claim. Closing this rough edge belongs to issue
-[#110](https://github.com/madmax983/waymaker/issues/110), which joins the async dispatcher to
-a real executor; it is not `waymaker-embassy`'s to close.
+That second test's first boot answers `Ok(Progress::Waiting)`, the clean stall a real caller
+wants to see. Its own `Wired::run` bridges the async façade through `waymaker-drive`'s
+synchronous `Boundary` the same way `ota.rs`'s `Downloader::run` does: it keeps the real
+`Suspended` the boundary returned on its last call, and falls back to
+`Suspended::awaiting_dispatch()` on the one path with no boundary call behind it at all — a
+dispatcher that answers `Produced::Unserviceable` with no journal call in between. An earlier
+version of this test believed the bridge had no such fallback and asserted
+`Err(DriveError::EffectOutstanding)` instead; that was wrong about the bridge, which already
+had the mechanism `ota.rs` uses, and Codex found it on review of this change.
 
 **The code-flash cost is nil.** `cargo xtask size`'s `facade` row measures **13174 B** of
 layers both before and after this change. Removing `Unhandled`'s wrapping paid for handling
@@ -129,6 +128,30 @@ moved a run's terminal/continued flag out of `TerminalFuture` and `ContinueFutur
 `an_unserviceable_kind_is_not_a_retry_after_the_future_is_dropped_and_recreated` drives the
 second future to `Poll::Pending` and asserts both the dispatcher and the journal saw the
 first `schedule` call and nothing after it.
+
+A third Codex round found the flag was still read in only one place. `waymaker-drive`'s
+boundary refuses a *second* boundary call while `Context`'s own `pending` field names an
+effect the workflow's last `run()` did not itself suspend over — `schedule`, `decide_timer`
+and `decide_gate` each set a hard `Stop::Failed(DriveError::EffectOutstanding)` when they see
+it, and `Context::conclude` answers the same way when `run()` returns `Ok(Outcome)` while
+`pending` is still `Some`. A workflow that met `Produced::Unserviceable` on one boundary and
+then asked for a different one on the same boot — a `ctx.timer()`, a `ctx.complete()`, a
+`ctx.continue_as_new()` — would reach exactly that: the still-outstanding effect turns a
+clean stall into a hard boot error, the very failure this ADR's mechanism exists to prevent
+for the boundary that actually met `Unserviceable`. `TimerFuture`, `ContinueFuture` and
+`TerminalFuture` now each carry the same `&'b bool` `Ctx` already gave `ActivityFuture`, and
+each refuses to reach the journal or record a conclusion once it is set — the same shape as
+`ActivityFuture`'s own first check, propagated to the three futures that had not needed it
+before this issue. Three tests in `crates/waymaker-embassy/tests/ctx.rs` —
+`an_unserviceable_kind_stops_a_timer_future_built_after_it_from_reaching_the_journal`,
+`an_unserviceable_kind_stops_continue_as_new_from_reaching_the_journal`, and
+`an_unserviceable_kind_stops_a_terminal_future_from_recording_a_conclusion` — each drive an
+activity to `Produced::Unserviceable` and then build one of the other three futures on the
+same `Ctx`, asserting the journal is asked nothing further and, for the terminal future, that
+`Ctx::conclusion` still answers `None`. Three `&'b bool` fields, one per future, moved the
+`facade` row from 13114 B to **13122 B** of the 14336 B gate — the second and third rounds'
+combined cost, against the first round's own claim of nil, which was true only of that
+round's own diff.
 
 ## Alternatives considered
 

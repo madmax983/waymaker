@@ -184,6 +184,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
         TimerFuture {
             journal: self.journal,
             concluded: &self.closed,
+            unserviceable: &self.unserviceable,
             spec,
             ended: false,
         }
@@ -198,6 +199,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
         ContinueFuture {
             journal: self.journal,
             closed: &mut self.closed,
+            unserviceable: &self.unserviceable,
             input,
         }
     }
@@ -224,6 +226,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
         TerminalFuture {
             out: self.out,
             closed: &mut self.closed,
+            unserviceable: &self.unserviceable,
             bytes,
             failed,
             error: PhantomData,
@@ -435,6 +438,12 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
 pub struct TimerFuture<'b, J: Journal> {
     journal: &'b mut J,
     concluded: &'b Option<Closed>,
+    /// Set on the `Ctx` once a dispatcher has answered [`Produced::Unserviceable`] for a
+    /// still-outstanding effect. `waymaker-drive`'s boundary refuses a second boundary while
+    /// one effect is unresolved (`DriveError::EffectOutstanding`), so a timer future built
+    /// after that stop must not reach the journal at all -- it would turn a clean stall into
+    /// a hard boot error. Issue #111, round 3.
+    unserviceable: &'b bool,
     spec: TimerSpec,
     ended: bool,
 }
@@ -444,7 +453,7 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if me.ended || me.concluded.is_some() {
+        if me.ended || me.concluded.is_some() || *me.unserviceable {
             return Poll::Pending;
         }
         // The deadline is asked again on every poll until it passes. Ending here would make
@@ -472,6 +481,10 @@ impl<J: Journal> Future for TimerFuture<'_, J> {
 pub struct ContinueFuture<'b, J: Journal> {
     journal: &'b mut J,
     closed: &'b mut Option<Closed>,
+    /// See [`TimerFuture::unserviceable`]. A `continue_as_new` reaching the journal while an
+    /// effect is still outstanding meets the same hard `EffectOutstanding` refusal a timer
+    /// would.
+    unserviceable: &'b bool,
     input: &'b [u8],
 }
 
@@ -480,7 +493,7 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if me.closed.is_none() {
+        if me.closed.is_none() && !*me.unserviceable {
             let Halted = me.journal.continue_as_new(me.input);
             *me.closed = Some(Closed::Continued);
         }
@@ -513,6 +526,12 @@ impl<J: Journal> Future for ContinueFuture<'_, J> {
 pub struct TerminalFuture<'b, E> {
     out: &'b mut [u8],
     closed: &'b mut Option<Closed>,
+    /// See [`TimerFuture::unserviceable`]. This future records no journal call itself, but
+    /// recording a conclusion here while an effect is still outstanding would let
+    /// [`Ctx::conclusion`] report a run that ended while `waymaker-drive`'s boundary still
+    /// holds the effect pending -- the same `Ok(Outcome)`-while-`pending.is_some()` shape
+    /// its own `Context::conclude` refuses as `EffectOutstanding`.
+    unserviceable: &'b bool,
     bytes: &'b [u8],
     failed: bool,
     error: PhantomData<fn() -> E>,
@@ -523,7 +542,7 @@ impl<E> Future for TerminalFuture<'_, E> {
 
     fn poll(self: Pin<&mut Self>, _task: &mut Task<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
-        if me.closed.is_none() {
+        if me.closed.is_none() && !*me.unserviceable {
             // Refused rather than truncated when it does not fit: a short terminal record
             // replays for ever. The refusal is recorded, so the caller cannot read it as a
             // run that never ended and complete it with nothing.
