@@ -2282,6 +2282,88 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
     Ok(declared.then_some(derives))
 }
 
+/// Whether any struct, enum or union `contents` declares derives something this
+/// module cannot rule out as one of Rust's own nine derivable traits.
+///
+/// Checked at module scope and at any depth of inline-module nesting. Found by
+/// Codex review of this change (PR #143), round 40: a procedural derive
+/// macro is not obliged to emit an implementation only for the trait its own name
+/// suggests, or only for the type it is attached to — `#[derive(Evil)] struct
+/// Helper;` anywhere in a production-reachable file can expand to `impl Clone for
+/// crate::recovery::Recovery` exactly as freely as a derive placed directly on
+/// `Recovery` itself, because a derive macro receives the whole item as input and
+/// emits whatever tokens it likes. [`struct_derives`] only ever validates the
+/// *pinned* type's own derive list, in the one file it is declared in; this walks
+/// every other struct, enum and union the same file declares and asks the same
+/// question of each, with the same `push_resolved_names` logic and the same
+/// fail-closed answer for a name this scan cannot vouch for.
+///
+/// Scoped to module-level and inline-module-nested declarations, matching
+/// `collect_trait_implementors`'s own module-boundary alias threading — an
+/// out-of-line child module is a separate file this function's own caller calls it
+/// on again, exactly as `trait_implementors_for_pinned_type` already is. A
+/// block-local struct, enum or union (declared inside a function body) is not
+/// walked; closing that narrower residual needs the same block-scoped descent
+/// `collect_trait_implementors_in_block` carries for a handwritten `impl`, which
+/// this module-scoped check does not yet share.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn unresolved_derive_elsewhere(contents: &str) -> Result<bool, syn::Error> {
+    let file = parse_rust(contents)?;
+    let mut aliases = module_scope_aliases(&file.items);
+    aliases.extend(glob_marker_alias(&file.items));
+    Ok(any_unresolved_derive_in_scope(&file.items, &aliases))
+}
+
+fn any_unresolved_derive_in_scope(items: &[syn::Item], aliases: &[UseAlias]) -> bool {
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Struct(found) => {
+                if any_unresolved_derive(&found.attrs, aliases) {
+                    return true;
+                }
+            }
+            syn::Item::Enum(found) => {
+                if any_unresolved_derive(&found.attrs, aliases) {
+                    return true;
+                }
+            }
+            syn::Item::Union(found) => {
+                if any_unresolved_derive(&found.attrs, aliases) {
+                    return true;
+                }
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = module.content.as_ref() {
+                    // Round 20's own reason: a `mod { .. }` block is a real scope
+                    // boundary, so this module's aliases are built fresh from its own
+                    // scope rather than inherited from the caller's.
+                    let mut module_aliases = module_scope_aliases(nested);
+                    module_aliases.extend(glob_marker_alias(nested.iter()));
+                    if any_unresolved_derive_in_scope(nested, &module_aliases) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn any_unresolved_derive(attrs: &[syn::Attribute], aliases: &[UseAlias]) -> bool {
+    let mut derives = Vec::new();
+    for attr in attrs {
+        collect_derive_names_from_meta(&attr.meta, aliases, &mut derives);
+    }
+    derives.iter().any(|name| name == UNRESOLVED_DERIVE)
+}
+
 /// Whether `contents` invokes a macro anywhere it could expand to an item, at any
 /// nesting depth.
 ///
@@ -2459,11 +2541,24 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         // to see it. Reparsing every whitelisted macro's own grammar is not this
         // module's to do — `assert!`, `matches!` and `write!` each take a different
         // shape of arguments, one of them a pattern rather than an expression at all
-        // — so instead of trying, [`token_stream_contains_a_brace_group`] refuses the
+        // — so instead of trying, [`token_stream_hides_a_possible_item`] refuses the
         // one thing every one of them shares: only a brace-delimited group can open a
         // block, and only a block can carry an item statement, so a whitelisted
         // macro's own tokens are trusted only when they carry no brace group at all,
         // at any depth.
+        //
+        // Round 40: a brace is not the only way one of these tokens can reach an item
+        // this scan cannot see. `#[allow(non_local_definitions)] const _: () =
+        // assert!(evil!());`, where `evil!` is an ordinary (non-whitelisted) macro
+        // that expands to `{ impl Clone for super::Recovery { .. } true }`, carries no
+        // brace anywhere in `assert!`'s own tokens — only `evil`, `!` and an empty
+        // `(..)` group, since `evil!()`'s own expansion is exactly as opaque to `syn`
+        // as any other macro's, and this scan never expands it to see the brace one
+        // level down. `token_stream_hides_a_possible_item` now also refuses any
+        // further macro invocation nested in a whitelisted macro's own tokens, at any
+        // depth: an identifier immediately followed by `!` and a delimited group is
+        // one, whichever delimiter it uses, and a nested invocation this scan does not
+        // itself recognize as safe is exactly as untrustworthy as a bare brace.
         // Round 36: a macro used as a *tail* expression still carries its own
         // attributes on this node — `fn helper() { #[cfg(test)] make_clone!() }` is
         // legal Rust whose macro is removed from every non-test build exactly like a
@@ -2483,7 +2578,7 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
             });
             if shadowed
                 || !is_known_safe_expression_macro(&node.mac.path)
-                || token_stream_contains_a_brace_group(node.mac.tokens.clone())
+                || token_stream_hides_a_possible_item(node.mac.tokens.clone())
             {
                 self.found = true;
             }
@@ -2637,10 +2732,11 @@ fn is_known_safe_attribute_path(path: &syn::Path) -> bool {
 /// change (PR #143), round 39: `include_str!` and `include_bytes!` can only ever
 /// produce a string or byte-string literal — their result is never parsed as Rust at
 /// all — but `include!` splices the *named file's own tokens* in as Rust source, and
-/// [`token_stream_contains_a_brace_group`]'s brace scan reads only the invocation's own
+/// [`token_stream_hides_a_possible_item`]'s scan reads only the invocation's own
 /// arguments, which for `include!("clone.inc")` is a single string literal with no
-/// brace in it anywhere. The file `"clone.inc"` names is never opened by this per-file
-/// scan — the same blind spot an out-of-line `mod name;` has — so
+/// brace or nested macro invocation in it anywhere. The file `"clone.inc"` names is
+/// never opened by this per-file scan — the same blind spot an out-of-line `mod name;`
+/// has — so
 /// `const _: () = include!("clone.inc");` in a production-reachable file, where
 /// `clone.inc` holds `{ impl Clone for Recovery { .. }; 0 }`, walked past this check
 /// unseen. No source in this workspace calls bare `include!` in expression position, so
@@ -2736,24 +2832,41 @@ fn shadowed_expression_macro_names(file: &syn::File) -> std::collections::HashSe
     visitor.shadowed
 }
 
-/// Whether `tokens` contains a brace-delimited group anywhere, at any depth.
+/// Whether `tokens` contains a brace-delimited group, or what looks like a nested
+/// macro invocation, anywhere at any depth.
 ///
 /// A macro invocation's own arguments are an opaque [`proc_macro2::TokenStream`] to
 /// `syn`'s visitor — it is never parsed into structured syntax the way an item, a
-/// statement or an ordinary expression is — so this is the one thing this module can
-/// still check about a whitelisted expression macro's own tokens without reparsing each
+/// statement or an ordinary expression is — so this is what this module can still
+/// check about a whitelisted expression macro's own tokens without reparsing each
 /// macro's own grammar: only a `{ .. }` group can open a block, and only a block can
-/// carry an item statement, so tokens with no brace group anywhere cannot hide one.
-/// Round 35 of Codex review on this change (PR #143).
-fn token_stream_contains_a_brace_group(tokens: proc_macro2::TokenStream) -> bool {
-    tokens.into_iter().any(|tree| match tree {
+/// carry an item statement, so tokens with no brace group anywhere cannot hide one
+/// directly (round 35 of Codex review on this change, PR #143).
+///
+/// Round 40 found the same hole one level of expansion down: an identifier
+/// immediately followed by `!` and a delimited group — `evil!()`, `evil!{}` or
+/// `evil![]`, whichever delimiter it uses — is a nested macro invocation, and its own
+/// expansion is exactly as opaque to `syn` as the outer, whitelisted macro's is.
+/// `assert!(evil!())` carries no brace anywhere in `assert!`'s own tokens at all, only
+/// in whatever `evil!`'s unexpandable expansion would occupy, so the brace scan alone
+/// passed a real `impl Clone for Recovery` hidden one macro deeper. A path of more
+/// than one segment (`crate::evil!()`) is still caught: the check only needs the last
+/// identifier before the `!`, whatever qualifies it.
+fn token_stream_hides_a_possible_item(tokens: proc_macro2::TokenStream) -> bool {
+    let trees: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+    trees.iter().enumerate().any(|(index, tree)| match tree {
         proc_macro2::TokenTree::Group(group) => {
             group.delimiter() == proc_macro2::Delimiter::Brace
-                || token_stream_contains_a_brace_group(group.stream())
+                || token_stream_hides_a_possible_item(group.stream())
         }
-        proc_macro2::TokenTree::Ident(_)
-        | proc_macro2::TokenTree::Punct(_)
-        | proc_macro2::TokenTree::Literal(_) => false,
+        proc_macro2::TokenTree::Ident(_) => matches!(
+            (trees.get(index + 1), trees.get(index + 2)),
+            (
+                Some(proc_macro2::TokenTree::Punct(bang)),
+                Some(proc_macro2::TokenTree::Group(_)),
+            ) if bang.as_char() == '!',
+        ),
+        proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => false,
     })
 }
 

@@ -2232,6 +2232,39 @@ fn recovery_reachable_file_is_clone_free(
             ),
         ));
     }
+    // Round 40 of Codex review on this change (PR #143): a procedural derive macro
+    // named on *any* struct, enum or union this file declares — not only `Recovery`
+    // itself — can expand to `impl Clone for Recovery` regardless of what it is
+    // ostensibly deriving for, since a derive macro receives the whole item and emits
+    // whatever tokens it likes. `struct_derives`, below, only ever asks this question
+    // of `Recovery`'s own declaration in the one file that pins it; this asks it of
+    // every other declaration this file reaches.
+    match crate::parse::unresolved_derive_elsewhere(contents) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} derives something, on a type other than `{RECOVERY_TYPE}`, \
+                     through a name this scan could not resolve to one of Rust's own \
+                     derivable traits — a procedural derive macro is not confined to \
+                     the type it is attached to, so whether it generates a `Clone` impl \
+                     for `{RECOVERY_TYPE}` cannot be ruled out"
+                ),
+            ));
+        }
+        Err(error) => {
+            return Some(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{path} does not parse, so whether it derives something that could \
+                     generate `Clone` for `{RECOVERY_TYPE}` cannot be checked: {error}"
+                ),
+            ));
+        }
+    }
     None
 }
 
@@ -14068,6 +14101,102 @@ mod tests {
                  pub struct Recovery;\n",
             ))
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_procedural_derive_on_an_unrelated_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 40: a procedural
+        // derive macro is not obliged to emit an implementation only for the trait
+        // its own name suggests, or only for the type it is attached to —
+        // `#[derive(Evil)] struct Helper;` anywhere in a production-reachable file
+        // can expand to `impl Clone for Recovery` exactly as freely as a derive
+        // placed directly on `Recovery` itself. `struct_derives` only ever
+        // validates `Recovery`'s own derive list; `Helper`'s was invisible to
+        // every check here.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "#[derive(Evil)]\npub struct Helper;\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_procedural_derive_on_an_unrelated_struct_in_a_nested_module_is_rejected() {
+        // The same finding one module deeper: a nested inline module's own struct
+        // is exactly as reachable a target for an unrecognized derive as one at
+        // the file's top level.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod nested {\n",
+                "    #[derive(Evil)]\n",
+                "    pub struct Helper;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn an_unrelated_structs_ordinary_derive_does_not_trip_the_recovery_pin() {
+        // The negative case beside the last two: an unrelated struct deriving one
+        // of the ordinary safe builtins, unaliased, must not be flagged — every
+        // production struct in this crate that is not `Recovery` still derives
+        // `Debug`, `PartialEq`, and the like.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("#[derive(Debug, PartialEq, Eq)]\n", "pub struct Helper;\n",)
+                .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_nested_macro_hidden_in_a_trusted_macros_own_arguments_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 40: `assert!(evil!())`
+        // carries no brace group anywhere in `assert!`'s own tokens — only `evil`,
+        // `!` and an empty `(..)` group — but `evil!` is an ordinary, unrecognized
+        // macro whose own (unexpandable) expansion could be `{ impl Clone for
+        // Recovery { .. } true }`. The brace scan alone missed a hidden macro
+        // invocation one level short of the brace it would have produced.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "const _: () = assert!(evil!());\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
         );
     }
 

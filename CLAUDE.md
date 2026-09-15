@@ -4231,6 +4231,39 @@ calling `.clone()` on the derived type and watching the macro's own `unreachable
 panic fire, the sharpest proof available that the import really does shadow the prelude
 derive.
 
+Round 40 found two more, both on the same commit round 39 was found on. The first is
+`struct_derives`'s own narrow scope: it validates only the *pinned* type's own derive
+list, in the one file that declares it, but a procedural derive macro is not obliged to
+emit an implementation only for the trait its own name suggests, or only for the type
+it is attached to — a derive macro receives the whole item as input and is free to emit
+whatever tokens it likes, so `#[derive(Evil)] struct Helper;` anywhere in a
+production-reachable file, naming a struct with nothing to do with `Recovery` at all,
+can expand to `impl Clone for crate::recovery::Recovery` exactly as freely as a derive
+on `Recovery` itself. A new `unresolved_derive_elsewhere` walks every other struct,
+enum and union a file declares — at module scope and at any depth of inline-module
+nesting, mirroring `collect_trait_implementors`'s own module-boundary alias threading —
+and asks the same question `push_resolved_names` already asks of the pinned type's own
+list, with the same fail-closed answer for a name this scan cannot vouch for. A
+block-local struct, enum or union is a narrower residual this round leaves open, noted
+in the function's own doc rather than chased here. The second is
+`token_stream_hides_a_possible_item`'s (formerly `token_stream_contains_a_brace_group`)
+own brace scan one macro deeper: `#[allow(non_local_definitions)] const _: () =
+assert!(evil!());`, where `evil!` is an ordinary, unrecognized macro that expands to
+`{ impl Clone for Recovery { .. } true }`, carries no brace anywhere in `assert!`'s own
+tokens at all — only `evil`, `!` and an empty `(..)` group — because the brace the
+check was built to catch sits one level down, in `evil!`'s own expansion, which is
+exactly as opaque to `syn` as the outer, whitelisted macro's is. The function now also
+refuses any further macro invocation nested in a whitelisted macro's own tokens, at any
+depth: an identifier immediately followed by `!` and a delimited group, whichever
+delimiter it uses. Both were verified against real compilation, and neither could be
+demonstrated inside `waymaker-flash` itself without the same external-dependency
+problem round 33 first ran into: the derive finding was shown with a standalone
+two-crate example — a `#[proc_macro_derive(Evil)]` invoked on an unrelated `Helper`
+that emits `impl Clone for Recovery` — confirmed live by calling `.clone()` on
+`Recovery` and watching the macro's own `unreachable!()` fire; the nested-macro finding
+was shown with a single-file `rustc` compile of `assert!(evil!())`, `evil!` declared
+locally as an ordinary `macro_rules!`, confirmed live the same way.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of
