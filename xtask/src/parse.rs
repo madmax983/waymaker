@@ -4977,10 +4977,7 @@ fn path_could_reach_target<'a>(
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    let Some(first) = segments.first() else {
-        return false;
-    };
-    if shadow.contains(first) {
+    if segments.is_empty() {
         return false;
     }
 
@@ -4993,6 +4990,7 @@ fn path_could_reach_target<'a>(
         None,
         block_items,
         scope,
+        shadow,
         target,
         &mut budget,
         cache,
@@ -5026,6 +5024,17 @@ fn path_could_reach_target<'a>(
 /// `budget` bounds the whole search. It is spent once per hop, shared across every
 /// branch by the same `&mut usize`. No branch can spend it twice.
 ///
+/// `shadow` names any generic type parameters in scope — see [`resolve_segments`]'s
+/// own `shadow`. Checked once, against the path's own first segment, then cleared:
+/// [`resolve_local_alias_chain`] chases a block-local alias with no shadow check at
+/// all — a block-local declaration shadows a generic type parameter of the same name
+/// unconditionally in real Rust — and only the deterministic resolver's fallback,
+/// reached when no block-local alias exists at all, ever consults `shadow`. So
+/// `shadow` gates only the module-scope half of a hop, never `block_items` (issue
+/// #197, Codex review: an earlier version of this fix checked `shadow` before ever
+/// trying `block_items`, so a block-local alias sharing a name with an enclosing
+/// generic parameter was refused instead of searched).
+///
 /// `cache` is [`path_could_reach_target`]'s own — see there.
 #[allow(clippy::too_many_arguments)]
 fn segments_could_reach_target<'a>(
@@ -5035,6 +5044,7 @@ fn segments_could_reach_target<'a>(
     mut entered: Option<&'a [syn::Item]>,
     block_items: &[&'a syn::Item],
     innermost_scope: usize,
+    mut shadow: &[String],
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
@@ -5061,17 +5071,29 @@ fn segments_could_reach_target<'a>(
             return false;
         };
 
+        // Only the path's own first segment is ever a shadowed generic parameter's
+        // name — every later hop's `first` comes from an alias's own target, a real
+        // name written somewhere else in the file, never the identifier that could
+        // collide with a generic parameter here.
+        let shadowed = shadow.contains(&first);
+        shadow = &[];
+
         // Block-local aliases are not cached: `block_items` has no one contiguous
         // scope to key a cache entry on, and it is small — one construction site's
-        // own enclosing blocks.
+        // own enclosing blocks. Not shadow-gated — see this function's own docs.
         let block_candidates: Vec<UseAlias> = if block_applies {
             own_aliases(block_items.iter().copied())
         } else {
             Vec::new()
         };
+        let module_candidates: Vec<UseAlias> = if shadowed {
+            Vec::new()
+        } else {
+            cache.aliases_of(items).iter().cloned().collect()
+        };
         let matches: Vec<UseAlias> = block_candidates
             .into_iter()
-            .chain(cache.aliases_of(items).iter().cloned())
+            .chain(module_candidates)
             .filter(|candidate| candidate.local == first)
             .collect();
 
@@ -5090,6 +5112,7 @@ fn segments_could_reach_target<'a>(
                         entered,
                         block_items,
                         innermost_scope,
+                        shadow,
                         target,
                         budget,
                         cache,
@@ -5101,7 +5124,7 @@ fn segments_could_reach_target<'a>(
             return false;
         }
 
-        if segments.len() > 1 {
+        if segments.len() > 1 && !shadowed {
             let module = cache
                 .modules_of(items)
                 .iter()
@@ -14626,6 +14649,52 @@ mod cfg_alias_ambiguity_tests {
              fn forge() -> u8 {\n\
              \x20   type Marker = CheckedDispatch;\n\
              \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_still_resolves_when_its_name_shadows_a_generic_parameter() {
+        // Codex review of this change, round 2, confirmed against real `rustc`: a
+        // block-local `type`/`use` item shadows an enclosing generic type parameter
+        // of the same name unconditionally — `resolve_local_alias_chain` chases it
+        // with no `shadow` check at all. The first version of this fix checked
+        // `shadow` before ever trying `block_items`, so a block-local alias sharing
+        // a name with a generic parameter was refused instead of searched.
+        let counts = struct_literal_counts(
+            "struct Decoy;\n\
+             fn forge<T>() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type T = CheckedDispatch;\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   type T = Decoy;\n\
+             \x20   let _ = T { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_shadowed_generic_parameter_with_no_block_local_alias_is_not_a_module() {
+        // The control: with no block-local declaration of the same name at all, a
+        // generic type parameter's name must still refuse module-scope resolution,
+        // matching `resolve_segments_from`'s own behavior.
+        let counts = struct_literal_counts(
+            "mod inner {\n\
+             \x20   pub struct CheckedDispatch;\n\
+             }\n\
+             use inner::CheckedDispatch as T;\n\
+             fn forge<T>() -> u8 {\n\
+             \x20   let _ = T { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
             "CheckedDispatch",

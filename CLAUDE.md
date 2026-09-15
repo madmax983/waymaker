@@ -5681,5 +5681,17 @@ search recomputed `own_aliases`/`own_modules` for the same scope from scratch on
 branch that revisited it; `AliasLookupCache`, shared across a whole file's search, computes
 each scope's aliases and modules once and reuses them. `many_ambiguous_aliases_and_literals_resolve_quickly`
 is the regression: forty modules, two hundred literals, real branching, held to a two-second
-ceiling it clears in well under one. No new ADR: nothing here moves a must-not-own cell, a
+ceiling it clears in well under one.
+
+A second review round found a third real problem, in the fix for the first one above. A
+block-local `type`/`use` item shadows an enclosing generic type parameter of the same name
+unconditionally in real Rust — confirmed against `rustc` — and `resolve_local_alias_chain`
+chases it with no `shadow` check at all. Only the deterministic resolver's own fallback,
+reached when no block-local alias exists at all, ever consults `shadow`. The block-items fix
+above checked `shadow` before trying `block_items`, so a block-local alias sharing a name
+with a generic parameter was refused instead of searched — the same "missed count" danger
+the whole mechanism exists to close. `shadow` is now checked once, against the path's own
+first segment, and gates only the module-scope half of a hop; a block-local alias is tried
+regardless. `a_block_local_alias_still_resolves_when_its_name_shadows_a_generic_parameter`
+and its control are the regression. No new ADR: nothing here moves a must-not-own cell, a
 dependency edge, or a rule id.
