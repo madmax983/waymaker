@@ -61,9 +61,14 @@ bank-pointed one it performs §10's seven steps for real: it consults
 next run with `RunId::successor()` (new, mirroring `Generation::successor()` and
 `EffectSeq::successor()` — refusing at `u64::MAX` rather than wrapping into a run id this
 device may already have sealed a bank under), and drives `Swap::beginning` through
-`prepare`, `stage`, `payload_barrier`, `commit` and `reclaim` — every step, so a `Migrated`
-run leaves no bank behind holding a stale seal. `Progress::Migrated { run }` is the new
-answer `boot` gives when this succeeds.
+`prepare`, `stage`, `payload_barrier` and `commit` — the point of no return, after which the
+new run is authoritative whatever happens next — and then `reclaim`, whose own error this
+call discards: a failed erase of the retiring bank does not turn a successful migration
+into a failure, matching `Installed::reclaim`'s own documented postcondition, and the next
+swap's own `prepare` erases that bank unconditionally before writing anything regardless.
+`Progress::Migrated { run }` is the new answer `boot` gives when this succeeds, and it is a
+statement about the new run's authority rather than a promise that the old bank's seal is
+already gone.
 
 The two fields ADR 0022 named as `Swap::beginning`'s unverified preconditions — `booted` and
 `run` — are read from the device fresh on this same boot rather than carried in by a caller,
@@ -115,11 +120,12 @@ this file, `crates/waymaker-drive/tests/boundary.rs`, is the only place this is 
 recovery begins.** `read_bank` copies up to `page.len()` bytes per bank into the scratch
 page to decode a header whose length is not known until its own prefix is read — the same
 shape `waymaker-flash`'s own `decode_header` already has, applied twice, before `Recovery`
-is ever constructed. A run whose header does not fit `page` is not a candidate at any
-generation, exactly as a bank whose seal does not validate is not; both fail the same way,
-by `read_bank` answering `None` rather than by a distinguishable error, because a caller
-handed a page too small to read its own device's header has nothing this driver can act on
-differently.
+is ever constructed. A header too large for `page` is not decided outright the way a bank
+whose seal does not validate is: `read_bank` answers `BankRead::Oversized`, naming the
+claimed generation and the size the caller would need, and bank selection surfaces that as
+a retryable `RecoveryError::PageTooSmall` — or ignores the candidate entirely once the
+other bank fully validates at a strictly higher generation, the same deferral an unreadable
+header gets.
 
 **`Driver::at_bank`'s `continue_as_new` calls `reclaim` immediately rather than leaving it
 lazy.** §10's seventh step does not have to happen before a swap is safe — the retiring
