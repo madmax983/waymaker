@@ -13816,6 +13816,13 @@ pub enum UnresolvedArmCause {
     /// has for a guard equality this scan cannot evaluate. See
     /// `pattern_has_ambiguous_discriminating_fields`.
     AmbiguousFields,
+    /// The pattern names a constant whose own initializer runs a `while` loop this scan
+    /// abandoned at `MAX_WHILE_LOOP_ITERATIONS` rather than folded to a real value —
+    /// `rustc` still folds it, given enough iterations, so `pattern_literal` resolving
+    /// no value here is not evidence the arm is *not* part of a table either, the
+    /// identical standing [`Self::GuardCall`] and [`Self::AmbiguousFields`] already have
+    /// for their own reasons this scan declines to guess. See `Resolve::capped`.
+    LoopIterationCapExceeded,
 }
 
 /// Every `match` expression `contents` declares, anywhere one can appear, outside
@@ -13905,6 +13912,7 @@ pub fn match_expressions_with_prefix(
     prefix: &[String],
 ) -> Result<Vec<FoundMatch>, syn::Error> {
     let file = parse_rust(contents)?;
+    let item_scope_capped = std::cell::Cell::new(false);
     let base = resolve_scope_consts(
         &OwnConsts {
             exprs: &item_const_exprs(&file.items),
@@ -13917,9 +13925,12 @@ pub fn match_expressions_with_prefix(
         },
         external_qualified,
         external_qualified_unsigned,
-        prefix,
-        &[],
-        &[],
+        &ScopePath {
+            module: prefix,
+            function: &[],
+            block: &[],
+        },
+        &item_scope_capped,
     );
     let mut visitor = MatchVisitor {
         scopes: ConstScopes(vec![base]),
@@ -13955,6 +13966,7 @@ pub fn match_expressions_with_prefix(
         // to reach that guard, and this parameter is what carries it there — the identical
         // map `qualified_constants_with_prefix` now returns instead of discarding.
         qualified_types: external_qualified_types.clone(),
+        any_const_capped: item_scope_capped.get(),
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -14088,9 +14100,17 @@ pub fn qualified_constants_with_prefix(
         },
         external_qualified,
         external_qualified_unsigned,
-        prefix,
-        &[],
-        &[],
+        &ScopePath {
+            module: prefix,
+            function: &[],
+            block: &[],
+        },
+        // This function returns only `qualified`/`qualified_unsigned`/`qualified_types`
+        // for a cross-file caller to fold in — never `found` — so a cap hit here has
+        // nowhere in this function's own return value to be carried to; the same gap
+        // `MatchVisitor::any_const_capped` closes for a same-file match is still open
+        // across files, unfixed here.
+        &std::cell::Cell::new(false),
     );
     let mut qualified = external_qualified.clone();
     // Codex's next-round finding: `qualified_unsigned` used to be seeded empty
@@ -14137,6 +14157,7 @@ pub fn qualified_constants_with_prefix(
         qualified,
         qualified_unsigned,
         qualified_types,
+        any_const_capped: false,
         found: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -14392,6 +14413,7 @@ pub(crate) fn item_enum_variant_constants(
         value: &no_value,
         unsigned: &not_unsigned,
         width: &no_width,
+        capped: &std::cell::Cell::new(false),
     };
     let mut found = std::collections::HashMap::new();
     for item in items {
@@ -14806,6 +14828,38 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
                 .elems
                 .iter()
                 .zip(expr_call.args.iter())
+                .flat_map(|(inner_pat, inner_expr)| destructured_binding(inner_pat, inner_expr))
+                .collect()
+        }
+        // Codex's finding: `let [x] = [0u8]; x` names an irrefutable array destructure
+        // — the plain tuple pattern's own reasoning, met one syntax over: a fixed-length
+        // array pattern over a fixed-length array literal binds its elements
+        // positionally the identical way a tuple pattern does, but the pattern is
+        // `Pat::Slice` and the initializer is `Expr::Array` rather than `Pat::Tuple`
+        // and `Expr::Tuple`. This fell through to `_ => Vec::new()` for the identical
+        // reason every earlier shape here once did: the whole statement went uncounted
+        // by every term that requires this function to answer at least one name, so a
+        // block built entirely from constants destructured this way refused outright.
+        // A `Pat::Rest` (`..`) anywhere in the pattern is declined rather than guessed
+        // at, since a variable-length slice binding has no fixed element to pair a
+        // literal array's own entries against — the identical caution the tuple case
+        // has no need for, because a tuple pattern can never contain one.
+        syn::Pat::Slice(pat_slice) => {
+            let syn::Expr::Array(expr_array) = strip_parens(expr) else {
+                return Vec::new();
+            };
+            if pat_slice.elems.len() != expr_array.elems.len()
+                || pat_slice
+                    .elems
+                    .iter()
+                    .any(|elem| matches!(elem, syn::Pat::Rest(_)))
+            {
+                return Vec::new();
+            }
+            pat_slice
+                .elems
+                .iter()
+                .zip(expr_array.elems.iter())
                 .flat_map(|(inner_pat, inner_expr)| destructured_binding(inner_pat, inner_expr))
                 .collect()
         }
@@ -15460,6 +15514,18 @@ struct OuterScopes<'a> {
     unsigned: &'a UnsignedConstScopes,
 }
 
+/// `module_path`, `function_path` and `block_path`, bundled behind one reference —
+/// [`OwnConsts`]'s own reason, met a second time: adding [`Resolve::capped`]'s own
+/// `capped` parameter to [`resolve_scope_consts`] gave it an eighth argument, and these
+/// three, always passed together to the same three qualified-lookup functions, are what
+/// this bundles back under `clippy::too_many_arguments` rather than `OwnConsts` or
+/// `OuterScopes` again, since neither already carries a scope position.
+struct ScopePath<'a> {
+    module: &'a [String],
+    function: &'a [String],
+    block: &'a [String],
+}
+
 /// `own`'s constants, each resolved to an integer where its initializer allows — directly,
 /// through a chain of references to other constants `own` itself declares, through one
 /// already visible in `outer`, or through a module-qualified path already recorded in
@@ -15485,15 +15551,24 @@ struct OuterScopes<'a> {
 /// which is the far more common shape and the one Codex's own repro used. Widened to
 /// [`resolve_qualified_path_at_any_depth`]'s full most-specific-first search, the same one
 /// [`resolve_pattern_path`] already runs for a pattern.
+///
+/// Codex's next-round finding: a name whose own initializer ran a `while` loop abandoned
+/// at [`MAX_WHILE_LOOP_ITERATIONS`] was left out of the returned map exactly the way a
+/// name this scan genuinely cannot fold is — with nothing to tell a caller the two
+/// apart. `capped` is set (never cleared) whenever that happens for any name `own`
+/// declares, so a caller can tell "resolved to nothing" apart from "abandoned at the
+/// cap" the way [`Resolve::capped`] already lets one resolver call tell the two apart.
 fn resolve_scope_consts(
     own: &OwnConsts<'_>,
     outer: &OuterScopes<'_>,
     qualified: &std::collections::HashMap<String, i128>,
     qualified_unsigned: &std::collections::HashMap<String, bool>,
-    module_path: &[String],
-    function_path: &[String],
-    block_path: &[String],
+    scope_path: &ScopePath<'_>,
+    capped: &std::cell::Cell<bool>,
 ) -> std::collections::HashMap<String, i128> {
+    let module_path = scope_path.module;
+    let function_path = scope_path.function;
+    let block_path = scope_path.block;
     let mut resolved: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
     for _ in 0..own.exprs.len().max(1) {
         let mut progressed = false;
@@ -15592,6 +15667,7 @@ fn resolve_scope_consts(
                 value: &resolve,
                 unsigned: &resolve_unsigned,
                 width: &resolve_width,
+                capped,
             };
             let declared_type = own.types.get(name).map(String::as_str);
             if let Some(value) = resolve_declared_initializer(expr, declared_type, &bundled) {
@@ -16113,6 +16189,7 @@ fn resolve_block_locals(
                 value: &local_resolve_value,
                 unsigned: &local_resolve_unsigned,
                 width: &local_resolve_width,
+                capped: resolve.capped,
             };
             let declared_type = local_types.get(name).map(String::as_str);
             if let Some(value) =
@@ -16236,6 +16313,7 @@ fn resolve_sequential_let(
             value: &scoped_resolve_value,
             unsigned: &scoped_resolve_unsigned,
             width: &scoped_resolve_width,
+            capped: resolve.capped,
         };
         let declared_type = ascribed_type
             .as_ref()
@@ -16373,6 +16451,7 @@ fn resolve_let_else_binding(
         value: &scoped_resolve_value,
         unsigned: &scoped_resolve_unsigned,
         width: &scoped_resolve_width,
+        capped: resolve.capped,
     };
     let scrutinee = literal_or_const_value(&init.expr, &scoped_resolve)?;
     if !match_arm_matches_constant(&local.pat, scrutinee, &scoped_resolve)? {
@@ -16475,6 +16554,7 @@ fn evaluate_while_loop(
             value: &condition_resolve_value,
             unsigned: &condition_resolve_unsigned,
             width: &condition_resolve_width,
+            capped: resolve.capped,
         };
         // Codex's finding: `while let x @ 1 = y { .. }` reduced its own condition to a
         // boolean through `literal_or_const_value`'s existing `Expr::Let` case — correct as
@@ -16525,6 +16605,7 @@ fn evaluate_while_loop(
                 value: &bound_value,
                 unsigned: &bound_unsigned,
                 width: &bound_width,
+                capped: resolve.capped,
             };
             let mut shadow_snapshot = std::collections::HashMap::new();
             resolve_block_sequential(
@@ -16551,6 +16632,13 @@ fn evaluate_while_loop(
         )?;
         restore_shadow_snapshot(local_types, resolved, shadow_snapshot);
     }
+    // Codex's finding: a loop that has not finished within `MAX_WHILE_LOOP_ITERATIONS`
+    // falls through here and answers `None` exactly as it should — but nothing told a
+    // caller that the reason was the cap rather than a shape this scan cannot
+    // interpret at all, even though `rustc` still folds the identical loop given enough
+    // iterations. `resolve.capped` is what carries that distinction to
+    // `MatchVisitor::visit_expr_match`.
+    resolve.capped.set(true);
     None
 }
 
@@ -16604,6 +16692,7 @@ fn evaluate_if_statement(
         value: &condition_resolve_value,
         unsigned: &condition_resolve_unsigned,
         width: &condition_resolve_width,
+        capped: resolve.capped,
     };
     if let syn::Expr::Let(let_expr) = strip_parens(&if_expr.cond) {
         let scrutinee = literal_or_const_value(&let_expr.expr, &condition_resolve)?;
@@ -16646,6 +16735,7 @@ fn evaluate_if_statement(
             value: &bound_value,
             unsigned: &bound_unsigned,
             width: &bound_width,
+            capped: resolve.capped,
         };
         let mut shadow_snapshot = ShadowSnapshot::new();
         resolve_block_sequential(
@@ -16970,6 +17060,7 @@ fn resolve_mutation_statement(
         value: &mutation_resolve_value,
         unsigned: &mutation_resolve_unsigned,
         width: &mutation_resolve_width,
+        capped: resolve.capped,
     };
     let declared_type = local_types.get(&name).map(String::as_str);
     // Codex's finding: `x = x - 100;` is `syn::Expr::Assign` rather than one of the ten
@@ -17161,6 +17252,7 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
         value: &block_resolve_value,
         unsigned: &block_resolve_unsigned,
         width: &block_resolve_width,
+        capped: resolve.capped,
     };
     literal_or_const_value(tail_expr, &block_resolve)
 }
@@ -17271,6 +17363,26 @@ struct Resolve<'a> {
     /// case in [`literal_or_const_value`], so every other caller of this struct declines it
     /// unconditionally rather than reasoning about a fact it has no use for.
     width: &'a dyn Fn(&syn::Path) -> Option<&'a str>,
+    /// Set to `true` by [`evaluate_while_loop`] when a `while` loop reachable through
+    /// this resolver was abandoned at [`MAX_WHILE_LOOP_ITERATIONS`] rather than folded
+    /// to a real value.
+    ///
+    /// Codex's finding: `const Pn: u8 = { let mut x = 4097u16; while x > 0 { x -= 1; }
+    /// n };` needs one more iteration than the cap allows, so `evaluate_while_loop`
+    /// answers `None` — correctly, since guessing a value neither this scan nor `rustc`
+    /// agree on would be worse than refusing — but every caller up to
+    /// [`MatchVisitor::visit_expr_match`] read that `None` exactly the way it reads a
+    /// name that resolves to nothing at all, no different from `_`. A constant `rustc`
+    /// *does* fold, just past a bound chosen to keep this scan from hanging, is not
+    /// evidence the pattern referencing it is a genuine catch-all — the identical
+    /// standing [`UnresolvedArmCause::GuardCall`] and [`UnresolvedArmCause::AmbiguousFields`]
+    /// already have for their own reasons this scan declines to guess. This flag is
+    /// what lets a caller tell "genuinely resolved to nothing" apart from "abandoned at
+    /// the cap" without widening every resolver function's own return type: every
+    /// place that only ever *forwards* an incoming `resolve` needs no change beyond the
+    /// field this struct already gives it, the same reasoning this struct's own
+    /// documentation gives for `width`.
+    capped: &'a std::cell::Cell<bool>,
 }
 
 /// Whether `expr` is written with an explicit unsigned integer type — a suffixed literal
@@ -18328,6 +18440,7 @@ fn evaluate_loop(expr_loop: &syn::ExprLoop, resolve: &Resolve<'_>) -> Option<i12
         value: &loop_resolve_value,
         unsigned: &loop_resolve_unsigned,
         width: &loop_resolve_width,
+        capped: resolve.capped,
     };
     literal_or_const_value(break_expr.expr.as_ref()?, &loop_resolve)
 }
@@ -18399,6 +18512,7 @@ fn evaluate_labelled_block(block_expr: &syn::ExprBlock, resolve: &Resolve<'_>) -
         value: &block_resolve_value,
         unsigned: &block_resolve_unsigned,
         width: &block_resolve_width,
+        capped: resolve.capped,
     };
     literal_or_const_value(break_expr.expr.as_ref()?, &block_resolve)
 }
@@ -18516,6 +18630,7 @@ fn evaluate_if_let(
         value: &bound_value,
         unsigned: &bound_unsigned,
         width: &bound_width,
+        capped: resolve.capped,
     };
     evaluate_block(&if_expr.then_branch, &let_resolve)
 }
@@ -18592,6 +18707,7 @@ fn evaluate_match(expr_match: &syn::ExprMatch, resolve: &Resolve<'_>) -> Option<
                 value: &bound_value,
                 unsigned: &bound_unsigned,
                 width: &bound_width,
+                capped: resolve.capped,
             };
             if let Some((_, guard_expr)) = arm.guard.as_ref() {
                 match literal_or_const_value(guard_expr, &arm_resolve) {
@@ -18671,6 +18787,7 @@ fn match_statement_guard_permits(
         value: &guard_value,
         unsigned: &guard_unsigned,
         width: &guard_width,
+        capped: condition_resolve.capped,
     };
     Some(literal_or_const_value(guard_expr, &guard_resolve)? != 0)
 }
@@ -18707,6 +18824,7 @@ fn evaluate_match_statement(
         value: &condition_resolve_value,
         unsigned: &condition_resolve_unsigned,
         width: &condition_resolve_width,
+        capped: resolve.capped,
     };
     let scrutinee = literal_or_const_value(&expr_match.expr, &condition_resolve)?;
     for arm in expr_match
@@ -18760,6 +18878,7 @@ fn evaluate_match_statement(
             value: &body_value,
             unsigned: &body_unsigned,
             width: &body_width,
+            capped: resolve.capped,
         };
         return resolve_statement_expr(&arm.body, &body_resolve, local_types, resolved);
     }
@@ -18827,6 +18946,7 @@ fn evaluate_tuple_match(
             value: &bound_value,
             unsigned: &bound_unsigned,
             width: &bound_width,
+            capped: resolve.capped,
         };
         if let Some((_, guard_expr)) = arm.guard.as_ref() {
             match literal_or_const_value(guard_expr, &arm_resolve) {
@@ -19643,8 +19763,23 @@ fn is_catchall_pattern(pattern: &syn::Pat, guarded: bool, resolve: &Resolve<'_>)
         // value of its own to discriminate on, exactly like a wildcard, which is why the
         // two share one arm here.
         syn::Pat::Wild(_) | syn::Pat::Rest(_) => true,
+        // Codex's finding: `P0` naming a `const P0: u32 = { .. while .. }` abandoned at
+        // `MAX_WHILE_LOOP_ITERATIONS` resolves to no *value* here exactly the way a
+        // genuine fresh binding does — Rust's own grammar cannot tell a bare-identifier
+        // constant pattern apart from a new binding without full name resolution, which
+        // is exactly why this scan tries `resolve.value` first and falls back to reading
+        // this as a catch-all when that fails. But a name this scan cannot fold is not
+        // evidence it names no constant at all: `resolve.width` answers from the
+        // declared *type* of a name in scope, which a real `const P0: u32 = ..;`
+        // populates regardless of whether its own initializer ever finishes folding —
+        // `block_const_types`/`item_const_types` read the type annotation alone, never
+        // the value. A name with a declared type is a known constant this scan merely
+        // could not evaluate, not a binding, so it is not a catch-all — without this,
+        // `P0` read as the match's own effective wildcard and the scan stopped there,
+        // never reaching `P1` through `P14` or the real trailing `_` at all.
         syn::Pat::Ident(named) if named.subpat.is_none() => {
-            (resolve.value)(&syn::Path::from(named.ident.clone())).is_none()
+            let path = syn::Path::from(named.ident.clone());
+            (resolve.value)(&path).is_none() && (resolve.width)(&path).is_none()
         }
         _ => false,
     }
@@ -21037,7 +21172,48 @@ struct MatchVisitor {
     /// module-qualified twin of `scopes_types`, inserted at the identical key every time
     /// `qualified` itself gains one, the same way `qualified_unsigned` already is.
     qualified_types: std::collections::HashMap<String, String>,
+    /// Whether any `const` this visitor has resolved so far — at either module, trait,
+    /// impl or block scope — had its own `while` loop abandoned at
+    /// [`MAX_WHILE_LOOP_ITERATIONS`]. Never reset between the two passes
+    /// [`match_expressions_with_prefix`] makes, the same way `qualified` itself never is:
+    /// a cap hit in either pass is real evidence for the second, real pass's own arm
+    /// construction. See [`Resolve::capped`] for what sets it and
+    /// [`UnresolvedArmCause::LoopIterationCapExceeded`] for what reads it.
+    any_const_capped: bool,
     found: Vec<FoundMatch>,
+}
+
+impl MatchVisitor {
+    /// `resolve_scope_consts` over `items`' own impl-level constants, folding a cap hit
+    /// into [`Self::any_const_capped`] — factored out of `visit_item_impl` to keep that
+    /// function under clippy's line count.
+    fn resolve_impl_scope_consts(
+        &mut self,
+        items: &[syn::ImplItem],
+    ) -> std::collections::HashMap<String, i128> {
+        let impl_scope_capped = std::cell::Cell::new(false);
+        let scope = resolve_scope_consts(
+            &OwnConsts {
+                exprs: &impl_const_exprs(items),
+                unsigned: &std::collections::HashMap::new(),
+                types: &std::collections::HashMap::new(),
+            },
+            &OuterScopes {
+                values: &self.scopes,
+                unsigned: &self.scopes_unsigned,
+            },
+            &self.qualified,
+            &self.qualified_unsigned,
+            &ScopePath {
+                module: &self.module_path,
+                function: &self.function_path,
+                block: &self.block_path,
+            },
+            &impl_scope_capped,
+        );
+        self.any_const_capped |= impl_scope_capped.get();
+        scope
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
@@ -21104,6 +21280,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
         key_path.extend(self.block_path.iter().cloned());
         let unsigned_names = item_const_unsigned(items);
         let types_names = item_const_types(items);
+        let mod_scope_capped = std::cell::Cell::new(false);
         let scope = resolve_scope_consts(
             &OwnConsts {
                 exprs: &item_const_exprs(items),
@@ -21116,10 +21293,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             },
             &self.qualified,
             &self.qualified_unsigned,
-            &self.module_path,
-            &self.function_path,
-            &self.block_path,
+            &ScopePath {
+                module: &self.module_path,
+                function: &self.function_path,
+                block: &self.block_path,
+            },
+            &mod_scope_capped,
         );
+        self.any_const_capped |= mod_scope_capped.get();
         key_path.push(ident_name(&node.ident));
         self.module_path.push(ident_name(&node.ident));
         for (name, value) in &scope {
@@ -21182,6 +21363,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             let mut key_path = self.module_path.clone();
             key_path.extend(self.function_path.iter().cloned());
             key_path.extend(self.block_path.iter().cloned());
+            let trait_scope_capped = std::cell::Cell::new(false);
             let scope = resolve_scope_consts(
                 &OwnConsts {
                     exprs: &trait_const_exprs(&node.items),
@@ -21194,10 +21376,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 },
                 &self.qualified,
                 &self.qualified_unsigned,
-                &self.module_path,
-                &self.function_path,
-                &self.block_path,
+                &ScopePath {
+                    module: &self.module_path,
+                    function: &self.function_path,
+                    block: &self.block_path,
+                },
+                &trait_scope_capped,
             );
+            self.any_const_capped |= trait_scope_capped.get();
             key_path.push(ident_name(&node.ident));
             self.trait_defaults.insert(key_path.join("::"), scope);
         }
@@ -21315,22 +21501,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                     let mut path = self.module_path.clone();
                     path.extend(self.function_path.iter().cloned());
                     path.extend(self.block_path.iter().cloned());
-                    scope.extend(resolve_scope_consts(
-                        &OwnConsts {
-                            exprs: &impl_const_exprs(&node.items),
-                            unsigned: &std::collections::HashMap::new(),
-                            types: &std::collections::HashMap::new(),
-                        },
-                        &OuterScopes {
-                            values: &self.scopes,
-                            unsigned: &self.scopes_unsigned,
-                        },
-                        &self.qualified,
-                        &self.qualified_unsigned,
-                        &self.module_path,
-                        &self.function_path,
-                        &self.block_path,
-                    ));
+                    scope.extend(self.resolve_impl_scope_consts(&node.items));
                     let name = ident_name(&segment.ident);
                     path.push(name.clone());
                     // Codex's forty-third-round finding: two sibling modules each
@@ -21452,6 +21623,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
                 value: &resolve_value,
                 unsigned: &resolve_unsigned,
                 width: &resolve_width,
+                capped: &std::cell::Cell::new(false),
             };
             let mut enum_path = self.module_path.clone();
             enum_path.extend(self.function_path.iter().cloned());
@@ -21488,6 +21660,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
+        let block_scope_capped = std::cell::Cell::new(false);
         let scope = resolve_scope_consts(
             &OwnConsts {
                 exprs: &block_const_exprs(node),
@@ -21500,10 +21673,14 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             },
             &self.qualified,
             &self.qualified_unsigned,
-            &self.module_path,
-            &self.function_path,
-            &self.block_path,
+            &ScopePath {
+                module: &self.module_path,
+                function: &self.function_path,
+                block: &self.block_path,
+            },
+            &block_scope_capped,
         );
+        self.any_const_capped |= block_scope_capped.get();
         self.scopes.0.push(scope);
         self.scopes_unsigned.0.push(block_const_unsigned(node));
         self.scopes_types.0.push(block_const_types(node));
@@ -21561,6 +21738,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             value: &resolve_value,
             unsigned: &resolve_unsigned,
             width: &resolve_width,
+            capped: &std::cell::Cell::new(false),
         };
         let selector = node.expr.to_token_stream().to_string();
         // Codex's next-round finding: an unsuffixed integer pattern's own unsignedness is
@@ -21639,15 +21817,30 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             // table would be keyed on, not that `rustc` declines to build one anyway.
             let ambiguous_discriminating_fields =
                 pattern_has_ambiguous_discriminating_fields(&arm.pat, &resolve);
+            let pattern = pattern_literal(&arm.pat, &resolve, &self.qualified);
+            // Codex's finding: `const Pn: u8 = { let mut x = 4097u16; while x > 0 { x
+            // -= 1; } n };` needs one more iteration than `MAX_WHILE_LOOP_ITERATIONS`
+            // allows, so `Pn` never enters `self.qualified` or `self.scopes` at all —
+            // `pattern_literal`'s `Pat::Path` case then resolves nothing from it, the
+            // identical empty `pattern` a genuine catch-all produces. But `rustc` still
+            // folds `Pn` given enough iterations, so a numbered arm naming one is not
+            // evidence it is not part of a table — only evidence this scan gave up
+            // before it converged. `self.any_const_capped` is the file-wide signal
+            // `resolve_scope_consts` leaves behind for exactly this, and it is checked
+            // only once every other, more specific cause has already been ruled out —
+            // a genuinely resolved arm, or one already explained by a guard call or an
+            // ambiguous pattern, is not this.
             let unresolved_cause = if guard_unresolved_call {
                 UnresolvedArmCause::GuardCall
             } else if ambiguous_discriminating_fields {
                 UnresolvedArmCause::AmbiguousFields
+            } else if pattern.is_empty() && !is_wild && self.any_const_capped {
+                UnresolvedArmCause::LoopIterationCapExceeded
             } else {
                 UnresolvedArmCause::None
             };
             arms.push(FoundArm {
-                pattern: pattern_literal(&arm.pat, &resolve, &self.qualified),
+                pattern,
                 is_wild,
                 call: call_shape_of(&arm.body, &resolve),
                 unsigned: scrutinee_unsigned || pattern_is_definitely_unsigned(&arm.pat, &resolve),
@@ -21711,6 +21904,7 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             value: &resolve_value,
             unsigned: &resolve_unsigned,
             width: &resolve_width,
+            capped: &std::cell::Cell::new(false),
         };
         if let Some((selector, arms)) = extract_if_chain(node, &resolve) {
             self.found.push(FoundMatch { selector, arms });
