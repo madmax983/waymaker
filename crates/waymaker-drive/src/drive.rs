@@ -470,6 +470,7 @@ impl<C: IntegrityCheck> Driver<C> {
             bank,
             stop: None,
             armed: None,
+            last_wait: None,
             pending: None,
             versions: workflow.identity().versions,
             recorded_version,
@@ -1382,6 +1383,19 @@ struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> 
     /// source, which has no business carrying a [`TimerSpec`] or a [`ClockCapability`] a
     /// caller never asked for.
     armed: Option<ArmedTimer>,
+    /// The [`TimerSpec`] the most recent [`Boundary::wait`](crate::Boundary::wait) named,
+    /// kept so [`Context::deadline_remaining`] can tell a repeat ask of the timer `armed`
+    /// describes from a caller that has moved on to a different one.
+    ///
+    /// A `select!` above this boundary that drops a still-open timer future and polls a
+    /// fresh one over a different spec does not close the first boundary — its schedule
+    /// record is already durable, and nothing but that same spec can ever resolve it.
+    /// Without this field, `deadline_remaining` had no way to see that the halt it is about
+    /// to report belongs to the timer the caller abandoned rather than the one it just asked
+    /// about, and reported the abandoned timer's frozen deadline as the new request's own —
+    /// arming a hardware alarm for a duration that never advances and never resolves what
+    /// was actually asked.
+    last_wait: Option<TimerSpec>,
     /// The effect §07 step 3 committed, while a caller performs step 4 for itself.
     ///
     /// [`Boundary::call`] never uses it: that path holds the value on its own stack for
@@ -2091,6 +2105,11 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     ///
     /// [`decide`](Self::decide)'s twin, row for row.
     fn decide_timer(&mut self, spec: TimerSpec) -> TimerDecision {
+        // Recorded before anything below can return early, so `deadline_remaining` always
+        // sees which spec this call was really about — including the mismatch case, where
+        // `remeasure_open_timer` leaves `armed` and `stop` holding an abandoned timer's
+        // state untouched.
+        self.last_wait = Some(spec);
         let Self {
             activities,
             machine,
@@ -2595,8 +2614,15 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
-        match self.stop {
-            Some(Stop::WaitingUntil(_, clock_kind, remaining)) => Some((clock_kind, remaining)),
+        let Some(Stop::WaitingUntil(_, clock_kind, remaining)) = self.stop else {
+            return None;
+        };
+        // `armed`'s spec is the timer this halt is really waiting on. A caller that has
+        // moved on to a different spec — a `select!` that dropped this boundary's timer
+        // future for another — gets `None` rather than the abandoned timer's frozen
+        // deadline, which never advances and would otherwise be re-armed for ever.
+        match self.armed {
+            Some(armed) if self.last_wait == Some(armed.spec) => Some((clock_kind, remaining)),
             _ => None,
         }
     }

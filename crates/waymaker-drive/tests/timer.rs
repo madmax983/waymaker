@@ -894,3 +894,98 @@ fn a_repeated_wait_that_finds_the_deadline_elapsed_resolves_rather_than_repeatin
         "the second ask is what durably records the firing"
     );
 }
+
+/// A workflow that asks for one deadline, then a different one, in the same boot.
+///
+/// Codex found this on review of issue [#110](https://github.com/madmax983/waymaker/issues/110)'s
+/// own pull request: a `select!` above this boundary can drop a still-open timer future and
+/// poll a fresh one over a different [`TimerSpec`] without ever resolving the abandoned
+/// one's committed `TimerScheduled` record — that record is durable, and nothing but its own
+/// spec can ever resolve it. `Context::deadline_remaining` used to answer such a mismatched
+/// ask with the abandoned timer's own frozen deadline anyway, which a façade would then
+/// re-arm a hardware alarm for as though it belonged to the new request — forever, since the
+/// mismatch recurs on every later ask and nothing ever refreshes it.
+struct SwitchesDeadline {
+    input: [u8; 4],
+    first: TimerSpec,
+    second: TimerSpec,
+    /// Whether `run` reached the `deadline_remaining` call at all.
+    observed: bool,
+    /// What it answered, when `observed` is `true`.
+    remaining: Option<(ClockKind, u64)>,
+}
+
+impl SwitchesDeadline {
+    const fn waiting(first: TimerSpec, second: TimerSpec) -> Self {
+        Self {
+            input: *b"seed",
+            first,
+            second,
+            observed: false,
+            remaining: None,
+        }
+    }
+}
+
+impl Workflow for SwitchesDeadline {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: 11,
+            versions: VersionRange::exact(1),
+            input: &self.input,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        // Arms `first` and halts on it — a real `TimerScheduled` record, committed.
+        let _ = boundary.wait(self.first);
+        // Stands in for a fresh timer future built over a different spec after `select!`
+        // dropped the one that named `first`. The open boundary is still `first`'s.
+        let second = boundary.wait(self.second);
+        self.remaining = boundary.deadline_remaining();
+        self.observed = true;
+        second?;
+        Ok(Outcome::Completed(b"unreachable"))
+    }
+}
+
+#[test]
+fn a_wait_for_a_different_spec_than_the_one_still_open_reports_no_deadline() {
+    let mut device = Device::new(geometry());
+    let mut world = booted(0);
+    let mut workflow = SwitchesDeadline::waiting(
+        TimerSpec::AfterBoot { ticks: 1_000 },
+        TimerSpec::AfterBoot { ticks: 2_000 },
+    );
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { .. })),
+        "{progress:?}"
+    );
+    assert!(workflow.observed, "the second wait must still return");
+    assert_eq!(
+        workflow.remaining, None,
+        "a mismatched spec must not be told the abandoned timer's own deadline"
+    );
+    // Only the first ask ever reached the kernel: the mismatch is refused before `peek` and
+    // `machine.timer_intent` are asked about a second, different boundary.
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
+            .count(),
+        1
+    );
+}
