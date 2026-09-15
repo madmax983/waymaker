@@ -703,33 +703,40 @@ fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
     })
 }
 
-/// `ty`, or a type it wraps in parens or a macro's hygiene grouping, names an associated-type
-/// projection this scanner cannot resolve: `<T as Trait>::Assoc`, `<T>::Assoc` with no `as`,
-/// or a bare `T::Assoc` where `T` is one of `type_params` — the alias's own declared generic
-/// type parameters.
+/// `ty`, or a type it wraps in parens or a macro's hygiene grouping, names a target this
+/// scanner cannot resolve.
 ///
-/// The third shape is issue #171's finding 2. `T::Dispatch` has no `qself`: no `<`, no `as`,
-/// nothing but an ordinary multi-segment path, so [`type_alias_target`] resolves it to
-/// `["T", "Dispatch"]` and a lookup chases `T` as if it were a real local alias — which it is
-/// not, so the chain dead-ends at `Dispatch` and never reaches whatever `T::Dispatch` really
-/// names. Restricting the match to the alias's *own* parameters is what tells this apart from
-/// a module-qualified path to some other, already-defined type (`type Foo =
-/// some_module::Bar;`): only a name the alias itself introduced as generic can be bound to
-/// anything a caller chooses, the same unresolvable shape as `<T as Trait>::Assoc`. A
-/// UFCS-style projection through a *concrete* type (`type Foo = Via::Dispatch;`, where `Via`
-/// is some other type implementing an associated-type-bearing trait) is not caught here —
-/// telling that apart from an ordinary qualified path needs real name resolution, which is
-/// out of scope for a syntactic scanner and left as a residual limit.
+/// Four shapes count: `<T as Trait>::Assoc`, `<T>::Assoc` with no `as`, `T::Assoc`, and bare
+/// `T`. In each, `T` is one of `type_params` — a generic type parameter the alias itself
+/// declares.
+///
+/// `T::Assoc` is issue #171's finding 2. It has no `qself`: no `<`, no `as`. It is an
+/// ordinary multi-segment path. So [`type_alias_target`] resolves it to `["T", "Assoc"]`.
+/// A lookup then chases `T` as a real local alias. `T` is not a real alias. The chain
+/// dead-ends at `Assoc` and never reaches what `T::Assoc` really names.
+///
+/// Bare `T` is issue #187. `type Unchecked<T> = T;` has no `::` at all. So
+/// [`type_alias_target`] resolves it to `["T"]`, with nothing left to chase. This looked
+/// safe: the alias's own body names no guarded type. But a use site can still supply `T`
+/// itself, through a turbofish. `Unchecked::<CheckedDispatch>` makes the whole alias mean
+/// `CheckedDispatch`. This scanner never reads a turbofish argument.
+///
+/// Both shapes are scoped to the alias's *own* parameters. This tells them apart from a
+/// module-qualified path to some other, already-defined type (`type Foo =
+/// some_module::Bar;`). Only a name the alias itself declared as generic can be bound to
+/// anything a caller chooses. A UFCS-style projection through a *concrete* type (`type Foo =
+/// Via::Dispatch;`, where `Via` implements an associated-type-bearing trait) is not caught
+/// here. Telling that apart from an ordinary qualified path needs real name resolution. That
+/// is out of scope for a syntactic scanner, and stays a residual limit.
 fn type_is_qself_projection(ty: &syn::Type, type_params: &[String]) -> bool {
     match ty {
         syn::Type::Path(type_path) => {
             type_path.qself.is_some()
-                || type_path.path.segments.len() > 1
-                    && type_path.path.segments.first().is_some_and(|first| {
-                        type_params
-                            .iter()
-                            .any(|param| ident_is(&first.ident, param.as_str()))
-                    })
+                || type_path.path.segments.first().is_some_and(|first| {
+                    type_params
+                        .iter()
+                        .any(|param| ident_is(&first.ident, param.as_str()))
+                })
         }
         syn::Type::Paren(inner) => type_is_qself_projection(&inner.elem, type_params),
         syn::Type::Group(inner) => type_is_qself_projection(&inner.elem, type_params),
@@ -737,19 +744,22 @@ fn type_is_qself_projection(ty: &syn::Type, type_params: &[String]) -> bool {
     }
 }
 
-/// Every `type` alias `contents` declares whose right-hand side is an associated-type
-/// projection [`syn`] cannot resolve, outside `#[cfg(test)]`.
+/// Every `type` alias `contents` declares whose right-hand side [`syn`] cannot safely
+/// resolve, outside `#[cfg(test)]`.
 ///
-/// At file scope, in an inline module, or inside a function body. See
-/// `type_is_qself_projection` for the three shapes a projection can take. Such a
-/// projection can name any struct the trait's `impl` chooses — `CheckedDispatch`
-/// included — and following it needs type inference `syn` does not have. A plain type alias
-/// already resolves a plain path and one wrapped in parens; a projection is the one shape it
-/// cannot safely treat as "not an alias" the way it treats a
-/// tuple, a reference or a trait object, because unlike those a projection genuinely can
-/// resolve to a struct usable in `Name { .. }` position. So this reports the alias's own
-/// name instead of silently skipping it, for a caller to refuse the file outright rather
-/// than resolve what it cannot see.
+/// Checked at file scope, in an inline module, and inside a function body. See
+/// `type_is_qself_projection` for the shapes this covers: an associated-type projection
+/// through a trait bound, and a bare use of the alias's own generic parameter. Either shape
+/// can name any type a caller chooses — a trait's `impl` names one, or a use site's own
+/// turbofish does — `CheckedDispatch` included. Following either needs resolution `syn`
+/// does not have.
+///
+/// A plain type alias already resolves a plain path, and one wrapped in parens. These two
+/// shapes are what it cannot safely treat as "not an alias" the same way it treats a tuple,
+/// a reference, or a trait object. Unlike those, they genuinely can resolve to a struct
+/// usable in `Name { .. }` position. So this reports the alias's own name instead of
+/// silently skipping it. A caller can then refuse the file outright, rather than resolve
+/// what it cannot see.
 ///
 /// # Errors
 ///
@@ -803,6 +813,9 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 /// A visitor's own `visit_item_mod` stays outside this macro — each already
 /// has its own, for `self.stack` — but must reset `self.shadow` to empty
 /// around it too: a module inherits no generics either.
+///
+/// Defined here, above its first use in this file. A `macro_rules!` macro
+/// is visible only after its own definition.
 macro_rules! shadow_generic_params {
     () => {
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -867,9 +880,8 @@ pub fn generic_assoc_type_bindings_naming(
         // point — a binding's value is exactly as aliasable as a struct literal's path.
         stack: Vec<&'ast [syn::Item]>,
         block_items: Vec<&'ast syn::Item>,
-        // Generic type-parameter names in scope at the current point (issue #181): a bound
-        // living on the same item that declares the parameter it names must not have that
-        // name resolved through a same-named module or alias instead.
+        // Generic type-parameter names in scope at the current point (issue #181), same
+        // shape as `struct_literal_counts`'s own `Literals`.
         shadow: Vec<String>,
     }
 
@@ -895,13 +907,16 @@ pub fn generic_assoc_type_bindings_naming(
             syn::visit::visit_trait_item(self, node);
         }
 
+        shadow_generic_params!();
+
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
             let pushed = node.content.is_some();
             if let Some((_, items)) = node.content.as_ref() {
                 self.stack.push(items);
             }
             let enclosing_block_items = core::mem::take(&mut self.block_items);
-            // A module sees none of an enclosing item's generics either (issue #181).
+            // A module sees none of an enclosing item's generics either (issue #181):
+            // reset for its own traversal, restore after.
             let outer_shadow = core::mem::take(&mut self.shadow);
             syn::visit::visit_item_mod(self, node);
             self.shadow = outer_shadow;
@@ -910,8 +925,6 @@ pub fn generic_assoc_type_bindings_naming(
                 self.stack.pop();
             }
         }
-
-        shadow_generic_params!();
 
         fn visit_block(&mut self, node: &'ast syn::Block) {
             let own_items: Vec<&'ast syn::Item> = node
@@ -4729,6 +4742,137 @@ pub struct LiteralCounts {
     pub inside: usize,
 }
 
+// `struct_literal_counts`'s own visitor. It moved out to module scope, to stay under this
+// file's own line-count lint (`clippy::too_many_lines`). Its behavior did not change.
+struct Literals<'ast> {
+    stack: Vec<&'ast [syn::Item]>,
+    // The function-local `use`/`type` aliases of every block enclosing the current
+    // point, flat and cumulative rather than a stack of separate scopes — a block
+    // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
+    // Codex's fifth round; issue #109 review).
+    block_items: Vec<&'ast syn::Item>,
+    // Generic type-parameter names in scope at the current point (issue
+    // #181), same shape as `block_items`: pushed on entering a
+    // generics-bearing item, truncated back off on the way out.
+    shadow: Vec<String>,
+    name: String,
+    count: usize,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if has_cfg_test(item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if has_cfg_test(impl_item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    shadow_generic_params!();
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // A nested module's own item list goes on top of the stack
+        // (issue #109 review): pushed while walking it, popped
+        // afterward, so `super::`/`crate::` can still reach an ancestor
+        // scope while the module's own scope never inherits it
+        // implicitly. An out-of-line declaration (`mod x;`) has no body
+        // to push, but its own name and attributes must still be
+        // visited the default way — an early return here had skipped
+        // them (Codex review, PR #160), hiding a banned identifier
+        // spelled as a module name.
+        let pushed = node.content.is_some();
+        if let Some((_, items)) = node.content.as_ref() {
+            self.stack.push(items);
+        }
+        // The enclosing block's own local aliases are not visible inside a module
+        // nested within it either — a module inherits nothing from its lexical
+        // surroundings, whether that surrounding is another module or a function body
+        // (Codex review) — so `block_items` is set aside for the module's own
+        // traversal and restored once it is done, the same way `self.stack` is.
+        let enclosing_block_items = core::mem::take(&mut self.block_items);
+        // A module sees none of an enclosing item's generics either
+        // (issue #181): reset for its own traversal, restore after.
+        let outer_shadow = core::mem::take(&mut self.shadow);
+        syn::visit::visit_item_mod(self, node);
+        self.shadow = outer_shadow;
+        self.block_items = enclosing_block_items;
+        if pushed {
+            self.stack.pop();
+        }
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        // A function-local `use` or `type` alias is visible only inside the block
+        // that declares it, and inherited by anything nested within it (issue #92,
+        // Codex's fifth round) — unlike a module, which never inherits an outer
+        // scope's aliases just by being written inside it. `block_items` therefore
+        // stays one flat, growing list: this block's own item declarations are
+        // appended so they are searched first (and so shadow a same-named one
+        // further out — see `resolve_local_alias_chain`), and exactly that many are
+        // truncated back off on the way out, restoring the parent's view for a
+        // sibling block.
+        let own_items: Vec<&'ast syn::Item> = node
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                syn::Stmt::Item(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        let pushed = own_items.len();
+        self.block_items.extend(own_items);
+        syn::visit::visit_block(self, node);
+        self.block_items.truncate(self.block_items.len() - pushed);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        // A block-local alias is innermost, so it is tried first — and only for a
+        // bare, single-segment path, the only shape a function-local `type`/`use`
+        // alias is ever written against; a multi-segment path and module descent stay
+        // `resolve_segments`'s own job over the file's item-slice stack.
+        let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
+            .then(|| node.path.segments.first())
+            .flatten()
+            .map(|segment| ident_name(&segment.ident));
+        let local = first
+            .as_ref()
+            .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
+        let resolved = match local {
+            // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
+            // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
+            Some((segments, true)) => segments,
+            // Ran out of block-local aliases: the leftover head may itself be a
+            // module-level alias — `resolve_segments_from` is a no-op if it is not.
+            Some((segments, false)) => resolve_segments_from(segments, &self.stack, &self.shadow),
+            None => resolve_segments(&node.path, &self.stack, &self.shadow),
+        };
+        let resolves_to_name = resolved
+            .last()
+            .is_some_and(|last| last.as_str() == self.name);
+        // Issue #185: a name declared more than once, live under more than one
+        // unevaluated `cfg`, is not something the deterministic resolution above
+        // can pick correctly between. Ask separately whether *some* live
+        // declaration could reach `self.name`, so an ambiguous alias is never
+        // silently outvoted by another declaration sharing its name.
+        let reachable_another_way = !resolves_to_name
+            && first.as_deref().is_some_and(|first| {
+                self.stack.last().is_some_and(|scope| {
+                    alias_could_reach_target(first, &self.block_items, scope, &self.name)
+                })
+            });
+        if resolves_to_name || reachable_another_way {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+}
+
 /// Counts the struct literals in `contents` whose path's final segment is `name` — after
 /// resolving the file's `use` and `type` aliases — in total and inside a function body.
 ///
@@ -4756,148 +4900,11 @@ pub struct LiteralCounts {
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one already-reviewed visitor; merging issue #109's block/module alias \
-              scoping with issue #181's generic-parameter shadowing in the same struct \
-              pushed it a few lines past the limit"
-)]
 pub fn struct_literal_counts(
     contents: &str,
     name: &str,
     inside: FnScope<'_>,
 ) -> Result<LiteralCounts, syn::Error> {
-    struct Literals<'ast> {
-        stack: Vec<&'ast [syn::Item]>,
-        // The function-local `use`/`type` aliases of every block enclosing the current
-        // point, flat and cumulative rather than a stack of separate scopes — a block
-        // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
-        // Codex's fifth round; issue #109 review).
-        block_items: Vec<&'ast syn::Item>,
-        // Generic type-parameter names in scope at the current point (issue
-        // #181), same shape as `block_items`: pushed on entering a
-        // generics-bearing item, truncated back off on the way out.
-        shadow: Vec<String>,
-        name: String,
-        count: usize,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
-        fn visit_item(&mut self, node: &'ast syn::Item) {
-            if has_cfg_test(item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_item(self, node);
-        }
-
-        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if has_cfg_test(impl_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, node);
-        }
-
-        shadow_generic_params!();
-
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            // A nested module's own item list goes on top of the stack
-            // (issue #109 review): pushed while walking it, popped
-            // afterward, so `super::`/`crate::` can still reach an ancestor
-            // scope while the module's own scope never inherits it
-            // implicitly. An out-of-line declaration (`mod x;`) has no body
-            // to push, but its own name and attributes must still be
-            // visited the default way — an early return here had skipped
-            // them (Codex review, PR #160), hiding a banned identifier
-            // spelled as a module name.
-            let pushed = node.content.is_some();
-            if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(items);
-            }
-            // The enclosing block's own local aliases are not visible inside a module
-            // nested within it either — a module inherits nothing from its lexical
-            // surroundings, whether that surrounding is another module or a function body
-            // (Codex review) — so `block_items` is set aside for the module's own
-            // traversal and restored once it is done, the same way `self.stack` is.
-            let enclosing_block_items = core::mem::take(&mut self.block_items);
-            // A module sees none of an enclosing item's generics either
-            // (issue #181): reset for its own traversal, restore after.
-            let outer_shadow = core::mem::take(&mut self.shadow);
-            syn::visit::visit_item_mod(self, node);
-            self.shadow = outer_shadow;
-            self.block_items = enclosing_block_items;
-            if pushed {
-                self.stack.pop();
-            }
-        }
-
-        fn visit_block(&mut self, node: &'ast syn::Block) {
-            // A function-local `use` or `type` alias is visible only inside the block
-            // that declares it, and inherited by anything nested within it (issue #92,
-            // Codex's fifth round) — unlike a module, which never inherits an outer
-            // scope's aliases just by being written inside it. `block_items` therefore
-            // stays one flat, growing list: this block's own item declarations are
-            // appended so they are searched first (and so shadow a same-named one
-            // further out — see `resolve_local_alias_chain`), and exactly that many are
-            // truncated back off on the way out, restoring the parent's view for a
-            // sibling block.
-            let own_items: Vec<&'ast syn::Item> = node
-                .stmts
-                .iter()
-                .filter_map(|stmt| match stmt {
-                    syn::Stmt::Item(item) => Some(item),
-                    _ => None,
-                })
-                .collect();
-            let pushed = own_items.len();
-            self.block_items.extend(own_items);
-            syn::visit::visit_block(self, node);
-            self.block_items.truncate(self.block_items.len() - pushed);
-        }
-
-        fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            // A block-local alias is innermost, so it is tried first — and only for a
-            // bare, single-segment path, the only shape a function-local `type`/`use`
-            // alias is ever written against; a multi-segment path and module descent stay
-            // `resolve_segments`'s own job over the file's item-slice stack.
-            let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
-                .then(|| node.path.segments.first())
-                .flatten()
-                .map(|segment| ident_name(&segment.ident));
-            let local = first
-                .as_ref()
-                .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
-            let resolved = match local {
-                // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
-                // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
-                Some((segments, true)) => segments,
-                // Ran out of block-local aliases: the leftover head may itself be a
-                // module-level alias — `resolve_segments_from` is a no-op if it is not.
-                Some((segments, false)) => {
-                    resolve_segments_from(segments, &self.stack, &self.shadow)
-                }
-                None => resolve_segments(&node.path, &self.stack, &self.shadow),
-            };
-            let resolves_to_name = resolved
-                .last()
-                .is_some_and(|last| last.as_str() == self.name);
-            // Issue #185: a name declared more than once, live under more than one
-            // unevaluated `cfg`, is not something the deterministic resolution above
-            // can pick correctly between. Ask separately whether *some* live
-            // declaration could reach `self.name`, so an ambiguous alias is never
-            // silently outvoted by another declaration sharing its name.
-            let reachable_another_way = !resolves_to_name
-                && first.as_deref().is_some_and(|first| {
-                    self.stack.last().is_some_and(|scope| {
-                        alias_could_reach_target(first, &self.block_items, scope, &self.name)
-                    })
-                });
-            if resolves_to_name || reachable_another_way {
-                self.count = self.count.saturating_add(1);
-            }
-            syn::visit::visit_expr_struct(self, node);
-        }
-    }
-
     let file = parse_rust(contents)?;
 
     let mut total = Literals {
@@ -22190,10 +22197,22 @@ mod raw_identifier_tests {
     }
 
     #[test]
-    fn a_bare_generic_parameter_with_no_projection_is_not_reported() {
-        // `T` alone is a plain path `type_alias_target` already resolves; nothing is
-        // projected through it.
+    fn a_bare_generic_parameter_as_the_whole_target_is_reported() {
+        // Issue #187: `type Same<T> = T;` has no `::` at all. It used to read as a plain
+        // path with nothing to project through. But a use site can still write
+        // `Same::<CheckedDispatch>`. The turbofish argument becomes the alias's real
+        // target. That is as unresolvable as `T::Dispatch`, one `::` shorter.
         let found = qself_type_alias_names("type Same<T> = T;").expect("the fixture parses");
+        assert_eq!(found, ["Same"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_parameter_used_inside_a_named_type_is_not_reported() {
+        // `Vec<T>` names a real, concrete type — `Vec`. `T` fills in one slot of it. The
+        // whole alias never becomes the caller's own choice of type, unlike a bare `T`.
+        // This is not the identity shape issue #187 closes.
+        let found =
+            qself_type_alias_names("type Wrapper<T> = Vec<T>;").expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
     }
 

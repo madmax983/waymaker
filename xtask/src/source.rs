@@ -8674,14 +8674,16 @@ fn check_effect_proof_fields_are_not_rebound(contents: &str) -> Vec<Violation> {
     }
 }
 
-/// `effect.rs` names no `type` alias whose target is a qualified associated-type
-/// projection.
+/// `effect.rs` names no `type` alias whose target this pin cannot resolve: a qualified
+/// associated-type projection, or a bare use of the alias's own generic parameter.
 ///
-/// `<T as Trait>::Assoc` can resolve to any struct the trait's `impl` chooses —
-/// `CheckedDispatch` included — and nothing here can follow it without type inference.
-/// `type_alias_target` already resolves a plain path and one wrapped in parens; a projection
-/// is the one shape it cannot safely treat as "not an alias" the way it treats a tuple, a
-/// reference or a trait object, because unlike those it genuinely can name a struct usable
+/// `<T as Trait>::Assoc` can resolve to any struct a trait's `impl` chooses.
+/// `Unchecked::<CheckedDispatch>` can resolve a bare `type Unchecked<T> = T;` to any struct
+/// a use site's own turbofish chooses. `CheckedDispatch` is one such struct in each case,
+/// and nothing here can follow either shape without real name resolution.
+/// `type_alias_target` already resolves a plain path and one wrapped in parens; these two
+/// shapes are what it cannot safely treat as "not an alias" the way it treats a tuple, a
+/// reference or a trait object, because unlike those they genuinely can name a struct usable
 /// in `Name { .. }` position. So the alias itself is refused outright, rather than silently
 /// passed over the way an unresolvable non-struct shape is.
 fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
@@ -8697,10 +8699,11 @@ fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
                 RULE,
                 DRIVER,
                 format!(
-                    "{found:?} aliases a qualified associated-type projection in \
-                     {EFFECT_PROTOCOL_PATH}: `<T as Trait>::Assoc` can name any struct the \
-                     trait's `impl` chooses, which no construction pin here can follow, so \
-                     the alias itself is refused"
+                    "{found:?} aliases an unresolvable target in {EFFECT_PROTOCOL_PATH}. \
+                     `<T as Trait>::Assoc` is a projection: a trait's `impl` can name any \
+                     struct through it. A bare `T` is the alias's own generic parameter: a \
+                     use site's own turbofish can name any type through it. This pin \
+                     follows neither, so it refuses the alias itself"
                 ),
             )]
         }
@@ -19519,6 +19522,29 @@ mod deferred_answer_pins {
             + "type Unchecked<'a> = <Via as Alias>::Dispatch;\n\
                pub(crate) fn forge<'a>(intent: DurableIntent) -> Unchecked<'a> {\n\
                \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("Unchecked") && detail.contains("projection")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_generic_identity_type_alias_is_reported() {
+        // Issue #187: `type Unchecked<T> = T;` has no `::` at all. It read as a plain path
+        // with nothing projected through it. A use site's own turbofish —
+        // `Unchecked::<CheckedDispatch<'_>>` — supplies the real target instead. This pin
+        // never read it. Refused the same way the qself shape above is: the alias itself,
+        // not the one construction site that happens to use it.
+        let source = tests_support::clean_effect_module()
+            + "type Unchecked<T> = T;\n\
+               pub(crate) fn forge<'a>(\n\
+               \x20   intent: DurableIntent,\n\
+               \x20   bytes: &'a [u8],\n\
+               ) -> Unchecked<CheckedDispatch<'a>> {\n\
+               \x20   Unchecked::<CheckedDispatch<'a>> { intent, bytes }\n}\n";
         let details = effect_details(&source);
         assert!(
             details
