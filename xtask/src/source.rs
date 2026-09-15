@@ -13506,6 +13506,104 @@ mod tests {
     }
 
     #[test]
+    fn an_absolute_path_aliased_to_a_trait_in_the_same_file_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 34: `impl ::dep::C for
+        // Recovery { .. }` is legal Rust — an absolute path reaches the extern prelude,
+        // and `extern crate self as dep;` can make it name this very crate under
+        // another name — but `every_resolution` took the leading `::` as a signal to
+        // trust the last segment (`C`) as a plain, unaliased name, never consulting
+        // this file's own alias table even when that table has `C` bound to `Clone`
+        // right here. `every_resolution` now fails closed on every absolute path. The
+        // impl lives in a child file so it cannot also trip the unrelated
+        // `RECOVERY_SURFACE` function-surface pin, which reads `recovery.rs` itself.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use core::clone::Clone as C;\n",
+                "impl ::dep::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_generic_alias_substituted_with_the_pinned_type_in_a_self_type_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 34: `type
+        // Identity<T> = T; impl Clone for Identity<Recovery> { .. }` is legal Rust that
+        // implements `Clone` for `Recovery` itself, because substituting `Recovery` for
+        // `T` makes `Identity<Recovery>` the type `Recovery`. The self-type scan reads
+        // only the segment identifier (`Identity`), discarding the generic argument
+        // that decides what the alias actually resolves to, so it followed `Identity`
+        // to its declared target `T` and reported an implementor named `T` — never
+        // `Recovery`. `every_resolution` now fails closed whenever a segment that
+        // carries a generic argument is also a locally aliased name, since resolving
+        // through the alias would mean substituting that argument, which this module
+        // does not do.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type Identity<T> = T;\n",
+                "impl Clone for Identity<super::Recovery> {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn an_unaliased_generic_self_type_on_an_unrelated_struct_is_still_accepted() {
+        // The negative case: an ordinary generic type that is not the pinned struct and
+        // is not aliased to anything must still pass, or round 34's fix would reject
+        // any generic `Clone` impl in the file rather than only the ones that resolve
+        // through an alias.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub struct Wrapper<T> {\n",
+                "    value: T,\n",
+                "}\n",
+                "impl<T: Clone> Clone for Wrapper<T> {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        Wrapper { value: self.value.clone() }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

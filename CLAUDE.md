@@ -4013,6 +4013,36 @@ standalone two-crate `rustc` example each, since a real derive macro and a real
 function-like macro cannot be added to `waymaker-flash` without an external dependency
 the layering forbids.
 
+Round 34 found two more, both in the exact hand-off round 33 had just drawn: what
+`every_resolution` does when a path cannot be substituted rather than merely chased
+through an alias table. The first is the absolute-path twin of round 32's own
+`crate::`-qualification fix: `impl ::dep::C for Recovery { .. }`, where `extern crate
+self as dep;` makes `dep` name this very crate and `pub use core::clone::Clone as C;`
+sits at its root, is legal Rust that implements `Clone` for `Recovery` — but a leading
+`::` had always been read as a signal to trust the last segment as a plain, unaliased
+name, so `every_resolution` never consulted this file's own alias table even when that
+table already had `C` bound to `Clone` right here. `every_resolution` now fails closed
+on every absolute path, the same way a `crate`-qualified one already does, because an
+absolute path reaches the extern prelude and this per-file scan has no crate-level view
+of what a self-reference there might rename. The second is round 28's own alias-target
+finding one hop later: `type Identity<T> = T; impl Clone for Identity<Recovery> { .. }`
+implements `Clone` for `Recovery` itself, because substituting `Recovery` for `T` makes
+`Identity<Recovery>` the type `Recovery` — but the self-type scan reads only the
+segment identifier (`Identity`), discarding the generic argument that decides what the
+substitution actually produces, so it followed `Identity` to its own declared target,
+`T`, and reported an implementor named `T` rather than `Recovery`. `every_resolution`
+now fails closed whenever a segment that carries a generic argument is also a locally
+aliased name — excluding a `LOCAL_SHADOWED_TYPE` entry, which names a struct, enum or
+union declared right in this file and so is never a substitution risk, only a real
+generic type using its own real name; without that exclusion the fix would have
+rejected every ordinary generic type declared and implemented in the same file, which a
+negative test now holds open. Both were verified against real compilation:
+`extern crate self as dep;` and the re-export it reaches, and the generic alias with
+`Recovery` substituted in for it, were each injected into `waymaker-flash`'s own crate
+root and `recovery` module and built, with `check-layering` catching both before the
+injection was reverted — no external dependency was needed for either, unlike round
+33's two macro findings.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

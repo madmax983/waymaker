@@ -956,14 +956,50 @@ const GLOB_IMPORT_MARKER: &str = "*";
 fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     const MAX_CANDIDATES: usize = 64;
 
+    if path.leading_colon.is_some() {
+        // Round 34: an absolute path (`::dep::C`) reaches the extern prelude — which,
+        // through `extern crate self as dep;`, can be this very crate under another
+        // name — so its root can be exactly as aliased as any local one, and this
+        // per-file scan has no crate-level view to resolve it with. Trusting the last
+        // segment (`C`) as a plain name let `impl ::dep::C for Recovery`, with `dep`
+        // renaming this crate and `C` a re-exported alias for `Clone`, read as an
+        // unrelated trait; failing closed matches `crate::`-qualified paths of any
+        // length, which fail the same way for the same reason.
+        return vec![UNRESOLVED_DERIVE.to_owned()];
+    }
+
+    // Round 34: a segment that is itself an aliased local name and also carries
+    // generic arguments can resolve to something this module cannot compute —
+    // `type Identity<T> = T; impl Clone for Identity<Recovery> { .. }` is legal Rust
+    // that implements `Clone` for `Recovery`, because substituting `Recovery` for `T`
+    // makes `Identity<Recovery>` the type `Recovery` itself. Resolving the alias here
+    // means substituting its target for the segment, which is real type-checking this
+    // module does not do; it reads identifiers only and drops every generic argument
+    // along the way (`segments`, below), so reporting a name for a segment shaped like
+    // this would be reporting a guess. Failing closed matches every other substitution
+    // this module cannot perform, from a projected associated type to a widened alias
+    // target.
+    //
+    // A [`LOCAL_SHADOWED_TYPE`] entry is excluded: it names a struct, enum or union
+    // declared right here, so the segment already names the real type directly — a
+    // generic parameter on `Wrapper<T>` where `Wrapper` is that local declaration is
+    // not a substitution this module has to compute, only a real generic type using
+    // its own real name.
+    if path.segments.iter().any(|segment| {
+        !matches!(segment.arguments, syn::PathArguments::None)
+            && aliases.iter().any(|alias| {
+                alias.local == ident_name(&segment.ident)
+                    && alias.target != [LOCAL_SHADOWED_TYPE.to_owned()]
+            })
+    }) {
+        return vec![UNRESOLVED_DERIVE.to_owned()];
+    }
+
     let segments: Vec<String> = path
         .segments
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    if path.leading_colon.is_some() {
-        return segments.last().cloned().into_iter().collect();
-    }
 
     let mut frontier = vec![segments];
     let mut finished: Vec<String> = Vec::new();
