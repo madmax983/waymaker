@@ -1898,6 +1898,17 @@ pub fn check_storage_contract(sources: &[crate::size::LayerSource]) -> Vec<Viola
 /// The file whose public surface [`RECOVERY_SURFACE`] pins.
 pub const RECOVERY_SURFACE_PATH: &str = "waymaker-flash/src/recovery.rs";
 
+/// The crate root [`check_recovery_is_not_clone`] walks its module tree from.
+///
+/// Codex review of this change (PR #143), round 38: a `Clone` implementation may be
+/// declared anywhere in `waymaker-flash`, not only somewhere [`RECOVERY_SURFACE_PATH`]'s
+/// own `mod` declarations reach — `impl Clone for crate::recovery::Recovery<'_, S> { .. }`
+/// written in `append.rs`, say, which `lib.rs` reaches directly and `recovery.rs` never
+/// does. Walking from the crate root instead reaches every production file the crate
+/// actually ships, `recovery.rs`'s own descendants included, so a handwritten impl has
+/// nowhere left in the crate to hide.
+const RECOVERY_ADAPTER_ROOT_PATH: &str = "waymaker-flash/src/lib.rs";
+
 /// Every public function the storage-backed recovery of issue #23 is allowed to have.
 ///
 /// Design document §02 decision 2 — "a cursor advances through history in workflow order;
@@ -2011,23 +2022,39 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
         // `check_pinned_surface`, called just above, already reports a missing module.
         return Vec::new();
     };
+    // Codex review of this change (PR #143), round 38: a handwritten `impl Clone for
+    // Recovery` need not live anywhere `recovery.rs`'s own `mod` declarations reach — it
+    // can sit in any production source of `waymaker-flash`, reached from `lib.rs` by a
+    // path that never passes through `recovery.rs` at all (`append.rs`, say). The walk
+    // therefore starts at the crate root rather than at `recovery.rs`, so every file the
+    // crate actually ships is read, not only `recovery.rs`'s own descendants.
+    let Some(crate_root) = find_source(sources, RECOVERY_ADAPTER_ROOT_PATH) else {
+        return vec![Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{RECOVERY_ADAPTER_ROOT_PATH} is missing, so whether any source of \
+                 `{ADAPTER}` implements `Clone` for `{RECOVERY_TYPE}` cannot be checked"
+            ),
+        )];
+    };
     // Codex review of this change (PR #143), round 12: an out-of-line `mod clone_impl;`
-    // in `recovery.rs` has no content in `recovery.rs`'s own text at all — its body
-    // lives in a sibling file this function never looked at — and that sibling can
-    // write `impl Clone for super::Recovery` or invoke a macro that does, with neither
-    // caught by anything below that reads only `source.contents`. `module_tree` is the
-    // walk `integrity-check`'s table scan already uses for the identical shape of
-    // problem (a `mod` this scan cannot resolve to exactly one scanned file), so this
-    // reuses it rather than re-deriving the same fail-closed resolution a second time.
-    let (production_reachable, _test_only) = match module_tree(sources, source) {
+    // in a reached file has no content in that file's own text at all — its body lives
+    // in a sibling file this function never looked at — and that sibling can write
+    // `impl Clone for super::Recovery` or invoke a macro that does, with neither caught
+    // by anything below that reads only a file's own contents. `module_tree` is the walk
+    // `integrity-check`'s table scan already uses for the identical shape of problem (a
+    // `mod` this scan cannot resolve to exactly one scanned file), so this reuses it
+    // rather than re-deriving the same fail-closed resolution a second time.
+    let (production_reachable, _test_only) = match module_tree(sources, crate_root) {
         Ok(reachable) => reachable,
         Err(error) => {
             return vec![Violation::new(
                 RULE,
                 ADAPTER,
                 format!(
-                    "{RECOVERY_SURFACE_PATH}'s module tree {error}, so whether it reaches \
-                     a `Clone` impl for `{RECOVERY_TYPE}` cannot be checked"
+                    "{RECOVERY_ADAPTER_ROOT_PATH}'s module tree {error}, so whether it \
+                     reaches a `Clone` impl for `{RECOVERY_TYPE}` cannot be checked"
                 ),
             )];
         }
@@ -10603,11 +10630,26 @@ mod tests {
     }
 
     fn recovery_source(extra: &str) -> Vec<crate::size::LayerSource> {
-        vec![crate::size::LayerSource {
+        vec![
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: format!("{}{extra}", tests_support::clean_recovery_surface()),
+            },
+        ]
+    }
+
+    /// The crate root [`recovery_source`] and [`recovery_source_with_struct`] need beside
+    /// their single `recovery.rs` fixture, now that `check_recovery_is_not_clone` walks
+    /// the module tree from [`RECOVERY_ADAPTER_ROOT_PATH`] rather than from `recovery.rs`
+    /// itself (round 38).
+    fn flash_lib_source() -> crate::size::LayerSource {
+        crate::size::LayerSource {
             crate_name: "waymaker-flash".to_owned(),
-            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
-            contents: format!("{}{extra}", tests_support::clean_recovery_surface()),
-        }]
+            path: format!("crates/{RECOVERY_ADAPTER_ROOT_PATH}"),
+            contents: tests_support::clean_flash_lib(),
+        }
     }
 
     #[test]
@@ -10646,11 +10688,14 @@ mod tests {
         // renamed or rewritten and the pin has stopped checking anything.
         let thinned =
             tests_support::clean_recovery_surface().replace("pub fn append_offset() {}\n", "");
-        let violations = check_recovery_surface(&[crate::size::LayerSource {
-            crate_name: "waymaker-flash".to_owned(),
-            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
-            contents: thinned,
-        }]);
+        let violations = check_recovery_surface(&[
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: thinned,
+            },
+        ]);
         assert_eq!(violations.len(), 1);
         assert!(
             violations[0].detail.contains("append_offset"),
@@ -10673,11 +10718,14 @@ mod tests {
             "#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n",
             struct_decl,
         );
-        vec![crate::size::LayerSource {
-            crate_name: "waymaker-flash".to_owned(),
-            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
-            contents,
-        }]
+        vec![
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents,
+            },
+        ]
     }
 
     #[test]
@@ -12667,11 +12715,14 @@ mod tests {
                 "pub struct Recovery;\n",
             ),
         );
-        let mut sources = vec![crate::size::LayerSource {
-            crate_name: "waymaker-flash".to_owned(),
-            path: format!("crates/{RECOVERY_SURFACE_PATH}"),
-            contents,
-        }];
+        let mut sources = vec![
+            flash_lib_source(),
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents,
+            },
+        ];
         sources.push(crate::size::LayerSource {
             crate_name: "waymaker-flash".to_owned(),
             path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
@@ -13806,6 +13857,85 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_impl_in_a_sibling_file_of_recovery_rs_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 38: a `Clone`
+        // implementation may be declared anywhere in `waymaker-flash`, not only
+        // somewhere `recovery.rs`'s own `mod` declarations reach —
+        // `impl Clone for crate::recovery::Recovery { .. }` in `append.rs`, say,
+        // which the crate root reaches directly and `recovery.rs` never does at
+        // all. `check_recovery_is_not_clone` now walks the module tree from
+        // `RECOVERY_ADAPTER_ROOT_PATH` rather than from `recovery.rs`, so a sibling
+        // the crate root reaches through its own `pub mod` declaration is read too.
+        let sources = vec![
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_ADAPTER_ROOT_PATH}"),
+                contents: "pub mod append;\npub mod recovery;\n".to_owned(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: tests_support::clean_recovery_surface(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/append.rs".to_owned(),
+                contents: concat!(
+                    "impl Clone for crate::recovery::Recovery {\n",
+                    "    fn clone(&self) -> Self {\n",
+                    "        crate::recovery::Recovery\n",
+                    "    }\n",
+                    "}\n",
+                )
+                .to_owned(),
+            },
+        ];
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_unrelated_clone_impl_in_a_sibling_file_does_not_trip_the_recovery_pin() {
+        // The negative case round 38's widened scan needs beside it: a sibling file
+        // the crate root reaches is free to implement `Clone` for an unrelated type of
+        // its own, named the ordinary way real code in this crate names its own
+        // self-type — relatively, not through a `crate::`-qualified path, which
+        // `every_resolution` fails closed on for an unrelated reason (rounds 25 and
+        // 32) and which is not the shape this test is about.
+        let sources = vec![
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_ADAPTER_ROOT_PATH}"),
+                contents: "pub mod append;\npub mod recovery;\n".to_owned(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: format!("crates/{RECOVERY_SURFACE_PATH}"),
+                contents: tests_support::clean_recovery_surface(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: "crates/waymaker-flash/src/append.rs".to_owned(),
+                contents: concat!(
+                    "pub struct Sealable;\n",
+                    "impl Clone for Sealable {\n",
+                    "    fn clone(&self) -> Self {\n",
+                    "        Sealable\n",
+                    "    }\n",
+                    "}\n",
+                )
+                .to_owned(),
+            },
+        ];
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
     fn an_absolute_path_aliased_to_a_trait_in_the_same_file_is_rejected() {
         // Found by Codex review of this change (PR #143), round 34: `impl ::dep::C for
         // Recovery { .. }` is legal Rust — an absolute path reaches the extern prelude,
@@ -13918,11 +14048,18 @@ mod tests {
 
     #[test]
     fn a_windows_path_separator_still_finds_the_recovery_module() {
-        let violations = check_recovery_surface(&[crate::size::LayerSource {
-            crate_name: "waymaker-flash".to_owned(),
-            path: RECOVERY_SURFACE_PATH.replace('/', "\\"),
-            contents: tests_support::clean_recovery_surface(),
-        }]);
+        let violations = check_recovery_surface(&[
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: RECOVERY_ADAPTER_ROOT_PATH.replace('/', "\\"),
+                contents: tests_support::clean_flash_lib(),
+            },
+            crate::size::LayerSource {
+                crate_name: "waymaker-flash".to_owned(),
+                path: RECOVERY_SURFACE_PATH.replace('/', "\\"),
+                contents: tests_support::clean_recovery_surface(),
+            },
+        ]);
         assert!(violations.is_empty(), "{violations:?}");
     }
 
@@ -19705,6 +19842,19 @@ mod tests {
         let mut source = surface("A recovery module.", RECOVERY_SURFACE);
         source.push_str("#[derive(Debug, PartialEq, Eq)]\npub struct Recovery;\n");
         source
+    }
+
+    /// A crate root for `waymaker-flash` declaring `recovery` as its only child module.
+    ///
+    /// Round 38 of Codex review on this change (PR #143) moved
+    /// `check_recovery_is_not_clone`'s module-tree walk from `recovery.rs` to the crate
+    /// root, so a fixture naming only `recovery.rs` now needs this beside it for the walk
+    /// to reach `recovery.rs` at all — otherwise `RECOVERY_ADAPTER_ROOT_PATH` is missing
+    /// from the fixture's own sources and the rule fails closed on that, rather than on
+    /// whatever the fixture meant to exercise.
+    #[must_use]
+    pub fn clean_flash_lib() -> String {
+        String::from("//! Two-bank NOR flash adapter for Waymaker.\npub mod recovery;\n")
     }
 
     /// A `waymaker-rig` oracle whose public surface is exactly the pin.

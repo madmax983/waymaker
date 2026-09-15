@@ -4146,6 +4146,44 @@ compounds were, confirmed by a duplicate-impl conflict to produce a real `Clone`
 only under `cargo test`, and confirmed cleared by `check-layering` in both
 configurations.
 
+Round 38 found a gap in the scan's own reach rather than in its alias-chasing: a `Clone`
+implementation for the pinned type need not live anywhere `recovery.rs`'s own `mod`
+declarations reach at all. `impl Clone for crate::recovery::Recovery { .. }` in
+`append.rs`, say, is legal Rust the crate root reaches directly through its own `pub mod
+append;` and `recovery.rs` never reaches by any path — `check_recovery_is_not_clone`
+walked the module tree rooted at `recovery.rs` itself, so the whole rest of the crate,
+every sibling file `lib.rs` declares independently, was outside the scan regardless of
+what it implemented. `waymaker-flash`'s single-writer invariant is a property of the
+*crate*, not of one module's own descendants, and `Journal::after`'s by-value `Recovery`
+is defeated exactly the same way from either. The fix walks from
+`RECOVERY_ADAPTER_ROOT_PATH` — the crate root — instead, so the reachable set is every
+production source `waymaker-flash` actually ships, `recovery.rs`'s own descendants
+included, rather than only the latter. Resolving that walk needed a real bug in
+`child_modules` fixed first: `mod` resolution had only ever been exercised from a
+non-root file before, and a crate root resolves a `mod` declared in it exactly the way
+`mod.rs` does — beside itself, never under a `lib/` subdirectory — which nothing had
+ever taught the function, so a first attempt reported every top-level module of
+`waymaker-flash` as unresolvable. `lib.rs` and `main.rs` are now recognized as crate
+roots the same way `mod.rs` already was, verified with a scratch fixture before the
+walk was ever pointed at them. What the wider reach does *not* do is loosen who counts
+as a match: `every_resolution`'s existing fail-closed handling of a `crate::`-qualified
+self type — any length, since round 32 — means a genuine `impl Clone for
+crate::recovery::Recovery` fails closed to `UNRESOLVED_DERIVE` rather than resolving
+cleanly to the pinned name, and an *unrelated* type's own `crate::`-qualified `Clone`
+impl elsewhere in the crate would fail exactly the same conservative way — but an
+unrelated type named the ordinary, relative way real code in this crate names its own
+self-type does not, so the widened scan gains no new false positive against a
+production `Clone` impl that never mentions `Recovery` at all. Every existing
+`recovery-surface` fixture was single-file and had never needed a crate root beside it,
+so all forty-odd of them needed a synthetic `lib.rs` declaring `pub mod recovery;` added
+alongside — folded into the two shared helpers where a test used them, and by hand into
+the half-dozen that built their own source lists directly. Verified against the real
+crate by injecting `impl Clone for crate::recovery::Recovery<'_, u8> { fn clone(&self)
+-> Self { unreachable!() } }` into `append.rs` — a file `recovery.rs`'s own tree never
+reaches and the crate root reaches directly — confirmed to compile under
+`cargo build -p waymaker-flash --no-default-features`, confirmed to be missed by
+`check-layering` before this fix and caught by it after, and reverted cleanly.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

@@ -3809,7 +3809,18 @@ pub fn child_modules(parent_path: &str, contents: &str) -> Result<Vec<ChildModul
         .rsplit_once('/')
         .map(|(dir, _)| format!("{dir}/"))
         .unwrap_or_default();
-    let child_dir = if parent_path == "mod.rs" || parent_path.ends_with("/mod.rs") {
+    // Round 38 of Codex review on this change (PR #143): `recovery-surface`'s
+    // Clone-detection scan now walks the module tree from `waymaker-flash`'s crate root
+    // rather than from `recovery.rs` (see `RECOVERY_ADAPTER_ROOT_PATH`), and `lib.rs` —
+    // like `main.rs` for a binary crate — resolves a `mod` declared in it the same way
+    // `mod.rs` resolves one: beside itself, in the directory it is already in, never
+    // under a `lib/` or `main/` subdirectory. Every prior caller of this function walked
+    // from a non-root file, so this shape had never been exercised before.
+    let is_crate_root = matches!(parent_path, "lib.rs" | "main.rs")
+        || parent_path.ends_with("/lib.rs")
+        || parent_path.ends_with("/main.rs");
+    let child_dir = if parent_path == "mod.rs" || parent_path.ends_with("/mod.rs") || is_crate_root
+    {
         parent_dir.clone()
     } else {
         let stem = parent_path
@@ -4889,6 +4900,47 @@ mod raw_identifier_tests {
     fn a_raw_ident_use_is_still_named() {
         let uses = name_uses("fn f() { let r#alloc = 1; }").expect("the fixture parses");
         assert!(uses.names_word("alloc"), "{uses:?}");
+    }
+
+    #[test]
+    fn a_module_declared_in_the_crate_root_resolves_beside_it() {
+        // Round 38 of Codex review on this change (PR #143): a `mod` declared in
+        // `lib.rs` resolves in the same directory as `lib.rs` itself, exactly as one
+        // declared in `mod.rs` does — never under a `lib/` subdirectory.
+        let modules =
+            child_modules("waymaker-flash/src/lib.rs", "mod append;").expect("the fixture parses");
+        assert_eq!(modules.len(), 1, "{}", modules.len());
+        assert_eq!(modules[0].name, "append");
+        assert!(
+            modules[0].candidates.iter().flatten().any(|candidate| {
+                candidate == "waymaker-flash/src/append.rs"
+                    || candidate == "waymaker-flash/src/append/mod.rs"
+            }),
+            "{:?}",
+            modules[0].candidates
+        );
+        assert!(
+            !modules[0]
+                .candidates
+                .iter()
+                .flatten()
+                .any(|candidate| candidate.contains("/lib/")),
+            "a crate-root module must not resolve under a `lib/` subdirectory: {:?}",
+            modules[0].candidates
+        );
+    }
+
+    #[test]
+    fn a_module_declared_in_a_binary_crate_root_resolves_beside_it() {
+        let modules =
+            child_modules("xtask/src/main.rs", "mod pipeline;").expect("the fixture parses");
+        assert!(
+            modules[0].candidates.iter().flatten().any(|candidate| {
+                candidate == "xtask/src/pipeline.rs" || candidate == "xtask/src/pipeline/mod.rs"
+            }),
+            "{:?}",
+            modules[0].candidates
+        );
     }
 }
 

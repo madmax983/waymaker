@@ -1180,6 +1180,17 @@ mod tests {
         clean_kernel_sources()
             .into_iter()
             .chain(vec![
+                // And the crate root, which `check_recovery_is_not_clone` now walks its
+                // module tree from (round 38) rather than from `recovery.rs` itself, so
+                // it can reach a handwritten `Clone` impl anywhere in the crate rather
+                // than only somewhere `recovery.rs`'s own `mod` declarations reach. It
+                // fails closed when the module is absent, for the same reason every
+                // other pinned file here does.
+                size::LayerSource {
+                    crate_name: "waymaker-flash".to_owned(),
+                    path: "crates/waymaker-flash/src/lib.rs".to_owned(),
+                    contents: source::tests_support::clean_flash_lib(),
+                },
                 size::LayerSource {
                     crate_name: "waymaker-flash".to_owned(),
                     path: format!("crates/{}", source::STORAGE_CONTRACT_PATH),
