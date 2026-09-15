@@ -120,8 +120,12 @@ pub trait IntegrityCheck {
 /// CRC-16/CCITT-FALSE over the header — polynomial `0x1021`, initial value `0xFFFF`, no
 /// reflection, no final xor, published check value `0x29B1` — and CRC-32/ISO-HDLC over the
 /// header and payload — reflected polynomial `0xEDB8_8320`, initial value and final xor
-/// `0xFFFF_FFFF`, published check value `0xCBF4_3926`. Both computed bitwise, with no
-/// lookup table.
+/// `0xFFFF_FFFF`, published check value `0xCBF4_3926`. CRC-16 is computed bitwise, with no
+/// lookup table at all. CRC-32 is not:
+/// [ADR 0045](https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
+/// supersedes ADR 0010's table-free conclusion for CRC-32 alone, once a profile of this
+/// workspace's own workloads showed it worth a 64-byte nibble table spent as a `match` — no
+/// `[u32; 16]` ever appears in source, so `crc32` stays a `const fn`.
 ///
 /// Both are catalogued algorithms rather than something invented here, which is the
 /// property ADR 0010 chose them for: a journal pulled off a device is verifiable with a
@@ -130,8 +134,8 @@ pub trait IntegrityCheck {
 /// agrees with its own bugs.
 ///
 /// The `integrity-check` gate rule fails a pull request that changes either polynomial or
-/// initial value, that adds a lookup table to the checksum module, or that binds this type
-/// to anything but those two functions.
+/// initial value, that adds a lookup table to the checksum module beyond the one ADR 0045
+/// permits for CRC-32, or that binds this type to anything but those two functions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Catalogued;
 
