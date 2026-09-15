@@ -819,6 +819,79 @@ fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
         .collect()
 }
 
+/// The type-parameter names `generics` declares. Lifetimes and const
+/// parameters are excluded: only a type parameter shares a namespace with a
+/// module or a `use` alias, so only a type parameter can shadow one.
+///
+/// Issue #181: a generic type parameter shadows a same-named sibling module
+/// or alias for the rest of the item that declares it — real Rust resolves
+/// a bare reference to the parameter, never to either. [`push_generic_shadow`]
+/// is the caller's half: it pushes this set and hands back how many names to
+/// pop once the item's body has been visited.
+fn generic_type_param_names(generics: &syn::Generics) -> Vec<String> {
+    generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            syn::GenericParam::Type(type_param) => Some(ident_name(&type_param.ident)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Pushes `generics`'s own type-parameter names onto `shadow` and returns how
+/// many were added, so the caller can truncate the same count back off once
+/// it is done visiting that item's body (issue #181).
+fn push_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> usize {
+    let names = generic_type_param_names(generics);
+    let added = names.len();
+    shadow.extend(names);
+    added
+}
+
+/// The five `syn::visit::Visit` overrides that push a generics-bearing
+/// item's own type-parameter names onto `self.shadow` before visiting its
+/// body, and pop them back off after (issue #181).
+///
+/// One macro rather than five methods copied into each visitor: every path-
+/// resolving visitor in this file needs the same five overrides, over its
+/// own `self.shadow` field, so a shared body keeps them from drifting apart
+/// and keeps each visitor's own `impl` short enough for
+/// `clippy::too_many_lines`.
+macro_rules! shadow_generic_params {
+    () => {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            let added = push_generic_shadow(&mut self.shadow, &node.sig.generics);
+            syn::visit::visit_item_fn(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            let added = push_generic_shadow(&mut self.shadow, &node.sig.generics);
+            syn::visit::visit_impl_item_fn(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+            let added = push_generic_shadow(&mut self.shadow, &node.sig.generics);
+            syn::visit::visit_trait_item_fn(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            let added = push_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_impl(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+            let added = push_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_trait(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+    };
+}
+
 /// Every item anywhere in `items`, at any nesting depth, `mod` blocks
 /// included.
 ///
@@ -970,6 +1043,11 @@ impl ResolvedPath {
 pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Error> {
     struct PathVisitor<'ast> {
         stack: Vec<&'ast [syn::Item]>,
+        // Generic type-parameter names in scope at the current point (issue
+        // #181), flat and cumulative like `block_items` elsewhere in this
+        // file: pushed on entering a generics-bearing item, truncated back
+        // off on the way out.
+        shadow: Vec<String>,
         paths: Vec<ResolvedPath>,
     }
 
@@ -984,6 +1062,8 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
             }
             syn::visit::visit_item(self, item);
         }
+
+        shadow_generic_params!();
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
             // A nested module's own item list goes on top of the stack
@@ -1007,7 +1087,7 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 
         fn visit_path(&mut self, path: &'ast syn::Path) {
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(path, &self.stack),
+                segments: resolve_segments(path, &self.stack, &self.shadow),
             });
             syn::visit::visit_path(self, path);
         }
@@ -1016,6 +1096,7 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
     let file = parse_rust(contents)?;
     let mut visitor = PathVisitor {
         stack: vec![&file.items],
+        shadow: Vec::new(),
         paths: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -1051,7 +1132,11 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 /// one exists by that name in the same scope (Codex review, PR #176) —
 /// there is nothing left to resolve inside it, so descending would only
 /// throw the name away.
-fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
+///
+/// `shadow` is every generic type-parameter name currently in scope (issue
+/// #181): a bare head segment it names is never looked up, because a real
+/// generic parameter shadows a same-named module or alias outright.
+fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]], shadow: &[String]) -> Vec<String> {
     let segments: Vec<String> = path
         .segments
         .iter()
@@ -1060,7 +1145,7 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
     if path.leading_colon.is_some() {
         return segments;
     }
-    resolve_segments_from(segments, stack)
+    resolve_segments_from(segments, stack, shadow)
 }
 
 /// [`resolve_segments`]'s own resolution loop, over a segment list that is already known to
@@ -1068,7 +1153,20 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]]) -> Vec<String> {
 /// alias chain's leftover head against the enclosing module stack, since a name a block's own
 /// aliases could not finish resolving may itself be a module-level alias (issue #92, Codex's
 /// post-merge review).
-fn resolve_segments_from(mut segments: Vec<String>, stack: &[&[syn::Item]]) -> Vec<String> {
+///
+/// See [`resolve_segments`] for what `shadow` is.
+fn resolve_segments_from(
+    mut segments: Vec<String>,
+    stack: &[&[syn::Item]],
+    shadow: &[String],
+) -> Vec<String> {
+    // Issue #181: a shadowed head segment names the generic parameter, not
+    // a module or an alias. Leaving it unresolved keeps the segment in the
+    // answer — a suffix check still reads it — rather than silently
+    // substituting through a same-named sibling module or alias.
+    if segments.first().is_some_and(|first| shadow.contains(first)) {
+        return segments;
+    }
     let mut scope = stack.len().saturating_sub(1);
     // `None` while resolution is still on the lexical ancestor stack;
     // `Some(items)` once it has stepped into a sibling module by name
@@ -1222,7 +1320,12 @@ fn collect_future_implementors<'ast>(
         match item {
             syn::Item::Impl(implementation) => {
                 if let Some((_, trait_path, _)) = implementation.trait_.as_ref() {
-                    let resolved = resolve_segments(trait_path, stack);
+                    // No shadow set (issue #181): this scan never enters a
+                    // function body, and a generic type parameter cannot
+                    // fill the trait position of an `impl` — a type
+                    // parameter is a type, never a trait, so it has
+                    // nothing here to shadow.
+                    let resolved = resolve_segments(trait_path, stack, &[]);
                     if resolved.last().is_some_and(|last| last == "Future") {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
                             if let Some(name) = self_type.path.segments.last() {
@@ -4195,6 +4298,10 @@ pub fn struct_literal_counts(
         // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
         // Codex's fifth round; issue #109 review).
         block_items: Vec<&'ast syn::Item>,
+        // Generic type-parameter names in scope at the current point (issue
+        // #181), same shape as `block_items`: pushed on entering a
+        // generics-bearing item, truncated back off on the way out.
+        shadow: Vec<String>,
         name: String,
         count: usize,
     }
@@ -4213,6 +4320,8 @@ pub fn struct_literal_counts(
             }
             syn::visit::visit_impl_item(self, node);
         }
+
+        shadow_generic_params!();
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
             // A nested module's own item list goes on top of the stack
@@ -4281,8 +4390,10 @@ pub fn struct_literal_counts(
                 Some((segments, true)) => segments,
                 // Ran out of block-local aliases: the leftover head may itself be a
                 // module-level alias — `resolve_segments_from` is a no-op if it is not.
-                Some((segments, false)) => resolve_segments_from(segments, &self.stack),
-                None => resolve_segments(&node.path, &self.stack),
+                Some((segments, false)) => {
+                    resolve_segments_from(segments, &self.stack, &self.shadow)
+                }
+                None => resolve_segments(&node.path, &self.stack, &self.shadow),
             };
             if resolved
                 .last()
@@ -4299,6 +4410,7 @@ pub fn struct_literal_counts(
     let mut total = Literals {
         stack: vec![&file.items],
         block_items: Vec::new(),
+        shadow: Vec::new(),
         name: name.to_owned(),
         count: 0,
     };
@@ -4306,9 +4418,16 @@ pub fn struct_literal_counts(
 
     let mut inside_count = 0_usize;
     for target in inside_targets(&file, &inside) {
+        // `shadow` starts empty here (issue #181): an `InsideTarget::Block` is
+        // visited from its `syn::Block` alone, with no `syn::Signature` in
+        // hand for the generics of the function that owns it. Any generics
+        // the target's own body declares afresh — a nested `fn` or `impl` —
+        // still push and pop correctly; only the outer function's own are
+        // unseen here, a narrower residual than the one this issue closes.
         let mut visitor = Literals {
             stack: target.stack().to_vec(),
             block_items: Vec::new(),
+            shadow: Vec::new(),
             name: name.to_owned(),
             count: 0,
         };
@@ -4657,6 +4776,9 @@ impl NameUses {
 pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
     struct Names<'ast> {
         stack: Vec<&'ast [syn::Item]>,
+        // Generic type-parameter names in scope at the current point (issue
+        // #181), same shape as `PathVisitor`'s own.
+        shadow: Vec<String>,
         idents: Vec<String>,
         paths: Vec<ResolvedPath>,
     }
@@ -4675,6 +4797,8 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
             }
             syn::visit::visit_impl_item(self, node);
         }
+
+        shadow_generic_params!();
 
         fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
             // A nested module's own item list goes on top of the stack
@@ -4702,7 +4826,7 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
 
         fn visit_path(&mut self, node: &'ast syn::Path) {
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(node, &self.stack),
+                segments: resolve_segments(node, &self.stack, &self.shadow),
             });
             syn::visit::visit_path(self, node);
         }
@@ -4712,6 +4836,7 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
 
     let mut names = Names {
         stack: vec![&file.items],
+        shadow: Vec::new(),
         idents: Vec::new(),
         paths: Vec::new(),
     };
@@ -13814,6 +13939,109 @@ mod alias_scope_tests {
             !implementors.contains(&"Innocent".to_owned()),
             "a sibling module's alias was reachable through an unrelated `super::` path: \
              {implementors:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod generic_shadow_tests {
+    //! Issue #181 (Codex review, PR #176): a generic type parameter shadows a
+    //! same-named sibling module inside the item that declares it, the same
+    //! way real Rust name resolution does. Module descent (issue #169) had
+    //! no notion of this and would step into the module anyway, so a
+    //! disallowed alias reached only through the shadowed name could
+    //! silently substitute in and vanish from a suffix check.
+    use super::{FnScope, name_uses, resolved_path_uses, struct_literal_counts};
+
+    #[test]
+    fn a_generic_parameter_shadows_a_same_named_sibling_module() {
+        // `TimerSpec` names the generic type parameter here, not the
+        // sibling module — real Rust resolves the bare head segment to the
+        // parameter. The path must stay `TimerSpec::BestEffort`, not
+        // resolve through the module's own alias to `Disallowed`.
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn f<TimerSpec: \
+             Spec>() {\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a generic parameter did not shadow the sibling module's alias: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn name_uses_also_respects_generic_parameter_shadowing() {
+        // `name_uses` shares `resolve_segments` with `resolved_path_uses`;
+        // both must agree.
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn f<TimerSpec: \
+             Spec>() {\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let names = name_uses(code).expect("the fixture parses");
+        assert!(
+            names.names_decision("TimerSpec::BestEffort"),
+            "{:?}",
+            names.paths
+        );
+        assert!(!names.names_decision("Disallowed"), "{:?}", names.paths);
+    }
+
+    #[test]
+    fn a_shadowing_generic_parameter_does_not_leak_into_a_sibling_function() {
+        // Only the generic function's own body is shadowed. An ordinary
+        // function in the same file must still see the real module and
+        // descend into it as issue #169 intends.
+        let code = "mod TimerSpec {\n    pub use core::future::Future as BestEffort;\n}\nfn \
+             shadowed<TimerSpec: Spec>() {\n    let _ = TimerSpec::BestEffort;\n}\nfn plain() \
+             {\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future"]),
+            "an unshadowed sibling function lost ordinary module descent: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "the shadowed function's own reference was resolved through the module anyway: \
+             {paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_impls_own_generic_parameter_shadows_inside_its_methods() {
+        // The impl block's generics are in scope for every method inside
+        // it, not only a method that repeats them on its own signature.
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nstruct \
+             Holder<TimerSpec>(TimerSpec);\nimpl<TimerSpec: Spec> Holder<TimerSpec> {\n    fn \
+             f(&self) {\n        let _ = TimerSpec::BestEffort;\n    }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "an impl's own generic parameter did not shadow inside its method: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn struct_literal_counts_respects_generic_parameter_shadowing() {
+        // A generic type parameter can qualify an associated-type struct
+        // literal the same way a module can be stepped into — the count
+        // must not attribute a shadowed reference to the real, disallowed
+        // type behind the module's alias.
+        let code = "mod CheckedDispatch {\n    pub use Disallowed as Sneaky;\n}\nfn \
+             f<CheckedDispatch: Spec>() {\n    let _ = CheckedDispatch::Sneaky {};\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(
+            counts.total, 0,
+            "a shadowed generic parameter's construction counted as the real type: {counts:?}"
         );
     }
 }

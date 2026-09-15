@@ -1269,15 +1269,24 @@ Stated so that nobody mistakes silence for coverage:
   was entered from. An alias declared in one module
   and reached through a `use` in another *file* is invisible outright, the same limit
   `capacity-reserve`, `recovery-surface` and `storage-contract` each record for the one file
-  they pin. Module descent (issue #169) inherits this scanner's oldest limit rather than
-  adding a new one: `resolve_segments` has never tracked a function body's own scope, so a
-  generic parameter or a block-local item named the same as a `use` alias was already able to
-  shadow it unsoundly before #169 existed, and a sibling `mod` block reached the same way now
-  can be shadowed the same way (issue
-  [#181](https://github.com/madmax983/waymaker/issues/181), Codex review, PR #176). Closing it
-  needs generic parameter lists and block-local scopes to become scopes of their own, ahead of
-  every module-level lookup — a materially larger mechanism than anything here today, the same
-  standing #169 itself had on PR #160 before it was filed rather than chased. Nor does
+  they pin. Module descent (issue #169) had inherited this scanner's oldest limit rather than
+  adding a new one: `resolve_segments` tracked no function-body scope at all, so a generic
+  parameter or a block-local item named the same as a `use` alias was already able to shadow
+  it unsoundly before #169 existed, and a sibling `mod` block reached the same way could be
+  shadowed the same way (issue
+  [#181](https://github.com/madmax983/waymaker/issues/181), Codex review, PR #176). The
+  generic-parameter half is closed: `resolve_segments`/`resolve_segments_from` take a shadow
+  set of the type-parameter names a `fn`, `impl` or `trait` item declares, pushed on entering
+  its body and popped on leaving, and a bare head segment that set names is left unresolved
+  rather than substituted through a same-named module or alias — every visitor built on
+  `resolve_segments` (`resolved_path_uses`, `name_uses`, `struct_literal_counts`) carries the
+  same five overrides, factored into one `shadow_generic_params!` macro so the five stay one
+  definition rather than three copies. A block-local item sharing a name with a sibling module
+  or alias stays open, filed as issue
+  [#193](https://github.com/madmax983/waymaker/issues/193): closing it needs a block's own
+  item declarations to become a scope of their own too, ahead of every module-level lookup —
+  more machinery than the generic-parameter half needed, the same standing #169 itself had on
+  PR #160 before it was filed rather than chased. Nor does
   it carry a namespace: two `use` items can bind one local name in different namespaces — a
   function and a trait can both spell `Pollable` — and a syntactic scan cannot tell which one
   a later occurrence meant. Picking the first-declared alias can silently miss a real match;
