@@ -4980,6 +4980,14 @@ fn path_could_reach_target<'a>(
     if segments.is_empty() {
         return false;
     }
+    // `resolve_local_alias_chain` — the deterministic resolver's own block-local
+    // chaser — is reached only for a path written as one bare segment, with no
+    // `self::`/`super::` or other qualification: `self::Unchecked` names the
+    // enclosing *module*, never a block-local item, however many hops a chain
+    // from it takes (issue #197, Codex review of the PR: a leading `self` left
+    // `scope` unmoved, so a block-local alias could be reached through a path
+    // that real Rust would resolve at module scope alone).
+    let block_eligible = segments.len() == 1;
 
     let scope = stack.len().saturating_sub(1);
     let mut budget = budget;
@@ -4990,6 +4998,7 @@ fn path_could_reach_target<'a>(
         None,
         block_items,
         scope,
+        block_eligible,
         shadow,
         target,
         &mut budget,
@@ -5021,8 +5030,22 @@ fn path_could_reach_target<'a>(
 /// chain of two block-local aliases, `type A = C; type C = CheckedDispatch;`, was
 /// missed when this search only tried `block_items` on its very first hop).
 ///
+/// `block_eligible` is [`path_could_reach_target`]'s own: whether the *original*
+/// construction path was one bare segment, with no `self::`/`super::` or other
+/// qualification. `self::Unchecked` names the enclosing module, never a block-local
+/// item, however many hops a chain from it takes — so this is checked once, for the
+/// whole search, rather than per hop the way `block_applies` is (issue #197, Codex
+/// review of the PR: `self` does not move `scope`, so a leading `self::` left
+/// `block_applies` true and a block-local alias answered for a path real Rust would
+/// resolve at module scope alone).
+///
 /// `budget` bounds the whole search. It is spent once per hop, shared across every
-/// branch by the same `&mut usize`. No branch can spend it twice.
+/// branch by the same `&mut usize`. No branch can spend it twice. Exhausting it
+/// answers `true`, not `false`: this is a fail-closed check, where a missed count is
+/// the danger, and a search that ran out of budget before finishing has not shown
+/// `target` is unreachable (issue #197, Codex review of the PR: a large enough file
+/// could exhaust the budget on one live branch before a later, real one was tried,
+/// answering `false` for a construction that is real).
 ///
 /// `shadow` names any generic type parameters in scope — see [`resolve_segments`]'s
 /// own `shadow`. Checked once, against the path's own first segment, then cleared:
@@ -5035,6 +5058,14 @@ fn path_could_reach_target<'a>(
 /// trying `block_items`, so a block-local alias sharing a name with an enclosing
 /// generic parameter was refused instead of searched).
 ///
+/// A hop tries every alias candidate it finds *and* — when none of them reach
+/// `target` — a sibling module of the same name, rather than treating a matching
+/// alias as ruling a same-named module out. An unevaluated `cfg` can make a module
+/// and an alias of one name mutually exclusive the same way it can two aliases (issue
+/// #197, Codex review of the PR: a live module was never tried once a live alias of
+/// the same name had already been, so a construction reachable only through the
+/// module was missed).
+///
 /// `cache` is [`path_could_reach_target`]'s own — see there.
 #[allow(clippy::too_many_arguments)]
 fn segments_could_reach_target<'a>(
@@ -5044,14 +5075,18 @@ fn segments_could_reach_target<'a>(
     mut entered: Option<&'a [syn::Item]>,
     block_items: &[&'a syn::Item],
     innermost_scope: usize,
+    block_eligible: bool,
     mut shadow: &[String],
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
 ) -> bool {
     loop {
+        // A missed count is the danger this search exists to close, so running out
+        // of budget answers "could reach" rather than "could not" — see this
+        // function's own docs.
         let Some(spent) = budget.checked_sub(1) else {
-            return false;
+            return true;
         };
         *budget = spent;
 
@@ -5062,10 +5097,11 @@ fn segments_could_reach_target<'a>(
             consume_scope_prefix(&mut segments, &mut scope);
             stack.get(scope).copied().unwrap_or_default()
         };
-        // A block-local alias applies only here: no module entered by name, and
-        // still at the scope the search started from. `super` above may have just
-        // moved `scope` past it, so this reads the state after consuming a prefix.
-        let block_applies = entered.is_none() && scope == innermost_scope;
+        // A block-local alias applies only here: the original path was eligible,
+        // no module entered by name, and still at the scope the search started
+        // from. `super`/`self` above may have just moved `scope` past it, so this
+        // reads the state after consuming a prefix.
+        let block_applies = block_eligible && entered.is_none() && scope == innermost_scope;
 
         let Some(first) = segments.first().cloned() else {
             return false;
@@ -5097,33 +5133,33 @@ fn segments_could_reach_target<'a>(
             .filter(|candidate| candidate.local == first)
             .collect();
 
-        if !matches.is_empty() {
-            for alias in matches {
-                let mut resolved = alias.target;
-                resolved.extend(segments.get(1..).unwrap_or_default().iter().cloned());
-                if resolved.last().is_some_and(|last| last.as_str() == target) {
-                    return true;
-                }
-                if !alias.absolute
-                    && segments_could_reach_target(
-                        resolved,
-                        stack,
-                        scope,
-                        entered,
-                        block_items,
-                        innermost_scope,
-                        shadow,
-                        target,
-                        budget,
-                        cache,
-                    )
-                {
-                    return true;
-                }
+        for alias in matches {
+            let mut resolved = alias.target;
+            resolved.extend(segments.get(1..).unwrap_or_default().iter().cloned());
+            if resolved.last().is_some_and(|last| last.as_str() == target) {
+                return true;
             }
-            return false;
+            if !alias.absolute
+                && segments_could_reach_target(
+                    resolved,
+                    stack,
+                    scope,
+                    entered,
+                    block_items,
+                    innermost_scope,
+                    block_eligible,
+                    shadow,
+                    target,
+                    budget,
+                    cache,
+                )
+            {
+                return true;
+            }
         }
 
+        // No alias reached `target` — a sibling module of the same name is still a
+        // live possibility, not ruled out by an alias that did not pan out.
         if segments.len() > 1 && !shadowed {
             let module = cache
                 .modules_of(items)
@@ -14337,7 +14373,7 @@ mod cfg_alias_ambiguity_tests {
     //! Issue #185, Codex review of PR #183: a `type`/`use` alias declared more than
     //! once under `#[cfg(..)]` must not let a construction pin silently pick the wrong
     //! declaration.
-    use super::{FnScope, struct_literal_counts};
+    use super::{AliasLookupCache, FnScope, path_could_reach_target, struct_literal_counts};
 
     #[test]
     fn a_dead_cfg_type_alias_does_not_hide_a_live_construction_at_module_scope() {
@@ -14757,6 +14793,93 @@ mod cfg_alias_ambiguity_tests {
             "took {:?} for {MODULES} modules and {LITERALS} literals",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn exhausting_the_budget_counts_the_construction_rather_than_clearing_it() {
+        // Codex review of PR #204: this is a fail-closed check, where a missed count
+        // is the danger and an extra one is not. A search that runs out of budget
+        // has not shown `target` is unreachable — it has shown nothing — so it must
+        // answer `true`, not `false`. `path_could_reach_target` is called directly
+        // here: a fixture large enough to exhaust the real budget through
+        // `struct_literal_counts` would be too large to read as a test.
+        let path: syn::Path = syn::parse_str("Nonexistent").expect("a bare path parses");
+        let mut cache = AliasLookupCache::default();
+        assert!(
+            path_could_reach_target(&path, &[&[]], &[], &[], "Target", 0, &mut cache),
+            "a budget of zero must count rather than clear the construction"
+        );
+    }
+
+    #[test]
+    fn a_real_answer_of_false_still_holds_with_budget_to_spare() {
+        // The control for the test above: a budget that is not exhausted must still
+        // answer honestly — this check is fail-closed, not unconditionally `true`.
+        let path: syn::Path = syn::parse_str("Nonexistent").expect("a bare path parses");
+        let mut cache = AliasLookupCache::default();
+        assert!(
+            !path_could_reach_target(&path, &[&[]], &[], &[], "Target", 8, &mut cache),
+            "a name with no alias at all must not be reachable"
+        );
+    }
+
+    #[test]
+    fn a_module_is_still_tried_when_a_same_named_alias_did_not_reach_the_target() {
+        // Codex review of PR #204: an unevaluated `cfg` can make a module and an
+        // alias of one name mutually exclusive the same way it can two aliases. A
+        // live alias that does not itself reach `target` must not rule a same-named
+        // live module out.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\nmod traits {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\nuse decoy as traits;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_self_qualified_path_does_not_reach_a_block_local_alias() {
+        // Codex review of PR #204: `self::Unchecked` names the enclosing *module*,
+        // never a block-local item — `self` does not move `scope`, so `block_applies`
+        // stayed true for a path real Rust resolves at module scope alone.
+        let counts = struct_literal_counts(
+            "type Unchecked = Decoy;\n\
+             fn forge() -> u8 {\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_bare_path_still_reaches_the_same_block_local_alias() {
+        // The control for the test above: the same block-local alias, reached
+        // through the bare, unqualified name real Rust resolves it through.
+        let counts = struct_literal_counts(
+            "type Unchecked = Decoy;\n\
+             fn forge() -> u8 {\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 }
 

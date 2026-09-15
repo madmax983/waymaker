@@ -5693,5 +5693,21 @@ with a generic parameter was refused instead of searched — the same "missed co
 the whole mechanism exists to close. `shadow` is now checked once, against the path's own
 first segment, and gates only the module-scope half of a hop; a block-local alias is tried
 regardless. `a_block_local_alias_still_resolves_when_its_name_shadows_a_generic_parameter`
-and its control are the regression. No new ADR: nothing here moves a must-not-own cell, a
-dependency edge, or a rule id.
+and its control are the regression.
+
+An automated review of the open pull request then found three more, all real. First: running
+out of budget answered `false`, the same as a genuine "not reachable" — but a search that
+exhausted its budget has shown nothing, not that `target` is unreachable, and answering
+`false` is exactly the missed-count danger this whole mechanism exists to close. Exhausting
+the budget now answers `true`. Second: once a hop found a live alias, a same-named sibling
+module was never tried, even when none of that hop's aliases reached `target` — but an
+unevaluated `cfg` can make a module and an alias of one name mutually exclusive the same way
+it can two aliases, so a module is now tried too. Third: `self::Unchecked` names the
+enclosing module, never a block-local item, in real Rust — but `self` does not move `scope`,
+so a block-local alias still answered for a path real Rust resolves at module scope alone.
+Whether the search may consult `block_items` at all is now decided once, from the shape of
+the original path, not per hop. `exhausting_the_budget_counts_the_construction_rather_than_clearing_it`,
+`a_module_is_still_tried_when_a_same_named_alias_did_not_reach_the_target`, and
+`a_self_qualified_path_does_not_reach_a_block_local_alias` — each with its own control — are
+the three regressions. No new ADR: nothing here moves a must-not-own cell, a dependency edge,
+or a rule id.
