@@ -435,12 +435,17 @@ stop naming the same set.
 The model half is `crates/waymaker-drive/tests/matrix.rs`: one test per row, named after it,
 and the rule reads the names out of the file. The rig half is
 `crates/waymaker-rig/tests/matrix.rs`: one test per swept row, named after it with
-`_on_the_rig`, which classifies every crash point the injector lists, resumes the run with
-`Rig::resume`, and holds it to the row. Both run in the `verification` job as the `matrix`
-stage. The rig half runs on the host through `waymaker-fault`; no board has run it, and
-[the boards](#what-the-boards-still-owe) stay `Not run`. The rig reaches six rows; the "On the
-rig" column says which, and `the_rig_fills_six_rows_and_names_the_seventh_as_its_gap` requires
-the rig's census to refuse rather than to stop at six.
+`_on_the_rig` for the six effect rows and the two bank rows, resumes the run with
+`Rig::resume` (or, once a swap has moved authority, reads the bank it moved to directly),
+and holds it to the row. The two remaining rows are driven rather than swept — a capacity
+refusal and a declared-workflow mismatch are not media crashes the injector produces — and
+credit their row without the `_on_the_rig` suffix, matching the model half's own naming for
+its driven rows. Both run in the `verification` job as the `matrix` stage. The rig half runs
+on the host through `waymaker-fault`; no board has run it, and
+[the boards](#what-the-boards-still-owe) stay `Not run`. The rig reaches all ten rows; the
+"On the rig" column says how, and
+`every_row_of_the_table_is_reached_and_the_sweeps_have_not_thinned` pins every count so a
+sweep that quietly thinned fails closed.
 
 All 10 failure rows, with the id to cite when a change touches one:
 
@@ -452,10 +457,10 @@ All 10 failure rows, with the id to cite when a change touches one:
 | `after-activity-before-completion-barrier` | After physical activity, before completion barrier | `after_physical_activity_before_completion_barrier_the_same_id_is_redelivered` | Swept |
 | `during-completion-write` | During completion write | `during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed` | Swept |
 | `after-completion-barrier` | After completion barrier | `after_completion_barrier_the_completion_is_replayed_and_the_activity_never_runs_again` | Swept |
-| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Owed |
-| `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Owed |
-| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Owed |
-| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Owed |
+| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | `during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues` | Swept |
+| `after-new-bank-seal-barrier` | After new bank seal barrier | `after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current` | Swept |
+| `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Driven |
+| `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Driven |
 
 Row 5 now holds as §14 writes it. It says "redeliver": no writer starts a record before the
 one ahead of it has sealed, so a torn completion's own reserved slot is the whole of what an
@@ -472,14 +477,26 @@ the bytes there are neither erased nor a real seal, so recovery still cannot tel
 interrupted append from damage — and that half of the row still refuses, exactly as
 [ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)
 says of a bank recovery cannot vouch for. The test sweeps both outcomes. See
-[ADR 0048](docs/adr/0048-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
+[ADR 0049](docs/adr/0049-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
 
-The four `Owed` rows are the rig's, not the model's: a swap workload, a capacity refusal and a
-divergent replay are things this rig does not do — issue
-[#96](https://github.com/madmax983/waymaker/issues/96). To move a row to `Swept`: name its
-rig test in `FAILURE_ROWS`, reach it in the rig's census, and move the pinned gap test. The
-same issue records what a board cannot do: rows 2, 3 and 4 are told apart by whether the
-dispatcher was entered and returned, which the harness sees and a reset takes with the RAM.
+Issue [#96](https://github.com/madmax983/waymaker/issues/96) closed the four rows the rig
+used to owe. Rows 7 and 8 needed a workload that rolls over: `Rig::iterate_until_rollover`
+writes a run's opening records and stops before its `RunCompleted`, a test drives §10's
+seven-step swap directly against the bank it leaves off in, and the crash injector sweeps
+every point of the combined sequence. Which row a point lands in is read from
+`bank::select` alone — a swap writes no journal record and marks no witness, so the old
+bank still authoritative is row 7 and the new bank authoritative is row 8. That needed
+`Rig::judge` and `Rig::resume` to stop assuming `Rig::BANK` is always the bank a boot would
+choose: the fix is `Rig::authority`, and reverting it reproduces the defect the rows exist
+to catch — a resumed run answering as current from a bank a swap had already retired. Row 9
+gates `Rig::iterate_reserved`/`Rig::resume_reserved` with `waymaker_flash::capacity::Reserve`
+and finds a declared tail wide enough to refuse the second effect on the rig's own fixture,
+then drives the same explicit swap to show the exit past it. Row 10 gives `Workload` a
+`diverging` knob that changes one schedule's activity kind with everything else — shape, run
+identity, every other record — untouched, and `Rig::resume_declaring` audits history against
+it instead of the workload that wrote it. The same issue records what a board still cannot
+do: rows 2, 3 and 4 are told apart by whether the dispatcher was entered and returned, which
+the harness sees and a reset takes with the RAM.
 
 ## The book
 
@@ -2488,7 +2505,7 @@ could — recovery had no way to tell an interrupted append from damage, so both
 bank, and the table's own continuation was `continue_as_new`, a new run that forfeits the
 effect's identity. [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
 recorded the deviation; issue #95 and
-[ADR 0048](docs/adr/0048-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
+[ADR 0049](docs/adr/0049-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
 close most of it, below.
 
 Issue #32 opens rung 0.5, and what it asks for is one sentence from §11 made structural: a
@@ -3596,7 +3613,7 @@ refused with `NearCapacity` forever. One wasted attempt is tolerated, not an unb
 number, matching this codebase's other single-crash guarantees;
 `a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry` drives exactly that
 shape end to end. Codex found this on review of the fix above. See
-[ADR 0048](docs/adr/0048-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
+[ADR 0049](docs/adr/0049-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
 
 Issue #99 then closes the route Codex found on issue #32's fourth review round. A
 `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec`, reached
@@ -3780,3 +3797,259 @@ crate exactly as they reached the three modules before: an ordinary workspace me
 than a feature-gated one, so nothing fell out of them. See
 [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md),
 which records the split as superseding its own `without-facade` compromise.
+
+Issue #96 closes the four rows [the failure matrix](#the-failure-matrix-row-by-row) owed on
+the rig, and it does so without moving a single count of the six rows already swept. The
+insight it rests on is that `Rig::judge` and `Rig::resume` hardcoded `Rig::BANK` in a way
+that happened to be harmless, because nothing had ever asked this rig to install a second
+run: `bank::select`'s own answer was always `Rig::BANK`, so reading it by name and reading it
+by authority were the same read. `Rig::authority` is the fix — a new private method that
+keeps *which* bank `bank::select` named rather than only how many — and `installed_journal`
+now refuses a bank whose header names this run but is not the one currently authoritative,
+which a stale, unerased losing bank's header could otherwise still satisfy. Reverting that
+one check and rerunning the row 8 test reproduces the defect directly: a resumed run answers
+`Ok(Completed { recovered: 3, .. })` from the retiring bank's own three records, on a device
+whose authority had already moved to the bank a swap installed.
+
+Rows 7 and 8 needed a workload that rolls over, and `Rig::iterate_until_rollover` is the
+smallest addition that provides one: it writes a run's `RunStarted` and as many
+schedule/completion pairs as it is asked for, and stops — no `RunCompleted`, because the
+run's continuation is whichever bank a swap leaves authoritative rather than this bank's own
+end. `crates/waymaker-rig/tests/matrix.rs`'s `drive_rollover_swap` drives §10's seven
+steps directly against the bank the partial run left off in, the same way
+`crates/waymaker-fault/tests/swap.rs` drives them for the model; the whole sequence — the
+partial run, the swap, and a small complete run written into the bank it installs — runs
+through the crash injector once, and every point is classified by `bank::select`'s answer
+alone. A swap declares no journal record and marks no witness, so there is nothing else a
+row-7-or-8 point could be read from. Where the point lands *before* the swap's own
+operations began, it is one of rows 1 to 6 already, not a new one — `classify_rollover`
+reads the operation index against a boundary taken from a separate fault-free run of just
+the partial sequence, so the two counts stay apart.
+
+Rows 9 and 10 are driven rather than swept, matching the model half's own treatment of the
+same two rows: a capacity refusal and a declared-workflow mismatch are not media crashes the
+injector produces. `Rig::iterate_reserved` and `Rig::resume_reserved` gate every append with
+`waymaker_flash::capacity::Reserve` instead of the ungated writer, and a search over
+declared tail widths on the rig's own fixture finds one that refuses the second effect's
+schedule once the first has completed — the same shape of search `waymaker-drive`'s row nine
+already uses, run here against a real bound instead of a real geometry, because this rig's
+own construction-time check already prices every record at its worst case and only a
+reserve stricter than that check can refuse before the run's true end. The explicit exit
+past it is the same seven-step swap rows 7 and 8 drive, run once by hand rather than swept.
+`Workload::diverging` is row 10's whole addition: an index and a different activity kind at
+it, leaving the run's shape, its identity and every other record's bytes exactly as they
+were, so `Rig::resume_declaring` meets a genuine one-record disagreement rather than a
+shortened or corrupted run — and refuses it with `Breach::RecordDiffers`, before any effect
+runs again and before any byte is written, at every crash point that leaves the changed
+effect's schedule recovered and its completion outstanding.
+
+What is owed is written down rather than implied closed. The two bank rows are swept at one
+`effects_before_swap` value and one declared next-run input; `waymaker-fault`'s own swap
+sweep is the one that varies the geometry and the step at which every crash lands. Row 9's
+search is over declared bounds rather than over geometries, so it says nothing about a bank
+sized differently than the rig's shared fixture. And issue #96's board half — rows 2, 3 and
+4 need the dispatcher's own record of what it was entered for, which a reset takes with the
+RAM — is exactly as unmet as it was before this issue, and stays a board's to close.
+
+Review of the pull request that closed issue #96 found two more real defects, both the same
+shape as `Rig::authority`'s own fix: an instrument reading a state issue #96 made reachable
+for the first time and answering the question it was never asked to answer. The first is in
+row 9's own no-mutation claim: `iterate_reserved` and `resume_reserved` wrote the witness's
+`Attempted` mark for a record *before* asking `Reserve::admits` whether that record would fit
+— so the very first encounter with a near-capacity refusal genuinely mutated the device's
+instrument region, even though `Reserved::stage` itself never touched the journal. The
+existing test could not see it: a *replay*'s witness continuation skips a mark the first
+attempt already wrote, so `assert_replay_refuses_without_mutation`'s wear comparison compared
+two states that were already equal for the wrong reason. A free `admits` function — the same
+`Reserve::admits` call `Reserved::stage` makes internally, read one call earlier — closes it;
+`the_first_capacity_refusal_writes_no_mark_of_its_own` compares the first refusal's rig-only
+wear against a device that legitimately stops after the same one-effect prefix and never
+meets a refusal at all, verified failing against the prior order (one extra program operation
+and barrier — the mark) before the fix landed.
+
+The second is `Rig::judge` itself, and it is the sharper of the two: gating the audit on
+*current* authority, the way `Rig::resume` correctly must, made a row-8 rollover's own
+retired bank read as though its acknowledged records had gone missing, because `uninstalled`
+assumes a bank with no current authority has nothing to say about this run rather than that
+it said something and was superseded. `installed_journal` stays authority-gated for
+`resume` and `recover_prefix`, which do need to know whether a bank is still the one a boot
+would choose; `judge` moves to a new `own_bank_journal`, which reads `Rig::BANK`'s own header
+by run id alone and audits what it holds regardless of which bank is authoritative now — a
+retired bank's own history does not change when a swap moves authority away from it.
+The row 8 test now asserts `rig.verify(0, ..)` reports `Outcome::Passed` at every one of its
+crash points, beside the assertion that `resume` refuses them; verified failing with
+`Breached(LostAcknowledgedRecord { .. })` against the prior single check before this split
+existed.
+
+A further round found two more, again the shape of an instrument answering a question the
+previous round made reachable for the first time. The first is in the pair of fixes above:
+`Rig::new` sizes the bank and the witness for `self.effects` alone, and `resume_declaring`'s
+`declared` can share this rig's seed and iteration — so it matches the recovered prefix —
+while naming more effects than either was ever provisioned for. Left as the earlier round
+left it, that call ran past its own provisioning until an unrelated capacity error
+(`AppendError::NoRoom`, `WitnessError::Full`) stopped it, rather than the refusal-before-
+mutation `resume`'s own postcondition promises. `resume_as` now refuses any workload wider
+than `self.effects` before touching the device at all, ahead of the recovery this rig's own
+authority check already gates on. Reproduced first from the same crash point the earlier
+round used — both of the rig's own effects durably completed, `RunCompleted` not yet begun —
+where the prior code durably appended and dispatched the extra effect's schedule record
+before this refusal existed.
+
+The second found that `rollover_sweep`'s combined run never called `Installed::reclaim` at
+all: `Installed::recovery` and `Installed::reclaim` both consume the value `commit` returns,
+and the sweep took the former to keep writing into the bank it installed, so the crash
+injector never produced a point during the retiring bank's own erase or its barrier — even
+though row 8 held authoritative throughout that window exactly as it does after `commit`,
+and the row was published as fully swept regardless. `drive_rollover_swap` now reclaims
+first and re-derives the installed bank's journal region by hand — the same read
+`iterate_until_rollover_and_iterate_reserved_refuse_a_bank_a_swap_moved_past` already does —
+so the erase is under the injector and the caller still gets a writer for the bank it
+installed. Row 8's own count moved from 167 to 175 crash points, the eight new ones all
+inside the erase and its barrier; row 7's count did not move, because reclaiming the
+retiring bank can only ever lose it `bank::select`'s vote, never regain it ahead of the
+bank the swap already installed.
+
+A further round found a fourth, in `require_own_authority` itself: it names the *bank* —
+`Rig::BANK` must be the current sole authority — and never the *run*, so a bank that is
+this rig's own and currently authoritative could still have been installed for a different
+iteration, and `iterate`, `iterate_until_rollover` and `iterate_reserved` would each write
+that iteration's records and witness marks into the wrong iteration's journal rather than
+refuse. `journal_region` — the write path's own twin of the run-id check
+`installed_journal` already holds `resume` and `recover_prefix` to — now takes the
+workload it means to write and refuses unless the bank's header names that workload's own
+run. Reproduced first by preparing a part for iteration 0 and calling `iterate(1, ..)` on
+it directly: the unfixed code answered `Ok(Stop::Completed)`, having written iteration 1's
+records and marks over iteration 0's bank, rather than `RigError::Bank`. Two existing tests
+had built their own fixtures by relying on exactly that gap — one in `resume`'s own test
+suite, one in the rig's crash-sweep judge test — and both now reach the same device states
+through the lower-level primitives `Rig` itself writes with, rather than through the write
+path this fix closes.
+
+A fifth was `resume_declaring` itself. `recover_prefix`'s audit only compares `declared`
+against what recovery actually found, so a crash landing before
+[`Workload::diverging`](crate::workload::Workload::diverging)'s own changed index left
+nothing there for the audit to disagree with — `resume_as`'s loop then wrote the declared,
+diverged record fresh and dispatched it, same as any other never-before-recorded record.
+The fix widens what a fresh write is checked against: a record `resume_as` is about to
+write for the first time must now agree with this rig's own undiverged truth —
+`self.workload(iteration)` — before it is marked, appended or dispatched, not only with
+whatever recovery happened to find. For an ordinary `resume` the two are the same workload
+and the check never fires; `resume_declaring`'s `declared` is where it can differ.
+Reproduced first from a crash point that left the first effect durably completed and the
+second effect's schedule — the record `diverging` changes — not yet recovered at all: the
+unfixed code answered `Ok(Completed { recovered: 3, .. })`, having written and dispatched
+the diverged record, rather than `RigError::Breach(Breach::RecordDiffers { .. })` before
+either happened.
+
+A sixth was the capacity preflight's own other half: it refused a `declared` *wider* than
+`self.effects` but let a *narrower* one through. A narrower run's opening effects are a
+byte-for-byte prefix of a longer one's, so its early records still agree with this rig's
+own truth and the per-record check above does not fire — the mutation and the dispatch it
+exists to prevent both happen for every record before the declaration's own early
+`RunCompleted` finally collides with an index the real run still has open. The preflight
+now refuses any effect count other than `self.effects`, not only a wider one:
+`resume_declaring` only ever means to audit a workload that agrees with this rig's own run
+everywhere but the one record `diverging` names, and a workload of another length is not
+that shape. Reproduced first from a crash point that left only `RunStarted` durable and a
+narrower declared workload: the unfixed code dispatched the first effect and only then
+answered `Breach::RecordDiffers` at the index where the shapes finally disagreed.
+
+A seventh was the per-record check's own placement, in the same shape once more: it ran
+*inside* the write loop, so a record that genuinely agreed with this rig's own truth was
+still written — and dispatched, if it scheduled an effect — before the loop reached
+whichever later index `declared` actually disagreed at. Row 10's own promise, "no further
+execution and history untouched", is about the whole declaration, not only the one record
+that turns out to disagree. The check now runs once, over every record this resume would
+still need to write, before the outstanding-effect redelivery or the write loop touch
+anything — so a disagreement anywhere in what is left of the run refuses before the first
+agreeing record in front of it is touched, not only before the disagreeing one itself.
+Reproduced first from a crash point that left only `RunStarted` durable, with a `declared`
+diverging at the *second* effect: the unfixed code dispatched the first effect — which
+agreed with `declared` — before reaching the second and refusing there.
+
+An eighth returned to row 9, and it is the same shape once more, in `iterate_reserved` and
+`resume_reserved` rather than in `resume_declaring`: `admits` is checked for the record
+about to be written and nothing else, so a schedule that fits a reserve whose
+`effect_result_bytes` is too narrow for the completion still gets marked, appended and
+dispatched — the effect runs — before the loop reaches the completion's own index and
+discovers `Refusal::OverDeclaredBound` there. By then refusing cannot undo the dispatch,
+and every retry through `resume_reserved` performs the effect again. A schedule's own
+width does not depend on `effect_result_bytes`, so the schedule's admission is never
+evidence that its completion's will follow. Both fresh-write loops now preflight the
+completion `Workload::completion_index` names, admitting it against the same reserve
+before the schedule's effect is dispatched — the same shape the redelivery branch above
+each loop already carried for an *outstanding* effect, extended to a schedule written
+fresh in the same call. Reproduced first with a zero-width `effect_result_bytes` reserve
+against a freshly prepared device: `iterate_reserved` dispatched effect 0 and only then
+answered `Refusal::OverDeclaredBound` at its completion's index, and `resume_reserved`
+did the same from a device recovered no further than `RunStarted`, where the main loop
+rather than the redelivery branch reaches the fresh schedule.
+
+A ninth, and a different shape from every one before it: `Workload::diverging` took a raw
+record index rather than an effect number, and `record`'s only consultation of it is in
+the `Role::Schedule` arm — so a caller who passed the index of a `Start`, `Completion` or
+`Finish` record, or one past the end of the run, got back a workload that agreed with the
+base one everywhere, byte for byte, rather than diverging at all. That is the same
+silent-masking shape every earlier finding in this issue closed against a media state;
+here the wrong input is a caller's own argument, and the fix is the same kind wrong-role
+arguments elsewhere in this codebase are refused by construction: `diverging` now takes
+the effect whose schedule diverges and derives the record index itself through
+`schedule_index`, so a `Start`, `Completion` or `Finish` index cannot be named through
+this API at all. An effect this run does not schedule still diverges nothing — honestly,
+since there is no schedule record for it to disagree at, which `schedule_index` already
+answers `None` for. Reproduced first against the old signature: `.diverging(0)` — record
+index 0, `Role::Start` — produced a workload indistinguishable from the base one across
+every record, and every existing caller turned out to have already been deriving the
+right index through `schedule_index` before calling it, so none needed anything but the
+one call site simplified to the effect number it was computing a schedule index from.
+
+A tenth returned to round 7's write-path check, and it is one identity narrower than the
+round it followed: `journal_region` compared `header.run` against the workload's own run
+id and stopped there, so a bank whose header names the right run but a different
+`workflow_kind` or `input` still passed. A run id agreeing is not the whole of a
+workflow's identity — a real boot (`crates/waymaker-drive/src/drive.rs`) refuses a
+recorded kind or input that disagrees with the one it expected — and nothing stops the
+public swap surface installing a header that reuses a run id under a different declared
+identity, since `SwapError::RunReused` only compares the *next* run against the
+*retiring* one. `journal_region` now also compares the header's `workflow_kind`,
+`workflow_version` and `input` against `workload`'s own opening record before handing
+back a region to write into. Reproduced first with two real swaps rather than a
+hand-fabricated header — a single swap moves authority to the *other* bank and would
+refuse earlier, at `require_own_authority`, for an unrelated reason: the first retires a
+freshly prepared run onto the other bank under a throwaway identity, and the second
+retires that throwaway run back onto `Rig::BANK` naming one iteration's own run id but
+another iteration's workflow input. The unfixed code answered `Ok(Completed)`, having
+written and dispatched into the mismatched bank, before this check existed.
+
+An eleventh found the read path's own twin of the ninth's gap: `resume_as`'s preflight
+compared `workload.effects()` against `self.effects`, but never `workload`'s own run
+against the run `iteration` names. Two iterations of one plan share an effect count by
+construction, so a `declared` sharing this rig's seed and *another* iteration's number
+passes that check while still naming a bank installed for a different run.
+`recover_prefix`'s audit then checks `declared` against the bank's own header, which
+agrees — `declared` genuinely is that other iteration's own workload — and once the
+recovered prefix already covers the whole run, the `recovered >= records` branch answers
+`Completed` before the per-record comparison against `self.workload(iteration)` is ever
+reached: a run belonging to iteration 0 is reported as iteration 1's. `resume_as` now
+also refuses unless `workload.run()` agrees with `self.workload(iteration).run()`, before
+recovery is read at all. Reproduced first by completing iteration 0 with no cut anywhere,
+then calling `resume_declaring(1, rig.workload(0), ..)` on the same device: the unfixed
+code answered `Ok(Completed { recovered: 6, .. })`, reporting iteration 0's own history as
+iteration 1's, rather than refusing with `RigError::Workload`.
+
+A twelfth found the eleventh's own fix unsound: comparing `Workload::run` is comparing a
+hash, and `RunId` is `SplitMix64::new(seed).at(iteration)` — `mix(seed + GAMMA *
+(iteration + 1))`, injective in the mixed word but not in the *pair* the word is built
+from. `seed` plus `GAMMA` at iteration zero sums to the same word as plain `seed` at
+iteration one, so a device whose real history was written by a wholly different rig —
+seeded `SEED` plus `GAMMA` rather than this rig's own `SEED` — at iteration zero satisfies
+both the eleventh's check and `own_bank_journal`'s header comparison for a
+`resume_declaring(1, ..)` call on the genuine rig: the header truly names the colliding
+run, and so does the declaration. `resume_as` now compares the seed and the iteration
+directly against this rig's own plan and the `iteration` argument, rather than routing the
+comparison through a hash nothing ever claimed was injective over two arguments at once.
+Reproduced first with two rigs sharing a geometry and differing only by that one seed
+offset: the foreign rig wrote a complete run at its own iteration zero, and the genuine
+rig's `resume_declaring(1, ..)` over that same device answered `Ok(Completed { recovered:
+6, .. })` under the eleventh's fix alone, never having written a byte to the device it
+just reported completing.

@@ -6,9 +6,13 @@ stage runs the tests on the in-memory model of NOR and on the power-cut rig.
 Both halves run on a host. The rig drives `waymaker-fault` rather than a part, and no board
 has run either half. See [the hardware compatibility matrix](hardware-matrix.md).
 
-The **rig** column says whether the rig reaches that row. The rig still owes four rows,
-because it has no bank-swap workload, no capacity refusal and no divergent replay. Issue
-[#96](https://github.com/madmax983/waymaker/issues/96) is where they arrive.
+The **rig** column says whether the rig reaches that row. It reaches all ten. Issue
+[#96](https://github.com/madmax983/waymaker/issues/96) closed the last four: a bank-swap
+workload for rows 7 and 8, a capacity refusal for row 9, and a divergent replay for row 10.
+Eight rows are swept: the crash injector interrupts a real run at every point and the rig
+classifies where each point landed. Rows 9 and 10 are driven instead, one hand-built case
+each, because a capacity refusal and a declared-workflow mismatch are not media crashes the
+injector produces.
 
 | Id | Failure point | What happens | On the rig |
 | --- | --- | --- | --- |
@@ -18,10 +22,10 @@ because it has no bank-swap workload, no capacity refusal and no divergent repla
 | `after-activity-before-completion-barrier` | After physical activity, before completion barrier | The same id is redelivered. | Swept |
 | `during-completion-write` | During completion write | The torn completion is ignored and no partial result bytes are exposed. If the frame's reserved slot is otherwise erased, the run redelivers the effect under its own identity; if a byte of the slot is neither erased nor a real seal, the bank has no append point and is refused. | Swept |
 | `after-completion-barrier` | After completion barrier | The completion is replayed. The activity never runs again. | Swept |
-| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | The old bank stays authoritative and the old run continues. | Owed |
-| `after-new-bank-seal-barrier` | After new bank seal barrier | The new bank is authoritative and the old run is never current. | Owed |
-| `history-capacity-reached` | History capacity reached | A capacity error with no mutation, or an explicit continue_as_new. | Owed |
-| `replay-divergence` | Replay divergence | A deterministic fault. No further execution, and history untouched. | Owed |
+| `during-inactive-bank-erase-or-write` | During inactive-bank erase/write | The old bank stays authoritative and the old run continues. | Swept |
+| `after-new-bank-seal-barrier` | After new bank seal barrier | The new bank is authoritative and the old run is never current. | Swept |
+| `history-capacity-reached` | History capacity reached | A capacity error with no mutation, or an explicit continue_as_new. | Driven |
+| `replay-divergence` | Replay divergence | A deterministic fault. No further execution, and history untouched. | Driven |
 
 ## Row 5 holds, except where recovery cannot tell an interrupted append from damage
 
@@ -42,5 +46,5 @@ seal, and recovery still cannot tell an interrupted append from damage there. Th
 no append point and is refused, exactly as before.
 
 The tests sweep both outcomes. See
-[ADR 0048](https://github.com/madmax983/waymaker/blob/main/docs/adr/0048-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
+[ADR 0049](https://github.com/madmax983/waymaker/blob/main/docs/adr/0049-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
 for the full decision.
