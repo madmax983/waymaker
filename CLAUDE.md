@@ -1238,21 +1238,17 @@ Stated so that nobody mistakes silence for coverage:
   under a *different*, unevaluated flag: `own_aliases` still deterministically picks one —
   the first at module scope, the last at block scope — so whichever a real build compiles
   can lose to the other. `struct_literal_counts` closes that residual for its own callers
-  with `alias_could_reach_target` (issue #185): a construction is counted when *any* live
-  alias sharing its name could reach it, not only the one declaration
-  `resolve_local_alias_chain`/`resolve_segments_from` would pick — but only for a bare,
-  single-segment construction path whose live alias resolves without stepping into
-  another module. A qualified site (`super::Unchecked { .. }`) or a live alias reached
-  through a module (`use traits::Marker as Unchecked;`) is not covered, and neither is
-  chasing a resolved target past its own module qualification — a multi-segment target
-  is compared once and the chain stops there, so it cannot be confused with an unrelated
-  local alias of the same bare name, but it also cannot be followed into the module it
-  names. Tracked as issue #197. `resolved_path_uses` and `future_trait_implementors`
-  still have the wider residual too, because they need `resolve_segments`' and
-  `resolve_segments_from`'s one deterministic answer for reasons of their own — see the
-  Status section's own paragraph on issue #185 for why widening those two was not taken
-  up here. Alias resolution also stops at the file it reads: a chain of `use .. as ..` renames resolves
-  within one module (issue #109), a nested module does not inherit an outer one's aliases,
+  with `path_could_reach_target`/`segments_could_reach_target` (issues #185 and #197): a
+  construction is counted when *any* live alias sharing its name could reach it, not only
+  the one declaration `resolve_local_alias_chain`/`resolve_segments_from` would pick — for a
+  bare construction path or a qualified one, and chased into a module a multi-segment alias
+  target names, mirroring `resolve_segments_from`'s own `own_modules` descent.
+  `resolved_path_uses` and `future_trait_implementors` still have the wider residual, because
+  they need `resolve_segments`'s and `resolve_segments_from`'s one deterministic answer for
+  reasons of their own — see the Status section's own paragraph on issue #185 for why
+  widening those two was not taken up here. Alias resolution also stops at the file it
+  reads: a chain of `use .. as ..` renames resolves within one module (issue #109), a
+  nested module does not inherit an outer one's aliases,
   and `self::` and `super::` reach the scope each names explicitly rather than by
   inheritance — a stack of each module's own aliases from the file this scan read down makes
   both well-defined *within that file's own nesting*. `crate::` is not well-defined at all:
@@ -5643,3 +5639,47 @@ site or a target reached through another module — which
 [what is not checked](#what-is-not-checked) names rather than leaves implied by a
 stale claim about `#[cfg(test)]` alone. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+Issue #197 closes the two gaps the paragraph above named. `path_could_reach_target`
+replaces `alias_could_reach_target` as `struct_literal_counts`'s fail-closed check. It
+runs for a qualified construction path (`super::Unchecked { .. }`) as well as a bare
+one. A helper beside it, `segments_could_reach_target`, follows a multi-segment alias
+target into the module it names — the same `self`/`super` and module-descent state
+`resolve_segments_from` already keeps, kept separate from it on purpose, for the
+reason the paragraph above states. One shared, decrementing budget bounds the whole
+search, so a crafted alias cycle across two modules still cannot loop forever. Tests
+for both gaps, and their negative controls, are in `xtask/src/parse.rs`'s own
+`cfg_alias_ambiguity_tests` module.
+
+Two unrelated, pre-existing bugs surfaced while fixing this and are fixed alongside
+it. `generic_assoc_type_bindings_naming` still called `resolve_segments` and
+`resolve_segments_from` with two arguments after issue #181 gave both a third,
+`shadow` — a plain build break on `main`. It now passes `&[]`, matching what another
+caller with no shadow tracking of its own already does. And `struct_literal_counts`
+had already grown past clippy's `too_many_lines` gate before this issue touched it;
+its `Literals` visitor moves to module scope, unchanged otherwise, to fix that.
+
+Review found two more real problems in the fix itself, both real gaps rather than
+nitpicks. First: `resolve_local_alias_chain` chases more than one block-local hop
+before it gives up — `type A = C; type C = CheckedDispatch;`, both declared in one
+function body, is a real, two-hop chain. The first version of this fix tried
+`block_items` only on the very first hop, so a live chain like that was missed. A
+missed count is exactly the danger this whole check exists to close. Fixed by
+threading `block_items` through `segments_could_reach_target` itself: it applies at
+every hop where no module has been entered by name and the search is still at the
+scope it started from — the same reach a block-local alias has in real Rust, and no
+wider.
+
+Second: a file with many `#[cfg(..)]`-ambiguous aliases sharing one name, each
+pointing into a different module, plus many struct literals of that name, took
+seconds rather than milliseconds — [what is not checked](#what-is-not-checked)'s own
+standard for this file's scanners. Two causes, both fixed. The search's own spending
+limit was computed from the whole file on every construction site; `alias_search_budget`
+computes it once per file instead, capped at a flat ceiling — `ALIAS_SEARCH_BUDGET_CEILING`
+— since no real alias chain in this codebase needs more than a handful of hops. And the
+search recomputed `own_aliases`/`own_modules` for the same scope from scratch on every
+branch that revisited it; `AliasLookupCache`, shared across a whole file's search, computes
+each scope's aliases and modules once and reuses them. `many_ambiguous_aliases_and_literals_resolve_quickly`
+is the regression: forty modules, two hundred literals, real branching, held to a two-second
+ceiling it clears in well under one. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.

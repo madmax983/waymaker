@@ -789,8 +789,13 @@ pub fn generic_assoc_type_bindings_naming(
                     .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
                 let resolved = match local {
                     Some((segments, true)) => segments,
-                    Some((segments, false)) => resolve_segments_from(segments, &self.stack),
-                    None => resolve_segments(path, &self.stack),
+                    // Fix for a pre-existing build break, not part of issue #197.
+                    // Issue #181 added a third parameter to `resolve_segments` and
+                    // `resolve_segments_from`. This visitor does not track generic
+                    // shadowing. `collect_future_implementors`'s own call has the
+                    // same gap and passes an empty slice for the same reason.
+                    Some((segments, false)) => resolve_segments_from(segments, &self.stack, &[]),
+                    None => resolve_segments(path, &self.stack, &[]),
                 };
                 if let Some(name) = resolved
                     .last()
@@ -4619,6 +4624,153 @@ pub struct LiteralCounts {
     pub inside: usize,
 }
 
+/// [`struct_literal_counts`]'s visitor. Walks a file once and counts every struct
+/// literal whose path resolves to `name`.
+struct Literals<'ast> {
+    stack: Vec<&'ast [syn::Item]>,
+    // The function-local `use`/`type` aliases of every block enclosing the current
+    // point, flat and cumulative rather than a stack of separate scopes — a block
+    // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
+    // Codex's fifth round; issue #109 review).
+    block_items: Vec<&'ast syn::Item>,
+    // Generic type-parameter names in scope at the current point (issue
+    // #181), same shape as `block_items`: pushed on entering a
+    // generics-bearing item, truncated back off on the way out.
+    shadow: Vec<String>,
+    name: String,
+    count: usize,
+    // The starting spending limit for one [`path_could_reach_target`] search — see
+    // [`alias_search_budget`]. Computed once per file rather than once per
+    // construction site (issue #197).
+    alias_search_budget: usize,
+    // Caches [`own_aliases`]/[`own_modules`] for [`path_could_reach_target`]'s
+    // search, keyed by scope. Many construction sites of one name can share the
+    // same ambiguous alias at the same scope — every literal in a `for` loop, say.
+    // Without this cache, each one re-walks that scope's items from scratch (issue
+    // #197, Codex review: this measured seconds on a file with many ambiguous
+    // aliases and many literals).
+    alias_lookup_cache: AliasLookupCache<'ast>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if has_cfg_test(item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if has_cfg_test(impl_item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    shadow_generic_params!();
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // A nested module's own item list goes on top of the stack
+        // (issue #109 review): pushed while walking it, popped
+        // afterward, so `super::`/`crate::` can still reach an ancestor
+        // scope while the module's own scope never inherits it
+        // implicitly. An out-of-line declaration (`mod x;`) has no body
+        // to push, but its own name and attributes must still be
+        // visited the default way — an early return here had skipped
+        // them (Codex review, PR #160), hiding a banned identifier
+        // spelled as a module name.
+        let pushed = node.content.is_some();
+        if let Some((_, items)) = node.content.as_ref() {
+            self.stack.push(items);
+        }
+        // The enclosing block's own local aliases are not visible inside a module
+        // nested within it either — a module inherits nothing from its lexical
+        // surroundings, whether that surrounding is another module or a function body
+        // (Codex review) — so `block_items` is set aside for the module's own
+        // traversal and restored once it is done, the same way `self.stack` is.
+        let enclosing_block_items = core::mem::take(&mut self.block_items);
+        // A module sees none of an enclosing item's generics either
+        // (issue #181): reset for its own traversal, restore after.
+        let outer_shadow = core::mem::take(&mut self.shadow);
+        syn::visit::visit_item_mod(self, node);
+        self.shadow = outer_shadow;
+        self.block_items = enclosing_block_items;
+        if pushed {
+            self.stack.pop();
+        }
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        // A function-local `use` or `type` alias is visible only inside the block
+        // that declares it, and inherited by anything nested within it (issue #92,
+        // Codex's fifth round) — unlike a module, which never inherits an outer
+        // scope's aliases just by being written inside it. `block_items` therefore
+        // stays one flat, growing list: this block's own item declarations are
+        // appended so they are searched first (and so shadow a same-named one
+        // further out — see `resolve_local_alias_chain`), and exactly that many are
+        // truncated back off on the way out, restoring the parent's view for a
+        // sibling block.
+        let own_items: Vec<&'ast syn::Item> = node
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                syn::Stmt::Item(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        let pushed = own_items.len();
+        self.block_items.extend(own_items);
+        syn::visit::visit_block(self, node);
+        self.block_items.truncate(self.block_items.len() - pushed);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        // A block-local alias is innermost, so it is tried first — and only for a
+        // bare, single-segment path, the only shape a function-local `type`/`use`
+        // alias is ever written against; a multi-segment path and module descent stay
+        // `resolve_segments`'s own job over the file's item-slice stack.
+        let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
+            .then(|| node.path.segments.first())
+            .flatten()
+            .map(|segment| ident_name(&segment.ident));
+        let local = first
+            .as_ref()
+            .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
+        let resolved = match local {
+            // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
+            // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
+            Some((segments, true)) => segments,
+            // Ran out of block-local aliases: the leftover head may itself be a
+            // module-level alias — `resolve_segments_from` is a no-op if it is not.
+            Some((segments, false)) => resolve_segments_from(segments, &self.stack, &self.shadow),
+            None => resolve_segments(&node.path, &self.stack, &self.shadow),
+        };
+        let resolves_to_name = resolved
+            .last()
+            .is_some_and(|last| last.as_str() == self.name);
+        // Issue #185: a name declared more than once, live under more than one
+        // unevaluated `cfg`, is not something the deterministic resolution above
+        // can pick correctly between. Ask separately whether *some* live
+        // declaration could reach `self.name`, from the path as written — a bare
+        // name or a qualified one alike (issue #197) — so an ambiguous alias is
+        // never silently outvoted by another declaration sharing its name.
+        let reachable_another_way = !resolves_to_name
+            && path_could_reach_target(
+                &node.path,
+                &self.stack,
+                &self.block_items,
+                &self.shadow,
+                &self.name,
+                self.alias_search_budget,
+                &mut self.alias_lookup_cache,
+            );
+        if resolves_to_name || reachable_another_way {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+}
+
 /// Counts the struct literals in `contents` whose path's final segment is `name` — after
 /// resolving the file's `use` and `type` aliases — in total and inside a function body.
 ///
@@ -4651,138 +4803,11 @@ pub fn struct_literal_counts(
     name: &str,
     inside: FnScope<'_>,
 ) -> Result<LiteralCounts, syn::Error> {
-    struct Literals<'ast> {
-        stack: Vec<&'ast [syn::Item]>,
-        // The function-local `use`/`type` aliases of every block enclosing the current
-        // point, flat and cumulative rather than a stack of separate scopes — a block
-        // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
-        // Codex's fifth round; issue #109 review).
-        block_items: Vec<&'ast syn::Item>,
-        // Generic type-parameter names in scope at the current point (issue
-        // #181), same shape as `block_items`: pushed on entering a
-        // generics-bearing item, truncated back off on the way out.
-        shadow: Vec<String>,
-        name: String,
-        count: usize,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
-        fn visit_item(&mut self, node: &'ast syn::Item) {
-            if has_cfg_test(item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_item(self, node);
-        }
-
-        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if has_cfg_test(impl_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, node);
-        }
-
-        shadow_generic_params!();
-
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            // A nested module's own item list goes on top of the stack
-            // (issue #109 review): pushed while walking it, popped
-            // afterward, so `super::`/`crate::` can still reach an ancestor
-            // scope while the module's own scope never inherits it
-            // implicitly. An out-of-line declaration (`mod x;`) has no body
-            // to push, but its own name and attributes must still be
-            // visited the default way — an early return here had skipped
-            // them (Codex review, PR #160), hiding a banned identifier
-            // spelled as a module name.
-            let pushed = node.content.is_some();
-            if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(items);
-            }
-            // The enclosing block's own local aliases are not visible inside a module
-            // nested within it either — a module inherits nothing from its lexical
-            // surroundings, whether that surrounding is another module or a function body
-            // (Codex review) — so `block_items` is set aside for the module's own
-            // traversal and restored once it is done, the same way `self.stack` is.
-            let enclosing_block_items = core::mem::take(&mut self.block_items);
-            // A module sees none of an enclosing item's generics either
-            // (issue #181): reset for its own traversal, restore after.
-            let outer_shadow = core::mem::take(&mut self.shadow);
-            syn::visit::visit_item_mod(self, node);
-            self.shadow = outer_shadow;
-            self.block_items = enclosing_block_items;
-            if pushed {
-                self.stack.pop();
-            }
-        }
-
-        fn visit_block(&mut self, node: &'ast syn::Block) {
-            // A function-local `use` or `type` alias is visible only inside the block
-            // that declares it, and inherited by anything nested within it (issue #92,
-            // Codex's fifth round) — unlike a module, which never inherits an outer
-            // scope's aliases just by being written inside it. `block_items` therefore
-            // stays one flat, growing list: this block's own item declarations are
-            // appended so they are searched first (and so shadow a same-named one
-            // further out — see `resolve_local_alias_chain`), and exactly that many are
-            // truncated back off on the way out, restoring the parent's view for a
-            // sibling block.
-            let own_items: Vec<&'ast syn::Item> = node
-                .stmts
-                .iter()
-                .filter_map(|stmt| match stmt {
-                    syn::Stmt::Item(item) => Some(item),
-                    _ => None,
-                })
-                .collect();
-            let pushed = own_items.len();
-            self.block_items.extend(own_items);
-            syn::visit::visit_block(self, node);
-            self.block_items.truncate(self.block_items.len() - pushed);
-        }
-
-        fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            // A block-local alias is innermost, so it is tried first — and only for a
-            // bare, single-segment path, the only shape a function-local `type`/`use`
-            // alias is ever written against; a multi-segment path and module descent stay
-            // `resolve_segments`'s own job over the file's item-slice stack.
-            let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
-                .then(|| node.path.segments.first())
-                .flatten()
-                .map(|segment| ident_name(&segment.ident));
-            let local = first
-                .as_ref()
-                .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
-            let resolved = match local {
-                // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
-                // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
-                Some((segments, true)) => segments,
-                // Ran out of block-local aliases: the leftover head may itself be a
-                // module-level alias — `resolve_segments_from` is a no-op if it is not.
-                Some((segments, false)) => {
-                    resolve_segments_from(segments, &self.stack, &self.shadow)
-                }
-                None => resolve_segments(&node.path, &self.stack, &self.shadow),
-            };
-            let resolves_to_name = resolved
-                .last()
-                .is_some_and(|last| last.as_str() == self.name);
-            // Issue #185: a name declared more than once, live under more than one
-            // unevaluated `cfg`, is not something the deterministic resolution above
-            // can pick correctly between. Ask separately whether *some* live
-            // declaration could reach `self.name`, so an ambiguous alias is never
-            // silently outvoted by another declaration sharing its name.
-            let reachable_another_way = !resolves_to_name
-                && first.as_deref().is_some_and(|first| {
-                    self.stack.last().is_some_and(|scope| {
-                        alias_could_reach_target(first, &self.block_items, scope, &self.name)
-                    })
-                });
-            if resolves_to_name || reachable_another_way {
-                self.count = self.count.saturating_add(1);
-            }
-            syn::visit::visit_expr_struct(self, node);
-        }
-    }
-
     let file = parse_rust(contents)?;
+    // Computed once for the whole file — every `Literals` visitor's `stack[0]` is
+    // `&file.items`, so this is the same limit for every search either one runs
+    // (issue #197).
+    let alias_search_budget = alias_search_budget(&file.items);
 
     let mut total = Literals {
         stack: vec![&file.items],
@@ -4790,6 +4815,8 @@ pub fn struct_literal_counts(
         shadow: Vec::new(),
         name: name.to_owned(),
         count: 0,
+        alias_search_budget,
+        alias_lookup_cache: AliasLookupCache::default(),
     };
     total.visit_file(&file);
 
@@ -4807,6 +4834,8 @@ pub fn struct_literal_counts(
             shadow: Vec::new(),
             name: name.to_owned(),
             count: 0,
+            alias_search_budget,
+            alias_lookup_cache: AliasLookupCache::default(),
         };
         match &target {
             InsideTarget::Block(block, _) => visitor.visit_block(block),
@@ -4821,95 +4850,272 @@ pub fn struct_literal_counts(
     })
 }
 
-/// Whether `name` — a bare, single-segment identifier, as written in source and before
-/// any alias resolution — could reach `target` through a chain of `use`/`type` aliases
-/// in `block_items` or `scope_items`. Tries every alias that shares a local name at each
-/// hop, not only the one declaration [`resolve_local_alias_chain`] or
-/// [`resolve_segments_from`] would pick.
+/// A ceiling on [`segments_could_reach_target`]'s own `budget`, independent of file
+/// size. Any real alias chain in this codebase needs only a handful of hops. This
+/// ceiling is generous next to that, and it keeps one construction site's search cheap
+/// even in a file with many aliases and many candidates sharing one name.
+const ALIAS_SEARCH_BUDGET_CEILING: usize = 512;
+
+/// The starting `budget` for every [`path_could_reach_target`] search in one file.
 ///
-/// [`struct_literal_counts`]'s extra, fail-closed check (issue #185, Codex review of PR
-/// #183). Those two functions pick one declaration when a name is declared more than
-/// once: the first at module scope, the last at block scope. That is correct once a
-/// dead `cfg` is dropped — [`has_cfg_test`]/[`Cfg::requires_test`] already drop one,
-/// because an always-false formula is also, trivially, "false whenever `test` is false"
-/// — but not when two declarations are both live under different flags this scanner
-/// cannot evaluate. `#[cfg(feature = "a")] type Unchecked = Decoy; #[cfg(not(feature =
-/// "a"))] type Unchecked = CheckedDispatch;` builds `CheckedDispatch` under one
-/// configuration and `Decoy` under the other. This scanner cannot tell which one a real
-/// build picks.
+/// A pure function of the file's own root items, so [`struct_literal_counts`] computes
+/// it once per file rather than once per construction site (issue #197, Codex review:
+/// the per-site version made an O(file-size) computation once per struct literal,
+/// which measured seconds on a file with many aliases and many literals).
+fn alias_search_budget(root_items: &[syn::Item]) -> usize {
+    item_count(root_items)
+        .saturating_add(total_alias_count(root_items))
+        .saturating_mul(8)
+        .saturating_add(64)
+        .min(ALIAS_SEARCH_BUDGET_CEILING)
+}
+
+/// A scope's own key in [`AliasLookupCache`]: its items slice's address and length.
+/// Two different scopes never share an address, and one scope keeps the same address
+/// for the life of the parsed file — `syn::File` does not move once parsed.
+type ScopeKey = (usize, usize);
+
+fn scope_key(items: &[syn::Item]) -> ScopeKey {
+    (items.as_ptr() as usize, items.len())
+}
+
+/// Caches [`own_aliases`]/[`own_modules`] for one scope, keyed by [`scope_key`].
 ///
-/// So this asks a narrower question instead: could `target` be reached at all, by any
-/// live candidate sharing `name`, `own_aliases` of `block_items` or `scope_items`?
-/// [`resolve_local_alias_chain`] and [`resolve_segments_from`] keep their one
-/// deterministic answer, because `resolved_path_uses` and `future_trait_implementors`
-/// depend on it too. A construction this function finds reachable is counted even when
-/// that answer disagreed — the safe direction for a construction pin, where a missed
-/// count is the danger, not an extra one.
+/// Many construction sites of one name can share the same scope and the same
+/// ambiguous alias — every literal in a `for` loop, say. Without this cache, every one
+/// of them re-walks that scope's items from scratch (issue #197, Codex review: this
+/// measured seconds on a file with many ambiguous aliases and many literals). One
+/// cache is shared across every search [`path_could_reach_target`] runs for one
+/// [`struct_literal_counts`] visitor, so a scope's aliases and modules are each
+/// computed once no matter how many construction sites or branches revisit it.
 ///
-/// An alias's target is chased only while it stays a single segment: a multi-segment
-/// target (`use foo::Bridge as Entry;`) names a path outside `block_items`/`scope_items`'
-/// own alias table, so its own last segment is compared to `target` directly and the
-/// chain stops there rather than being looked up again as though it were a further
-/// local name. Codex review of this change found the gap that skips: chasing every
-/// target's bare last segment let an unrelated `type Bridge = CheckedDispatch;` answer
-/// for `Entry` above, purely because `Entry` resolves to something whose *last* segment
-/// happens to read `Bridge` too.
+/// One scope's own sibling modules, cached — a name and its items. See
+/// [`AliasLookupCache`].
+type CachedModules<'a> = std::rc::Rc<[(String, &'a [syn::Item])]>;
+
+/// Holds no block-local lookup: [`segments_could_reach_target`]'s `block_items` is a
+/// scattered slice of references, not one contiguous scope, so it has no single
+/// address to key a cache entry on.
+#[derive(Default)]
+struct AliasLookupCache<'a> {
+    aliases: std::collections::HashMap<ScopeKey, std::rc::Rc<[UseAlias]>>,
+    modules: std::collections::HashMap<ScopeKey, CachedModules<'a>>,
+}
+
+impl<'a> AliasLookupCache<'a> {
+    fn aliases_of(&mut self, items: &'a [syn::Item]) -> std::rc::Rc<[UseAlias]> {
+        self.aliases
+            .entry(scope_key(items))
+            .or_insert_with(|| own_aliases(items.iter()).into())
+            .clone()
+    }
+
+    fn modules_of(&mut self, items: &'a [syn::Item]) -> CachedModules<'a> {
+        self.modules
+            .entry(scope_key(items))
+            .or_insert_with(|| own_modules(items).into())
+            .clone()
+    }
+}
+
+/// Checks whether `path` could resolve to `target`, through any live `use`/`type`
+/// alias. Works for a bare name and for a qualified path alike.
 ///
-/// What this still does not reach, found by the same review and left as a residual
-/// rather than widened here: a qualified construction site (`super::Unchecked { .. }`,
-/// two or more segments) never calls this at all, since [`struct_literal_counts`]'s own
-/// caller restricts it to a bare, single-segment path; and a live alias whose target
-/// steps into another module (`use traits::Marker as Unchecked;`) is not chased into
-/// that module, unlike [`resolve_segments_from`]'s own `own_modules` descent. Both are
-/// the same underlying ambiguity issue #185 names, reached through a path shape this
-/// narrower, purely additive check does not follow. Closing them needs the same
-/// branching threaded through `resolve_segments_from`'s module descent, which risks the
-/// two callers that need its one deterministic answer; tracked rather than attempted
-/// here, matching this project's own guidance to stop past a bounded number of review
-/// rounds and open an issue once a further one is still finding real gaps.
+/// [`struct_literal_counts`]'s fail-closed check (issue #185). Two aliases can share
+/// one local name under different `#[cfg(..)]` flags. This scanner cannot evaluate
+/// those flags. [`resolve_segments`] and [`resolve_local_alias_chain`] each pick one
+/// declaration. That answer is right once a dead `cfg` is dropped — an always-false
+/// formula is also "false whenever `test` is false". It is wrong when both
+/// declarations are live. This function checks every live declaration instead. A real
+/// construction is then never missed just because the deterministic resolver picked
+/// the other one.
 ///
-/// Bounded by the number of aliases in scope, so neither a real chain nor a
-/// hand-written alias cycle (`use A as B; use B as A;`) can loop forever.
-fn alias_could_reach_target(
-    name: &str,
-    block_items: &[&syn::Item],
-    scope_items: &[syn::Item],
+/// A construction this function finds reachable is counted, even when the
+/// deterministic answer disagreed. A missed count is the danger here, not an extra
+/// one. So this function looks for more matches, not fewer.
+///
+/// `shadow` names any generic type parameters in scope, the same as
+/// [`resolve_segments`]'s own `shadow` — see that function's docs. A path whose first
+/// segment is one of these names is left alone: it names the parameter, not a module
+/// or an alias.
+///
+/// Stays separate from [`resolve_segments`]/[`resolve_segments_from`]'s one
+/// deterministic walk on purpose. [`resolved_path_uses`] and
+/// [`future_trait_implementors`] depend on that single answer. Widening it risks
+/// attributing an unrelated, legitimate construct to the wrong one (this project's own
+/// precedent, Codex review, PR #160, rounds 3-4).
+///
+/// Issue #197 widens this past its first version two ways. A qualified construction
+/// site (`super::Unchecked { .. }`) is now searched too, not only a bare name. And a
+/// multi-segment alias target is now followed into the module it names — `use
+/// traits::Marker as Unchecked;`, where `traits::Marker` is itself an alias for
+/// `target`, now resolves. That is the same module descent
+/// [`resolve_segments_from`]'s own `own_modules` step already does for an ordinary
+/// path.
+///
+/// `budget` is the search's own spending limit — see [`alias_search_budget`] and
+/// [`segments_could_reach_target`]. A crafted alias cycle (`use a as b; use b as a;`)
+/// cannot loop forever, and branching cannot grow the search past that limit.
+///
+/// `cache` is [`AliasLookupCache`] — the caller's own, reused across every
+/// construction site so a scope's aliases and modules are read from the file, not
+/// recomputed, once another search has already visited it.
+fn path_could_reach_target<'a>(
+    path: &syn::Path,
+    stack: &[&'a [syn::Item]],
+    block_items: &[&'a syn::Item],
+    shadow: &[String],
     target: &str,
+    budget: usize,
+    cache: &mut AliasLookupCache<'a>,
 ) -> bool {
-    let candidates: Vec<UseAlias> = own_aliases(block_items.iter().copied())
-        .into_iter()
-        .chain(own_aliases(scope_items.iter()))
+    if path.leading_colon.is_some() {
+        return false;
+    }
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
         .collect();
-    let bound = candidates.len().saturating_add(1);
-    let mut frontier = vec![name.to_owned()];
-    let mut explored = std::collections::HashSet::new();
-    for _ in 0..=bound {
-        let mut next = Vec::new();
-        for current in &frontier {
-            if !explored.insert(current.clone()) {
-                continue;
-            }
-            for alias in candidates.iter().filter(|alias| &alias.local == current) {
-                if alias
-                    .target
-                    .last()
-                    .is_some_and(|last| last.as_str() == target)
+    let Some(first) = segments.first() else {
+        return false;
+    };
+    if shadow.contains(first) {
+        return false;
+    }
+
+    let scope = stack.len().saturating_sub(1);
+    let mut budget = budget;
+    segments_could_reach_target(
+        segments,
+        stack,
+        scope,
+        None,
+        block_items,
+        scope,
+        target,
+        &mut budget,
+        cache,
+    )
+}
+
+/// [`path_could_reach_target`]'s module-scope search, one hop at a time.
+///
+/// Branches over every live alias a hop finds, instead of picking one. Follows a
+/// multi-segment alias target into the module it names, when the target's own last
+/// segment does not already match `target` by name.
+///
+/// `scope`/`entered` are the state [`resolve_segments_from`]'s own loop keeps. `scope`
+/// is an index into `stack`, while resolution is still on the lexical ancestor chain.
+/// `entered` is a module's own items, once a plain relative path has stepped into it
+/// by name (issue #169). Module descent stays inline — a `continue` in the same call —
+/// because it is deterministic. An alias hop recurses instead, because it may branch.
+///
+/// `block_items` are the function-local aliases visible at the construction site
+/// [`path_could_reach_target`] started from — the same ones
+/// [`resolve_local_alias_chain`] chases, but chased here alongside a module-scope
+/// alias of the same name rather than instead of one (issue #185's own review: a
+/// block-local declaration can itself be absent under the very `cfg` that makes an
+/// ambiguity live, so the module-scope candidate is just as real a branch). They apply
+/// only at `innermost_scope`, with no module entered — the same reach a block-local
+/// alias has in real Rust, and the same reason [`resolve_local_alias_chain`] loops
+/// through more than one block-local hop before giving up (issue #197, Codex review: a
+/// chain of two block-local aliases, `type A = C; type C = CheckedDispatch;`, was
+/// missed when this search only tried `block_items` on its very first hop).
+///
+/// `budget` bounds the whole search. It is spent once per hop, shared across every
+/// branch by the same `&mut usize`. No branch can spend it twice.
+///
+/// `cache` is [`path_could_reach_target`]'s own — see there.
+#[allow(clippy::too_many_arguments)]
+fn segments_could_reach_target<'a>(
+    mut segments: Vec<String>,
+    stack: &[&'a [syn::Item]],
+    mut scope: usize,
+    mut entered: Option<&'a [syn::Item]>,
+    block_items: &[&'a syn::Item],
+    innermost_scope: usize,
+    target: &str,
+    budget: &mut usize,
+    cache: &mut AliasLookupCache<'a>,
+) -> bool {
+    loop {
+        let Some(spent) = budget.checked_sub(1) else {
+            return false;
+        };
+        *budget = spent;
+
+        let items: &'a [syn::Item] = if let Some(entered_items) = entered {
+            consume_self_prefix(&mut segments);
+            entered_items
+        } else {
+            consume_scope_prefix(&mut segments, &mut scope);
+            stack.get(scope).copied().unwrap_or_default()
+        };
+        // A block-local alias applies only here: no module entered by name, and
+        // still at the scope the search started from. `super` above may have just
+        // moved `scope` past it, so this reads the state after consuming a prefix.
+        let block_applies = entered.is_none() && scope == innermost_scope;
+
+        let Some(first) = segments.first().cloned() else {
+            return false;
+        };
+
+        // Block-local aliases are not cached: `block_items` has no one contiguous
+        // scope to key a cache entry on, and it is small — one construction site's
+        // own enclosing blocks.
+        let block_candidates: Vec<UseAlias> = if block_applies {
+            own_aliases(block_items.iter().copied())
+        } else {
+            Vec::new()
+        };
+        let matches: Vec<UseAlias> = block_candidates
+            .into_iter()
+            .chain(cache.aliases_of(items).iter().cloned())
+            .filter(|candidate| candidate.local == first)
+            .collect();
+
+        if !matches.is_empty() {
+            for alias in matches {
+                let mut resolved = alias.target;
+                resolved.extend(segments.get(1..).unwrap_or_default().iter().cloned());
+                if resolved.last().is_some_and(|last| last.as_str() == target) {
+                    return true;
+                }
+                if !alias.absolute
+                    && segments_could_reach_target(
+                        resolved,
+                        stack,
+                        scope,
+                        entered,
+                        block_items,
+                        innermost_scope,
+                        target,
+                        budget,
+                        cache,
+                    )
                 {
                     return true;
                 }
-                // Only a single-segment target can itself be a further local alias;
-                // a longer one names a path this flat, same-scope table cannot chase.
-                if let [only] = alias.target.as_slice() {
-                    next.push(only.clone());
-                }
             }
-        }
-        if next.is_empty() {
             return false;
         }
-        frontier = next;
+
+        if segments.len() > 1 {
+            let module = cache
+                .modules_of(items)
+                .iter()
+                .find(|(name, _)| *name == first)
+                .map(|(_, module_items)| *module_items);
+            if let Some(module_items) = module {
+                segments.remove(0);
+                entered = Some(module_items);
+                continue;
+            }
+        }
+
+        return segments.last().is_some_and(|last| last.as_str() == target);
     }
-    false
 }
 
 /// Something [`struct_literal_counts`] can count literals inside of, with the
@@ -14230,6 +14436,258 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_live_live_ambiguity_reached_through_a_qualified_path_is_still_counted() {
+        // Issue #197: the fix above ran the fail-closed search only for a bare,
+        // single-segment construction path. A qualified site
+        // (`super::Unchecked { .. }`) was exactly as unprotected as before issue
+        // #185's fix.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             mod inner {\n\
+             \x20   pub fn forge() -> u8 {\n\
+             \x20       let _ = super::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20       0\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_qualified_live_live_ambiguity_does_not_count_an_unrelated_name() {
+        // The control for the test above: widening the search to a qualified path must
+        // not turn every ambiguous alias into a match for every name asked about.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             mod inner {\n\
+             \x20   pub fn forge() -> u8 {\n\
+             \x20       let _ = super::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20       0\n\
+             \x20   }\n\
+             }",
+            "Unrelated",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_live_alias_reached_through_another_module_is_still_counted() {
+        // Issue #197: `use traits::Marker as Unchecked;` names a live alias whose
+        // target steps into another module. `traits::Marker` is itself an alias for
+        // the pinned type. The old check never chased into that module — only a
+        // single-segment target could be chased, unlike `resolve_segments_from`'s own
+        // `own_modules` descent.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\nuse traits::Marker as Unchecked;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_descent_live_live_ambiguity_does_not_count_an_unrelated_name() {
+        // The control for the test above.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\nuse traits::Marker as Unchecked;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "Unrelated",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_that_does_not_exist_is_not_chained_through() {
+        // A multi-segment alias target can name a module this file never declares.
+        // That must not count as reachable just because its own last segment reads
+        // like an ordinary name. The direct last-segment check already covers a
+        // genuine match; this is the case where it must not fire.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\nuse traits::Marker as Unchecked;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_cross_module_alias_cycle_terminates() {
+        // A crafted cycle spanning two modules must not hang the search that issue
+        // #197 threads through module descent.
+        let counts = struct_literal_counts(
+            "mod a {\n\
+             \x20   pub use super::b::Y as X;\n\
+             }\n\
+             mod b {\n\
+             \x20   pub use super::a::X as Y;\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\nuse a::X as Unchecked;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_chain_of_two_block_local_aliases_under_ambiguous_cfg_is_still_counted() {
+        // Codex review of this change: the fail-closed search tried `block_items`
+        // only on its first hop. `resolve_local_alias_chain` — the deterministic
+        // path this search backs up — chases more than one block-local hop before
+        // giving up. So a chain of two block-local aliases went unfound: `A` is
+        // live and resolves to `C`, which is itself live and resolves to
+        // `CheckedDispatch`, both declared in the same function body.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype A = Decoy;\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type A = C;\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type C = CheckedDispatch;\n\
+             \x20   let _ = A { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_still_applies_after_a_module_scope_hop() {
+        // The mirror of the test above: a module-scope alias chained to a
+        // block-local one must still resolve — block-local aliases are not only
+        // reachable as the very first hop.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Bridge = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Bridge = A;\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type A = CheckedDispatch;\n\
+             \x20   let _ = Bridge { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_does_not_apply_once_a_module_is_entered_by_name() {
+        // The control: once resolution has stepped into a sibling module by name,
+        // a block-local alias of the caller's own function body must not apply —
+        // the same scope a real block-local `type`/`use` alias has.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   pub type Marker = Decoy;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   type Marker = CheckedDispatch;\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn many_ambiguous_aliases_and_literals_resolve_quickly() {
+        // Codex review of this change: the search's own spending limit used to be
+        // recomputed from the whole file on every construction site — an
+        // O(file-size) computation, once per construction site — and the search
+        // itself branches over every live candidate sharing a name rather than
+        // picking one. A file with many `#[cfg(..)]`-ambiguous aliases sharing one
+        // local name, each pointing into a different module, plus many struct
+        // literals of an unrelated name, used to measure in seconds. It now spends
+        // this file's *one* shared, capped search limit per literal, computed
+        // once for the whole file rather than once per literal.
+        use std::fmt::Write as _;
+        const MODULES: usize = 40;
+        const LITERALS: usize = 200;
+        let mut src = String::new();
+        for m in 0..MODULES {
+            let _ = write!(
+                src,
+                "mod m{m} {{\n\
+                 \x20   #[cfg(not(feature = \"x\"))]\n\
+                 \x20   pub struct Marker;\n\
+                 \x20   #[cfg(feature = \"x\")]\n\
+                 \x20   pub struct Decoy;\n\
+                 }}\n"
+            );
+        }
+        for m in 0..MODULES {
+            // Every one of these is "live" to this scanner — it does not evaluate
+            // `cfg` — so the search branches over all `MODULES` of them at the
+            // very first hop.
+            let _ = writeln!(
+                src,
+                "#[cfg(feature = \"f{m}\")]\nuse m{m}::Marker as Unchecked;"
+            );
+        }
+        src.push_str(
+            "#[cfg(not(any(feature = \"f0\")))]\ntype Unchecked = m0::Decoy;\n\
+             fn forge() -> u8 {\n",
+        );
+        for i in 0..LITERALS {
+            let _ = writeln!(src, "    let _ = Unchecked {{ x: {i} }};");
+        }
+        src.push_str("    0\n}\n");
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?} for {MODULES} modules and {LITERALS} literals",
+            start.elapsed()
+        );
     }
 }
 
