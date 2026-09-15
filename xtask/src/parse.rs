@@ -1138,6 +1138,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     &html,
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
+                    &mut ancestors,
                 );
                 if !consumed && !hidden && is_line_break_tag(&html) {
                     out.push('\n');
@@ -1944,10 +1945,25 @@ fn opens_hidden_element(line: &str) -> Option<String> {
 /// around it, unlike a block-level line this module can re-scan from its own start, so
 /// this stack has to be carried the same way `stack` already is, tracked here
 /// unconditionally so every caller gets it for free.
+///
+/// `ancestors` is threaded through the same way `foreign_content` is (Codex, pull
+/// request #138, round 58, "Track ordinary ancestors across inline HTML events"):
+/// the inline twin of `visible_html_ranges`' own top-level `Markup` handling records
+/// an ordinary tag reached while nothing is tracked (the `None` arm below) the same
+/// way, and — round 57's own whole-stack ancestor unwind, met here for the nesting
+/// arm — a closing tag matching neither `top` nor anything `opens_any_tag` finds is
+/// checked against `ancestors` before being left inert: `<span><em
+/// hidden>ignored</span>decision-id headline` never gives `em` its own end tag, but
+/// a browser still force-closes it the moment its ancestor `span` closes, and
+/// `</span>` reaching this function as its own self-contained inline construct
+/// matches neither `opens_non_rendering_element` nor `closes_non_rendering_element`
+/// nor `opens_any_tag` (all three read "opens", and a close is never an open) — so
+/// without this, `stack` stayed at `["em"]` through end of document.
 fn track_non_rendering_html(
     html: &str,
     stack: &mut Vec<String>,
     foreign_content: &mut Vec<ForeignFrame>,
+    ancestors: &mut Vec<String>,
 ) -> bool {
     if html.starts_with("<!--") {
         return true;
@@ -1985,6 +2001,21 @@ fn track_non_rendering_html(
                     // block-level scan's `top_reopen` already does.
                     stack.push(top);
                 }
+            } else if let Some(name) = html
+                .starts_with("</")
+                .then(|| markup_tag_name(html).to_ascii_lowercase())
+                && ancestors.contains(&name)
+            {
+                // Round 57's "Unwind all elements through a matching ancestor",
+                // met here for a self-contained inline construct rather than a
+                // byte-by-byte walk: a closing tag matching neither `top` nor
+                // anything this construct itself opens, but matching *some*
+                // element genuinely known to be open outside it, force-closes
+                // everything nested inside — the whole tracked stack, not only
+                // `top` — the same "pop everything nested inside a closing
+                // ancestor's end tag" a real HTML5 parser does.
+                stack.clear();
+                while ancestors.pop().as_deref() != Some(name.as_str()) {}
             }
             true
         }
@@ -2026,6 +2057,14 @@ fn track_non_rendering_html(
                     true
                 }
             } else {
+                // An ordinary tag, reached while nothing is tracked, updates
+                // `ancestors` the same way `visible_html_ranges`' own top-level
+                // `Markup` handling does (Codex, pull request #138, round 58,
+                // "Track ordinary ancestors across inline HTML events") — without
+                // this, an inline `<span>` opened outside any hidden element was
+                // invisible to the ancestor-unwind check in the nesting arm above,
+                // since only the block-level scan ever recorded one.
+                track_ordinary_ancestor(html, ancestors);
                 false
             }
         }
@@ -5781,6 +5820,7 @@ pub fn visible_source(contents: &str) -> String {
                 &mut open_non_rendering,
                 &mut non_rendering_start,
                 &mut foreign_content,
+                &mut ancestors,
                 &mut hidden,
             ),
             _ => {}
@@ -5834,10 +5874,11 @@ fn hide_non_rendering_in_inline_html(
     open_non_rendering: &mut Vec<String>,
     non_rendering_start: &mut Option<usize>,
     foreign_content: &mut Vec<ForeignFrame>,
+    ancestors: &mut Vec<String>,
     hidden: &mut Vec<(usize, usize)>,
 ) {
     let was_open = !open_non_rendering.is_empty();
-    track_non_rendering_html(html, open_non_rendering, foreign_content);
+    track_non_rendering_html(html, open_non_rendering, foreign_content, ancestors);
     let now_open = !open_non_rendering.is_empty();
     if !was_open && now_open {
         non_rendering_start.get_or_insert(range.start);
@@ -6245,6 +6286,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                     collecting,
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
+                    &mut ancestors,
                     &mut hidden_markup_seen,
                 ) =>
             {
@@ -6267,9 +6309,10 @@ fn advance_list_item_inline_html(
     collecting: bool,
     open_non_rendering_tag: &mut Vec<String>,
     foreign_content: &mut Vec<ForeignFrame>,
+    ancestors: &mut Vec<String>,
     hidden_markup_seen: &mut bool,
 ) -> bool {
-    let opened = track_non_rendering_html(html, open_non_rendering_tag, foreign_content);
+    let opened = track_non_rendering_html(html, open_non_rendering_tag, foreign_content, ancestors);
     if opened {
         *hidden_markup_seen = true;
     }
@@ -6353,8 +6396,25 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
                     &mut ancestors,
                 );
             }
+            // `<br>` is a real line break, this collector's own twin of
+            // `markdown_prose`'s round-37 fix (Codex, pull request #138, round 58,
+            // "Preserve inline breaks while collecting heading text"): the fix
+            // there never reached this independent collector, so `## Con<br>text`
+            // still fused into `Context`, a literal substring `check_adr_structure`
+            // could match even though no reader ever sees those words run
+            // together. Pushed only when the tag was not itself swallowed by an
+            // open non-rendering element and nothing else is already hiding this
+            // text, matching every other collector's own guard.
             Event::InlineHtml(html) => {
-                track_non_rendering_html(&html, &mut open_non_rendering_tag, &mut foreign_content);
+                let consumed = track_non_rendering_html(
+                    &html,
+                    &mut open_non_rendering_tag,
+                    &mut foreign_content,
+                    &mut ancestors,
+                );
+                if collecting && !consumed && !hidden && is_line_break_tag(&html) {
+                    current.push('\n');
+                }
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 blockquote_depth = blockquote_depth.saturating_add(1);
@@ -6571,6 +6631,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                     &html,
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
+                    &mut ancestors,
                 ) && in_row
                     && !html.starts_with("<!--") =>
             {

@@ -5955,6 +5955,31 @@ mod tests {
     }
 
     #[test]
+    fn a_heading_split_by_an_inline_break_is_reported_as_missing() {
+        // Codex, pull request #138, round 58, finding "Preserve inline breaks
+        // while collecting heading text": `## Con<br>text` reaches `heading_lines`
+        // as `Event::Text("Con")`, `Event::InlineHtml("<br>")`,
+        // `Event::Text("text")` — a browser renders `<br>` as a real line break, so
+        // this heading reads as two separate lines, "Con" and "text", never as one
+        // heading reading "Context". `heading_lines`' `Event::InlineHtml` arm only
+        // ever called `track_non_rendering_html` for its tracking side effect,
+        // unlike `markdown_prose` (round 37) and `table_rows` (round 38), which
+        // both push a real line break for a genuine `<br>`; the missing separator
+        // let the two fragments concatenate into the literal string `## Context`,
+        // satisfying the required-section check with a heading no reader would
+        // ever see rendered as one line.
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: clean_adr("one").replace("## Context", "## Con<br>text"),
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("## Context")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn an_adr_with_no_status_line_is_reported() {
         let adrs = vec![AdrFile {
             name: "0001-one.md".to_owned(),
@@ -7403,6 +7428,42 @@ mod tests {
                     .replace(&format!("({})", first.id), "(elsewhere)");
                 adr.contents = format!(
                     "{without_heading_id}\n<svg>\n<script\n />\n<text>{} {}</text>\n</svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_inline_span_closing_a_hidden_element_still_counts() {
+        // Codex, pull request #138, round 58, finding "Track ordinary ancestors
+        // across inline HTML events": `<span><em hidden>ignored</span>decision-id
+        // headline` reaches `markdown_prose` as three self-contained
+        // `Event::InlineHtml` constructs — `<span>`, `<em hidden>`, `</span>` — a
+        // browser force-closes the hidden `em` the moment its ancestor `span`
+        // closes, even though `em` never gets its own end tag, but
+        // `track_non_rendering_html` recorded only foreign-content state, never an
+        // ordinary ancestor the way the block-level scan's `ancestors` stack
+        // (round 56) already does. `</span>` therefore matched neither the
+        // tracked `em` nor anything this single-tag construct itself opens, and
+        // was left inert — the same "positive evidence only" discipline that
+        // correctly leaves a *stray*, wholly unmatched close alone here wrongly
+        // left a real ancestor's close alone too, latching `em` hidden through end
+        // of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span><em hidden>ignored</span>{} {}\n",
                     first.id, first.headline
                 );
             }
