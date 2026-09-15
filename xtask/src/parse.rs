@@ -5104,13 +5104,19 @@ fn path_could_reach_target<'a>(
 /// only through the second was missed too).
 ///
 /// A block-local alias's own target is resolved as `block_eligible`, since it can
-/// itself chain through further block-local hops (see above). A module-scope alias's
-/// target is resolved with `block_eligible` forced `false`: that alias's target
-/// belongs to the scope it was *declared* in, never the caller's block, so a
-/// block-local name it happens to share is not the same name at all (issue #197,
-/// Codex review of the PR: a module-scope alias's target kept the caller's own
-/// `block_eligible`, so a construction site's own function-local alias answered for a
-/// name the module-scope alias's target never meant).
+/// itself chain through further block-local hops (see above) — unless the target
+/// itself is written `self::`/`super::`-qualified, which names the enclosing
+/// module's own item and so is never `block_eligible` either, exactly like the
+/// original construction path (issue #197, Codex review of the PR: a block-local
+/// `type B = self::A;` forwarded `block_eligible` unconditionally, so a later,
+/// unrelated block-local `A` answered for a name real Rust resolves at module scope
+/// alone). A module-scope alias's target is resolved with `block_eligible` forced
+/// `false` regardless: that alias's target belongs to the scope it was *declared*
+/// in, never the caller's block, so a block-local name it happens to share is not
+/// the same name at all (issue #197, Codex review of the PR: a module-scope
+/// alias's target kept the caller's own `block_eligible`, so a construction site's
+/// own function-local alias answered for a name the module-scope alias's target
+/// never meant).
 ///
 /// Every hop recurses rather than looping in place, module descent included: once a
 /// name can name more than one live module, "the one match" is no longer a thing a
@@ -5137,6 +5143,19 @@ fn try_alias_candidates<'a>(
     cache: &mut AliasLookupCache<'a>,
 ) -> bool {
     for alias in candidates {
+        // An alias target written `self::`/`super::`-qualified explicitly names
+        // the enclosing module's own item, never a block-local one — the same
+        // fact [`path_could_reach_target`]'s own `block_eligible` already
+        // states of the original construction path. A block-local alias's
+        // target keeps `next_block_eligible` only when its own target carries
+        // no such qualification (issue #197, Codex review of the PR: a
+        // block-local `type B = self::A;` forwarded `block_eligible`
+        // unconditionally, so a later, unrelated block-local `A` answered for
+        // a name real Rust resolves at module scope alone).
+        let qualified = matches!(
+            alias.target.first().map(String::as_str),
+            Some("self" | "super")
+        );
         let mut resolved = alias.target;
         resolved.extend(rest.iter().cloned());
         if resolved.last().is_some_and(|last| last.as_str() == target) {
@@ -5150,7 +5169,7 @@ fn try_alias_candidates<'a>(
                 entered,
                 block_items,
                 innermost_scope,
-                next_block_eligible,
+                next_block_eligible && !qualified,
                 false,
                 target,
                 budget,
@@ -15096,6 +15115,51 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_to_a_self_qualified_path_does_not_chain_through_a_shadow() {
+        // Codex review of PR #204: `self::A` explicitly names the enclosing
+        // *module*'s own `A`, never a block-local one — but the block-local
+        // alias's own recursive call kept `block_eligible` regardless of
+        // whether its own target was `self::`/`super::`-qualified, so a
+        // later, unrelated block-local `A` answered for a name real Rust
+        // resolves at module scope alone.
+        let counts = struct_literal_counts(
+            "type A = Decoy;\n\
+             fn forge() -> u8 {\n\
+             \x20   type B = self::A;\n\
+             \x20   type A = CheckedDispatch;\n\
+             \x20   let _ = B { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_to_a_bare_name_still_chains_through_a_shadow() {
+        // The control for the test above: the same shape with no `self::`
+        // qualification on `B`'s own target still chains through the later,
+        // shadowing block-local `A`, exactly as
+        // `a_chain_of_two_block_local_aliases_under_ambiguous_cfg_is_still_counted`
+        // already covers for an ambiguous pair.
+        let counts = struct_literal_counts(
+            "type A = Decoy;\n\
+             fn forge() -> u8 {\n\
+             \x20   type B = A;\n\
+             \x20   type A = CheckedDispatch;\n\
+             \x20   let _ = B { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 }
 

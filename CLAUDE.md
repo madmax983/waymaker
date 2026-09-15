@@ -5737,5 +5737,19 @@ and `a_self_qualified_path_reaches_a_live_live_module_ambiguity_despite_a_generi
 each with its own control — are the two regressions; one earlier test
 (`a_block_local_alias_still_applies_after_a_module_scope_hop`) rested on a premise real Rust
 does not allow at all — a module-scope alias's target naming an item only a later, unrelated
-function declares — and is replaced by the first of the two. No new ADR: nothing here moves a
-must-not-own cell, a dependency edge, or a rule id.
+function declares — and is replaced by the first of the two.
+
+A further round found a fifth in the same family: a block-local alias's own target can itself
+be `self::`/`super::`-qualified — `type B = self::A;`, declared beside a later, unrelated
+`type A = CheckedDispatch;` in the same block — and `self::A` explicitly names the enclosing
+*module*'s own `A`, never the block-local one, exactly the fact `path_could_reach_target`'s
+own `block_eligible` already states of the original construction path. But a block-local
+alias's own recursive call forwarded `block_eligible` unconditionally, with no check on
+whether *its own target* carried that same qualification, so `B { .. }` was counted as
+possibly reaching `CheckedDispatch` through the later block-local `A` — a name real Rust never
+lets `self::A` see. `try_alias_candidates` now withholds `block_eligible` from a candidate
+whose own target begins `self`/`super`, the same test every other qualified path in this
+search is already held to. `a_block_local_alias_to_a_self_qualified_path_does_not_chain_through_a_shadow`
+and its control, `a_block_local_alias_to_a_bare_name_still_chains_through_a_shadow`, are the
+regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
+id.
