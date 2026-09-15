@@ -45,14 +45,18 @@
 //! * **unsealed** is here too, since issue
 //!   [#24](https://github.com/madmax983/waymaker/issues/24). §09's frame ends with a commit
 //!   seal one program unit wide, written only after a payload barrier, so a frame body with
-//!   no valid seal over it is a frame whose writer never reached §07 step 3. If every byte
-//!   between the frame's own length and the end of its reserved slot is erased, nothing else
-//!   was ever written there — no writer starts a record before the one ahead of it has
-//!   sealed — so the frame is ignored and the scan carries on past it: issue
-//!   [#95](https://github.com/madmax983/waymaker/issues/95). Otherwise it stops the scan at
-//!   its own first byte with [`Ending::Unsealed`], which is what lets a caller tell "the
-//!   power went during an append" from "this bank is damaged" — the distinction this module
-//!   was written without, and the one [`Ending`] said it would grow a variant for.
+//!   no valid seal over it is a frame whose writer never reached §07 step 3. For an
+//!   outcome — `EffectCompleted`, `EffectFailed` or `TimerFired`, the only three kinds
+//!   `frame::redeliverable_kind` admits — if every byte between the frame's own length and
+//!   the end of its reserved slot is erased, nothing else was ever written there — no writer
+//!   starts a record before the one ahead of it has sealed — so the frame is ignored and the
+//!   scan carries on past it: issue [#95](https://github.com/madmax983/waymaker/issues/95).
+//!   Every other kind never reaches that check at all, whatever its slot holds. Otherwise —
+//!   an unsealed frame of any other kind, or an outcome whose slot is not fully erased — it
+//!   stops the scan at its own first byte with [`Ending::Unsealed`], which is what lets a
+//!   caller tell "the power went during an append" from "this bank is damaged" — the
+//!   distinction this module was written without, and the one [`Ending`] said it would grow
+//!   a variant for.
 //!
 //! # The append offset
 //!
@@ -444,12 +448,15 @@ pub enum Ending {
     /// where the prefix may be short. Nothing may be appended: `at` is the first byte of a
     /// frame whose cells a program cycle has already cleared.
     ///
-    /// An unsealed frame whose own reserved slot is otherwise erased is *not* this shape —
-    /// issue [#95](https://github.com/madmax983/waymaker/issues/95): it is ignored, and the
-    /// scan reports [`Clean`](Self::Clean) past it, because nothing else was ever written
-    /// there. This ending is what is left once that case is ruled out: a byte in the slot
-    /// that is neither erased nor a real seal, which is a tear inside the seal itself, or
-    /// media this module has no way to trust.
+    /// An unsealed *outcome* — `EffectCompleted`, `EffectFailed` or `TimerFired`, the only
+    /// three kinds `frame::redeliverable_kind` admits — whose own reserved slot is otherwise
+    /// erased is *not* this shape — issue
+    /// [#95](https://github.com/madmax983/waymaker/issues/95): it is ignored, and the scan
+    /// reports [`Clean`](Self::Clean) past it, because nothing else was ever written there.
+    /// Every other kind never reaches that check at all, whatever its slot holds, and always
+    /// ends here. For an outcome, this ending is what is left once the erased case is ruled
+    /// out: a byte in the slot that is neither erased nor a real seal, which is a tear
+    /// inside the seal itself, or media this module has no way to trust.
     Unsealed {
         /// The first byte of the unsealed frame, relative to [`JournalRegion::base`].
         at: u32,
