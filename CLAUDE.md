@@ -3577,12 +3577,25 @@ either way. `Recovery::next`'s one call to `frame::decode_with::<C>` is kept in 
 `sealed` helper for the `integrity-check` routing pin's sake, and the loop this needed is
 bounded the same way every offset advance in this module already is — by `stride > 0` — so a
 chain of ignored slots from repeated crashes still terminates over a region of finite length.
-Costs 91 B of layers, 12912 B of 13312 with 400 B left and no raise asked for; runtime RAM and
+Costs 100 B of layers, 12920 B of 13312 with 392 B left and no raise asked for; runtime RAM and
 kernel state are unmoved, because nothing here grows what `Recovery` carries between calls.
 `waymaker-spec`'s ghost model is untouched: it already treats the two-barrier write as coarser
 than this — see [what is not checked](#what-is-not-checked)'s note that the model "has no
 transition for the state §07's payload barrier creates" — so this is a fact about bytes the
-model was never fine-grained enough to see change. See
+model was never fine-grained enough to see change.
+
+Redelivering in place moved a cost that used to be absorbed by starting a fresh run: the
+bytes a torn, ignored attempt consumes cannot be reclaimed on NOR, and §10's capacity reserve
+priced a schedule against only the *real* outcome that would eventually land, not against one
+that might be wasted first. `Reserve::exit_bytes_after`'s `EffectScheduled`/`TimerScheduled`
+arm and `Reserve::for_layout`'s floor both now reserve one extra outcome's worth —
+`redelivery_slack` — so a single tear at the reserve boundary cannot strand the run: without
+it, dispatch happens on `Ending::Clean`, before capacity is ever checked, so the activity
+would be redelivered on every later boot while the retry that has to record its outcome
+refused with `NearCapacity` forever. One wasted attempt is tolerated, not an unbounded
+number, matching this codebase's other single-crash guarantees;
+`a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry` drives exactly that
+shape end to end. Codex found this on review of the fix above. See
 [ADR 0048](docs/adr/0048-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
 
 Issue #99 then closes the route Codex found on issue #32's fourth review round. A

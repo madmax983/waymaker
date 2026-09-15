@@ -1124,8 +1124,14 @@ impl StableStorage for Counted<'_> {
 /// Searched for rather than written down, so the number comes from the reserve's own
 /// arithmetic over real records.
 fn near_capacity() -> (Geometry, BankLayout, Reserve, JournalRegion, Device) {
-    for erase in [64_u32, 128, 256, 512] {
-        let Ok(geometry) = Geometry::new(erase * 2, erase, 4, 1) else {
+    // Erase size has to be a power of two (`Geometry::new`), which is too coarse a step to
+    // land on the exact boundary directly — doubling it can jump clean over the one bank
+    // size that fits one effect and refuses the second. Held at its smallest legal value
+    // instead, with the *block count* swept one erase unit at a time, so the search has
+    // byte-level resolution over the bank size regardless of what the reserve's own
+    // arithmetic costs.
+    for blocks in (2_u32..=4096).step_by(2) {
+        let Ok(geometry) = Geometry::new(4_u32.saturating_mul(blocks), 4, 4, 1) else {
             continue;
         };
         let Ok(layout) = BankLayout::new(geometry) else {

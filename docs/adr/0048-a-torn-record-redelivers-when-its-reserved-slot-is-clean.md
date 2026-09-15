@@ -100,11 +100,32 @@ the same way. None of them costs anything by being ignored: an unsealed schedule
 effect was never dispatched — §07 dispatches after the commit barrier, at step 4 — so losing
 it is what §14 already asked for, now without losing the bank to get there.
 
-**Numbers.** `cargo xtask size`: the `default` row moves from 12820 B to 12912 B of the 13312 B
-gate ADR 0036 set, 92 B for the two new methods and the loop, no raise asked for and 400 B
-left. `cargo xtask profile`: zero heap blocks on all four workloads, unchanged. Runtime RAM
-and kernel state are unmoved — `Recovery`'s own fields did not change, only a local, frame-only
-struct (`Staged`) gained one field and two private methods joined it.
+**The capacity reserve had to widen for it.** A completion record is the one kind where
+"ignored and redelivered" is not free: the effect was already dispatched, so a torn,
+ignored attempt costs `outcome_bytes` of media the bank cannot get back, and dispatch
+happens on `Ending::Clean` — before capacity is ever checked — so the activity is
+redelivered whether or not there is still room to record its outcome. A schedule admitted at
+§10's reserve boundary used to leave room for exactly one outcome and the terminal record;
+after one torn-and-ignored attempt that is down to the terminal record alone, and the retry
+that has to record the *real* outcome refuses with `Refusal::NearCapacity` — on every later
+boot, forever, after the activity has already run again. Codex found this on review of the
+fix above: it is a real regression this ADR's own first version introduced, because before
+it, any torn outcome refused the whole bank *before* redelivering, and never reached this
+state. `Reserve::exit_bytes_after`'s `EffectScheduled`/`TimerScheduled` arm and
+`Reserve::for_layout`'s floor both now add one more `outcome_bytes` —
+`redelivery_slack` — so one wasted attempt is always affordable. A second tear on the retry
+itself is outside what this covers, the same standing this codebase gives its other
+single-crash guarantees rather than an unbounded one.
+`a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry` drives the exact
+shape: a schedule at the boundary, a torn outcome attempt, a fresh recovery, and a retry that
+now fits — verified to fail without `redelivery_slack` before it existed.
+
+**Numbers.** `cargo xtask size`: the `default` row moves from 12820 B to 12920 B of the 13312 B
+gate ADR 0036 set — 92 B for the recovery fix's two new methods and the loop, and 8 B more for
+`redelivery_slack` — no raise asked for and 392 B left. `cargo xtask profile`: zero heap
+blocks on all four workloads, unchanged. Runtime RAM and kernel state are unmoved —
+`Recovery`'s own fields did not change, only a local, frame-only struct (`Staged`) gained one
+field and two private methods joined it, and `Reserve` gained no field at all.
 
 **`waymaker-rig`'s own row classification needed a signal of its own.** The rig judges only
 what a board could: it has no access to which byte of a program call a crash landed on, so it
@@ -127,6 +148,15 @@ so this issue is a fact about bytes the model was never built to see change, and
 things this ADR does not attempt: it does not widen `EffectScheduled`'s wire-format fields, and
 it settles no part of issue [#16](https://github.com/madmax983/waymaker/issues/16)'s
 `retry-policy-placement`, which stays open at rung 0.4.
+
+`redelivery_slack` tolerates exactly one wasted outcome attempt per scheduled effect, not an
+unbounded number. Two independent tears — the first consuming the slack, a second landing on
+the retry itself — are outside what this reserve prices, and would strand the run exactly as
+described above: the activity redelivered on every later boot with no way to ever record its
+outcome. Closing that fully needs either an unbounded reserve, which no finite bank can pay
+for, or `waymaker-drive` falling back to `continue_as_new` on a `NearCapacity` refusal it
+meets after redelivery — which is rung 0.4's dispatcher, the same standing as every other
+"nothing obliges a future dispatcher to..." limitation this codebase already records.
 
 ## Alternatives considered
 
