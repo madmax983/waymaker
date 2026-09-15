@@ -5779,5 +5779,19 @@ module — because a name any of those three explains is never a bare, direct re
 whatever its own resolution turned out to answer.
 `a_module_scope_alias_that_resolves_away_does_not_count_its_own_written_name` and its
 control, `a_module_scope_alias_still_reaches_the_name_it_really_resolves_to`, are the
-regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
-rule id.
+regression.
+
+A further round found a sixth, and it is the opposite direction from the round before it —
+a missed count rather than a false one. `block_eligible` was computed from the original
+path's own segment count, so a plain (no `self`/`super`) *multi*-segment path never tried
+a block-local alias for its own first segment — but a block-local `use good as traits;`
+really does let `traits::Marker` reach `good::Marker`, confirmed against real `rustc`, and
+this search missed it the same way `resolve_local_alias_chain` — the deterministic
+resolver's own block-local chaser, scoped to one bare segment for an unrelated, older
+reason — already does. `block_eligible` is now computed from whether the path's own first
+segment is `self`/`super`, not from its length; the deterministic resolver stays as
+narrow as it was, since this search is a backstop over it and widening what it alone can
+find still counts every real construction. `a_block_local_alias_still_qualifies_a_further_segment`
+and its control, `a_self_qualified_path_still_does_not_reach_a_block_local_alias_of_its_first_segment`,
+are the regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge,
+or a rule id.

@@ -5000,14 +5000,24 @@ fn path_could_reach_target<'a>(
     if segments.is_empty() {
         return false;
     }
-    // `resolve_local_alias_chain` — the deterministic resolver's own block-local
-    // chaser — is reached only for a path written as one bare segment, with no
-    // `self::`/`super::` or other qualification: `self::Unchecked` names the
-    // enclosing *module*, never a block-local item, however many hops a chain
-    // from it takes (issue #197, Codex review of the PR: a leading `self` left
-    // `scope` unmoved, so a block-local alias could be reached through a path
-    // that real Rust would resolve at module scope alone).
-    let block_eligible = segments.len() == 1;
+    // A block-local `use`/`type` alias is visible as the *first* segment of any
+    // plain relative path in its own block, not only a bare, single-segment one
+    // — `use good as traits;` really does let `traits::Marker` reach
+    // `good::Marker`, confirmed against real `rustc`. `self`/`super` are the
+    // one exception: `self::Unchecked` names the enclosing *module*, never a
+    // block-local item, however many hops a chain from it takes, because those
+    // two keywords explicitly select module scope and can never themselves be
+    // the local name of a block-local alias (issue #197, Codex review of the
+    // PR, two rounds: first that a leading `self` left `scope` unmoved, so a
+    // block-local alias answered for a path real Rust resolves at module scope
+    // alone; then that restricting eligibility to one bare segment threw the
+    // qualifier case out with it too, missing a block-local alias used to
+    // qualify a further segment). `resolve_local_alias_chain` — the
+    // deterministic resolver's own block-local chaser — stays scoped to one
+    // bare segment: this search is a backstop over it, so widening what this
+    // search alone can find still counts every real construction, without
+    // needing to touch the deterministic path's own, narrower reach.
+    let block_eligible = !matches!(segments.first().map(String::as_str), Some("self" | "super"));
     // `shadow` is checked here, against the path's own first segment exactly as
     // written — before any `self`/`super` consumption — matching
     // `resolve_segments_from`'s own check, which runs before its loop ever touches
@@ -15285,6 +15295,53 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_still_qualifies_a_further_segment() {
+        // Codex review of PR #204: `block_eligible` was computed from the
+        // original path's own segment count, so a plain (no `self`/`super`)
+        // multi-segment path never tried a block-local alias for its own
+        // first segment — but a block-local `use good as traits;` really
+        // does let `traits::Marker` reach `good::Marker` in real Rust
+        // (confirmed against real `rustc`), and this search, like the
+        // deterministic resolver it backstops, never tried it.
+        let counts = struct_literal_counts(
+            "mod good {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   use good as traits;\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_self_qualified_path_still_does_not_reach_a_block_local_alias_of_its_first_segment() {
+        // The control for the test above: `self::traits` explicitly names
+        // the enclosing module's own `traits`, never a block-local alias of
+        // that name, so widening block eligibility past a bare single
+        // segment must not widen it past `self`/`super` too.
+        let counts = struct_literal_counts(
+            "mod good {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   use good as traits;\n\
+             \x20   let _ = self::traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 }
 
