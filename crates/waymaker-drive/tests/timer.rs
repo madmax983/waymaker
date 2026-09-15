@@ -756,15 +756,21 @@ fn a_boot_clock_that_regresses_while_the_intent_commits_is_refused() {
 ///
 /// Codex's review of issue [#110](https://github.com/madmax983/waymaker/issues/110)'s pull
 /// request asked whether a real alarm firing could re-enter `Context::decide_timer` on the
-/// very `Context` its own `Stop::WaitingUntil` already halted, and hang there forever. It
-/// cannot, but not because a second ask is re-measured — it is because a second ask is not
-/// how this driver is resumed at all. `a_deadline_is_re_armed_across_a_reset_from_the_reading_history_recorded`,
-/// above, is the real mechanism: a wake means calling `Driver::boot` again, fresh, and the
-/// durable `TimerScheduled` intent is what carries the deadline to that new `Context`'s own
-/// `Recorded`/`Rearm` path. This workflow is the other half of that answer: a *second* ask
-/// inside the *same* boot must refuse exactly as the first one did, because falling through
-/// to `ReplayMachine::timer_intent` again — the call reserved for a boundary not yet open —
-/// is the one thing that must never happen here, and does not.
+/// very `Context` its own `Stop::WaitingUntil` already halted, and hang there forever. The
+/// first answer here argued it could not, on the theory that a second ask is never how this
+/// driver is really resumed — only a fresh `Driver::boot` reads the clock again. That was
+/// wrong: `Alarm`'s own documentation is explicit that "the executor can suspend the core
+/// until the interrupt wakes it" and asks the deadline again "on the next poll", which is a
+/// real, retained task polled again by a real waker, still inside the one call to
+/// `Workflow::run` that built it — an in-boot sleep is what issue #110 is *for*. Falling
+/// through to `ReplayMachine::timer_intent` a second time for a boundary already
+/// `AwaitingFiring` does still diverge — `ReplayCursor::next_effect_id` refuses everything
+/// but `Replaying` and `Halted` — which is why `Context::decide_timer` must never take that
+/// path twice. What it does instead, now, is answer a repeated ask by calling `measure`
+/// directly over the same recorded `armed_at`, against a fresh clock reading: the same
+/// `TimerFired` transition a fresh boot's own `Rearm` path takes from the identical state,
+/// reached without asking the kernel's intent question again. This workflow is what proves
+/// it either way, depending on how far the clock the two asks share has moved.
 struct WokenTwice {
     input: [u8; 4],
     spec: TimerSpec,
@@ -789,10 +795,9 @@ impl Workflow for WokenTwice {
     }
 
     fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-        // The first ask halts, exactly as `Napping`'s does, and is not the thing under
-        // test. The second is: the very same boundary, asked again in the same boot,
-        // standing in for `TimerFuture::poll`'s own habit of asking `wait` on every poll —
-        // which this driver never actually re-enters live, per the doc comment above.
+        // The first ask arms the deadline. The second is the very same boundary, asked
+        // again in the same boot — standing in for a real executor's `TimerFuture` retained
+        // across an `Alarm::wake_after` sleep and polled again by its own real waker.
         let _ = boundary.wait(self.spec);
         boundary.wait(self.spec)?;
         Ok(Outcome::Completed(b"woke"))
@@ -800,7 +805,54 @@ impl Workflow for WokenTwice {
 }
 
 #[test]
-fn a_boundary_asked_again_within_the_same_boot_repeats_its_own_halt_rather_than_diverging() {
+fn a_repeated_wait_remeasures_the_clock_rather_than_repeating_a_stale_remaining() {
+    // The clock advances a little between the two asks — enough to prove the second one
+    // read it again, not enough to have elapsed the deadline.
+    let mut device = Device::new(geometry());
+    let mut world = Ticking::new(100);
+    let mut workflow = WokenTwice::waiting(TimerSpec::AfterBoot { ticks: 1_000 });
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+
+    let progress = Driver::new(region(), RUN, reserve()).boot(
+        &mut device,
+        &mut world,
+        &mut workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    );
+
+    // The first ask reports 900 remaining (armed at 0, read at 100). A stale repeat would
+    // report exactly that again; the fresh reading the second ask takes reports 800.
+    assert!(
+        matches!(progress, Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 800),
+        "{progress:?}"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
+            .count(),
+        1,
+        "a repeated ask of the same open deadline arms nothing a second time"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_FIRED)
+            .count(),
+        0,
+        "the deadline has not elapsed, so nothing here should have fired it"
+    );
+}
+
+#[test]
+fn a_repeated_wait_that_finds_the_deadline_elapsed_resolves_rather_than_repeating_the_halt() {
+    // The clock advances far enough between the two asks that the second one finds the
+    // deadline already passed — issue #110's whole point, and Codex's round 12/13 finding:
+    // a live re-poll after a real alarm interrupt must be able to see that.
     let mut device = Device::new(geometry());
     let mut world = Ticking::new(600);
     let mut workflow = WokenTwice::waiting(TimerSpec::AfterBoot { ticks: 1_000 });
@@ -817,11 +869,13 @@ fn a_boundary_asked_again_within_the_same_boot_repeats_its_own_halt_rather_than_
         },
     );
 
-    // Exactly the first ask's own answer — not a kernel divergence, and not a false
-    // `Ready` reached by silently re-arming what history already recorded.
-    assert!(
-        matches!(progress, Ok(Progress::WaitingUntil { remaining, .. }) if remaining == 400),
-        "{progress:?}"
+    assert_eq!(
+        progress,
+        Ok(Progress::Finished {
+            conclusion: Conclusion::Completed,
+            result_len: 4,
+        }),
+        "the second, live ask must see the deadline the first one could not"
     );
     assert_eq!(
         kinds(&mut device)
@@ -829,6 +883,14 @@ fn a_boundary_asked_again_within_the_same_boot_repeats_its_own_halt_rather_than_
             .filter(|kind| **kind == RecordKind::TIMER_SCHEDULED)
             .count(),
         1,
-        "the second ask commits nothing new"
+        "still one arming, from the first ask"
+    );
+    assert_eq!(
+        kinds(&mut device)
+            .iter()
+            .filter(|kind| **kind == RecordKind::TIMER_FIRED)
+            .count(),
+        1,
+        "the second ask is what durably records the firing"
     );
 }

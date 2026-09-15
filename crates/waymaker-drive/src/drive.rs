@@ -462,6 +462,7 @@ impl<C: IntegrityCheck> Driver<C> {
             reserve: self.reserve,
             bank,
             stop: None,
+            armed: None,
             pending: None,
             versions: workflow.identity().versions,
             recorded_version,
@@ -1322,6 +1323,24 @@ enum Stop<E> {
     Migrated(RunId),
 }
 
+/// What [`measure`] needs to re-evaluate a still-open deadline against a fresh clock
+/// reading, without asking [`ReplayMachine::timer_intent`] a second time.
+///
+/// A second ask of that method for a boundary already `AwaitingFiring` is not a
+/// re-measurement — `ReplayCursor::next_effect_id` refuses everything but `Replaying` and
+/// `Halted`, so it is the one call this driver must never repeat while a deadline is still
+/// open. This is what lets [`Context::decide_timer`] answer a repeated
+/// [`Boundary::wait`](crate::Boundary::wait) honestly instead: by calling [`measure`]
+/// again directly, over the same recorded `armed_at` and the same declared capability,
+/// exactly as a fresh boot's own [`TimerResolve::Rearm`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArmedTimer {
+    id: EffectId,
+    spec: TimerSpec,
+    capability: ClockCapability,
+    armed_at: u64,
+}
+
 /// The driver, as the workflow sees it.
 struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> {
     activities: &'a mut A,
@@ -1335,6 +1354,15 @@ struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> 
     /// driver [`Driver::new`] pointed at a fixed region.
     bank: Option<BankContext>,
     stop: Option<Stop<S::Error>>,
+    /// The still-open deadline `stop`'s own [`Stop::WaitingUntil`] is waiting on, if any —
+    /// everything [`measure`] needs to re-read the clock without asking the kernel again.
+    ///
+    /// [`Some`] exactly when `stop` is `Some(Stop::WaitingUntil(..))` for the boundary this
+    /// holds, and [`None`] the moment that deadline is answered any other way. Kept apart
+    /// from `stop` itself because `Stop::WaitingUntil` is also [`Progress::WaitingUntil`]'s
+    /// source, which has no business carrying a [`TimerSpec`] or a [`ClockCapability`] a
+    /// caller never asked for.
+    armed: Option<ArmedTimer>,
     /// The effect §07 step 3 committed, while a caller performs step 4 for itself.
     ///
     /// [`Boundary::call`] never uses it: that path holds the value on its own stack for
@@ -1824,12 +1852,17 @@ enum TimerHalf<E> {
 /// precedes its committed intent, and this driver performs none for a deadline: it records
 /// the intent and then compares readings. A dispatcher that armed a hardware alarm would
 /// have a physical act to order, and that is rung 0.4's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one of the driver's fields, destructured by its caller"
+)]
 fn arming<S, C, K>(
     source: &mut Source<'_, S, C>,
     machine: &mut ReplayMachine,
     clocks: &mut K,
     page: &mut [u8],
     stop: &mut Option<Stop<S::Error>>,
+    armed_timer: &mut Option<ArmedTimer>,
     id: EffectId,
     spec: TimerSpec,
 ) -> TimerDecision
@@ -1877,7 +1910,16 @@ where
     // defensively and masked the fault it was meant to leave visible. Re-arming a *recorded*
     // deadline is the only place a reset can have intervened, and that path still uses it.
     measure(
-        source, machine, page, stop, id, spec, capability, now, reading,
+        source,
+        machine,
+        page,
+        stop,
+        armed_timer,
+        id,
+        spec,
+        capability,
+        now,
+        reading,
     )
 }
 
@@ -1895,6 +1937,7 @@ fn measure<S, C>(
     machine: &mut ReplayMachine,
     page: &mut [u8],
     stop: &mut Option<Stop<S::Error>>,
+    armed_timer: &mut Option<ArmedTimer>,
     id: EffectId,
     spec: TimerSpec,
     capability: ClockCapability,
@@ -1914,6 +1957,7 @@ where
     let armed = match Timer::arm(spec, capability, armed_at) {
         Ok(armed) => armed,
         Err(error) => {
+            *armed_timer = None;
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
             return TimerDecision::Stop;
         }
@@ -1921,6 +1965,7 @@ where
     let elapsed = match armed.evaluate(reading) {
         Ok(deadline) => deadline,
         Err(error) => {
+            *armed_timer = None;
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
             return TimerDecision::Stop;
         }
@@ -1928,15 +1973,29 @@ where
     let Deadline::Elapsed = elapsed else {
         let Deadline::Remaining { ticks } = elapsed else {
             // Unreachable: `Deadline` has two shapes and the other is the arm above.
+            *armed_timer = None;
             *stop = Some(Stop::Failed(DriveError::Kernel(
                 KernelError::NondeterministicWorkflow,
             )));
             return TimerDecision::Stop;
         };
+        // Kept beside `stop`, not only in it: a repeated `wait()` for this same boundary
+        // must re-read the clock rather than repeat this answer, and `ReplayMachine`'s own
+        // cursor refuses a second `timer_intent` for as long as this deadline stays open —
+        // see `Context::decide_timer`'s own guard, and `ArmedTimer`'s documentation.
+        *armed_timer = Some(ArmedTimer {
+            id,
+            spec,
+            capability,
+            armed_at,
+        });
         *stop = Some(Stop::WaitingUntil(id, spec.clock_kind(), ticks));
         return TimerDecision::Stop;
     };
 
+    // Answered: whatever a further ask of this boundary meets from here is a fresh
+    // question, not a repeat of this one.
+    *armed_timer = None;
     let record = RecordRef::TimerFired { seq: id.seq };
     if let Err(error) = write(source, &record, page) {
         *stop = Some(Stop::Failed(error));
@@ -1947,6 +2006,65 @@ where
         return TimerDecision::Stop;
     }
     TimerDecision::Passed
+}
+
+/// A repeat ask of the exact same still-open deadline, if `stop`/`armed_timer` show one.
+///
+/// [`None`] when this is not that case — no boundary is open, a different reason stopped
+/// this boot, or `spec` names a different deadline than the one recorded — so the caller
+/// falls through to its own, ordinary handling. [`Some`] when it is: an executor that
+/// suspended the core on a hardware alarm and re-polled the same task on the interrupt asks
+/// this boundary again rather than a fresh one, and it deserves an honest answer —
+/// re-measured against a fresh clock reading — not the stale halt `stop` already holds.
+///
+/// This is not [`ReplayMachine::timer_intent`] asked twice: `machine` and `source` are not
+/// touched unless the deadline has genuinely elapsed, in which case this is the same
+/// `TimerFired` transition a fresh boot's own [`TimerResolve::Rearm`] path takes from the
+/// identical `AwaitingFiring` state, reached without asking the kernel's intent question
+/// again. See [`ArmedTimer`]'s own documentation for why that call may never be repeated.
+fn remeasure_open_timer<S, C, K>(
+    source: &mut Source<'_, S, C>,
+    machine: &mut ReplayMachine,
+    clocks: &mut K,
+    page: &mut [u8],
+    stop: &mut Option<Stop<S::Error>>,
+    armed_timer: &mut Option<ArmedTimer>,
+    spec: TimerSpec,
+) -> Option<TimerDecision>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+    K: Clocks,
+{
+    if !matches!(stop, Some(Stop::WaitingUntil(..))) {
+        return None;
+    }
+    let armed_timer_value = (*armed_timer)?;
+    if spec != armed_timer_value.spec {
+        return None;
+    }
+    let Some(reading) = clocks.now(armed_timer_value.spec.clock_kind()) else {
+        *armed_timer = None;
+        *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
+        return Some(TimerDecision::Stop);
+    };
+    // Cleared before the re-measurement, exactly as a fresh arming starts with `stop`
+    // unset: `measure` only ever sets it again for a deadline still remaining, so an
+    // elapsed answer here must not be reported through the stale `WaitingUntil` this call
+    // is about to replace.
+    *stop = None;
+    Some(measure(
+        source,
+        machine,
+        page,
+        stop,
+        armed_timer,
+        armed_timer_value.id,
+        armed_timer_value.spec,
+        armed_timer_value.capability,
+        armed_timer_value.armed_at,
+        reading,
+    ))
 }
 
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
@@ -1962,9 +2080,18 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             source,
             reserve,
             stop,
+            armed,
             pending,
             ..
         } = self;
+
+        // A repeat ask of the exact same still-open deadline re-measures the clock instead
+        // of repeating whatever `stop` already holds — see `remeasure_open_timer`.
+        if let Some(decision) =
+            remeasure_open_timer(source, machine, *activities, page, stop, armed, spec)
+        {
+            return decision;
+        }
 
         if stop.is_some() {
             return TimerDecision::Stop;
@@ -2008,7 +2135,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                 });
                 TimerDecision::Stop
             }
-            TimerHalf::Arm(id) => arming(source, machine, *activities, page, stop, id, spec),
+            TimerHalf::Arm(id) => arming(source, machine, *activities, page, stop, armed, id, spec),
             TimerHalf::Recorded => {
                 let resolved = match peek(source, page, *reserve) {
                     Err(error) => Err(error),
@@ -2043,6 +2170,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                             machine,
                             page,
                             stop,
+                            armed,
                             id,
                             recorded,
                             request.capability,
