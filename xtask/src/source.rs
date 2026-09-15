@@ -9471,6 +9471,75 @@ fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
     slots <= bound
 }
 
+/// Whether `values`, sorted and deduplicated, form an exact arithmetic progression whose
+/// stride is a power of two greater than one — the shape LLVM's own switch-table lowering
+/// normalizes by rotating the scrutinee before ever consulting the raw span
+/// [`compact_window_with_gaps`] measures, so a table that check alone would call too sparse
+/// to flag can still be the identical value lookup table once the scrutinee is divided by
+/// that stride.
+///
+/// Codex's finding: `match n { 0 => 9, 4 => 3, 8 => 27, 12 => 1, _ => 0 }` spans thirteen raw
+/// slots for four values — over `compact_window_with_gaps`'s own bound of twelve — but
+/// `rustc` 1.95 with `-O` still emits a four-entry `.Lswitch.table`, confirmed by disassembly:
+/// `roll $30, %edi` rotates a 32-bit value right by two bits, exactly a division by four for
+/// values whose low two bits are already zero (stride eight was checked the same way, at a
+/// span of twenty-five, and rotates by three bits).
+///
+/// Scoped to a power-of-two stride specifically, not any uniform stride at all, because the
+/// two are not the same threat. A *non*-power-of-two stride wide enough to miss the existing
+/// bound (`0, 5, 10, 15`, stride five) was checked by disassembly too, and compiles to an
+/// ordinary jump table instead — a dispatch mechanism practically every match with more than
+/// a handful of arms already uses, and not the value-array-replacing-computation shape this
+/// whole check exists to catch. A *narrow* non-power-of-two stride (`0, 3, 6, 9`, stride
+/// three) needs no help from this function at all: `compact_window_with_gaps`'s own raw span
+/// already accepts it directly.
+fn values_form_a_power_of_two_stride(values: &[i128]) -> bool {
+    if values.len() < 2 {
+        return false;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != values.len() {
+        return false;
+    }
+    let (Some(&first), Some(&second)) = (sorted.first(), sorted.get(1)) else {
+        return false;
+    };
+    let Some(stride) = second.checked_sub(first) else {
+        return false;
+    };
+    if stride < 2 {
+        return false;
+    }
+    let Ok(stride_bits) = u128::try_from(stride) else {
+        return false;
+    };
+    if !stride_bits.is_power_of_two() {
+        return false;
+    }
+    sorted.windows(2).all(|pair| {
+        let [a, b] = pair else {
+            return false;
+        };
+        b.checked_sub(*a) == Some(stride)
+    })
+}
+
+/// [`values_form_a_power_of_two_stride`]'s own arm-pattern-flattening wrapper —
+/// [`compact_window_with_gaps`]'s identical extraction, reused here so the stride check
+/// declines the same way that one does on an unresolved arm's own empty pattern.
+fn dense_power_of_two_stride(numbered: &[crate::parse::FoundArm]) -> bool {
+    let mut values = Vec::new();
+    for arm in numbered {
+        if arm.pattern.is_empty() {
+            return false;
+        }
+        values.extend(arm.pattern.iter().copied());
+    }
+    values_form_a_power_of_two_stride(&values)
+}
+
 /// The narrowest circular span (modulo `2^128`) `values` fit within — every value tried in
 /// turn as the candidate starting point, the identical search [`window_layout`] runs, since
 /// only the window's true circular start gives the tightest span and any other candidate
@@ -9571,7 +9640,9 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
                     // as the case where the sub-slice happens to run to the end.
                     let min_len = MINIMUM_DENSE_TABLE_ARMS.saturating_sub(1);
                     if any_dense_sub_slice(numbered, min_len, |slice| {
-                        missing_value(slice).is_some() || compact_window_with_gaps(slice)
+                        missing_value(slice).is_some()
+                            || compact_window_with_gaps(slice)
+                            || dense_power_of_two_stride(slice)
                     }) {
                         return true;
                     }
@@ -22714,6 +22785,106 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 6-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_power_of_two_strided_pattern_is_reported() {
+        // Codex's finding: `match n { 0 => 9, 4 => 3, 8 => 27, 12 => 1, _ => 0 }` — a stride
+        // of four — spans thirteen raw slots for four values, over
+        // `compact_window_with_gaps`'s own bound of twelve, but `rustc` 1.95 with `-O`
+        // still emits a four-entry `.Lswitch.table`, confirmed by disassembly: `roll $30,
+        // %edi` rotates the scrutinee right by two bits, exactly a division by the common
+        // stride. This test uses a wider stride of eight instead (`0, 8, 16, 24`, span
+        // twenty-five): the stride-four reproduction's own three-element runs (`0, 4, 8` and
+        // `4, 8, 12`) each already span nine slots for three values, exactly
+        // `compact_window_with_gaps`'s own bound at that length, so `any_dense_sub_slice`'s
+        // sub-slice search already flagged it *without* this fix — stride eight's own
+        // three-element runs span seventeen, over that bound too, so this genuinely
+        // exercises `dense_power_of_two_stride` rather than a pre-existing sub-slice match.
+        // Checked by disassembly the identical way: `roll $29, %edi` rotates right by three
+        // bits, a division by eight. `dense_power_of_two_stride` is the additional check:
+        // an exact arithmetic progression whose stride is a power of two greater than one is
+        // flagged regardless of the raw span, since LLVM normalizes it before the span this
+        // scan otherwise measures is ever reached.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_a_power_of_two_stride(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 9,\n        8 => 3,\n        16 => 27,\n        \
+             24 => 1,\n        _ => 0,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_loop_setup_statement_is_reported() {
+        // Codex's finding: `loop { let x = n; break x; }` is two statements rather than the
+        // one `evaluate_loop`'s own exact-one-statement match required — a `let` setting up
+        // the value a trailing, unconditional `break` then returns — so it declined
+        // outright even though nothing about a setup statement before a total break is any
+        // less knowable than the break alone. `evaluate_loop` now walks every statement
+        // before the break through `resolve_block_sequential`, the identical sequential
+        // interpreter every other nested scope in this scan already uses, before resolving
+        // the break expression against whatever that walk bound. Verified against real
+        // rustc, warning-free: `x` is `n` for every `n` in `0..8`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..8u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = loop {{ let x = {n}u8; break x; }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_loop_setup_statement(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        _ => 8,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_fp_category_variants_is_reported() {
+        // Codex's finding: `core::num::FpCategory`'s five variants named the identical gap
+        // `core::sync::atomic::Ordering`'s own fix closed one enum over — resolved to
+        // nothing, so a match assigning non-linear results to all five (an exhaustive
+        // match, since `FpCategory` is not `#[non_exhaustive]` and needs no wildcard arm)
+        // passed `fully_dense_arm_patterns` unseen. `well_known_std_enum_variant` now
+        // answers for this enum too. Verified against real rustc, warning-free: `Nan`
+        // through `Normal` resolve to the dense `0..5` sequence the outer table's patterns
+        // actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_fp_category(nibble: u32) -> u32 {\n    \
+             match core::num::FpCategory::Nan {\n        \
+             core::num::FpCategory::Nan => 9,\n        \
+             core::num::FpCategory::Infinite => 3,\n        \
+             core::num::FpCategory::Zero => 27,\n        \
+             core::num::FpCategory::Subnormal => 1,\n        \
+             core::num::FpCategory::Normal => 81,\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
             "{violations:?}"
         );
     }

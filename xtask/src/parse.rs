@@ -3967,11 +3967,15 @@ fn well_known_bound_segments(segments: &[String]) -> Option<(&str, &str)> {
 /// Codex's finding: `core::sync::atomic::Ordering`'s five variants — a real, reachable enum
 /// with no dependency edge this scan could ever walk source for — resolved to nothing, so a
 /// match naming all five with a trailing wildcard passed `has_dense_arm_patterns` unseen.
-/// Scoped to the one enum the finding demonstrates plus its two nearest well-known siblings,
+/// Scoped to the one enum the finding demonstrates plus its nearest well-known siblings,
 /// rather than a general "resolve any external path" feature this scan has no way to make
 /// safe for an arbitrary crate it cannot read at all: a real declaration always wins first,
 /// exactly the way [`well_known_integer_bound`]'s own fallback stands only where nothing real
 /// answered — this is the identical last resort, one dependency layer further out.
+///
+/// Codex's next-round finding: `core::num::FpCategory`'s five variants named the identical
+/// gap one enum over, resolved to nothing for the identical reason. Added rather than
+/// generalised, for the identical reason the first three entries were.
 fn well_known_std_enum_variant(segments: &[String]) -> Option<i128> {
     const ENUMS: &[(&[&str], &[&str])] = &[
         (
@@ -3980,6 +3984,10 @@ fn well_known_std_enum_variant(segments: &[String]) -> Option<i128> {
         ),
         (&["cmp", "Ordering"], &["Less", "Equal", "Greater"]),
         (&["task", "Poll"], &["Ready", "Pending"]),
+        (
+            &["num", "FpCategory"],
+            &["Nan", "Infinite", "Zero", "Subnormal", "Normal"],
+        ),
     ];
     let (root, rest) = segments.split_first()?;
     if root != "core" && root != "std" {
@@ -6203,8 +6211,22 @@ fn literal_or_const_value(expr: &syn::Expr, resolve: &Resolve<'_>) -> Option<i12
 /// Only a break naming a *different* label (an outer loop's) is the real ambiguity this case
 /// exists to decline; compared by the label's own identifier, the same way two lifetimes are
 /// compared everywhere else in this scan.
+///
+/// Codex's next-round finding: `loop { let x = n; break x; }` is two statements rather than
+/// one — a `let` setting up the value a trailing, unconditional `break` then returns — which
+/// the exact-one-statement match above declined outright, even though nothing about a setup
+/// statement before a total break is any less knowable than the break alone. The body's
+/// statements *before* the break are now walked through [`resolve_block_sequential`], the
+/// identical sequential interpreter every other nested scope in this scan uses, and the break
+/// expression is then resolved against whatever that walk bound — so `x` reads the value the
+/// `let` gave it. A body of exactly one statement (the original shape) still works: `rest` is
+/// simply empty, and `resolve_block_sequential` over no statements is a no-op. Any statement
+/// the sequential walker itself cannot interpret still declines the whole loop, via the
+/// identical `?` propagation every other caller of that function already relies on.
 fn evaluate_loop(expr_loop: &syn::ExprLoop, resolve: &Resolve<'_>) -> Option<i128> {
-    let [syn::Stmt::Expr(syn::Expr::Break(break_expr), _)] = expr_loop.body.stmts.as_slice() else {
+    let stmts = production_stmts(&expr_loop.body);
+    let (last, rest) = stmts.split_last()?;
+    let syn::Stmt::Expr(syn::Expr::Break(break_expr), _) = last else {
         return None;
     };
     let targets_this_loop = match (&break_expr.label, expr_loop.label.as_ref()) {
@@ -6215,7 +6237,43 @@ fn evaluate_loop(expr_loop: &syn::ExprLoop, resolve: &Resolve<'_>) -> Option<i12
     if !targets_this_loop {
         return None;
     }
-    literal_or_const_value(break_expr.expr.as_ref()?, resolve)
+    let mut local_types = std::collections::HashMap::new();
+    let mut resolved = std::collections::HashMap::new();
+    resolve_block_sequential(
+        rest,
+        resolve,
+        &mut local_types,
+        &mut resolved,
+        &mut ShadowSnapshot::new(),
+    )?;
+    let loop_resolve_value = |path: &syn::Path| {
+        path.get_ident()
+            .map(ident_name)
+            .and_then(|candidate| resolved.get(&candidate).copied())
+            .or_else(|| (resolve.value)(path))
+    };
+    let loop_resolve_unsigned = |path: &syn::Path| {
+        resolved_local_name(path, &resolved).map_or_else(
+            || (resolve.unsigned)(path),
+            |candidate| {
+                local_types
+                    .get(&candidate)
+                    .is_some_and(|name| is_unsigned_type_name(name))
+            },
+        )
+    };
+    let loop_resolve_width = |path: &syn::Path| {
+        resolved_local_name(path, &resolved).map_or_else(
+            || (resolve.width)(path),
+            |candidate| local_types.get(&candidate).map(String::as_str),
+        )
+    };
+    let loop_resolve = Resolve {
+        value: &loop_resolve_value,
+        unsigned: &loop_resolve_unsigned,
+        width: &loop_resolve_width,
+    };
+    literal_or_const_value(break_expr.expr.as_ref()?, &loop_resolve)
 }
 
 /// `block_expr`'s own value, for the one labelled-block shape this scan folds —
