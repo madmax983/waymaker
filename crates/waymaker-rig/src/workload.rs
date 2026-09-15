@@ -54,6 +54,10 @@ pub struct Workload {
     seed: u64,
     iteration: u32,
     effects: u16,
+    /// The schedule record index this workload declares with a different activity kind.
+    ///
+    /// `None` for an ordinary run. See [`diverging`](Self::diverging).
+    divergent: Option<u16>,
 }
 
 impl Workload {
@@ -69,6 +73,10 @@ impl Workload {
     /// Its version.
     pub const WORKFLOW_VERSION: u16 = 1;
 
+    /// The activity kind a [`diverging`](Self::diverging) workload declares instead of
+    /// [`activity`](Self::activity), at its one changed record.
+    const DIVERGENT_ACTIVITY: ActivityKind = ActivityKind(2);
+
     /// The run seeded with `seed`, at `iteration`, scheduling `effects` effects.
     #[must_use]
     pub const fn new(seed: u64, iteration: u32, effects: u16) -> Self {
@@ -76,6 +84,30 @@ impl Workload {
             seed,
             iteration,
             effects,
+            divergent: None,
+        }
+    }
+
+    /// This workload, but `effect`'s schedule record declares a different activity kind.
+    ///
+    /// Everything else stays the same: the run identity, the record count, and every other
+    /// record's bytes. This is what a firmware upgrade that changed one boundary looks like
+    /// on the wire — issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// replay-divergence row.
+    ///
+    /// Takes the effect this run schedules rather than a raw record index, and derives the
+    /// index itself through [`schedule_index`](Self::schedule_index): [`record`](Self::record)
+    /// consults `divergent` only from the `Role::Schedule` arm, so a raw index naming a
+    /// `Start`, `Completion` or `Finish` record — or one past the end of the run — used to
+    /// produce a workload that agreed with the base one everywhere, silently, rather than
+    /// diverging at all. An `effect` this run does not schedule — `effect >= effects` —
+    /// still diverges nothing, and honestly: there is no schedule record for it to disagree
+    /// at, which [`schedule_index`](Self::schedule_index) already answers `None` for.
+    #[must_use]
+    pub const fn diverging(self, effect: u16) -> Self {
+        Self {
+            divergent: self.schedule_index(effect),
+            ..self
         }
     }
 
@@ -243,9 +275,14 @@ impl Workload {
                 let input = self.effect_input(effect, out)?;
                 let input_len = u16::try_from(input.len()).ok()?;
                 let input_crc = input_digest(input);
+                let kind = if self.divergent == Some(index) {
+                    Self::DIVERGENT_ACTIVITY
+                } else {
+                    self.activity()
+                };
                 Some(RecordRef::EffectScheduled {
                     seq: EffectSeq(u32::from(effect)),
-                    kind: self.activity(),
+                    kind,
                     input_len,
                     input_crc,
                 })

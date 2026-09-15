@@ -3212,6 +3212,12 @@ pub const FAILURE_RIG_TESTS_PATH: &str = "crates/waymaker-rig/tests/matrix.rs";
 pub enum RigStanding {
     /// `crates/waymaker-rig/tests/matrix.rs` classifies crash points into it and resumes them.
     Swept,
+    /// `crates/waymaker-rig/tests/matrix.rs` reaches it with one hand-driven case rather
+    /// than a crash-point sweep — a capacity refusal or a declared-workflow mismatch is not
+    /// a media crash the injector produces, matching the model half's own treatment of the
+    /// same two rows. Still discharged, and still named by a test of its own; `Swept` would
+    /// overstate what a reader should expect this row's coverage to look like.
+    Driven,
     /// The rig has no workload that reaches it. Owed, and said so: issue #96.
     Owed,
 }
@@ -3222,6 +3228,7 @@ impl RigStanding {
     pub const fn render(self) -> &'static str {
         match self {
             Self::Swept => "Swept",
+            Self::Driven => "Driven",
             Self::Owed => "Owed",
         }
     }
@@ -3250,9 +3257,9 @@ pub struct FailureRow {
 
 /// The ten rows of §14's failure-semantics table.
 ///
-/// Six are swept on the rig. Four are owed there — a swap workload, a capacity refusal and a
-/// divergent replay are things this rig does not do — and a row owed is a row the table says
-/// is owed, rather than one the rig's census quietly omits.
+/// All ten are swept or driven on the rig. Issue #96 closed the last four — a swap
+/// workload, a capacity refusal and a divergent replay. If a row here is ever marked
+/// `Owed` again, that means the rig's census stopped reaching it.
 pub const FAILURE_ROWS: &[FailureRow] = &[
     FailureRow {
         id: "during-schedule-frame-write",
@@ -3319,32 +3326,40 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         variant: "DuringInactiveBankEraseOrWrite",
         failure_point: "During inactive-bank erase/write",
         model_test: "during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues_on_the_rig",
+        ),
     },
     FailureRow {
         id: "after-new-bank-seal-barrier",
         variant: "AfterNewBankSealBarrier",
         failure_point: "After new bank seal barrier",
         model_test: "after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current_again_on_the_rig",
+        ),
     },
     FailureRow {
         id: "history-capacity-reached",
         variant: "HistoryCapacityReached",
         failure_point: "History capacity reached",
         model_test: "history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Driven,
+        rig_test: Some(
+            "history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new",
+        ),
     },
     FailureRow {
         id: "replay-divergence",
         variant: "ReplayDivergence",
         failure_point: "Replay divergence",
         model_test: "replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Driven,
+        rig_test: Some(
+            "replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched",
+        ),
     },
 ];
 
@@ -7544,8 +7559,8 @@ mod tests {
         tests.sort_unstable();
         tests.dedup();
         assert_eq!(tests.len(), 10, "two rows share a test");
-        assert!(FAILURE_ROWS.iter().any(|row| row.rig == RigStanding::Swept));
-        assert!(FAILURE_ROWS.iter().any(|row| row.rig == RigStanding::Owed));
+        // Issue #96 closed the rig's last four owed rows: every row is swept or driven now.
+        assert!(FAILURE_ROWS.iter().all(|row| row.rig != RigStanding::Owed));
     }
 
     #[test]
@@ -7657,7 +7672,7 @@ mod tests {
             .iter()
             .find_map(|row| row.rig_test.map(|test| (row, test)))
         else {
-            unreachable!("the rig sweeps six rows")
+            unreachable!("the rig reaches every row")
         };
         let mut inputs = matrix_inputs();
         inputs.failure_rig_tests = inputs
@@ -7673,10 +7688,10 @@ mod tests {
     }
 
     #[test]
-    fn every_swept_row_names_a_rig_test_and_no_owed_row_does() {
+    fn every_swept_or_driven_row_names_a_rig_test_and_no_owed_row_does() {
         for row in FAILURE_ROWS {
             assert_eq!(
-                row.rig == RigStanding::Swept,
+                row.rig != RigStanding::Owed,
                 row.rig_test.is_some(),
                 "{}",
                 row.id
@@ -7745,7 +7760,7 @@ mod tests {
             .iter()
             .find_map(|row| row.rig_test.map(|test| (row, test)))
         else {
-            unreachable!("the rig sweeps six rows")
+            unreachable!("the rig reaches every row")
         };
         let mut inputs = matrix_inputs();
         inputs.failure_rig_tests = inputs.failure_rig_tests.map(|tests| {
@@ -7887,7 +7902,7 @@ mod tests {
         let mut wrong_standing = matrix_inputs();
         wrong_standing.claude_md = wrong_standing
             .claude_md
-            .map(|md| md.replace("| Owed |", "| Swept |"));
+            .map(|md| md.replacen("| Swept |", "| Owed |", 1));
         assert!(
             matrix_violations(&wrong_standing)
                 .iter()
