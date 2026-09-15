@@ -695,6 +695,50 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
     Ok(visitor.found)
 }
 
+/// The five `syn::visit::Visit` overrides that keep `self.shadow` correct
+/// across a generics-bearing item's own body (issue #181).
+///
+/// One macro, not five methods copied into each visitor. Every path-
+/// resolving visitor here needs the same five overrides, over its own
+/// `self.shadow` field. One shared body keeps them from drifting apart, and
+/// keeps each visitor's own `impl` short enough for `clippy::too_many_lines`.
+/// A visitor's own `visit_item_mod` stays outside this macro — each already
+/// has its own, for `self.stack` — but must reset `self.shadow` to empty
+/// around it too: a module inherits no generics either.
+macro_rules! shadow_generic_params {
+    () => {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.sig.generics);
+            syn::visit::visit_item_fn(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            let added = extend_generic_shadow(&mut self.shadow, &node.sig.generics);
+            syn::visit::visit_impl_item_fn(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+            let added = extend_generic_shadow(&mut self.shadow, &node.sig.generics);
+            syn::visit::visit_trait_item_fn(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_impl(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_trait(self, node);
+            self.shadow = outer;
+        }
+    };
+}
+
 /// Every name in `names` that a generic parameter's own trait bound binds an associated
 /// type to, anywhere `contents` declares one, outside `#[cfg(test)]`.
 ///
@@ -725,6 +769,11 @@ pub fn generic_assoc_type_bindings_naming(
         // point — a binding's value is exactly as aliasable as a struct literal's path.
         stack: Vec<&'ast [syn::Item]>,
         block_items: Vec<&'ast syn::Item>,
+        // Generic type-parameter names in scope at the current point (issue #181), the
+        // same field every other `resolve_segments` caller carries: a bound's own value can
+        // itself be a generic parameter, and a parameter named `CheckedDispatch` is not the
+        // real type.
+        shadow: Vec<String>,
     }
 
     impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
@@ -755,7 +804,11 @@ pub fn generic_assoc_type_bindings_naming(
                 self.stack.push(items);
             }
             let enclosing_block_items = core::mem::take(&mut self.block_items);
+            // A module sees none of an enclosing item's generics either (issue #181):
+            // reset for its own traversal, restore after.
+            let outer_shadow = core::mem::take(&mut self.shadow);
             syn::visit::visit_item_mod(self, node);
+            self.shadow = outer_shadow;
             self.block_items = enclosing_block_items;
             if pushed {
                 self.stack.pop();
@@ -777,6 +830,8 @@ pub fn generic_assoc_type_bindings_naming(
             self.block_items.truncate(self.block_items.len() - pushed);
         }
 
+        shadow_generic_params!();
+
         // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
         // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
         // shape `Iterator<Item = u8>`'s syntax can take.
@@ -789,8 +844,10 @@ pub fn generic_assoc_type_bindings_naming(
                     .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
                 let resolved = match local {
                     Some((segments, true)) => segments,
-                    Some((segments, false)) => resolve_segments_from(segments, &self.stack),
-                    None => resolve_segments(path, &self.stack),
+                    Some((segments, false)) => {
+                        resolve_segments_from(segments, &self.stack, &self.shadow)
+                    }
+                    None => resolve_segments(path, &self.stack, &self.shadow),
                 };
                 if let Some(name) = resolved
                     .last()
@@ -809,6 +866,7 @@ pub fn generic_assoc_type_bindings_naming(
         found: Vec::new(),
         stack: vec![&file.items],
         block_items: Vec::new(),
+        shadow: Vec::new(),
     };
     visitor.visit_file(&file);
     Ok(visitor.found)
@@ -981,50 +1039,6 @@ fn extend_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> 
 /// #181, Codex review of PR #195).
 fn reset_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> Vec<String> {
     core::mem::replace(shadow, generic_type_param_names(generics))
-}
-
-/// The five `syn::visit::Visit` overrides that keep `self.shadow` correct
-/// across a generics-bearing item's own body (issue #181).
-///
-/// One macro, not five methods copied into each visitor. Every path-
-/// resolving visitor here needs the same five overrides, over its own
-/// `self.shadow` field. One shared body keeps them from drifting apart, and
-/// keeps each visitor's own `impl` short enough for `clippy::too_many_lines`.
-/// A visitor's own `visit_item_mod` stays outside this macro — each already
-/// has its own, for `self.stack` — but must reset `self.shadow` to empty
-/// around it too: a module inherits no generics either.
-macro_rules! shadow_generic_params {
-    () => {
-        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-            let outer = reset_generic_shadow(&mut self.shadow, &node.sig.generics);
-            syn::visit::visit_item_fn(self, node);
-            self.shadow = outer;
-        }
-
-        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-            let added = extend_generic_shadow(&mut self.shadow, &node.sig.generics);
-            syn::visit::visit_impl_item_fn(self, node);
-            self.shadow.truncate(self.shadow.len() - added);
-        }
-
-        fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-            let added = extend_generic_shadow(&mut self.shadow, &node.sig.generics);
-            syn::visit::visit_trait_item_fn(self, node);
-            self.shadow.truncate(self.shadow.len() - added);
-        }
-
-        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
-            syn::visit::visit_item_impl(self, node);
-            self.shadow = outer;
-        }
-
-        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
-            syn::visit::visit_item_trait(self, node);
-            self.shadow = outer;
-        }
-    };
 }
 
 /// Every item anywhere in `items`, at any nesting depth, `mod` blocks
@@ -4619,6 +4633,139 @@ pub struct LiteralCounts {
     pub inside: usize,
 }
 
+/// The visitor behind `struct_literal_counts`, split out so the counting function
+/// below stays under this file's own line-count lint (`clippy::too_many_lines`) —
+/// the established shape for this file: a nested `impl` counted toward its owning
+/// function's own line count, so the fix is the split, not a suppression.
+struct Literals<'ast> {
+    stack: Vec<&'ast [syn::Item]>,
+    // The function-local `use`/`type` aliases of every block enclosing the current
+    // point, flat and cumulative rather than a stack of separate scopes — a block
+    // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
+    // Codex's fifth round; issue #109 review).
+    block_items: Vec<&'ast syn::Item>,
+    // Generic type-parameter names in scope at the current point (issue
+    // #181), same shape as `block_items`: pushed on entering a
+    // generics-bearing item, truncated back off on the way out.
+    shadow: Vec<String>,
+    name: String,
+    count: usize,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if has_cfg_test(item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if has_cfg_test(impl_item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    shadow_generic_params!();
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // A nested module's own item list goes on top of the stack
+        // (issue #109 review): pushed while walking it, popped
+        // afterward, so `super::`/`crate::` can still reach an ancestor
+        // scope while the module's own scope never inherits it
+        // implicitly. An out-of-line declaration (`mod x;`) has no body
+        // to push, but its own name and attributes must still be
+        // visited the default way — an early return here had skipped
+        // them (Codex review, PR #160), hiding a banned identifier
+        // spelled as a module name.
+        let pushed = node.content.is_some();
+        if let Some((_, items)) = node.content.as_ref() {
+            self.stack.push(items);
+        }
+        // The enclosing block's own local aliases are not visible inside a module
+        // nested within it either — a module inherits nothing from its lexical
+        // surroundings, whether that surrounding is another module or a function body
+        // (Codex review) — so `block_items` is set aside for the module's own
+        // traversal and restored once it is done, the same way `self.stack` is.
+        let enclosing_block_items = core::mem::take(&mut self.block_items);
+        // A module sees none of an enclosing item's generics either
+        // (issue #181): reset for its own traversal, restore after.
+        let outer_shadow = core::mem::take(&mut self.shadow);
+        syn::visit::visit_item_mod(self, node);
+        self.shadow = outer_shadow;
+        self.block_items = enclosing_block_items;
+        if pushed {
+            self.stack.pop();
+        }
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        // A function-local `use` or `type` alias is visible only inside the block
+        // that declares it, and inherited by anything nested within it (issue #92,
+        // Codex's fifth round) — unlike a module, which never inherits an outer
+        // scope's aliases just by being written inside it. `block_items` therefore
+        // stays one flat, growing list: this block's own item declarations are
+        // appended so they are searched first (and so shadow a same-named one
+        // further out — see `resolve_local_alias_chain`), and exactly that many are
+        // truncated back off on the way out, restoring the parent's view for a
+        // sibling block.
+        let own_items: Vec<&'ast syn::Item> = node
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                syn::Stmt::Item(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        let pushed = own_items.len();
+        self.block_items.extend(own_items);
+        syn::visit::visit_block(self, node);
+        self.block_items.truncate(self.block_items.len() - pushed);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        // A block-local alias is innermost, so it is tried first — and only for a
+        // bare, single-segment path, the only shape a function-local `type`/`use`
+        // alias is ever written against; a multi-segment path and module descent stay
+        // `resolve_segments`'s own job over the file's item-slice stack.
+        let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
+            .then(|| node.path.segments.first())
+            .flatten()
+            .map(|segment| ident_name(&segment.ident));
+        let local = first
+            .as_ref()
+            .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
+        let resolved = match local {
+            // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
+            // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
+            Some((segments, true)) => segments,
+            // Ran out of block-local aliases: the leftover head may itself be a
+            // module-level alias — `resolve_segments_from` is a no-op if it is not.
+            Some((segments, false)) => resolve_segments_from(segments, &self.stack, &self.shadow),
+            None => resolve_segments(&node.path, &self.stack, &self.shadow),
+        };
+        let resolves_to_name = resolved
+            .last()
+            .is_some_and(|last| last.as_str() == self.name);
+        // Issue #185: a name declared more than once, live under more than one
+        // unevaluated `cfg`, is not something the deterministic resolution above
+        // can pick correctly between. Ask separately whether *some* live
+        // declaration could reach `self.name`, so an ambiguous alias is never
+        // silently outvoted by another declaration sharing its name.
+        let reachable_another_way = !resolves_to_name
+            && first.as_deref().is_some_and(|first| {
+                self.stack.last().is_some_and(|scope| {
+                    alias_could_reach_target(first, &self.block_items, scope, &self.name)
+                })
+            });
+        if resolves_to_name || reachable_another_way {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+}
+
 /// Counts the struct literals in `contents` whose path's final segment is `name` — after
 /// resolving the file's `use` and `type` aliases — in total and inside a function body.
 ///
@@ -4651,137 +4798,6 @@ pub fn struct_literal_counts(
     name: &str,
     inside: FnScope<'_>,
 ) -> Result<LiteralCounts, syn::Error> {
-    struct Literals<'ast> {
-        stack: Vec<&'ast [syn::Item]>,
-        // The function-local `use`/`type` aliases of every block enclosing the current
-        // point, flat and cumulative rather than a stack of separate scopes — a block
-        // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
-        // Codex's fifth round; issue #109 review).
-        block_items: Vec<&'ast syn::Item>,
-        // Generic type-parameter names in scope at the current point (issue
-        // #181), same shape as `block_items`: pushed on entering a
-        // generics-bearing item, truncated back off on the way out.
-        shadow: Vec<String>,
-        name: String,
-        count: usize,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
-        fn visit_item(&mut self, node: &'ast syn::Item) {
-            if has_cfg_test(item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_item(self, node);
-        }
-
-        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if has_cfg_test(impl_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, node);
-        }
-
-        shadow_generic_params!();
-
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            // A nested module's own item list goes on top of the stack
-            // (issue #109 review): pushed while walking it, popped
-            // afterward, so `super::`/`crate::` can still reach an ancestor
-            // scope while the module's own scope never inherits it
-            // implicitly. An out-of-line declaration (`mod x;`) has no body
-            // to push, but its own name and attributes must still be
-            // visited the default way — an early return here had skipped
-            // them (Codex review, PR #160), hiding a banned identifier
-            // spelled as a module name.
-            let pushed = node.content.is_some();
-            if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(items);
-            }
-            // The enclosing block's own local aliases are not visible inside a module
-            // nested within it either — a module inherits nothing from its lexical
-            // surroundings, whether that surrounding is another module or a function body
-            // (Codex review) — so `block_items` is set aside for the module's own
-            // traversal and restored once it is done, the same way `self.stack` is.
-            let enclosing_block_items = core::mem::take(&mut self.block_items);
-            // A module sees none of an enclosing item's generics either
-            // (issue #181): reset for its own traversal, restore after.
-            let outer_shadow = core::mem::take(&mut self.shadow);
-            syn::visit::visit_item_mod(self, node);
-            self.shadow = outer_shadow;
-            self.block_items = enclosing_block_items;
-            if pushed {
-                self.stack.pop();
-            }
-        }
-
-        fn visit_block(&mut self, node: &'ast syn::Block) {
-            // A function-local `use` or `type` alias is visible only inside the block
-            // that declares it, and inherited by anything nested within it (issue #92,
-            // Codex's fifth round) — unlike a module, which never inherits an outer
-            // scope's aliases just by being written inside it. `block_items` therefore
-            // stays one flat, growing list: this block's own item declarations are
-            // appended so they are searched first (and so shadow a same-named one
-            // further out — see `resolve_local_alias_chain`), and exactly that many are
-            // truncated back off on the way out, restoring the parent's view for a
-            // sibling block.
-            let own_items: Vec<&'ast syn::Item> = node
-                .stmts
-                .iter()
-                .filter_map(|stmt| match stmt {
-                    syn::Stmt::Item(item) => Some(item),
-                    _ => None,
-                })
-                .collect();
-            let pushed = own_items.len();
-            self.block_items.extend(own_items);
-            syn::visit::visit_block(self, node);
-            self.block_items.truncate(self.block_items.len() - pushed);
-        }
-
-        fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            // A block-local alias is innermost, so it is tried first — and only for a
-            // bare, single-segment path, the only shape a function-local `type`/`use`
-            // alias is ever written against; a multi-segment path and module descent stay
-            // `resolve_segments`'s own job over the file's item-slice stack.
-            let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
-                .then(|| node.path.segments.first())
-                .flatten()
-                .map(|segment| ident_name(&segment.ident));
-            let local = first
-                .as_ref()
-                .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
-            let resolved = match local {
-                // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
-                // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
-                Some((segments, true)) => segments,
-                // Ran out of block-local aliases: the leftover head may itself be a
-                // module-level alias — `resolve_segments_from` is a no-op if it is not.
-                Some((segments, false)) => {
-                    resolve_segments_from(segments, &self.stack, &self.shadow)
-                }
-                None => resolve_segments(&node.path, &self.stack, &self.shadow),
-            };
-            let resolves_to_name = resolved
-                .last()
-                .is_some_and(|last| last.as_str() == self.name);
-            // Issue #185: a name declared more than once, live under more than one
-            // unevaluated `cfg`, is not something the deterministic resolution above
-            // can pick correctly between. Ask separately whether *some* live
-            // declaration could reach `self.name`, so an ambiguous alias is never
-            // silently outvoted by another declaration sharing its name.
-            let reachable_another_way = !resolves_to_name
-                && first.as_deref().is_some_and(|first| {
-                    self.stack.last().is_some_and(|scope| {
-                        alias_could_reach_target(first, &self.block_items, scope, &self.name)
-                    })
-                });
-            if resolves_to_name || reachable_another_way {
-                self.count = self.count.saturating_add(1);
-            }
-            syn::visit::visit_expr_struct(self, node);
-        }
-    }
-
     let file = parse_rust(contents)?;
 
     let mut total = Literals {
