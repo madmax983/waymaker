@@ -717,13 +717,17 @@ fn generic_type_param_names(generics: &syn::Generics) -> Vec<String> {
 /// a nested `fn` or `impl` included. That is unlike a generic type parameter.
 /// Confirmed against `rustc`: real Rust resets this only at a `mod` boundary.
 ///
-/// A `#[cfg(test)]`-gated declaration is excluded. It does not exist in a shipped
-/// build, so it must not hide a production path's real target — [`own_aliases`]'s own
-/// reason for the same exclusion. A `use` or `type` alias declared in the same block
-/// shadows too, but resolves to something instead of merely blocking resolution;
-/// [`resolve_local_alias_chain`] tracks those, not this list. A `let` binding is left
-/// out on purpose: it names a value, never a type or a module, so it cannot shadow a
-/// path this function's callers resolve.
+/// A `#[cfg(..)]`-gated declaration is excluded, whatever its condition — not only
+/// `#[cfg(test)]` — because this module does not evaluate a `cfg` (see
+/// [`has_any_cfg`]'s own doc). Shadowing suppresses a real resolution, the opposite
+/// of what [`own_aliases`] does with an uncertain alias, so the safe answer here is
+/// the opposite too: an item that might not ship must not be trusted to shadow
+/// (Codex review of this change, PR #203, on a `#[cfg(feature = "x")]` example). A
+/// `use` or `type` alias declared in the same block shadows too, but resolves to
+/// something instead of merely blocking resolution; [`resolve_local_alias_chain`]
+/// tracks those, not this list. A `let` binding is left out on purpose: it names a
+/// value, never a type or a module, so it cannot shadow a path this function's
+/// callers resolve.
 fn block_item_shadow_names(block: &syn::Block) -> Vec<String> {
     block
         .stmts
@@ -732,7 +736,7 @@ fn block_item_shadow_names(block: &syn::Block) -> Vec<String> {
             let syn::Stmt::Item(item) = stmt else {
                 return None;
             };
-            if has_cfg_test(item_attrs(item)) {
+            if has_any_cfg(item_attrs(item)) {
                 return None;
             }
             match item {
@@ -15224,6 +15228,23 @@ mod block_local_item_shadow_tests {
         assert!(
             paths.iter().any(|path| path.segments == ["Real"]),
             "a #[cfg(test)]-gated struct wrongly shadowed a production reference: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_struct_gated_by_a_non_test_cfg_does_not_shadow_either() {
+        // Codex review of this change (PR #203): this module does not
+        // evaluate a `cfg`, so a struct behind `#[cfg(feature = "x")]`
+        // might not ship either. Shadowing would suppress a real match in
+        // the build where it does not exist, so it must not shadow, the
+        // same as a `#[cfg(test)]`-gated one.
+        let code = "mod TimerSpec {\n    pub use Real as BestEffort;\n}\nfn f() {\n    \
+             #[cfg(feature = \"local\")]\n    struct TimerSpec;\n    let _ = \
+             TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Real"]),
+            "a struct gated by a non-test cfg wrongly shadowed a production reference: {paths:?}"
         );
     }
 }

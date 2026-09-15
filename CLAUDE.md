@@ -1320,8 +1320,12 @@ Stated so that nobody mistakes silence for coverage:
   `resolved_path_uses`, `name_uses`, `struct_literal_counts`, and
   `generic_assoc_type_bindings_naming`. That last one, issue #184's own caller, had been
   calling both functions with the wrong argument count since #181 landed, and the crate did
-  not compile until this fix. A `#[cfg(test)]`-gated declaration is excluded from
-  `block_shadow`, `own_aliases`'s own reason (issue #51). A `let`-bound name is left out on
+  not compile until this fix. Any `#[cfg(..)]`-gated declaration is excluded from
+  `block_shadow`, not only a `#[cfg(test)]` one: shadowing suppresses a real
+  resolution, the opposite of what `own_aliases` does with an alias behind an
+  unevaluated `cfg` (issue #51), so the safe direction here is the opposite too —
+  Codex found this on review of the pull request, against a `#[cfg(feature = "x")]`
+  example. A `let`-bound name is left out on
   purpose rather than left open: it occupies only Rust's value namespace, never the type or
   module namespace `resolve_segments`'s callers resolve in, so it cannot shadow a path any
   of them reads — issue #193's own reproducer names one only as part of the `let _ = ...`
@@ -5665,8 +5669,12 @@ must-not-own cell, a dependency edge, or a rule id.
 Issue #193 closes the other half of #181's own residual: a block-local `struct`,
 `enum` or `union` now shadows a same-named sibling module or `use` alias too, not
 only a generic type parameter. `block_item_shadow_names` reads a block's own
-directly-declared items, skipping a `#[cfg(test)]`-gated one for `own_aliases`'s own
-reason. Its names go into a *new*, separate list, `block_shadow`, not the generic
+directly-declared items, skipping any `#[cfg(..)]`-gated one — not only a
+`#[cfg(test)]`-gated one, which the first version wrongly stopped at: Codex found on
+review that shadowing suppresses a real resolution, the opposite of what
+`own_aliases` does with an alias behind an unevaluated `cfg`, so the safe reading
+here is the opposite too, and a `#[cfg(feature = "x")]`-gated struct still shadowed
+in every build before this fix. Its names go into a *new*, separate list, `block_shadow`, not the generic
 parameter's own `shadow` — the review round that found this checked the claim
 against `rustc` rather than assuming it, and the two lists reset at different points
 because real Rust treats them differently. `E0401`'s "nested items are
