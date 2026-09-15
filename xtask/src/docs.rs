@@ -7410,6 +7410,76 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_a_script_inside_mglyph_nested_in_a_span_stays_hidden() {
+        // Codex, pull request #138, round 61, finding "Require `mglyph` to be a
+        // direct integration-point child": round 60's `mglyph`/`malignmark`
+        // exception read only the innermost open frame's own name, blind to any
+        // ordinary HTML element opened beneath it — but WHATWG's exception applies
+        // only while `mglyph`/`malignmark` is a genuine *direct* child of the
+        // MathML text integration point, the adjusted current node. Once an
+        // ordinary `<span>` opens inside `<mtext>`, the current node is `span`, an
+        // HTML element, so a further `<mglyph>` nested inside *it* no longer
+        // qualifies: `<math><mtext><span><mglyph><script
+        // />decision-id headline</script></mglyph></span></mtext></math>` has the
+        // `<script />`'s slash ignored under ordinary HTML rules there, opening a
+        // real, raw-text `<script>` whose body a browser never renders — but the
+        // round-60 check still re-entered MathML anyway, wrongly reading it as
+        // bodyless and exposing the id and headline as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><span><mglyph><script />{} {}</script></mglyph></span></mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_div_implicitly_closing_a_hidden_ancestors_paragraph_still_counts() {
+        // Codex, pull request #138, round 61, finding "Apply implicit closes
+        // through hidden descendants": `<p><span hidden>ignored<div>decision-id
+        // headline</div>` has `<div>` implicitly close the ancestor `<p>` — HTML5's
+        // own "close a p element" rule — which pops everything nested inside `p`
+        // off the stack right along with it, the hidden `span` included, so the
+        // `div` and its text are genuinely outside any hidden element and visible.
+        // `next_non_rendering_marker`'s implicit-close check only ever asked
+        // whether the incoming tag implicitly closes `top` (`span`) itself — which
+        // it does not, `span` having no optional-tag rules of its own — so `div`
+        // was recorded as an ordinary child nested *inside* the still-open hidden
+        // `span` instead, latching it (and the id and headline inside `div`)
+        // hidden through end of document, since no `</span>` ever follows.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<p><span hidden>ignored<div>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_div_closing_through_a_hidden_span_still_counts() {
         // Codex, pull request #138, round 57, finding "Unwind all elements
         // through a matching ancestor": a real HTML5 parser searches its whole

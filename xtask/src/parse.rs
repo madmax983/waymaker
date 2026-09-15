@@ -1497,6 +1497,20 @@ struct ForeignFrame {
     /// the innermost open one — true for a foreign-content root, false for an HTML
     /// integration point.
     honors_self_closing: bool,
+    /// Ordinary (non-foreign, non-void, non-self-closing) elements opened directly
+    /// under this frame while it is the innermost one and not yet closed — tracked
+    /// only to answer "is `<mglyph>`/`<malignmark>` still a genuine *direct* child of
+    /// an open `MathML` text integration point" (Codex, pull request #138, round 61,
+    /// "Require `mglyph` to be a direct integration-point child"): `<mtext><span>
+    /// <mglyph>...` has `mglyph` nested inside `span`, an ordinary HTML element, not
+    /// directly inside `mtext` — the adjusted current node is `span`, an HTML
+    /// element, so WHATWG's `mglyph`/`malignmark` exception does not apply there,
+    /// only when nothing else genuinely open sits between the two. Pushed and popped
+    /// the same "close only what actually opened" discipline every other tracked
+    /// stack in this module already follows, so `<mtext><b>x</b><mglyph>...` — a
+    /// sibling opened and properly closed before `mglyph`, not an ancestor — still
+    /// finds it empty and lets the exception apply.
+    ordinary_descendants: Vec<String>,
 }
 
 /// Whether a self-closing `/` is currently honored — the innermost open [`ForeignFrame`]
@@ -1758,11 +1772,22 @@ fn is_foreign_breakout_tag(span: &str, name: &str) -> bool {
 fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFrame>) {
     let name = markup_tag_name(span);
     if span.starts_with("</") {
-        if foreign_content
-            .last()
-            .is_some_and(|frame| frame.name.eq_ignore_ascii_case(name))
-        {
-            foreign_content.pop();
+        if let Some(top) = foreign_content.last_mut() {
+            if top.name.eq_ignore_ascii_case(name) {
+                foreign_content.pop();
+            } else {
+                // A close for an ordinary element opened directly under the
+                // innermost frame (Codex, pull request #138, round 61) — tracked
+                // only so the `mglyph`/`malignmark` direct-child check below can
+                // tell whether anything else is currently open between it and an
+                // enclosing MathML text integration point. Truncated through the
+                // match, the same "close only what actually opened" discipline
+                // every other tracked stack here already follows.
+                let lower = name.to_ascii_lowercase();
+                if top.ordinary_descendants.contains(&lower) {
+                    while top.ordinary_descendants.pop().as_deref() != Some(lower.as_str()) {}
+                }
+            }
         }
         return;
     }
@@ -1790,21 +1815,41 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
     // invariants</mtext></math>` keeps the `<script />` bodyless this way; without it,
     // the still-innermost `mtext` frame read the slash as ignored, opening a real,
     // unclosed `<script>` that swallowed everything after it to end of document.
+    //
+    // Only while genuinely a *direct* child of the integration point, its own
+    // `ordinary_descendants` empty (Codex, round 61, "Require `mglyph` to be a
+    // direct integration-point child"): `<mtext><span><mglyph>...` has `mglyph`
+    // nested inside the ordinary `span`, not directly inside `mtext` — the adjusted
+    // current node there is `span`, an HTML element, so the exception does not
+    // apply, and the round-60 fix (which read only the innermost *frame*'s own
+    // name, blind to any ordinary element opened beneath it) wrongly re-entered
+    // MathML anyway.
     let is_mglyph_exception = !honors_self_closing_now(foreign_content)
         && (name.eq_ignore_ascii_case("mglyph") || name.eq_ignore_ascii_case("malignmark"))
-        && foreign_content
-            .last()
-            .is_some_and(|frame| is_mathml_text_integration_point(&frame.name));
+        && foreign_content.last().is_some_and(|frame| {
+            is_mathml_text_integration_point(&frame.name) && frame.ordinary_descendants.is_empty()
+        });
     if is_mglyph_exception || is_foreign_content_root(name) {
         foreign_content.push(ForeignFrame {
             name: name.to_ascii_lowercase(),
             honors_self_closing: true,
+            ordinary_descendants: Vec::new(),
         });
     } else if is_html_integration_point(span, name) {
         foreign_content.push(ForeignFrame {
             name: name.to_ascii_lowercase(),
             honors_self_closing: false,
+            ordinary_descendants: Vec::new(),
         });
+    } else if !honors_self_closing_now(foreign_content)
+        && !is_void_element(&name.to_ascii_lowercase())
+    {
+        // An ordinary tag opened while under an HTML integration point's "in html
+        // content" rules — recorded on the innermost frame alone (Codex, round 61),
+        // so a later `mglyph`/`malignmark` can tell it is no longer a direct child.
+        if let Some(top) = foreign_content.last_mut() {
+            top.ordinary_descendants.push(name.to_ascii_lowercase());
+        }
     }
 }
 
@@ -2722,6 +2767,29 @@ fn next_non_rendering_marker(
             // as HTML5's own tokenizer does for an end tag with no matching open
             // element anywhere on the stack.
         } else if implicitly_closed_by(top, &name) {
+            return Some(NonRenderingAdvance::Close(start));
+        } else if let Some(closed_ancestor) = ancestors
+            .iter()
+            .rev()
+            .find(|ancestor| implicitly_closed_by(ancestor, &name))
+            .cloned()
+        {
+            // An opening tag can implicitly close an *ancestor* genuinely open
+            // outside `top`, not only `top` itself (Codex, pull request #138,
+            // round 61, "Apply implicit closes through hidden descendants"):
+            // `<p><span hidden>ignored<div>All 6 recovery invariants</div>` has
+            // `div` implicitly close the ancestor `p` — HTML5's own "close a p
+            // element" rule — which pops everything nested inside `p`, the
+            // hidden `span` included, off the stack right along with it. Checking
+            // only `implicitly_closed_by(top, &name)` missed this, since `span`
+            // has no optional-tag rules of its own naming `div`, so the incoming
+            // tag was recorded as an ordinary nested child instead, latching the
+            // hidden stack open through the ancestor's own implicit close. The
+            // search walks `ancestors` innermost first — the same "nearest open
+            // instance" a real stack-based algorithm finds — and truncates
+            // through the match the same way an *explicit* ancestor close
+            // already does (round 57).
+            while ancestors.pop().as_deref() != Some(closed_ancestor.as_str()) {}
             return Some(NonRenderingAdvance::Close(start));
         } else if matches!(
             name.as_str(),
