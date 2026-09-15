@@ -7089,6 +7089,96 @@ mod tests {
     }
 
     #[test]
+    fn a_visible_suffix_after_an_abrupt_empty_comment_close_still_counts() {
+        // Codex, pull request #138, round 55, "Recognize abrupt empty-comment
+        // closes": HTML5's tokenizer treats `<!-->` and `<!--->` as parse-error
+        // "abrupt closing of empty comment" — the comment closes at that very `>`,
+        // right after the opener's own dashes, rather than waiting for a standard
+        // `-->` or `--!>` later in the document.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-->{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a visible suffix after an abrupt empty-comment close was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_ancestor_closes_a_still_open_hidden_element_still_counts() {
+        // Codex, pull request #138, round 55, "Unwind hidden descendants when an
+        // ancestor closes": `<div><span hidden>ignored</div>decision-id headline`
+        // never gives `span` its own end tag, but a browser still force-closes it
+        // — and anything nested inside it — the moment its ancestor `<div>`
+        // closes, via the standard "pop the stack of open elements" end-tag
+        // algorithm. Tracking only the fixed non-rendering/hidden stack, blind to
+        // any ordinary ancestor that was never pushed onto it, left `span`
+        // latched open through end of document, hiding the decision that follows.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden>ignored</div>{} {}\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after an ancestor closed a still-open hidden element was \
+             wrongly hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_bogus_comment_with_a_quote_still_counts() {
+        // Codex, pull request #138, round 55, "End bogus comments at the first
+        // greater-than sign": HTML5's bogus-comment state (`<!ignored ...>`)
+        // tracks no quotes at all — the very first `>` ends it, so `<!ignored
+        // title=">decision-id headline">` closes right after `title="`, and
+        // everything after that — the id, the headline, the stray quote and the
+        // final `>` alike — is ordinary visible text. Routing this construct
+        // through the quote-aware scan built for real tags instead waited for the
+        // matching close-quote's own trailing `>`, swallowing the decision as
+        // though it were still markup.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<!ignored title=\">{} {}\">\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after a bogus comment with a quote was wrongly hidden: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_an_escaped_or_encoded_comment_marker_still_counts() {
         // Codex, pull request #138, round 22: `\<!--` and `&lt;!--` both decode to text
         // containing `<!--`, but a real, unescaped one is always recognized by

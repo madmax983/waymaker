@@ -2032,6 +2032,21 @@ enum HidingMarker {
 /// matching close quote is what re-arms the search.
 fn find_any_tag(line: &str, from: usize) -> Option<(usize, usize)> {
     let start = next_tag_start(line, from)?;
+    // A markup declaration (`<!ignored ...>`) or processing instruction (`<?...?>`)
+    // is not a real tag at all — HTML5 tokenizes both into "bogus comment state",
+    // which tracks no quotes whatsoever and ends at the very first `>` it meets
+    // (Codex, pull request #138, round 55, "End bogus comments at the first
+    // greater-than sign"): `<!ignored title=">decision-id headline">` closes right
+    // after `title="`, not at the matching close-quote's own trailing `>` the
+    // quote-aware scan below would find instead — which would swallow the whole
+    // quoted-looking remainder, ordinary visible text a reader sees plainly, as
+    // though it were still markup. `next_tag_start` never yields this `start` for a
+    // real `<!--` comment (intercepted separately, above it), so a `!` or `?`
+    // reaching here always means one of these two constructs.
+    if matches!(line.as_bytes().get(start + 1), Some(b'!' | b'?')) {
+        let offset = line.get(start + 1..)?.find('>')?;
+        return Some((start, start + 1 + offset + 1));
+    }
     let mut quote: Option<u8> = None;
     let end = scan_tag_close(line, start + 1, &mut quote)?;
     Some((start, end))
@@ -2324,6 +2339,14 @@ fn next_non_rendering_marker(
         });
     }
     let mut cursor = cursor;
+    // Ordinary elements opened *during this walk*, nested inside `top` (Codex, pull
+    // request #138, round 55, "Unwind hidden descendants when an ancestor closes") —
+    // an ordinary `<div>` an untracked ancestor already opened *before* `top` itself
+    // never appears here at all, since consuming its own opening tag happened at the
+    // top level, before `top` was ever pushed; only a child opened after `top`, while
+    // this very walk is what is scanning past it, is recorded. That is exactly the
+    // distinction the closing-tag arm below needs to draw.
+    let mut descendants: Vec<String> = Vec::new();
     loop {
         let comment = find_comment_opener(line, cursor);
         let Some((start, end)) = find_any_tag(line, cursor) else {
@@ -2344,6 +2367,27 @@ fn next_non_rendering_marker(
             if name == top {
                 return Some(NonRenderingAdvance::Close(end));
             }
+            if descendants.last().is_some_and(|open| *open == name) {
+                // A genuine nested child, opened after `top` and closed properly —
+                // not relevant to `top`'s own state.
+                descendants.pop();
+            } else if !descendants.contains(&name) {
+                // Matches neither `top` nor anything this walk watched open inside
+                // it, so it can only be the close of an ancestor `top` itself is
+                // nested in — untracked, since an ordinary element carries nothing
+                // to suppress on its own. A real HTML5 parser pops its whole stack
+                // of open elements up through a matching ancestor's end tag,
+                // force-closing every descendant still open beneath it — including
+                // `top`, however deeply hidden — so `<div><span
+                // hidden>ignored</div>All 6 recovery invariants` closes `span` the
+                // moment `</div>` is reached, not never: `top` never gets an end tag
+                // of its own to wait for, and the suffix after `</div>` is real,
+                // visible prose a reader sees.
+                return Some(NonRenderingAdvance::Close(end));
+            }
+            // Otherwise `name` is on `descendants` but not at its top — an
+            // out-of-order close inside a genuine nested child; keep walking rather
+            // than guess which entry it meant.
         } else if implicitly_closed_by(top, &name) {
             return Some(NonRenderingAdvance::Close(start));
         } else if matches!(
@@ -2360,6 +2404,11 @@ fn next_non_rendering_marker(
             if !(ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content)) {
                 return Some(NonRenderingAdvance::Open(end, name));
             }
+        } else if !ends_with_self_closing_slash(span) && !is_void_element(&name) {
+            // An ordinary element genuinely nested inside `top`, opened during this
+            // same walk — tracked so its own later close (above) is told apart from
+            // an untracked ancestor's.
+            descendants.push(name);
         }
         // Not relevant to `top` — carry its own namespace effect forward (a no-op for
         // anything that is not a foreign-content root or an HTML integration point)
