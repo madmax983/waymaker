@@ -156,7 +156,16 @@ fn variant_build_dir(build_dir: &Path, variant: &str) -> PathBuf {
 const STRIP_NOTHING: &str = "profile.release.strip=\"none\"";
 
 /// The version stamped into the JSON report.
-const REPORT_SCHEMA: u64 = 3;
+///
+/// Codex's finding: renaming `ChecksumCandidate::shipped` to `adr0010_shipped` changed
+/// what a schema-3 report's own `checksum_candidates` entries look like, but the schema
+/// number stayed 3 — so a report a pre-rename build wrote, still carrying `shipped`,
+/// passed the schema check and only then failed with a field-not-found error, which
+/// reads as a malformed report rather than as the version mismatch it actually is.
+/// Bumped to 4, the same way a report from an older schema is already refused rather
+/// than misread: `--report` fails closed on the schema number itself, not on whichever
+/// field a shape change happened to touch.
+const REPORT_SCHEMA: u64 = 4;
 
 /// The row every other row is an increment on: an image with no Waymaker in it.
 pub const BASELINE_ROW: &str = "baseline";
@@ -608,8 +617,22 @@ fn identifier(rest: &str) -> Option<&str> {
 pub struct ChecksumCandidate {
     /// The candidate's name, as ADR 0010's table names it.
     pub name: String,
-    /// Whether Waymaker ships this candidate.
-    pub shipped: bool,
+    /// Whether ADR 0010 chose this candidate's *algorithm family* to ship —
+    /// CRC-32/ISO-HDLC and CRC-16/CCITT-FALSE, both still true today.
+    ///
+    /// Codex's finding: this used to be named and documented as "whether Waymaker
+    /// ships this candidate", which stopped being true the moment
+    /// [ADR 0046](../../../docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md)
+    /// and
+    /// [ADR 0053](../../../docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md)
+    /// moved `crc16` and `crc32` off the exact bitwise shapes
+    /// `crates/waymaker-size-probe/src/checksum_candidates.rs` still measures — the name
+    /// and the rendered report both kept saying "shipped" of a *body* nothing ships
+    /// anymore, with nothing to tell a report reader the two claims had come apart. The
+    /// field is renamed to say what it has actually meant since those two ADRs: which
+    /// algorithm ADR 0010's own comparison settled on, not that this exact loop is
+    /// still compiled into a device today.
+    pub adr0010_shipped: bool,
     /// `.text` bytes: the loop body.
     pub text: u64,
     /// `.rodata` bytes: a lookup table. Zero for a bitwise loop.
@@ -703,7 +726,7 @@ pub fn checksum_candidate_sizes(
     let crate_name = probe_crate_name();
     CHECKSUM_CANDIDATES
         .iter()
-        .map(|&(name, shipped, function, table)| {
+        .map(|&(name, adr0010_shipped, function, table)| {
             let text = candidate_symbol_bytes(symbols, &crate_name, function)?;
             let rodata = table
                 .map(|table| candidate_symbol_bytes(symbols, &crate_name, table))
@@ -711,7 +734,7 @@ pub fn checksum_candidate_sizes(
                 .unwrap_or(0);
             Ok(ChecksumCandidate {
                 name: name.to_owned(),
-                shipped,
+                adr0010_shipped,
                 text,
                 rodata,
             })
@@ -1492,7 +1515,7 @@ impl SizeReport {
     ///
     /// Issue #61 asks this section not to be gated against design document §04's budget: it
     /// is a comparison between candidates, not a cost this firmware pays. What it must not
-    /// do is go quiet — an empty, duplicated, missing, unknown, wrongly-`shipped`, or
+    /// do is go quiet — an empty, duplicated, missing, unknown, wrongly-`adr0010_shipped`, or
     /// zero-byte candidate is a measurement that did not happen, the same rule every other
     /// section in this file holds to — and a `None` section is refused unconditionally, the
     /// way [`Self::runtime_shortfalls`] refuses a missing `runtime` section, rather than read
@@ -1557,7 +1580,7 @@ impl SizeReport {
         // A report can name every candidate it has correctly and still be missing most of
         // ADR 0010's table — `--report` reads a document this process did not produce, and
         // a section with one valid entry passed every check above it until this one.
-        for &(name, shipped, _function, table) in CHECKSUM_CANDIDATES {
+        for &(name, adr0010_shipped, _function, table) in CHECKSUM_CANDIDATES {
             let Some(candidate) = candidates.iter().find(|candidate| candidate.name == name) else {
                 shortfalls.push(BudgetShortfall::Unmeasurable {
                     detail: format!(
@@ -1566,11 +1589,11 @@ impl SizeReport {
                 });
                 continue;
             };
-            if candidate.shipped != shipped {
+            if candidate.adr0010_shipped != adr0010_shipped {
                 shortfalls.push(BudgetShortfall::Unmeasurable {
                     detail: format!(
-                        "the checksum candidate `{name}` is marked shipped: {}, but ADR 0010 says shipped: {shipped}",
-                        candidate.shipped
+                        "the checksum candidate `{name}` is marked adr0010_shipped: {}, but ADR 0010 says adr0010_shipped: {adr0010_shipped}",
+                        candidate.adr0010_shipped
                     ),
                 });
             }
@@ -1921,7 +1944,11 @@ impl SizeReport {
                 candidate.name,
                 candidate.text,
                 candidate.rodata,
-                if candidate.shipped { "  shipped" } else { "" },
+                if candidate.adr0010_shipped {
+                    "  ADR 0010 pick"
+                } else {
+                    ""
+                },
             ));
         }
         lines.concat()
@@ -2241,7 +2268,10 @@ fn checksum_candidates_json(candidates: Option<&[ChecksumCandidate]>) -> Value {
                 .map(|candidate| {
                     let mut entry = Map::new();
                     entry.insert("name".to_owned(), Value::from(candidate.name.clone()));
-                    entry.insert("shipped".to_owned(), Value::from(candidate.shipped));
+                    entry.insert(
+                        "adr0010_shipped".to_owned(),
+                        Value::from(candidate.adr0010_shipped),
+                    );
                     entry.insert("text".to_owned(), Value::from(candidate.text));
                     entry.insert("rodata".to_owned(), Value::from(candidate.rodata));
                     Value::Object(entry)
@@ -2276,10 +2306,12 @@ fn parse_checksum_candidates(
                     .and_then(Value::as_str)
                     .ok_or_else(|| SizeError::new("a checksum candidate has no `name`"))?
                     .to_owned(),
-                shipped: entry
-                    .get("shipped")
+                adr0010_shipped: entry
+                    .get("adr0010_shipped")
                     .and_then(Value::as_bool)
-                    .ok_or_else(|| SizeError::new("a checksum candidate has no `shipped` flag"))?,
+                    .ok_or_else(|| {
+                        SizeError::new("a checksum candidate has no `adr0010_shipped` flag")
+                    })?,
                 text: number(entry, "text")?,
                 rodata: number(entry, "rodata")?,
             })
@@ -5783,6 +5815,41 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_rename_schema_3_report_is_refused_on_its_schema_not_its_field_name() {
+        // Codex's finding: renaming `ChecksumCandidate::shipped` to `adr0010_shipped`
+        // changed a schema-3 report's own shape without moving the schema number, so a
+        // report a pre-rename build wrote — still carrying `shipped` on every checksum
+        // candidate — passed the schema check and then failed with a field-not-found
+        // error, which reads as a malformed report rather than as the version mismatch
+        // it actually is. `REPORT_SCHEMA` moved to 4 over this rename, the same way an
+        // older schema is already refused rather than misread — this constructs the
+        // exact shape a pre-rename build would have written (schema 3, `shipped` rather
+        // than `adr0010_shipped`) and requires the refusal to name the schema, not the
+        // field.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 0, 512, 0).to_json())
+                .expect("the report should be JSON");
+        let object = document.as_object_mut().expect("a report is an object");
+        object.insert("schema".to_owned(), Value::from(3_u64));
+        object.insert(
+            "checksum_candidates".to_owned(),
+            serde_json::json!([{
+                "name": "crc32-iso-hdlc-bitwise",
+                "shipped": true,
+                "text": 52,
+                "rodata": 0,
+            }]),
+        );
+        let refusal = SizeReport::from_json(&document.to_string())
+            .expect_err("a pre-rename schema-3 report must not be read");
+        assert!(refusal.to_string().contains("schema"), "{refusal}");
+        assert!(
+            !refusal.to_string().contains("adr0010_shipped"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
     fn a_workflow_future_that_measures_nothing_is_not_a_pass() {
         let message = rendered(&with_future(0).shortfalls());
         assert!(message.contains("ota_update"), "{message}");
@@ -5950,27 +6017,33 @@ mod tests {
 
         let bitwise = by_name("crc32-iso-hdlc-bitwise");
         assert_eq!(
-            (bitwise.text, bitwise.rodata, bitwise.shipped),
+            (bitwise.text, bitwise.rodata, bitwise.adr0010_shipped),
             (52, 0, true)
         );
 
         let rejected = by_name("crc32c-bitwise");
         assert_eq!(
-            (rejected.text, rejected.rodata, rejected.shipped),
+            (rejected.text, rejected.rodata, rejected.adr0010_shipped),
             (52, 0, false)
         );
 
         let nibble = by_name("crc32c-nibble-table");
         assert_eq!(
-            (nibble.text, nibble.rodata, nibble.shipped),
+            (nibble.text, nibble.rodata, nibble.adr0010_shipped),
             (76, 64, false)
         );
 
         let byte = by_name("crc32c-byte-table");
-        assert_eq!((byte.text, byte.rodata, byte.shipped), (44, 1_024, false));
+        assert_eq!(
+            (byte.text, byte.rodata, byte.adr0010_shipped),
+            (44, 1_024, false)
+        );
 
         let crc16 = by_name("crc16-ccitt-false-bitwise");
-        assert_eq!((crc16.text, crc16.rodata, crc16.shipped), (60, 0, true));
+        assert_eq!(
+            (crc16.text, crc16.rodata, crc16.adr0010_shipped),
+            (60, 0, true)
+        );
     }
 
     #[test]
@@ -6050,13 +6123,13 @@ mod tests {
         let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
             ChecksumCandidate {
                 name: "crc32c-bitwise".to_owned(),
-                shipped: false,
+                adr0010_shipped: false,
                 text: 52,
                 rodata: 0,
             },
             ChecksumCandidate {
                 name: "crc32c-bitwise".to_owned(),
-                shipped: false,
+                adr0010_shipped: false,
                 text: 52,
                 rodata: 0,
             },
@@ -6070,7 +6143,7 @@ mod tests {
         let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
             ChecksumCandidate {
                 name: "crc32c-bitwise".to_owned(),
-                shipped: false,
+                adr0010_shipped: false,
                 text: 0,
                 rodata: 0,
             },
@@ -6088,7 +6161,7 @@ mod tests {
         let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(vec![
             ChecksumCandidate {
                 name: "crc32c-bitwise".to_owned(),
-                shipped: false,
+                adr0010_shipped: false,
                 text: 52,
                 rodata: 0,
             },
@@ -6111,7 +6184,7 @@ mod tests {
         let mut candidates = fixture_checksum_candidates();
         candidates.push(ChecksumCandidate {
             name: "crc32-koopman".to_owned(),
-            shipped: false,
+            adr0010_shipped: false,
             text: 52,
             rodata: 0,
         });
@@ -6121,19 +6194,19 @@ mod tests {
     }
 
     #[test]
-    fn a_checksum_candidate_with_the_wrong_shipped_flag_is_not_a_pass() {
+    fn a_checksum_candidate_with_the_wrong_adr0010_shipped_flag_is_not_a_pass() {
         // ADR 0010 says exactly two of the five ship. A report that flipped the flag on
         // one is not the measurement it claims to be.
         let mut candidates = fixture_checksum_candidates();
         for candidate in &mut candidates {
             if candidate.name == "crc32-iso-hdlc-bitwise" {
-                candidate.shipped = false;
+                candidate.adr0010_shipped = false;
             }
         }
         let report = full_report(1_024, 0, 1_024, 0).with_checksum_candidates(Some(candidates));
         let message = rendered(&report.shortfalls());
         assert!(message.contains("crc32-iso-hdlc-bitwise"), "{message}");
-        assert!(message.contains("shipped"), "{message}");
+        assert!(message.contains("adr0010_shipped"), "{message}");
     }
 
     #[test]
@@ -6180,7 +6253,7 @@ mod tests {
         assert!(table.contains("checksum candidates"), "{table}");
         assert!(table.contains("crc32c-byte-table"), "{table}");
         assert!(table.contains("1024"), "{table}");
-        assert!(table.contains("shipped"), "{table}");
+        assert!(table.contains("ADR 0010 pick"), "{table}");
         assert!(table.contains("ADR 0010"), "{table}");
     }
 
@@ -6234,8 +6307,8 @@ mod tests {
                 serde_json::json!([{"name": "crc32c-bitwise"}]),
             );
         let refusal = SizeReport::from_json(&document.to_string())
-            .expect_err("a candidate with no `shipped` flag must not be read");
-        assert!(refusal.to_string().contains("shipped"), "{refusal}");
+            .expect_err("a candidate with no `adr0010_shipped` flag must not be read");
+        assert!(refusal.to_string().contains("adr0010_shipped"), "{refusal}");
     }
 
     #[test]

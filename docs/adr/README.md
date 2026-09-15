@@ -61,6 +61,7 @@ be superseded.
 | [0050](0050-a-durable-intent-carries-its-request-and-perform-checks-it.md) | A durable intent carries its request, and `perform` checks it | accepted |
 | [0051](0051-an-alarm-is-armed-on-a-halt-and-a-driver-at-a-bank-can-swap.md) | An alarm is armed on a halt, and a driver at a bank can swap | accepted |
 | [0052](0052-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md) | A torn record redelivers when its reserved slot is clean | accepted |
+| [0053](0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md) | A `crc32` nibble table still beats the branchless loop | accepted |
 
 ## Reading the numbers
 
