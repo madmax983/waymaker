@@ -22469,6 +22469,48 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_a_loop_statement_body_is_reported() {
+        // Codex's finding: `{ let mut x = 100u8 + n; loop { x -= 100; break; } x }` names a
+        // top-level `loop` statement with no trailing semicolon, ending in a bare `break;`
+        // that carries no value — `evaluate_loop` answers a *value* a loop folds to (its own
+        // doc comment requires a break carrying one), so it declines this shape, and
+        // `resolve_statement_expr`'s own dispatch named `While`, `Block`, `If` and `Match`
+        // but never `Loop`, so the whole statement fell to `resolve_mutation_statement`,
+        // which declines a bare `loop` outright (it names no assignment target) and refused
+        // the entire block regardless of what running the body once would have computed.
+        // `evaluate_loop_statement` now runs the body's setup statements once and treats the
+        // trailing unconditional break as the loop's own exit, the identical sequential
+        // dispatch a `while` body, an `if` branch or a `match` arm already goes through.
+        // Verified against real rustc, warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8 + {n}; loop {{ x -= 100; break; \
+                 }} x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_loop_statement_body(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_assigning_an_unsuffixed_bitwise_not_to_a_typed_local_is_reported()
      {
         // Codex's finding: `{ let mut x: u8 = 99; let _old = x; x = !255 + n; x }` names a

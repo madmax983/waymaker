@@ -3473,6 +3473,37 @@ fn block_match_statement_count(block: &syn::Block) -> usize {
     block_match_stmts(block).len()
 }
 
+/// Every top-level `loop` *statement* `block` declares directly, in source order —
+/// [`block_while_stmts`]'s own unconditional twin: a `loop` needs no trailing semicolon to
+/// stand as a statement either, the same handful of expression forms `rustc` accepts bare in
+/// statement position `block_while_stmts` already names.
+fn block_loop_stmts(block: &syn::Block) -> Vec<&syn::ExprLoop> {
+    block_non_tail_stmts(block)
+        .into_iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Expr(expr, _) = stmt else {
+                return None;
+            };
+            let syn::Expr::Loop(loop_expr) = strip_parens(expr) else {
+                return None;
+            };
+            Some(loop_expr)
+        })
+        .collect()
+}
+
+/// [`block_loop_stmts`]'s own statement count — `evaluate_block`'s `rest.len()` invariant's
+/// fifth missing term. Codex's finding: `{ let mut x = 100u8 + n; loop { x -= 100; break; } x
+/// }` names a block whose statements are a `let` and a top-level `loop` with an unconditional,
+/// unlabelled `break` and no trailing semicolon — the identical shape `block_match_statement_count`
+/// was added for, one syntax further over: `rest` already counts a `loop` in *tail* position
+/// (through [`evaluate_loop`]), but nothing on either side of this invariant ever counted one
+/// used as a statement, so a block holding one refused outright regardless of what running its
+/// body once would have computed.
+fn block_loop_statement_count(block: &syn::Block) -> usize {
+    block_loop_stmts(block).len()
+}
+
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
 /// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
 /// [`item_const_exprs`] makes for a `const`.
@@ -4987,7 +5018,58 @@ fn resolve_statement_expr(
     if let syn::Expr::Match(match_expr) = strip_parens(expr) {
         return evaluate_match_statement(match_expr, resolve, local_types, resolved);
     }
+    if let syn::Expr::Loop(loop_expr) = strip_parens(expr) {
+        return evaluate_loop_statement(loop_expr, resolve, local_types, resolved);
+    }
     resolve_mutation_statement(expr, resolve, &*local_types, resolved)
+}
+
+/// `expr_loop` — an unconditional `loop { .. }` used as a *statement*, never as a value —
+/// run against `resolved`/`local_types`: [`evaluate_loop`]'s own reasoning (a body of setup
+/// statements followed by one unconditional, unlabelled-or-same-labelled `break`) applied at
+/// a boundary where the loop's own result is discarded rather than fed to a caller.
+///
+/// Codex's finding: `{ let mut x = 100u8 + n; loop { x -= 100; break; } x }` names a
+/// top-level `loop` with no trailing semicolon, ending in a bare `break;` that carries no
+/// value — [`evaluate_loop`] answers a *value*, so it declines this shape twice over (a
+/// `break` with no expression, and a loop this scan is never asked what it evaluates to in
+/// the first place), and `resolve_statement_expr`'s own dispatch named `While`, `Block`,
+/// `If` and `Match` but never `Loop`, so the whole statement fell to
+/// `resolve_mutation_statement`, which declines a bare `loop` outright (it names no
+/// assignment target) and refused the entire block regardless of what running the body once
+/// would have computed.
+///
+/// Scoped identically to [`evaluate_loop`]: the body's statements *before* the break are run
+/// once, through [`resolve_block_sequential`], the same sequential interpreter a `while`
+/// body or an `if` branch already goes through, in a nested scope restored once the loop
+/// statement finishes — and a `break` carrying a value, a conditional break, one that never
+/// fires, or one naming a different label all stay unresolved rather than guessed at.
+fn evaluate_loop_statement(
+    expr_loop: &syn::ExprLoop,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    let stmts = production_stmts(&expr_loop.body);
+    let (last, rest) = stmts.split_last()?;
+    let syn::Stmt::Expr(syn::Expr::Break(break_expr), _) = last else {
+        return None;
+    };
+    if break_expr.expr.is_some() {
+        return None;
+    }
+    let targets_this_loop = match (&break_expr.label, expr_loop.label.as_ref()) {
+        (None, _) => true,
+        (Some(break_label), Some(loop_label)) => break_label.ident == loop_label.name.ident,
+        (Some(_), None) => false,
+    };
+    if !targets_this_loop {
+        return None;
+    }
+    let mut nested_snapshot = ShadowSnapshot::new();
+    resolve_block_sequential(rest, resolve, local_types, resolved, &mut nested_snapshot)?;
+    restore_shadow_snapshot(local_types, resolved, nested_snapshot);
+    Some(())
 }
 
 /// A plain `x = EXPR;` or compound `x OP= EXPR;` statement — [`resolve_block_sequential`]'s
@@ -5162,7 +5244,11 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // here and the whole block refused before a later assignment to `NAME` ever ran.
     // `block_match_statement_count` is `block_if_statement_count`'s own twin one more syntax
     // over: a top-level `match` statement binds no name at the outer scope either, and was
-    // counted by neither side of this sum until now.
+    // counted by neither side of this sum until now. `block_loop_statement_count` is the
+    // identical gap a fourth time, one syntax further over: an unconditional `loop` statement
+    // binds no name at the outer scope either, and `production_stmts` never excluded it, so
+    // `rest` always came up one statement short until now, refusing the whole block regardless
+    // of what running the loop's body once would have computed.
     if rest.len()
         != const_item_count
             + block_let_statement_count(block)
@@ -5173,6 +5259,7 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
             + block_let_else_statement_count(block)
             + block_uninitialized_let_statement_count(block)
             + block_match_statement_count(block)
+            + block_loop_statement_count(block)
             + ignored_lets
     {
         return None;
