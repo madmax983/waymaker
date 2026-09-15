@@ -9613,6 +9613,23 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
         if let Some(wildcard) = found.arms.get(last) {
             if wildcard.is_wild {
                 if let Some(numbered) = found.arms.get(..last) {
+                    // Codex's finding: `x if x == index(0) => .., x if x == index(1) => ..,
+                    // .. _ => ..` binds a plain identifier in every numbered arm and
+                    // dispatches entirely through a guard equality against a call this scan
+                    // does not evaluate. Every such arm's own `pattern` is empty — the
+                    // identical shape one barrier arm's guarded, unconstrained binding
+                    // already produces — but here *every* numbered arm is shaped this way,
+                    // so `missing_value`, `compact_window_with_gaps` and
+                    // `dense_power_of_two_stride` below all bail on the first arm they meet
+                    // and no contiguous sub-slice is ever found dense, whatever `rustc`
+                    // itself folds `index(0)` through `index(14)` into at compile time. The
+                    // same refusal `const_call_initializer_uses` already gives a call
+                    // inside a `const` initializer applies here: reasoning about which
+                    // calls are safe to fold is not attempted, and a match built from arms
+                    // shaped this way is reported outright rather than read as unresolved.
+                    if numbered.iter().any(|arm| arm.guard_unresolved_call) {
+                        return true;
+                    }
                     // Codex's next-round finding: `_x if flag => 999, 0 => .., 1 => .., 2
                     // => .., 3 => .., _ => ..` names a first arm whose *pattern* (`_x`)
                     // matches every input outright, guarded by a condition this scan
@@ -22405,6 +22422,41 @@ mod deferred_answer_pins {
              P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
              P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
              P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_dispatched_entirely_through_unresolved_guard_calls_is_reported() {
+        // Codex's finding: `x if x == index(0) => .., x if x == index(1) => .., .. _ => ..`
+        // binds a plain identifier in every numbered arm and dispatches entirely through a
+        // guard equality against a call this scan does not evaluate (`index` a `const fn`).
+        // `pattern_literal` answers such a pattern with no values at all, so every numbered
+        // arm's own `pattern` is empty and `missing_value`/`compact_window_with_gaps`/
+        // `dense_power_of_two_stride` each bail on the first arm they meet — no contiguous
+        // sub-slice was ever found dense and `has_dense_arm_patterns` returned `false`,
+        // approving the table unseen. Verified against real rustc, warning-free: this exact
+        // 16-arm reproduction (with a permutation as each arm's own value, so the compiler
+        // cannot fold the whole thing into an identity clamp) compiles to a real
+        // `.Lswitch.table` in `.rodata`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let permutation = [5, 2, 9, 0, 14, 7, 1, 13, 4, 11, 8, 3, 12, 6, 10];
+        let mut arms = String::new();
+        for (n, value) in permutation.iter().enumerate() {
+            let _ = writeln!(arms, "        x if x as u32 == index({n}) => {value},");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn index(n: u32) -> u32 {{ n }}\n\n\
+             const fn guard_call_dispatch_table(nibble: u8) -> u32 {{\n    match nibble {{\n{arms}        \
              _ => 15,\n    }}\n}}\n"
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);

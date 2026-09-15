@@ -1268,43 +1268,13 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
         found: Vec<String>,
     }
 
-    /// Whether `expr`'s own tree contains a call anywhere within it — a plain
-    /// `f(..)`/`Type::method(..)` `Expr::Call`, or a `receiver.method(..)` `Expr::MethodCall`.
-    ///
-    /// Codex's next-round finding: `syn` gives a dot-call its own node kind rather than
-    /// lowering it to `Expr::Call`, so `0u8.wrapping_add(0)` — a real, `const`-evaluable
-    /// method call `rustc` folds before the match it feeds ever lowers, exactly like the
-    /// free-function call this function already refuses to interpret — walked straight
-    /// past the original `visit_expr_call`-only override. The same conservative answer this
-    /// function already gives a free call is given to a method call too: refuse the
-    /// initializer outright rather than deciding which method calls are safe to interpret.
-    fn contains_call(expr: &syn::Expr) -> bool {
-        struct FindCall {
-            found: bool,
-        }
-        impl<'ast> syn::visit::Visit<'ast> for FindCall {
-            fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-                self.found = true;
-                syn::visit::visit_expr_call(self, node);
-            }
-
-            fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-                self.found = true;
-                syn::visit::visit_expr_method_call(self, node);
-            }
-        }
-        let mut finder = FindCall { found: false };
-        finder.visit_expr(expr);
-        finder.found
-    }
-
     impl<'ast> syn::visit::Visit<'ast> for ConstCallInitializers {
         fn visit_item(&mut self, node: &'ast syn::Item) {
             if has_cfg_test(item_attrs(node)) {
                 return;
             }
             if let syn::Item::Const(constant) = node {
-                if contains_call(&constant.expr) {
+                if expr_contains_call(&constant.expr) {
                     self.found.push(ident_name(&constant.ident));
                 }
             }
@@ -1316,7 +1286,7 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
                 return;
             }
             if let syn::ImplItem::Const(constant) = node {
-                if contains_call(&constant.expr) {
+                if expr_contains_call(&constant.expr) {
                     self.found.push(ident_name(&constant.ident));
                 }
             }
@@ -1337,6 +1307,41 @@ pub fn const_call_initializer_uses(contents: &str) -> Result<Vec<String>, syn::E
     let mut visitor = ConstCallInitializers { found: Vec::new() };
     visitor.visit_file(&file);
     Ok(visitor.found)
+}
+
+/// Whether `expr`'s own tree contains a call anywhere within it — a plain
+/// `f(..)`/`Type::method(..)` `Expr::Call`, or a `receiver.method(..)` `Expr::MethodCall`.
+///
+/// [`const_call_initializer_uses`]'s own helper, factored out to a top-level function so
+/// [`match_expressions_with_prefix`]'s guard check can share it: a `const` initializer and
+/// a match arm's guard are the same question — "does resolving this need interpreting an
+/// arbitrary function body" — asked in two different positions.
+///
+/// Codex's finding: `syn` gives a dot-call its own node kind rather than lowering it to
+/// `Expr::Call`, so `0u8.wrapping_add(0)` — a real, `const`-evaluable method call `rustc`
+/// folds before the match it feeds ever lowers, exactly like the free-function call this
+/// function already refuses to interpret — walked straight past the original
+/// `visit_expr_call`-only override. The same conservative answer this function already
+/// gives a free call is given to a method call too: report the call rather than deciding
+/// which method calls are safe to interpret.
+fn expr_contains_call(expr: &syn::Expr) -> bool {
+    struct FindCall {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for FindCall {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            self.found = true;
+            syn::visit::visit_expr_call(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            self.found = true;
+            syn::visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut finder = FindCall { found: false };
+    finder.visit_expr(expr);
+    finder.found
 }
 
 /// Every name a file uses: all identifiers in source order, and all paths with `use`
@@ -1977,6 +1982,23 @@ pub struct FoundArm {
     /// tell the two apart before it decides whether wrapping past `i128::MIN` means
     /// anything at all.
     pub unsigned: bool,
+    /// Whether the arm carries a guard that both failed to resolve to a value at all and
+    /// names a call this scan does not evaluate — `x if x == index(0)` among them, `index`
+    /// a `const fn` this scan refuses to interpret the body of.
+    ///
+    /// Codex's finding: a table dispatched entirely through arms shaped this way — a plain
+    /// binding pattern, refutable only by its own guard — resolves to an empty `pattern` on
+    /// every arm, the identical shape `_x if flag => 999`'s single barrier arm already
+    /// produces. But there the numbered arms *after* the barrier still carried literal
+    /// patterns of their own; here every arm is a barrier, so `missing_value`,
+    /// `compact_window_with_gaps` and `dense_power_of_two_stride` each bail on the first
+    /// empty pattern they meet and no contiguous sub-slice is ever found dense, exactly as
+    /// [`const_call_initializer_uses`] already refuses to reason about which `const`
+    /// initializer calls are safe to fold rather than guessing. This field is the same
+    /// refusal one level over: a guard equality this scan cannot evaluate because a call
+    /// sits inside it is not evidence the arm is *not* part of a table, so a caller treats
+    /// it as evidence that it might be — reported outright rather than silently passed.
+    pub guard_unresolved_call: bool,
 }
 
 /// Every `match` expression `contents` declares, anywhere one can appear, outside
@@ -7844,6 +7866,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
         is_wild: false,
         call: call_shape_of(&block_as_expr(&node.then_branch), resolve),
         unsigned: first_unsigned,
+        guard_unresolved_call: false,
     }];
     let mut current = node;
     loop {
@@ -7860,6 +7883,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
                     is_wild: false,
                     call: call_shape_of(&block_as_expr(&next_if.then_branch), resolve),
                     unsigned: next_unsigned,
+                    guard_unresolved_call: false,
                 });
                 current = next_if;
             }
@@ -7869,6 +7893,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
                     is_wild: true,
                     call: call_shape_of(&block_as_expr(&else_block.block), resolve),
                     unsigned: false,
+                    guard_unresolved_call: false,
                 });
                 break;
             }
@@ -9560,11 +9585,25 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             }
             let effectively_guarded = arm.guard.is_some() && guard_value.is_none();
             let is_wild = is_catchall_pattern(&arm.pat, effectively_guarded, &resolve);
+            // Codex's finding: `x if x == index(0) => .., x if x == index(1) => .., .. _ =>
+            // ..` binds a plain identifier and dispatches entirely through a guard
+            // equality against a call this scan does not evaluate — `index` a `const fn`,
+            // exactly the shape `const_call_initializer_uses` already refuses to interpret
+            // when it appears in a `const`'s own initializer. `pattern_literal` answers
+            // such a pattern with no values at all, so a table built entirely from arms
+            // shaped this way never has a resolved value anywhere `missing_value` or
+            // `compact_window_with_gaps` could find dense — this field is what lets
+            // `has_dense_arm_patterns` refuse it outright instead of reading the silence
+            // as "not a table".
+            let guard_unresolved_call = arm.guard.as_ref().is_some_and(|(_, guard_expr)| {
+                guard_value.is_none() && expr_contains_call(guard_expr)
+            });
             arms.push(FoundArm {
                 pattern: pattern_literal(&arm.pat, &resolve, &self.qualified),
                 is_wild,
                 call: call_shape_of(&arm.body, &resolve),
                 unsigned: scrutinee_unsigned || pattern_is_definitely_unsigned(&arm.pat, &resolve),
+                guard_unresolved_call,
             });
             if is_wild {
                 break;
