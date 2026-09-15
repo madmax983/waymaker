@@ -606,29 +606,30 @@ fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
 }
 
 /// `ty`, or a type it wraps in parens or a macro's hygiene grouping, names a target this
-/// scanner cannot resolve: `<T as Trait>::Assoc`, `<T>::Assoc` with no `as`, `T::Assoc`, or
-/// bare `T` — where `T` is one of `type_params`, the alias's own declared generic type
-/// parameters.
+/// scanner cannot resolve.
 ///
-/// `T::Assoc` is issue #171's finding 2. It has no `qself`: no `<`, no `as`, nothing but an
-/// ordinary multi-segment path, so [`type_alias_target`] resolves it to `["T", "Assoc"]` and
-/// a lookup chases `T` as a real local alias — which it is not, so the chain dead-ends at
-/// `Assoc` and never reaches whatever `T::Assoc` really names.
+/// Four shapes count: `<T as Trait>::Assoc`, `<T>::Assoc` with no `as`, `T::Assoc`, and bare
+/// `T`. In each, `T` is one of `type_params` — a generic type parameter the alias itself
+/// declares.
 ///
-/// Bare `T` is issue #187. `type Unchecked<T> = T;` has no `::` at all, so
-/// [`type_alias_target`] resolves it to `["T"]` with nothing to chase further — this looked
-/// safe, because nothing about the alias's own body names the guarded type. But a use site
-/// supplies `T` itself, through a turbofish: `Unchecked::<CheckedDispatch>` makes the whole
-/// alias name `CheckedDispatch`, and this scanner never reads a turbofish argument.
+/// `T::Assoc` is issue #171's finding 2. It has no `qself`: no `<`, no `as`. It is an
+/// ordinary multi-segment path. So [`type_alias_target`] resolves it to `["T", "Assoc"]`.
+/// A lookup then chases `T` as a real local alias. `T` is not a real alias. The chain
+/// dead-ends at `Assoc` and never reaches what `T::Assoc` really names.
 ///
-/// Restricting both shapes to the alias's *own* parameters is what tells them apart from a
+/// Bare `T` is issue #187. `type Unchecked<T> = T;` has no `::` at all. So
+/// [`type_alias_target`] resolves it to `["T"]`, with nothing left to chase. This looked
+/// safe: the alias's own body names no guarded type. But a use site can still supply `T`
+/// itself, through a turbofish. `Unchecked::<CheckedDispatch>` makes the whole alias mean
+/// `CheckedDispatch`. This scanner never reads a turbofish argument.
+///
+/// Both shapes are scoped to the alias's *own* parameters. This tells them apart from a
 /// module-qualified path to some other, already-defined type (`type Foo =
-/// some_module::Bar;`): only a name the alias itself introduced as generic can be bound to
+/// some_module::Bar;`). Only a name the alias itself declared as generic can be bound to
 /// anything a caller chooses. A UFCS-style projection through a *concrete* type (`type Foo =
-/// Via::Dispatch;`, where `Via` is some other type implementing an associated-type-bearing
-/// trait) is not caught here — telling that apart from an ordinary qualified path needs real
-/// name resolution, which is out of scope for a syntactic scanner and left as a residual
-/// limit.
+/// Via::Dispatch;`, where `Via` implements an associated-type-bearing trait) is not caught
+/// here. Telling that apart from an ordinary qualified path needs real name resolution. That
+/// is out of scope for a syntactic scanner, and stays a residual limit.
 fn type_is_qself_projection(ty: &syn::Type, type_params: &[String]) -> bool {
     match ty {
         syn::Type::Path(type_path) => {
@@ -648,17 +649,19 @@ fn type_is_qself_projection(ty: &syn::Type, type_params: &[String]) -> bool {
 /// Every `type` alias `contents` declares whose right-hand side [`syn`] cannot safely
 /// resolve, outside `#[cfg(test)]`.
 ///
-/// At file scope, in an inline module, or inside a function body. See
-/// `type_is_qself_projection` for the four shapes this covers: an associated-type
-/// projection through a trait bound, and a bare use of the alias's own generic parameter.
-/// Either can name any type a caller chooses — a trait's `impl`, or a use site's own
-/// turbofish — `CheckedDispatch` included, and following either needs resolution `syn`
-/// does not have. A plain type alias already resolves a plain path and one wrapped in
-/// parens; these are the one shape it cannot safely treat as "not an alias" the way it
-/// treats a tuple, a reference or a trait object, because unlike those they genuinely can
-/// resolve to a struct usable in `Name { .. }` position. So this reports the alias's own
-/// name instead of silently skipping it, for a caller to refuse the file outright rather
-/// than resolve what it cannot see.
+/// Checked at file scope, in an inline module, and inside a function body. See
+/// `type_is_qself_projection` for the shapes this covers: an associated-type projection
+/// through a trait bound, and a bare use of the alias's own generic parameter. Either shape
+/// can name any type a caller chooses — a trait's `impl` names one, or a use site's own
+/// turbofish does — `CheckedDispatch` included. Following either needs resolution `syn`
+/// does not have.
+///
+/// A plain type alias already resolves a plain path, and one wrapped in parens. These two
+/// shapes are what it cannot safely treat as "not an alias" the same way it treats a tuple,
+/// a reference, or a trait object. Unlike those, they genuinely can resolve to a struct
+/// usable in `Name { .. }` position. So this reports the alias's own name instead of
+/// silently skipping it. A caller can then refuse the file outright, rather than resolve
+/// what it cannot see.
 ///
 /// # Errors
 ///
@@ -713,8 +716,8 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 /// has its own, for `self.stack` — but must reset `self.shadow` to empty
 /// around it too: a module inherits no generics either.
 ///
-/// Defined here, above its first use in this file, because a `macro_rules!`
-/// macro is visible only after its own definition.
+/// Defined here, above its first use in this file. A `macro_rules!` macro
+/// is visible only after its own definition.
 macro_rules! shadow_generic_params {
     () => {
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -4641,9 +4644,8 @@ pub struct LiteralCounts {
     pub inside: usize,
 }
 
-// `struct_literal_counts`'s own visitor, hoisted to module scope to keep that function
-// under this file's own line-count lint (`clippy::too_many_lines`) — a size limit, not a
-// behavior change.
+// `struct_literal_counts`'s own visitor. It moved out to module scope, to stay under this
+// file's own line-count lint (`clippy::too_many_lines`). Its behavior did not change.
 struct Literals<'ast> {
     stack: Vec<&'ast [syn::Item]>,
     // The function-local `use`/`type` aliases of every block enclosing the current
@@ -13830,19 +13832,19 @@ mod raw_identifier_tests {
 
     #[test]
     fn a_bare_generic_parameter_as_the_whole_target_is_reported() {
-        // Issue #187: `type Same<T> = T;` has no `::` at all, so this used to read as a
-        // plain path with nothing to project through. But a use site can still write
-        // `Same::<CheckedDispatch>`, and the turbofish argument becomes the alias's real
-        // target — exactly as unresolvable as `T::Dispatch`, one `::` shorter.
+        // Issue #187: `type Same<T> = T;` has no `::` at all. It used to read as a plain
+        // path with nothing to project through. But a use site can still write
+        // `Same::<CheckedDispatch>`. The turbofish argument becomes the alias's real
+        // target. That is as unresolvable as `T::Dispatch`, one `::` shorter.
         let found = qself_type_alias_names("type Same<T> = T;").expect("the fixture parses");
         assert_eq!(found, ["Same"], "{found:?}");
     }
 
     #[test]
     fn a_generic_parameter_used_inside_a_named_type_is_not_reported() {
-        // `Vec<T>` names a real, concrete type — `Vec` — whatever `T` is filled in with;
-        // the whole alias never becomes the caller's own choice of type the way a bare
-        // `T` does, so this is not the identity shape issue #187 closes.
+        // `Vec<T>` names a real, concrete type — `Vec`. `T` fills in one slot of it. The
+        // whole alias never becomes the caller's own choice of type, unlike a bare `T`.
+        // This is not the identity shape issue #187 closes.
         let found =
             qself_type_alias_names("type Wrapper<T> = Vec<T>;").expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
