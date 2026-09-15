@@ -5903,5 +5903,30 @@ and its control,
 `a_block_local_alias_target_shadowed_at_its_own_declaration_block_does_not_count`, are
 the regression — both RED against the pre-fix code, in opposite directions (a missed
 count and an over-count), confirming the flat list got both scenarios wrong rather than
-merely one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
-rule id.
+merely one.
+
+A further round found a thirteenth: only one leading `super` was ever stripped per hop,
+so a target written `super::super::X` — from a module nested two deep by name — left the
+second `super` as an ordinary segment no real declaration is ever spelled, confirmed
+against real `rustc`: both tokens really do escape, landing at the scope that named the
+outermost entered module. The stripping loop now keeps popping the entered-module stack
+and removing a leading `super` until either runs out, rather than stopping after one;
+once `entered` empties, a further `super` falls through to `consume_scope_prefix`, which
+already loops over the lexical ancestor stack the same way.
+`a_chain_of_two_leading_supers_escapes_both_entered_modules` and its control,
+`a_chain_of_two_leading_supers_that_resolves_elsewhere_does_not_count`, are the
+regression, RED against the pre-fix code.
+
+The same round also raised a finding this search declines: that a `crate`-qualified
+path should be resolved against the file's own top level before candidate lookup. It is
+not taken up, because it is the identical fix this file's own parsing limits already
+tried and reverted for the deterministic resolver (Codex review, PR #160, rounds 5 and
+6): this scan reads one file and has no way to tell whether that file is really the
+crate root, so treating its own top level as `crate`'s target is right only for the one
+file that happens to be `lib.rs` and a guess everywhere else — the same over- vs
+under-matching shape [what is not checked](#what-is-not-checked) already states for it.
+Both resolvers already agree on the honest answer: `consume_scope_prefix` leaves
+`crate` unconsumed, so a `crate`-qualified path is compared by its own untouched last
+segment, exactly as `resolve_segments_from` does — this is a shared, deliberate limit
+rather than a gap where the backstop trails the deterministic path. No new ADR: nothing
+here moves a must-not-own cell, a dependency edge, or a rule id.

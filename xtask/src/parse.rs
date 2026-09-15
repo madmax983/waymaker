@@ -5439,17 +5439,27 @@ fn segments_could_reach_target<'a>(
     // on this exact escape: the first fix modelled `entered` as a single
     // `Option`, so a `super` inside a module nested two deep escaped straight
     // to the outermost lexical scope, skipping the immediate parent module
-    // `super` actually names — confirmed against real `rustc`).
+    // `super` actually names — confirmed against real `rustc`). A chain of
+    // more than one leading `super` pops one entered level per token, not
+    // only the first — confirmed against real `rustc`: `super::super::X`
+    // from a module nested two deep by name escapes both, landing at the
+    // scope that named the outermost one (issue #197, Codex review of the
+    // PR, third round: only one `super` was ever stripped per hop, so a
+    // second one was left as an ordinary segment no real declaration is
+    // ever named). Once `entered` is empty, a further `super` falls through
+    // to `consume_scope_prefix` below, which already loops over the lexical
+    // ancestor stack the same way.
     let mut popped_entered;
-    let entered: &[&'a [syn::Item]] =
-        if !entered.is_empty() && segments.first().map(String::as_str) == Some("super") {
+    let entered: &[&'a [syn::Item]] = if entered.is_empty() {
+        entered
+    } else {
+        popped_entered = entered.to_vec();
+        while segments.first().map(String::as_str) == Some("super") && !popped_entered.is_empty() {
             segments.remove(0);
-            popped_entered = entered.to_vec();
             popped_entered.pop();
-            &popped_entered
-        } else {
-            entered
-        };
+        }
+        &popped_entered
+    };
     let items: &'a [syn::Item] = if let Some(&entered_items) = entered.last() {
         consume_self_prefix(&mut segments);
         entered_items
@@ -15801,6 +15811,67 @@ mod cfg_alias_ambiguity_tests {
              \x20       }\n\
              \x20       let _ = traits::Marker { intent: 0, bytes: 0 };\n\
              \x20   }\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_chain_of_two_leading_supers_escapes_both_entered_modules() {
+        // Codex review of PR #204: only one leading `super` was ever
+        // stripped per hop, so a target written `super::super::X` from a
+        // module nested two deep by name left the second `super` as an
+        // ordinary segment no real declaration is ever spelled. Confirmed
+        // against real `rustc`: `a::b::Marker`, whose own target is
+        // `super::super::X` from inside `mod a::b`, really constructs
+        // whatever the file's own top-level `X` names — both `super`s
+        // escape, landing at the scope that named the outermost entered
+        // module.
+        let counts = struct_literal_counts(
+            "mod a {\n\
+             \x20   pub mod b {\n\
+             \x20       pub type Marker = super::super::X;\n\
+             \x20   }\n\
+             }\n\
+             type X = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = a::b::Marker;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_chain_of_two_leading_supers_that_resolves_elsewhere_does_not_count() {
+        // The control for the test above: with the file's own top-level `X`
+        // aliasing something other than `CheckedDispatch`, the identical
+        // two-`super` chain resolves to that other name instead, so it must
+        // not count.
+        let counts = struct_literal_counts(
+            "mod a {\n\
+             \x20   pub mod b {\n\
+             \x20       pub type Marker = super::super::X;\n\
+             \x20   }\n\
+             }\n\
+             type X = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = a::b::Marker;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
             "CheckedDispatch",
