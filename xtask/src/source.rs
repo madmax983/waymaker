@@ -12739,6 +12739,103 @@ mod tests {
     }
 
     #[test]
+    fn a_derive_reached_through_a_glob_imported_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 30: `mod traits { pub
+        // use core::clone::Clone as C; } use traits::*; #[derive(C)] struct Recovery;`
+        // is legal Rust, and `collect_tree_aliases` deliberately drops `UseTree::Glob`
+        // — this scan does not perform name resolution, so it has no way to know what
+        // a glob import actually brings into scope. Without a fail-closed answer, `C`
+        // fell through to "no matching alias, take the last segment" and reported the
+        // bare, harmless-looking name `C` rather than `Clone`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "mod traits {\n",
+            "    pub use core::clone::Clone as C;\n",
+            "}\n",
+            "use traits::*;\n",
+            "#[derive(C, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone")
+                || violations[0].detail.contains("could not fully resolve"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_handwritten_clone_reached_through_a_glob_imported_alias_is_rejected() {
+        // The handwritten-impl half of the same finding, in a production-reachable
+        // child file: `use traits::*;` brings `C` into scope with nothing this scan
+        // can see, so `impl C for Recovery` must fail closed the same way a
+        // `super`-qualified path does rather than silently comparing the bare `C`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub use core::clone::Clone as C;\n",
+                "}\n",
+                "use traits::*;\n",
+                "impl C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_block_local_recovery_struct_shadows_the_pinned_type() {
+        // Found by Codex review of this change (PR #143), round 30: a function is just
+        // as free to declare its own local `struct Recovery` as an inline module is
+        // (round 29's finding) — `fn install() { struct Recovery; impl Clone for
+        // Recovery { .. } }` is legal Rust whose unqualified `Recovery` means the
+        // block-local declaration, but `extend_with_local_scope` only ever collected
+        // `use` and `type` aliases, so the local declaration never earned the shadow
+        // marker round 29 registers for the identical shape at module scope, and this
+        // was rejected as though it implemented `Clone` for the pinned type.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod unrelated;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/unrelated.rs".to_owned(),
+            contents: concat!(
+                "fn install() {\n",
+                "    struct Recovery;\n",
+                "\n",
+                "    impl Clone for Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

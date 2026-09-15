@@ -3534,6 +3534,37 @@ rather than letting the tail segment silently survive as the harmless-looking `"
 the same shape of gap the `LOCAL_SHADOWED_TYPE` sentinel needed its own propagation
 guard for, added beside it on the same review round.
 
+Round 30 found two more, both the same shape one level deeper than round 29's own
+fixes. The first: a function is just as free to declare its own local `struct
+Recovery` as an inline module is — `fn install() { struct Recovery; impl Clone for
+Recovery { .. } }` is legal Rust whose unqualified `Recovery` means the block-local
+declaration — but `extend_with_local_scope`, the function that threads a block's own
+local aliases into the ambient table, only ever called `direct_scope_aliases`, which
+reads `use` and `type` items alone; a block-local struct, enum or union never earned
+the `LOCAL_SHADOWED_TYPE` marker `shadow_aliases_for_local_types` registers for the
+identical shape at module scope, so it was rejected as though it implemented `Clone`
+for the pinned type. `extend_with_local_scope` now takes the same `shadow_locals` flag
+every other caller in this chain already threads, and — when set — folds
+`shadow_aliases_for_local_types` into both the block's own local aliases and the set
+that unconditionally shadows an ambient one of the same name, exactly as a block-local
+`use` or `type` alias already does. The second: `mod traits { pub use
+core::clone::Clone as C; } use traits::*; #[derive(C)] struct Recovery;` is legal
+Rust, and `collect_tree_aliases` deliberately drops `UseTree::Glob` — this scan does
+not perform name resolution, so it has no way to know what a glob import actually
+brings into scope, and issue #51's own "what is not checked" already states that
+limit for every scanner in this module. Silently treating `C` as an ordinary,
+unaliased identifier let it resolve to the harmless-looking bare name `C` instead of
+`Clone`, rather than to the fail-closed answer a `super`-qualified path already gets.
+A new `GLOB_IMPORT_MARKER` sentinel, registered by `glob_marker_alias` for any scope
+whose directly declared `use` items name a glob anywhere in their tree (mirroring
+`collect_tree_aliases`'s own recursive walk through a `UseTree::Group`), makes
+`every_resolution`'s "no matching alias" fallback fail closed to `UNRESOLVED_DERIVE`
+rather than trust the bare name whenever it is present. Both fixes are threaded only
+through `shadow_locals`-gated callers — `trait_implementors_for_pinned_type` and
+`struct_derives` — so `trait_implementors`'s unrelated `future_trait_implementors`
+scan, which asks no such question about a *specific* pinned type, is untouched by
+either.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

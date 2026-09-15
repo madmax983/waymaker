@@ -295,6 +295,45 @@ fn collect_tree_aliases(
     }
 }
 
+/// Whether `tree` names a glob anywhere in it — `use a::*;` directly, or nested inside a
+/// group such as `use a::{b, c::*};` — the same shape [`collect_tree_aliases`] walks, but
+/// answering "is one here at all" instead of collecting the aliases the non-glob branches
+/// name.
+fn tree_has_glob(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Glob(_) => true,
+        syn::UseTree::Path(path) => tree_has_glob(&path.tree),
+        syn::UseTree::Group(group) => group.items.iter().any(tree_has_glob),
+        syn::UseTree::Name(_) | syn::UseTree::Rename(_) => false,
+    }
+}
+
+/// A synthetic [`GLOB_IMPORT_MARKER`] alias, present exactly when `items` directly
+/// declares a non-`#[cfg(test)]`-gated `use` naming a glob anywhere in its tree.
+///
+/// See [`GLOB_IMPORT_MARKER`] for why this is registered and where it is consulted. A
+/// `#[cfg(test)]`-gated glob is excluded for [`direct_scope_aliases`]'s reason: code
+/// reachable only from a shipped struct could never reach a name a test-only import
+/// brought in. A glob gated by any *other* `cfg` is still included, matching
+/// [`direct_scope_aliases`]'s own conservative reading of an alias it cannot evaluate the
+/// condition of.
+fn glob_marker_alias<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAlias> {
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        if let syn::Item::Use(use_item) = item {
+            if tree_has_glob(&use_item.tree) {
+                return vec![UseAlias {
+                    local: GLOB_IMPORT_MARKER.to_owned(),
+                    target: Vec::new(),
+                }];
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// One path as written in the code, with `use` aliases resolved.
 ///
 /// `segments` is the canonical spelling: `use core::future::Future as Pollable;`
@@ -481,6 +520,24 @@ pub const UNRESOLVED_DERIVE: &str = "<unresolved derive>";
 /// [`trait_implementors_for_pinned_type`] for why.
 const LOCAL_SHADOWED_TYPE: &str = "<locally shadowed type>";
 
+/// Reserved [`UseAlias::local`] value marking that a scope contains an unresolved glob
+/// `use` — never a real Rust identifier, so it can never collide with one a lookup would
+/// otherwise search for.
+///
+/// Found by Codex review of this change (PR #143), round 30: `mod traits { pub use
+/// core::clone::Clone as C; } use traits::*; #[derive(C)] struct Recovery;` is legal
+/// Rust, and [`collect_tree_aliases`] deliberately drops `UseTree::Glob` — this scan does
+/// not perform name resolution, so it has no way to know what a glob import actually
+/// brings into scope (see the module's "What is not checked" limit on glob imports).
+/// Silently treating `C` as an ordinary, unaliased identifier let the derive resolve to
+/// the harmless-looking bare name `C` instead of `Clone`. [`glob_marker_alias`] registers
+/// this sentinel for a scope that contains one, and [`every_resolution`]'s "no matching
+/// alias" fallback fails closed to [`UNRESOLVED_DERIVE`] rather than trusting the bare
+/// name whenever it is present — the same fail-closed shape as an unresolvable `super`-
+/// or `crate`-qualified path, because a name a glob *might* have rebound is exactly as
+/// unaccountable as one this scan gave up chasing.
+const GLOB_IMPORT_MARKER: &str = "*";
+
 /// Every name `path` could ultimately mean, considering every alias that could bind any
 /// step along the way — not just the one [`resolve_segments`] would pick by taking the
 /// first match at the first step alone.
@@ -616,7 +673,15 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
                 }
             }
             if !matched {
-                if let Some(last) = current.last() {
+                if aliases
+                    .iter()
+                    .any(|alias| alias.local == GLOB_IMPORT_MARKER)
+                {
+                    // Round 30: a glob import in the ambient scope could have bound
+                    // this very name to anything, and this scan does not perform name
+                    // resolution — see `GLOB_IMPORT_MARKER`.
+                    finished.push(UNRESOLVED_DERIVE.to_owned());
+                } else if let Some(last) = current.last() {
                     finished.push(last.clone());
                 }
             }
@@ -710,6 +775,7 @@ pub fn trait_implementors_for_pinned_type(
     if !is_pinned_type_file {
         aliases.extend(shadow_aliases_for_local_types(file.items.iter()));
     }
+    aliases.extend(glob_marker_alias(&file.items));
     let mut implementors = Vec::new();
     collect_trait_implementors(&file.items, &aliases, trait_name, true, &mut implementors);
     Ok(implementors)
@@ -1071,6 +1137,10 @@ fn collect_trait_implementors<'a>(
                         // `shadow_aliases_for_local_types` and
                         // `trait_implementors_for_pinned_type`.
                         module_aliases.extend(shadow_aliases_for_local_types(nested.iter()));
+                        // Round 30: a glob import inside this module is exactly as
+                        // opaque to this scan as one at file scope — see
+                        // `GLOB_IMPORT_MARKER`.
+                        module_aliases.extend(glob_marker_alias(nested.iter()));
                     }
                     collect_trait_implementors(
                         nested,
@@ -1362,7 +1432,7 @@ fn collect_trait_implementors_in_block(
             _ => None,
         })
         .collect();
-    let scoped_aliases = extend_with_local_scope(aliases, &direct_items);
+    let scoped_aliases = extend_with_local_scope(aliases, &direct_items, shadow_locals);
     collect_trait_implementors(
         direct_items.iter().copied(),
         &scoped_aliases,
@@ -1415,14 +1485,43 @@ fn collect_trait_implementors_in_block(
 /// branch alone. Only a local declaration with no `#[cfg(..)]` at all — checked with
 /// [`has_any_cfg`], not [`has_cfg_test`], since any condition leaves the ambient
 /// binding possibly still live — shadows the ambient alias it redeclares.
-fn extend_with_local_scope(ambient: &[UseAlias], local_items: &[&syn::Item]) -> Vec<UseAlias> {
-    let local = direct_scope_aliases(local_items.iter().copied());
-    let unconditionally_shadowed: Vec<String> = local_items
+///
+/// Found by Codex review of this change (PR #143), round 30: a function is just as free
+/// to declare its own local `struct Recovery` as an inline module is (round 29's
+/// finding) — `fn install() { struct Recovery; impl Clone for Recovery { .. } }` is
+/// legal Rust whose unqualified `Recovery` means the block-local declaration — but this
+/// function only ever extended the table with [`direct_scope_aliases`], which reads
+/// `use` and `type` items alone, so a block-local struct, enum or union never earned the
+/// [`LOCAL_SHADOWED_TYPE`] marker [`shadow_aliases_for_local_types`] registers for the
+/// identical shape at module scope. `shadow_locals` gates it the same way it gates every
+/// other caller of this function: `trait_implementors`'s unrelated
+/// `future_trait_implementors` scan never asks for it.
+fn extend_with_local_scope(
+    ambient: &[UseAlias],
+    local_items: &[&syn::Item],
+    shadow_locals: bool,
+) -> Vec<UseAlias> {
+    let mut local = direct_scope_aliases(local_items.iter().copied());
+    let mut unconditionally_shadowed: Vec<String> = local_items
         .iter()
         .filter(|item| !has_cfg_test(item_attrs(item)) && !has_any_cfg(item_attrs(item)))
         .flat_map(|item| direct_scope_aliases(std::iter::once(*item)))
         .map(|alias| alias.local)
         .collect();
+    if shadow_locals {
+        let unconditional_shadows: Vec<UseAlias> = local_items
+            .iter()
+            .filter(|item| !has_cfg_test(item_attrs(item)) && !has_any_cfg(item_attrs(item)))
+            .flat_map(|item| shadow_aliases_for_local_types(std::iter::once(*item)))
+            .collect();
+        unconditionally_shadowed.extend(
+            unconditional_shadows
+                .iter()
+                .map(|alias| alias.local.clone()),
+        );
+        local.extend(unconditional_shadows);
+        local.extend(glob_marker_alias(local_items.iter().copied()));
+    }
     let mut extended: Vec<UseAlias> = ambient
         .iter()
         .filter(|alias| !unconditionally_shadowed.contains(&alias.local))
@@ -1497,7 +1596,8 @@ fn extend_with_local_scope(ambient: &[UseAlias], local_items: &[&syn::Item]) -> 
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>, syn::Error> {
     let file = parse_rust(contents)?;
-    let aliases = module_scope_aliases(&file.items);
+    let mut aliases = module_scope_aliases(&file.items);
+    aliases.extend(glob_marker_alias(&file.items));
     let mut derives = Vec::new();
     let mut declared = false;
     for item in &file.items {
