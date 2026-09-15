@@ -4416,6 +4416,45 @@ explicit second `impl Clone for Recovery`, confirming the injected impl is real;
 `waymaker-flash` itself, confirmed caught by `check-layering` before the fix and cleared
 by it after, reverted cleanly.
 
+Round 46 found two more of the same shape round 45 had just closed for one caller, left
+open in a second. The first: `collect_derive_names_from_meta` — the derive-list twin of
+`meta_is_unresolved_attribute_macro`, and unrelated to it in code even though both walk a
+`cfg_attr`'s own injected attributes — still recursed into every `derive(..)` a `cfg_attr`
+injects regardless of the condition, so `#[cfg_attr(test, derive(Clone))]` on `Recovery`
+read as an unconditional `Clone` derive and `recovery-surface` rejected a crate whose
+production build never carries one at all. The fix is the identical check round 45 gave
+the attribute-macro scan, given to the derive scan too: `Cfg::requires_test` on the
+`cfg_attr`'s own first argument, skipping the recursion when it is provably true. The
+second is sharper, in `declares_item_macro`'s own `MacroVisitor`: every gate it carries —
+one per node reachable through an item, a member, a field, a variant or a foreign item —
+asked `has_cfg_test` of that one node's own attributes alone, discarding what an
+*enclosing* node's own `cfg` had already narrowed down. `#[cfg(any(test, feature = "x"))]
+mod parent { #[cfg(not(feature = "x"))] fn helper() { evil!(); } }` can never include
+`helper` in a non-test build — the two conditions correlate through the shared flag
+exactly the way round 43's `has_cfg_test` fix closed for several attributes on *one*
+item — but neither `parent`'s own condition (satisfiable under `feature = "x"` with no
+test) nor `helper`'s (satisfiable under `!x` the same way) requires `test` alone, so a
+visitor that reduced every level to its own separate boolean read past both and reached
+`evil!()`. `MacroVisitor` gains `enclosing_cfg`, a `Cfg` accumulated with `Cfg::All` as
+the walk descends through `visit_item`, `visit_impl_item`, `visit_trait_item`,
+`visit_field`, `visit_variant` and `visit_foreign_item` and restored on the way back out;
+`visit_stmt_macro` and `visit_expr_macro` ask the combination too, since a macro
+statement's or expression's own gate is checked against everything that has to hold for
+it to be *reached* rather than against its own attributes in isolation. `attrs_cfg` is
+the `Cfg` half of `has_cfg_test` split out so a caller can combine it with an enclosing
+scope's own formula before asking, which `has_cfg_test` alone — answering only a bare
+`bool` — could not do. Both were verified against real compilation: the derive fix by
+injecting `#[cfg_attr(test, derive(Clone))]` onto the real `Recovery` struct in
+`waymaker-flash` itself, confirmed caught by `check-layering` before the fix (via the
+regression test's own neutralization) and cleared by it after, reverted cleanly; the
+visitor fix could not be injected into the real crate without either a genuinely
+undefined macro breaking `check-layering`'s own `cargo build` step (round 42's pitfall)
+or a `macro_rules!` declaration that would itself trip the unconditional item-macro check
+regardless of the nested-cfg gating under test, so it was verified by neutralizing the
+fix in place — dropping `enclosing_cfg` from the combination — and confirming the
+regression test fails exactly at the correlated-conditions case while its positive twin
+(two conditions that do not correlate) stays green throughout.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

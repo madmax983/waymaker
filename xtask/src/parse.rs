@@ -89,11 +89,24 @@ fn path_is_ident(path: &syn::Path, name: &str) -> bool {
 /// under `any` and once negated under a sibling attribute, correlate correctly instead
 /// of being treated as two independent unknowns.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    let combined: Vec<Cfg> = attrs
-        .iter()
-        .filter_map(|attr| attribute_cfg(&attr.meta))
-        .collect();
-    Cfg::All(combined).requires_test()
+    attrs_cfg(attrs).requires_test()
+}
+
+/// `attrs` — the whole attribute list on one item — as one [`Cfg`] formula: every
+/// `#[cfg(..)]` and `#[cfg_attr(.., ..)]` on it parsed with [`attribute_cfg`] and
+/// joined with [`Cfg::All`], exactly the way [`has_cfg_test`] combines them before
+/// asking [`Cfg::requires_test`] of the result. Split out so a caller that needs the
+/// formula itself — rather than only whether it requires `test` — can combine it with
+/// an *enclosing* scope's own formula before asking, which [`has_cfg_test`] alone
+/// cannot do: see `declares_item_macro`'s `MacroVisitor` for why that combination
+/// matters.
+fn attrs_cfg(attrs: &[syn::Attribute]) -> Cfg {
+    Cfg::All(
+        attrs
+            .iter()
+            .filter_map(|attr| attribute_cfg(&attr.meta))
+            .collect(),
+    )
 }
 
 /// A `cfg` predicate's truth value, abstracted from `syn`'s parsed tokens into a small
@@ -2620,16 +2633,56 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
     struct MacroVisitor {
         found: bool,
         shadowed_expression_macro_names: std::collections::HashSet<String>,
+        /// Every enclosing item's own `cfg`, joined with [`Cfg::All`] as the walk
+        /// descends and restored on the way back out — [`Cfg::All(Vec::new())`] at the
+        /// file's own top level, which [`Cfg::eval`] holds vacuously true regardless of
+        /// `test`.
+        ///
+        /// Found by Codex review of this change (PR #143), round 46: every override
+        /// below used to ask `has_cfg_test` of one item's own attributes alone,
+        /// discarding what an *enclosing* item's own `cfg` had already narrowed down —
+        /// `#[cfg(any(test, feature = "x"))] mod parent { #[cfg(not(feature = "x"))] fn
+        /// helper() { evil!(); } }` can never include `helper` in a non-test build, the
+        /// two conditions correlating through the shared flag exactly the way
+        /// [`has_cfg_test`] itself closed for several attributes on *one* item in round
+        /// 43 — but neither `parent`'s nor `helper`'s own condition alone requires
+        /// `test`, so a per-node check that compared each in isolation read past both
+        /// and reached `evil!()`. This field is what lets a descendant be checked
+        /// against everything that has to hold for it to be reached at all, rather than
+        /// reducing every level to its own separate boolean.
+        enclosing_cfg: Cfg,
+    }
+
+    impl MacroVisitor {
+        /// Whether `attrs`, combined with [`Self::enclosing_cfg`], can only hold under
+        /// `test`.
+        fn requires_test_here(&self, attrs: &[syn::Attribute]) -> bool {
+            Cfg::All(vec![self.enclosing_cfg.clone(), attrs_cfg(attrs)]).requires_test()
+        }
+
+        /// [`Self::requires_test_here`] followed by a descent: when `attrs` combined
+        /// with the accumulated enclosing formula is not provably test-only,
+        /// [`Self::enclosing_cfg`] is updated to include `attrs` for the span of
+        /// `visit` and restored afterward, so a still-deeper descendant is checked
+        /// against this item's own `cfg` as well as every one of its ancestors'.
+        fn descend_gated<F: FnOnce(&mut Self)>(&mut self, attrs: &[syn::Attribute], visit: F) {
+            let combined = Cfg::All(vec![self.enclosing_cfg.clone(), attrs_cfg(attrs)]);
+            if combined.requires_test() {
+                return;
+            }
+            let previous = std::mem::replace(&mut self.enclosing_cfg, combined);
+            visit(self);
+            self.enclosing_cfg = previous;
+        }
     }
 
     impl<'ast> syn::visit::Visit<'ast> for MacroVisitor {
         fn visit_item(&mut self, item: &'ast syn::Item) {
             // Test code is not shipped: `#[cfg(test)]` removes the item, and anything
             // inside it, before any expansion that could reach the real `Recovery` runs.
-            if has_cfg_test(item_attrs(item)) {
-                return;
-            }
-            syn::visit::visit_item(self, item);
+            self.descend_gated(item_attrs(item), |visitor| {
+                syn::visit::visit_item(visitor, item);
+            });
         }
 
         // Round 27: an item's own `#[cfg(test)]` was the only gate this visitor read,
@@ -2641,17 +2694,15 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         // `visit_item_macro`/`visit_stmt_macro` regardless and rejected valid
         // production code.
         fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-            if has_cfg_test(impl_item_attrs(item)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, item);
+            self.descend_gated(impl_item_attrs(item), |visitor| {
+                syn::visit::visit_impl_item(visitor, item);
+            });
         }
 
         fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
-            if has_cfg_test(trait_item_attrs(item)) {
-                return;
-            }
-            syn::visit::visit_trait_item(self, item);
+            self.descend_gated(trait_item_attrs(item), |visitor| {
+                syn::visit::visit_trait_item(visitor, item);
+            });
         }
 
         // Round 28: the same gap as round 27's, one level of subitem further —
@@ -2662,24 +2713,21 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         // method (`visit_field`, `visit_variant`, `visit_foreign_item`) rather than
         // back through `visit_item` or `visit_impl_item`/`visit_trait_item`.
         fn visit_field(&mut self, field: &'ast syn::Field) {
-            if has_cfg_test(&field.attrs) {
-                return;
-            }
-            syn::visit::visit_field(self, field);
+            self.descend_gated(&field.attrs, |visitor| {
+                syn::visit::visit_field(visitor, field);
+            });
         }
 
         fn visit_variant(&mut self, variant: &'ast syn::Variant) {
-            if has_cfg_test(&variant.attrs) {
-                return;
-            }
-            syn::visit::visit_variant(self, variant);
+            self.descend_gated(&variant.attrs, |visitor| {
+                syn::visit::visit_variant(visitor, variant);
+            });
         }
 
         fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
-            if has_cfg_test(foreign_item_attrs(item)) {
-                return;
-            }
-            syn::visit::visit_foreign_item(self, item);
+            self.descend_gated(foreign_item_attrs(item), |visitor| {
+                syn::visit::visit_foreign_item(visitor, item);
+            });
         }
 
         fn visit_item_macro(&mut self, _node: &'ast syn::ItemMacro) {
@@ -2693,7 +2741,7 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         // its own `attrs`, so a test-only macro statement failed the whole file closed
         // over code that ships with nothing generated at all.
         fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
-            if has_cfg_test(&node.attrs) {
+            if self.requires_test_here(&node.attrs) {
                 return;
             }
             self.found = true;
@@ -2759,7 +2807,7 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         // the whole file closed over a macro that never ships. `visit_stmt_macro`
         // already gained this same check for the statement-position shape.
         fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
-            if has_cfg_test(&node.attrs) {
+            if self.requires_test_here(&node.attrs) {
                 return;
             }
             // Round 36: a name on the whitelist is only trusted when nothing in this
@@ -2794,6 +2842,7 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
     let mut visitor = MacroVisitor {
         found: false,
         shadowed_expression_macro_names: shadowed_expression_macro_names(&file),
+        enclosing_cfg: Cfg::All(Vec::new()),
     };
     visitor.visit_file(&file);
     Ok(visitor.found)
@@ -3143,6 +3192,18 @@ fn meta_introduces_cfg(meta: &syn::Meta) -> bool {
 /// however many levels deep — `cfg_attr(a, cfg_attr(b, derive(Clone)))` is valid Rust,
 /// and rustc derives `Clone` from it exactly as it would from a bare `#[derive(Clone)]`,
 /// so a scan that only looked one level in would miss it.
+///
+/// A `cfg_attr` whose own condition [`Cfg::requires_test`] can prove never holds outside
+/// `test` contributes nothing: rustc removes the whole attribute, injected `derive` and
+/// all, in every build that ships. Found by Codex review of this change (PR #143), round
+/// 46: this used to recurse into every injected attribute regardless of the condition,
+/// so `#[cfg_attr(test, derive(Clone))]` on `Recovery` read as an unconditional `Clone`
+/// derive and `recovery-surface` rejected a crate whose production build never carries
+/// one — the same gap round 45 closed for [`meta_is_unresolved_attribute_macro`]'s
+/// unrelated scan, left open here. A condition this scan cannot *prove* test-only —
+/// `feature = ".."`, or anything unrecognized — still reads its injected attributes
+/// exactly as before, matching the fail-closed default every other use of
+/// [`Cfg::requires_test`] keeps.
 fn collect_derive_names_from_meta(
     meta: &syn::Meta,
     aliases: &[UseAlias],
@@ -3164,13 +3225,19 @@ fn collect_derive_names_from_meta(
     }
     // `cfg_attr(condition, attr, attr, ..)`: the first argument is the condition and
     // every argument after it applies when the condition holds. Every one is read
-    // regardless of what the condition is, for the reason the doc comment above gives —
-    // including one that is itself a `cfg_attr`, which is why this recurses.
+    // unless the condition is provably test-only — including one that is itself a
+    // `cfg_attr`, which is why this recurses.
     let Ok(metas) = list.parse_args_with(
         syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
     ) else {
         return;
     };
+    if metas
+        .first()
+        .is_some_and(|condition| parse_cfg_meta(condition).requires_test())
+    {
+        return;
+    }
     for nested in metas.into_iter().skip(1) {
         collect_derive_names_from_meta(&nested, aliases, derives);
     }

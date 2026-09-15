@@ -10839,6 +10839,24 @@ mod tests {
     }
 
     #[test]
+    fn a_derive_behind_a_cfg_attr_that_only_activates_under_test_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 46: when `Recovery` has
+        // `#[cfg_attr(test, derive(Clone))]`, `collect_derive_names_from_meta` used to
+        // recurse into every injected attribute regardless of the `cfg_attr`'s own
+        // condition, so a `Clone` that rustc only ever injects under `cfg(test)` — never
+        // in a build that ships — was recorded exactly as an unconditional
+        // `#[derive(Clone)]` would be, and `recovery-surface` rejected a crate whose
+        // production build never carries the derive at all. This is the derive-list
+        // twin of round 45's `meta_is_unresolved_attribute_macro` fix.
+        let violations = check_recovery_surface(&recovery_source_with_struct(
+            "#[derive(Debug, PartialEq, Eq)]\n\
+             #[cfg_attr(test, derive(Clone))]\n\
+             pub struct Recovery;\n",
+        ));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_recovery_with_a_handwritten_clone_impl_is_rejected() {
         // A reviewer told to remove the derive can still write the same defect by hand.
         // `clone` also lands as a new name on the surface pin — unlike a derive, a
@@ -13468,6 +13486,78 @@ mod tests {
             crate_name: "waymaker-flash".to_owned(),
             path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
             contents: concat!("fn helper() {\n", "    generate_clone!();\n", "}\n",).to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_reachable_only_through_two_correlated_enclosing_cfg_conditions_is_not_reported() {
+        // Found by Codex review of this change (PR #143), round 46:
+        // `#[cfg(any(test, feature = "x"))] mod parent { #[cfg(not(feature = "x"))] fn
+        // helper() { evil!(); } }` can never include `helper` in a non-test build — the
+        // two conditions correlate through the shared flag exactly the way `has_cfg_test`
+        // itself closed for several attributes on *one* item in round 43 — but neither
+        // `parent`'s own condition (satisfiable under `feature = "x"` with no test) nor
+        // `helper`'s own condition (satisfiable under `!x` the same way) requires `test`
+        // in isolation, so a visitor that checked each item's own attributes against a
+        // separate boolean, discarding what its enclosing item's own `cfg` had already
+        // narrowed down, reached `evil!()` and rejected a macro invocation that never
+        // ships. `MacroVisitor::enclosing_cfg` threads the accumulated formula down
+        // through every level instead.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[cfg(any(test, feature = \"x\"))]\n",
+                "mod parent {\n",
+                "    #[cfg(not(feature = \"x\"))]\n",
+                "    fn helper() {\n",
+                "        evil!();\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_macro_reachable_through_two_enclosing_cfg_conditions_that_do_not_correlate_is_still_rejected()
+     {
+        // The positive twin: `parent`'s condition is satisfiable under `feature = "x"`
+        // with no test, and `helper`'s own condition, `feature = "y"`, is satisfiable
+        // under `y` regardless of `x` — the two share no flag, so the combination is
+        // still reachable without `test` (`x && y`) and the macro still ships.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[cfg(any(test, feature = \"x\"))]\n",
+                "mod parent {\n",
+                "    #[cfg(feature = \"y\")]\n",
+                "    fn helper() {\n",
+                "        evil!();\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
         });
         let violations = check_recovery_surface(&sources);
         assert_eq!(violations.len(), 1, "{violations:?}");
