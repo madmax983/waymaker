@@ -51,6 +51,7 @@
 //! memory, and issue [#39](https://github.com/madmax983/waymaker/issues/39) asks that a
 //! large future not be hidden behind a small context.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -3278,20 +3279,33 @@ fn scan_public_functions(
         // crate's private trait names first, before any `impl` in the crate is read.
         let private_traits = private_trait_names(sources, &source.crate_name);
         let external_roots = external_roots_for(&source.crate_name);
-        // A module this file declares can shadow a dependency of the same name at
-        // the point it is declared. Drop such a name from this file's own roots,
-        // so an impl of it still checks against private trait names. Per file,
-        // like `imported_external_names` below — not crate-wide, or a shadow in
-        // one file would hide a real external impl reachable from another.
+        // The file-level floor: a module this file declares, or a name this file
+        // imports, anywhere in the file. Stands in only where the scope-precise
+        // pass below has no answer — an `impl` inside a function body, or a file
+        // this crate's `syn`-based pass could not read. See `local_module_names`
+        // and `imported_external_names`.
         let shadowed = local_module_names(&source.contents);
-        let external_roots: HashSet<String> =
+        let external_roots_fallback: HashSet<String> =
             external_roots.difference(&shadowed).cloned().collect();
-        // A file that imports a name from an external root settles that name for
-        // itself, whatever a private trait of the same name elsewhere in the crate
-        // says. `use` is scoped per file, so this reads only this file's own
-        // imports. See `imported_external_names`.
-        let private_traits =
-            &private_traits - &imported_external_names(&source.contents, &external_roots);
+        let private_traits_fallback =
+            &private_traits - &imported_external_names(&source.contents, &external_roots_fallback);
+        // Issue #180: each `impl`'s trait path, checked against its own enclosing
+        // scope only — never a sibling or enclosing scope's `use` or `mod`. Keyed
+        // by the 1-indexed line the `impl` keyword starts on, to join to the text
+        // scan below. A file that fails to parse contributes no entry, so every
+        // line in it falls back to the floor above — the safe direction.
+        let resolved_impls: HashMap<usize, crate::parse::ImplTraitPath> =
+            crate::parse::impl_trait_paths(&source.contents)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|resolved| (resolved.line, resolved))
+                .collect();
+        let context = TraitRootContext {
+            private_traits: &private_traits,
+            external_roots: &external_roots,
+            private_traits_fallback: &private_traits_fallback,
+            external_roots_fallback: &external_roots_fallback,
+        };
 
         let mut depth: i32 = 0;
         let mut test_module: Option<i32> = None;
@@ -3303,7 +3317,9 @@ fn scan_public_functions(
         // declares it until the line that opens it.
         let mut pending: Option<Block> = None;
 
-        for line in source.contents.lines() {
+        for (line_index, line) in source.contents.lines().enumerate() {
+            let line_number = line_index.saturating_add(1);
+            let resolved = resolved_impls.get(&line_number);
             let trimmed = line.trim();
             let opens = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
             let closes = i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
@@ -3339,8 +3355,7 @@ fn scan_public_functions(
                     // rather than above it. Review of issue #35 landed exactly that and
                     // watched nine surface pins and `size-probe-reach` stay green, so it is
                     // closed in the reader they share rather than in one rule.
-                    let declared_here =
-                        declaration_kind(classified, &private_traits, &external_roots);
+                    let declared_here = declaration_kind(classified, resolved, &context);
                     let inline = declared_here.is_some() && opens > 0;
                     // The member's *own* prefix, which is what follows the block's opening
                     // brace — not the whole line before the `fn` keyword. Testing that the
@@ -3364,7 +3379,7 @@ fn scan_public_functions(
                     }
                 }
 
-                if let Some(kind) = declaration_kind(classified, &private_traits, &external_roots) {
+                if let Some(kind) = declaration_kind(classified, resolved, &context) {
                     pending = Some(kind);
                 }
                 if opens > 0 {
@@ -3409,12 +3424,14 @@ fn scan_public_functions(
 /// `None` for every other line, so that a block nobody declared — a `mod`, a function body
 /// — is pushed as [`Block::Other`] and the stack still mirrors the brace depth.
 ///
-/// `external_roots` is the set of path roots that can never name a trait this crate
-/// declares — see [`external_path_roots`].
+/// `resolved` is this line's own entry from [`crate::parse::impl_trait_paths`], if one
+/// exists — the scope-precise answer issue #180 asks for. `context` holds both that
+/// answer's crate-level roots and the file-level floor to fall back on when `resolved`
+/// is `None`. See [`impl_trait_outcome`].
 fn declaration_kind(
     line: &str,
-    private_traits: &HashSet<String>,
-    external_roots: &HashSet<String>,
+    resolved: Option<&crate::parse::ImplTraitPath>,
+    context: &TraitRootContext<'_>,
 ) -> Option<Block> {
     if let Some((_, public)) = trait_declaration(line) {
         return Some(if public { Block::Trait } else { Block::Other });
@@ -3423,13 +3440,95 @@ fn declaration_kind(
         // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
         // makes its unmarked methods callable from outside, and only while `Storage` is
         // itself a trait the probe has a path to.
-        return Some(match impl_trait_name(line, external_roots) {
-            Some((name, true)) if private_traits.contains(name) => Block::Other,
+        let private_traits = context.private_traits(resolved);
+        return Some(match impl_trait_outcome(line, resolved, context) {
+            Some((name, true)) if private_traits.contains(&name) => Block::Other,
             Some(_) => Block::TraitImpl,
             None => Block::Other,
         });
     }
     None
+}
+
+/// What [`declaration_kind`] needs to judge an `impl <Trait> for <Type>` line: which
+/// trait names are private, and which path roots are external, each held as a
+/// crate-level pair and a file-level fallback pair. [`Self::private_traits`] and
+/// [`Self::external_roots`] pick the right half of each pair for one `resolved`
+/// answer, so `declaration_kind` and [`impl_trait_outcome`] read the same choice from
+/// one place rather than each testing `resolved.is_some()` on its own.
+struct TraitRootContext<'a> {
+    /// Every non-public trait name this crate declares. See [`private_trait_names`].
+    private_traits: &'a HashSet<String>,
+    /// This crate's real dependency names, plus `core`/`std`/`alloc`. See
+    /// [`external_path_roots`].
+    external_roots: &'a HashSet<String>,
+    /// `private_traits`, less any name this file imports from `external_roots_fallback`
+    /// anywhere in the file. See [`imported_external_names`].
+    private_traits_fallback: &'a HashSet<String>,
+    /// `external_roots`, less any module name this file declares anywhere in the file.
+    /// See [`local_module_names`].
+    external_roots_fallback: &'a HashSet<String>,
+}
+
+impl<'a> TraitRootContext<'a> {
+    /// `private_traits` when `resolved` exists, `private_traits_fallback` otherwise.
+    const fn private_traits(
+        &self,
+        resolved: Option<&crate::parse::ImplTraitPath>,
+    ) -> &'a HashSet<String> {
+        if resolved.is_some() {
+            self.private_traits
+        } else {
+            self.private_traits_fallback
+        }
+    }
+
+    /// `external_roots` when `resolved` exists, `external_roots_fallback` otherwise —
+    /// the same resolved/fallback split as [`Self::private_traits`].
+    const fn external_roots(
+        &self,
+        resolved: Option<&crate::parse::ImplTraitPath>,
+    ) -> &'a HashSet<String> {
+        if resolved.is_some() {
+            self.external_roots
+        } else {
+            self.external_roots_fallback
+        }
+    }
+}
+
+/// The trait name an `impl` line names, and whether it can resolve to a trait this
+/// crate declares.
+///
+/// Prefers `resolved` — the impl's own scope, checked by
+/// [`crate::parse::impl_trait_paths`] (issue #180) — over [`impl_trait_name`]'s
+/// file-level floor. `resolved` is `None` only for an impl the scope-precise pass does
+/// not cover: one inside a function body, or one in a file that failed to parse.
+///
+/// A name `resolved` finds shadowed by a local module, or absolute, decides locality on
+/// its own, whatever the external roots say of its first segment — see
+/// [`crate::parse::ImplTraitPath`]. A `self`/`super`/`crate` first segment never
+/// matches either root set, since neither ever names one: such a path is local by
+/// construction, with no special case needed here.
+fn impl_trait_outcome(
+    line: &str,
+    resolved: Option<&crate::parse::ImplTraitPath>,
+    context: &TraitRootContext<'_>,
+) -> Option<(String, bool)> {
+    let external_roots = context.external_roots(resolved);
+    if let Some(resolved) = resolved {
+        let name = resolved.segments.last()?.clone();
+        let qualified = resolved.segments.len() > 1;
+        let local = !resolved.absolute
+            && (resolved.shadowed
+                || !qualified
+                || resolved
+                    .segments
+                    .first()
+                    .is_none_or(|first| !external_roots.contains(first)));
+        return Some((name, local));
+    }
+    impl_trait_name(line, external_roots).map(|(name, local)| (name.to_owned(), local))
 }
 
 /// The name a `trait` declaration names. Also whether it is `pub`.
@@ -3612,10 +3711,11 @@ fn external_path_roots(graph: &PackageGraph, crate_name: &str) -> HashSet<String
 /// `mod` inside another is exactly the shape a line scanner miscounts. A file
 /// that fails to parse contributes no name, the safe direction.
 ///
-/// A floor, not a proof: per file is not per lexical scope. A `use crate::x as
-/// serde;` local alias reusing a dependency's name shadows it too, in the scope
-/// it is declared, and this function does not see it — issue
-/// [#180](https://github.com/madmax983/waymaker/issues/180).
+/// A floor, not a proof: per file, not per lexical scope. `scan_public_functions`
+/// uses this only as its fallback now — for an impl [`crate::parse::impl_trait_paths`]
+/// does not cover — since that function checks each impl against its own scope
+/// alone, closing this gap for the common case (issue
+/// [#180](https://github.com/madmax983/waymaker/issues/180)).
 fn local_module_names(source: &str) -> HashSet<String> {
     crate::parse::declared_module_names(source)
         .unwrap_or_default()
@@ -3645,11 +3745,12 @@ fn local_module_names(source: &str) -> HashSet<String> {
 /// root there, immune to any local shadow. Codex found this on this pull
 /// request's own review, after the same fix already existed for `impl` paths.
 ///
-/// A floor, not a proof, in one further way issue
-/// [#180](https://github.com/madmax983/waymaker/issues/180) tracks. `use_aliases`
-/// flattens every inline module's imports into one set for the whole file, so an
-/// import nested in one module can settle a name for an unrelated impl elsewhere
-/// in the same file.
+/// A floor, not a proof: `use_aliases` flattens every inline module's imports into
+/// one set for the whole file, so an import nested in one module can settle a name
+/// for an unrelated impl elsewhere in the same file. `scan_public_functions` uses
+/// this only as its fallback now — [`crate::parse::impl_trait_paths`] checks each
+/// impl against its own scope alone, closing this gap for the common case (issue
+/// [#180](https://github.com/madmax983/waymaker/issues/180)).
 fn imported_external_names(source: &str, external_roots: &HashSet<String>) -> HashSet<String> {
     crate::parse::use_aliases(source)
         .unwrap_or_default()
@@ -7948,6 +8049,180 @@ mod tests {
             .map(|function| function.name.as_str())
             .collect();
         assert_eq!(names, ["serialize"]);
+    }
+
+    // --- issue #180: scope-precise external roots -----------------------------------
+
+    #[test]
+    fn a_root_alias_rename_is_credited_as_the_dependency_it_names() {
+        // `use serde as wire;` renames the crate root itself. `wire::Serialize` must
+        // still resolve to the real dependency, not to a same-named private trait.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/lib.rs".to_owned(),
+                contents: "trait Serialize {\n    fn hidden(&self);\n}\n".to_owned(),
+            },
+            LayerSource {
+                crate_name: "waymaker-core".to_owned(),
+                path: "crates/waymaker-core/src/bank.rs".to_owned(),
+                contents: "use serde as wire;\n\n\
+                           impl wire::Serialize for Bank {\n    fn serialize(&self) {}\n}\n"
+                    .to_owned(),
+            },
+        ];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["serialize"]);
+    }
+
+    #[test]
+    fn a_local_alias_that_reuses_an_external_roots_name_shadows_it_in_its_own_scope() {
+        // `use crate::sealed as serde;` binds the name `serde` to a local module, not
+        // the dependency. `serde::Trait` in this scope must resolve to
+        // `crate::sealed::Trait` — a private trait — and stay hidden.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "mod sealed {\n\
+                       \x20   pub(crate) trait Trait {\n\
+                       \x20       fn hidden(&self);\n\
+                       \x20   }\n\
+                       }\n\
+                       \n\
+                       use crate::sealed as serde;\n\
+                       \n\
+                       impl serde::Trait for Bank {\n    fn hidden(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_import_nested_in_one_module_does_not_settle_a_name_for_an_unrelated_impl_outside_it() {
+        // `use serde::Serialize;` inside `tests_support` is that module's own import.
+        // The file-scope `impl Serialize for Bank` below it does not inherit it, so it
+        // must still resolve to the file's own private `Serialize` and stay hidden.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "trait Serialize {\n    fn hidden(&self);\n}\n\
+                       \n\
+                       mod tests_support {\n\
+                       \x20   use serde::Serialize;\n\
+                       }\n\
+                       \n\
+                       impl Serialize for Bank {\n    fn hidden(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn a_module_declared_in_a_nested_scope_does_not_shadow_a_dependency_at_file_scope() {
+        // `mod serde { .. }` inside `tests_support` shadows `serde` only within that
+        // module's own scope. The file-scope `impl serde::Trait for Bank` below it
+        // does not inherit that shadow and must still name the real dependency.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "trait Trait {\n    fn other(&self);\n}\n\
+                       \n\
+                       mod tests_support {\n\
+                       \x20   mod serde {\n\
+                       \x20       pub(crate) trait Trait {\n\
+                       \x20           fn hidden(&self);\n\
+                       \x20       }\n\
+                       \x20   }\n\
+                       }\n\
+                       \n\
+                       impl serde::Trait for Bank {\n    fn hidden(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        let names: Vec<&str> = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(names, ["hidden"]);
+    }
+
+    #[test]
+    fn a_shadow_and_its_impl_in_the_same_nested_scope_still_resolve_as_local() {
+        // Regression guard: a `mod serde { .. }` and the `impl` of it that shares its
+        // own nested scope must keep resolving as local, the same as the file-scope
+        // case already covered above.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "mod tests_support {\n\
+                       \x20   mod serde {\n\
+                       \x20       pub(crate) trait Trait {\n\
+                       \x20           fn hidden(&self);\n\
+                       \x20       }\n\
+                       \x20   }\n\
+                       \n\
+                       \x20   impl serde::Trait for Bank {\n\
+                       \x20       fn hidden(&self) {}\n\
+                       \x20   }\n\
+                       }\n"
+            .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        assert!(functions.is_empty(), "{functions:?}");
+    }
+
+    #[test]
+    fn an_alias_whose_root_is_shadowed_by_a_local_module_in_the_same_scope_still_resolves_local() {
+        // `use serde as local_serde;` names whatever `serde` resolves to in this
+        // same scope, and a local `mod serde { .. }` there wins over the
+        // dependency — the same rule this file's own name resolution follows for
+        // every other path. Adversarial review of issue #180 found the alias
+        // branch skipping this check.
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core").with_dependency("serde", DepKind::Normal),
+        ]);
+        let sources = vec![LayerSource {
+            crate_name: "waymaker-core".to_owned(),
+            path: "crates/waymaker-core/src/lib.rs".to_owned(),
+            contents: "mod serde {\n\
+                       \x20   pub(crate) trait Trait {\n\
+                       \x20       fn hidden(&self);\n\
+                       \x20   }\n\
+                       }\n\
+                       \n\
+                       use serde as local_serde;\n\
+                       \n\
+                       impl local_serde::Trait for Bank {\n    fn hidden(&self) {}\n}\n"
+                .to_owned(),
+        }];
+        let functions = public_functions_reachable(&sources, &graph);
+        // A local `mod serde` in this same scope shadows the `serde` dependency for
+        // the `use serde as local_serde;` alias too, so `local_serde::Trait` names
+        // the crate's own private trait and its impl should stay hidden — matching
+        // the already-passing `a_local_alias_that_reuses_an_external_roots_name_shadows_it_in_its_own_scope`
+        // test above, just with the shadowing `mod` and the aliasing `use` reversed.
+        assert!(functions.is_empty(), "{functions:?}");
     }
 
     #[test]

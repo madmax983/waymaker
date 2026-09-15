@@ -3734,6 +3734,134 @@ fn push_resolved_names(
     }
 }
 
+/// One `impl <Trait> for <Type>` item's trait path, root-checked against its own
+/// scope only.
+///
+/// Issue #180: a name declared in one scope must not decide an `impl` in a
+/// different scope. Rust does not let a nested `mod` inherit an outer scope's
+/// `use` or `mod` names, and a sibling scope never sees another sibling's names
+/// either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplTraitPath {
+    /// The source line the `impl` keyword starts on. 1-indexed, so a caller can
+    /// join this to the line a text scan reads the same declaration from.
+    pub line: usize,
+    /// The trait path's segments. Resolved through a local alias in the impl's
+    /// own scope, if the first segment names one. Written as-is otherwise.
+    pub segments: Vec<String>,
+    /// True for a path starting `::`, or one that resolves through a `use
+    /// ::a::b as c;` alias. Such a path always names a real external item —
+    /// never a local module or a local alias (issue #180).
+    pub absolute: bool,
+    /// True when the first segment names a `mod` the impl's own scope
+    /// declares. A local module shadows a same-named dependency at the point
+    /// of use — the impl always names the local module, never the dependency
+    /// (issue #180).
+    pub shadowed: bool,
+}
+
+/// Every `impl <Trait> for <Type>` item in `contents`, outside `#[cfg(test)]`.
+///
+/// Each path is checked against its own enclosing scope's `use` and `mod`
+/// declarations only — `resolve_local_alias_chain` and `own_modules`, the
+/// same per-scope, non-inheriting lookups [`struct_literal_counts`] and
+/// `resolve_segments` already use for a block-local alias and a sibling
+/// module. A trait path names only one root, so this needs no deeper,
+/// multi-hop descent: a first segment not aliased or shadowed in this scope
+/// stays exactly as written, for the caller's own crate-level dependency
+/// check to read.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn impl_trait_paths(contents: &str) -> Result<Vec<ImplTraitPath>, syn::Error> {
+    let file = parse_rust(contents)?;
+    let mut paths = Vec::new();
+    collect_impl_trait_paths(&file.items, &mut paths);
+    Ok(paths)
+}
+
+fn collect_impl_trait_paths(items: &[syn::Item], paths: &mut Vec<ImplTraitPath>) {
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        match item {
+            syn::Item::Impl(implementation) => {
+                if let Some((_, trait_path, _)) = implementation.trait_.as_ref() {
+                    paths.push(resolve_impl_trait_path(items, implementation, trait_path));
+                }
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, nested)) = module.content.as_ref() {
+                    collect_impl_trait_paths(nested, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Resolves one `impl` item's trait path against `scope` — the item list of
+/// the block the `impl` is declared directly in.
+fn resolve_impl_trait_path(
+    scope: &[syn::Item],
+    implementation: &syn::ItemImpl,
+    trait_path: &syn::Path,
+) -> ImplTraitPath {
+    let line = implementation.impl_token.span.start().line;
+    let segments: Vec<String> = trait_path
+        .segments
+        .iter()
+        .map(|segment| ident_name(&segment.ident))
+        .collect();
+    if trait_path.leading_colon.is_some() {
+        return ImplTraitPath {
+            line,
+            segments,
+            absolute: true,
+            shadowed: false,
+        };
+    }
+    let Some(first) = segments.first().cloned() else {
+        return ImplTraitPath {
+            line,
+            segments,
+            absolute: false,
+            shadowed: false,
+        };
+    };
+    let scope_refs: Vec<&syn::Item> = scope.iter().collect();
+    if let Some((mut resolved, absolute)) = resolve_local_alias_chain(&scope_refs, &first) {
+        resolved.extend(segments.into_iter().skip(1));
+        // Real Rust resolves a `use` item's own right-hand side the same way any
+        // path is resolved: a local item first, the extern prelude only once none
+        // exists. So `use serde as wire;` beside a `mod serde { .. }` in this same
+        // scope names that module, not the dependency — the alias forwards the
+        // shadow rather than escaping it. Checked only once, against the chain's
+        // landing segment: a shadow on an *intermediate* hop cannot arise, since
+        // Rust refuses two same-named items in one scope (E0255), so an alias
+        // chain that reached that name found no such module there to begin with.
+        let shadowed = !absolute
+            && resolved
+                .first()
+                .is_some_and(|root| own_modules(scope).iter().any(|(name, _)| name == root));
+        return ImplTraitPath {
+            line,
+            segments: resolved,
+            absolute,
+            shadowed,
+        };
+    }
+    let shadowed = own_modules(scope).iter().any(|(name, _)| *name == first);
+    ImplTraitPath {
+        line,
+        segments,
+        absolute: false,
+        shadowed,
+    }
+}
+
 /// Whether `op` rewrites its left operand in place: one of the ten compound-assignment
 /// operators (`+=`, `^=`, and the rest), each of which `syn` parses as a `BinOp` on an
 /// `Expr::Binary` rather than as an `Expr::Assign` — `ExprAssign` is `=` alone.
@@ -13800,7 +13928,7 @@ mod alias_scope_tests {
     //! Codex review, issue #109: a `use` alias is scoped to its own module. It
     //! is not visible in a sibling module, and a sibling module's alias must
     //! not resolve a chain that starts here.
-    use super::{future_trait_implementors, name_uses, resolved_path_uses};
+    use super::{future_trait_implementors, impl_trait_paths, name_uses, resolved_path_uses};
 
     #[test]
     fn an_unrelated_trait_in_a_sibling_module_is_not_a_fifth_future() {
@@ -13933,6 +14061,49 @@ mod alias_scope_tests {
              as Awaitable;\n    struct Sneaky;\n    impl Awaitable for Sneaky {}\n}\n";
         let implementors = future_trait_implementors(code).expect("the fixture parses");
         assert_eq!(implementors, ["Sneaky"], "{implementors:?}");
+    }
+
+    #[test]
+    fn impl_trait_paths_resolves_a_root_alias_rename() {
+        // Issue #180: `use serde as wire;` renames the crate root itself. The
+        // trait path must resolve through it to `serde::Serialize`, not stay
+        // `wire::Serialize`.
+        let code = "use serde as wire;\nimpl wire::Serialize for Bank {}\n";
+        let paths = impl_trait_paths(code).expect("the fixture parses");
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert_eq!(paths[0].segments, ["serde", "Serialize"]);
+        assert!(!paths[0].absolute);
+        assert!(!paths[0].shadowed);
+    }
+
+    #[test]
+    fn impl_trait_paths_reports_a_local_module_shadow() {
+        // Issue #180: a `mod serde { .. }` in the same scope as the `impl`
+        // shadows a same-named dependency at the point of use.
+        let code = "mod serde {\n    pub(crate) trait Trait {}\n}\nimpl serde::Trait for Bank {}\n";
+        let paths = impl_trait_paths(code).expect("the fixture parses");
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].shadowed, "{:?}", paths[0]);
+    }
+
+    #[test]
+    fn impl_trait_paths_does_not_let_a_nested_scopes_alias_leak_outward() {
+        // Issue #180: `use serde::Serialize;` inside `inner` is that module's
+        // own import. The file-scope `impl Serialize for Bank` below it does
+        // not inherit it, so it stays exactly as written — unshadowed,
+        // unaliased — for the caller's own crate-level check to read.
+        let code = "mod inner {\n    use serde::Serialize;\n}\nimpl Serialize for Bank {}\n";
+        let paths = impl_trait_paths(code).expect("the fixture parses");
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert_eq!(paths[0].segments, ["Serialize"]);
+        assert!(!paths[0].shadowed);
+    }
+
+    #[test]
+    fn impl_trait_paths_skips_a_cfg_test_impl() {
+        let code = "#[cfg(test)]\nmod tests {\n    impl Debug for Bank {}\n}\n";
+        let paths = impl_trait_paths(code).expect("the fixture parses");
+        assert!(paths.is_empty(), "{paths:?}");
     }
 
     #[test]
