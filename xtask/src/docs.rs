@@ -7959,6 +7959,42 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_math_nested_inside_svg_never_leaves_the_svg_namespace_still_counts() {
+        // Codex, pull request #138, round 70, finding "Keep nested foreign roots in
+        // the current namespace": a foreign root genuinely starts new foreign content
+        // only while HTML's own "in body" insertion mode is the one in effect —
+        // nothing open, or an open HTML integration point — not while *already*
+        // inside raw foreign content. `<svg><math><mtext><script
+        // /></mtext></math><text>decision-id headline</text></svg>` never leaves the
+        // SVG namespace a real browser reads it in: `math` and `mtext` are just
+        // unrecognized SVG-namespaced elements there, self-closing stays honored
+        // throughout, and `<script />` is bodyless. Pushing a frame for `math`
+        // unconditionally opened a genuinely new (and wrong) MathML root, whose
+        // `mtext` was then read as a real integration point switching to HTML rules —
+        // leaving `<script />` a real, unclosed script that swallowed the closing
+        // `</mtext></math>`, the following `<text>` and the id and headline inside it,
+        // to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><math><mtext><script /></mtext></math><text>{} {}</text></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
     {
         // Codex, pull request #138, round 69, finding "Match integration points to

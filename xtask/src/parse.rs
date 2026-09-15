@@ -1638,6 +1638,21 @@ fn has_attribute(span: &str, attribute: &str) -> bool {
     false
 }
 
+/// Whether `character` is one of HTML5's own five "ASCII whitespace" bytes — tab, line
+/// feed, form feed, carriage return, space — the fixed set its tokenizer's attribute
+/// states (and every other whitespace-sensitive state) test against, not Rust's
+/// `char::is_whitespace`'s full Unicode notion (Codex, round 70, "Treat only ASCII
+/// bytes as HTML attribute whitespace"): a non-breaking space (U+00A0) is Unicode
+/// whitespace but not one of these five, so a browser's unquoted-attribute-value state
+/// does not end on one — `<a href=tests/spine.rs\u{A0}junk>` has `\u{A0}junk` as part
+/// of the value a reader's click follows, not a separator before a second, discarded
+/// token. [`anchor_href`] and [`attribute_value`] both use this in place of
+/// `char::is_whitespace` everywhere they skip or scan for HTML whitespace, so neither
+/// reads past a non-breaking space early nor reports the wrong destination.
+const fn is_html_whitespace(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
 /// The value of `attribute` on a well-formed opening tag's own markup `span`, if it
 /// carries one — [`anchor_href`]'s generalization to an arbitrary attribute name, used
 /// here only to read `<annotation-xml>`'s `encoding` (Codex, pull request #138, round
@@ -1668,7 +1683,7 @@ fn attribute_value<'a>(span: &'a str, attribute: &str) -> Option<&'a str> {
                 }
                 let after_name_whitespace = span
                     .get(after_name..)?
-                    .find(|character: char| !character.is_whitespace())
+                    .find(|character: char| !is_html_whitespace(character))
                     .map_or(span.len(), |offset| after_name + offset);
                 if bytes.get(after_name_whitespace) != Some(&b'=') {
                     index = after_name;
@@ -1677,13 +1692,13 @@ fn attribute_value<'a>(span: &'a str, attribute: &str) -> Option<&'a str> {
                 let after_equals = after_name_whitespace + 1;
                 let value_start = span
                     .get(after_equals..)?
-                    .find(|character: char| !character.is_whitespace())
+                    .find(|character: char| !is_html_whitespace(character))
                     .map_or(span.len(), |offset| after_equals + offset);
                 let value_quote = *bytes.get(value_start)?;
                 if value_quote != b'"' && value_quote != b'\'' {
                     let end = span
                         .get(value_start..)?
-                        .find(|character: char| character.is_whitespace() || character == '>')
+                        .find(|character: char| is_html_whitespace(character) || character == '>')
                         .map_or(span.len(), |offset| value_start + offset);
                     return Some(&span[value_start..end]);
                 }
@@ -1899,7 +1914,24 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
     // unconditionally left a stale, still-open `honors_self_closing: true` frame
     // behind, wrongly reading the following `<script />` as bodyless.
     let self_closes_immediately = ends_with_self_closing_slash(span);
-    if is_mglyph_exception || is_foreign_content_root(name) {
+    // A foreign root genuinely starts new foreign content only while HTML's own "in
+    // body" insertion mode is the one in effect — nothing (top level) or an open
+    // HTML integration point, where descendants parse under ordinary HTML rules
+    // again (Codex, round 70, "Keep nested foreign roots in the current
+    // namespace"): a `<math>` or `<svg>` reached *inside already-open* raw foreign
+    // content is not special there at all, and is inserted as an ordinary element
+    // of the *current* namespace, the same as any other tag foreign content's own
+    // rules do not name. `<svg><math><mtext><script /></mtext></math><text>...`
+    // never leaves the SVG namespace a real browser reads it in — `math` and
+    // `mtext` are just unrecognized SVG-namespaced elements, self-closing stays
+    // honored throughout, and `<script />` is bodyless — but pushing a frame for
+    // `math` unconditionally opened a genuinely new (and wrong) MathML root, whose
+    // `mtext` was then read as a real integration point switching to HTML rules,
+    // leaving `<script />` a real, unclosed script that swallowed the rest of the
+    // document.
+    if is_mglyph_exception
+        || (is_foreign_content_root(name) && !honors_self_closing_now(foreign_content))
+    {
         if !self_closes_immediately {
             foreign_content.push(ForeignFrame {
                 name: name.to_ascii_lowercase(),
@@ -3792,7 +3824,7 @@ fn anchor_href(html: &str) -> Option<&str> {
                 // written with any of that legal spacing.
                 let after_name_whitespace = html
                     .get(after_name..)?
-                    .find(|character: char| !character.is_whitespace())
+                    .find(|character: char| !is_html_whitespace(character))
                     .map_or(html.len(), |offset| after_name + offset);
                 if bytes.get(after_name_whitespace) != Some(&b'=') {
                     index = after_name;
@@ -3801,7 +3833,7 @@ fn anchor_href(html: &str) -> Option<&str> {
                 let after_equals = after_name_whitespace + 1;
                 let value_start = html
                     .get(after_equals..)?
-                    .find(|character: char| !character.is_whitespace())
+                    .find(|character: char| !is_html_whitespace(character))
                     .map_or(html.len(), |offset| after_equals + offset);
                 let value_quote = *bytes.get(value_start)?;
                 if value_quote != b'"' && value_quote != b'\'' {
@@ -3811,10 +3843,13 @@ fn anchor_href(html: &str) -> Option<&str> {
                     // quoted `href` — so `href=tests/spine.rs` must not be read as an
                     // empty or absent value. It runs to the next HTML whitespace or the
                     // tag's own closing `>`, whichever comes first; neither character is
-                    // legal inside an unquoted value.
+                    // legal inside an unquoted value. HTML whitespace specifically
+                    // (Codex, round 70, "Treat only ASCII bytes as HTML attribute
+                    // whitespace"), not `char::is_whitespace`'s full Unicode notion — see
+                    // `is_html_whitespace`'s own doc comment.
                     let end = html
                         .get(value_start..)?
-                        .find(|character: char| character.is_whitespace() || character == '>')
+                        .find(|character: char| is_html_whitespace(character) || character == '>')
                         .map_or(html.len(), |offset| value_start + offset);
                     return Some(&html[value_start..end]);
                 }
@@ -7463,4 +7498,48 @@ fn block_text(block: &syn::Block) -> String {
         body.push(' ');
     }
     body.replace(" :: ", "::")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{anchor_href, attribute_value};
+
+    // Codex, pull request #138, round 70, finding "Treat only ASCII bytes as HTML
+    // attribute whitespace": every other behavior this module is responsible for is
+    // exercised indirectly, through a `docs.rs` check that reads a full document —
+    // but the check that consumes an unquoted `href` value only ever tests whether a
+    // *substring* of it is present (`table_rows`'s own callers all read a table row
+    // with `str::contains`, not equality), which cannot observe a value that grew
+    // *longer* than the correct one: a string that starts with the required substring
+    // still contains it however much more text is appended after it, so no
+    // downstream check can tell an unquoted value that stopped at a non-breaking
+    // space apart from one that correctly kept reading past it. Tested directly here
+    // instead, against the one thing that changed: what the function itself returns.
+    //
+    // A non-breaking space (U+00A0) is Unicode whitespace but not one of HTML5's own
+    // five ASCII whitespace bytes (tab, line feed, form feed, carriage return, space)
+    // — the fixed set its tokenizer's unquoted-attribute-value state actually ends
+    // on — so a browser reads `\u{A0}junk` as part of the value, not a separator
+    // before a second, discarded token. `<a href=tests/spine.rs\u{A0}junk>proof</a>`
+    // has the real destination a reader's click follows as the whole
+    // `tests/spine.rs\u{A0}junk`; reporting `tests/spine.rs` alone would tell a
+    // caller the link points where it does not.
+    #[test]
+    fn anchor_href_keeps_text_past_a_non_breaking_space_in_an_unquoted_value() {
+        let html = "<a href=tests/spine.rs\u{A0}junk>recovery proof</a>";
+        assert_eq!(anchor_href(html), Some("tests/spine.rs\u{A0}junk"));
+    }
+
+    // `attribute_value` is `anchor_href`'s own generalization to an arbitrary
+    // attribute name (used to read `<annotation-xml>`'s `encoding`), built from the
+    // same three whitespace-scanning sites — fixed the same way, for the same
+    // reason.
+    #[test]
+    fn attribute_value_keeps_text_past_a_non_breaking_space_in_an_unquoted_value() {
+        let span = "<annotation-xml encoding=text/html\u{A0}junk>";
+        assert_eq!(
+            attribute_value(span, "encoding"),
+            Some("text/html\u{A0}junk")
+        );
+    }
 }
