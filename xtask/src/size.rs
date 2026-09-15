@@ -3440,11 +3440,7 @@ fn declaration_kind(
         // `impl Storage for Bank` implements a trait; `impl Bank` does not. Only the first
         // makes its unmarked methods callable from outside, and only while `Storage` is
         // itself a trait the probe has a path to.
-        let private_traits = if resolved.is_some() {
-            context.private_traits
-        } else {
-            context.private_traits_fallback
-        };
+        let private_traits = context.private_traits(resolved);
         return Some(match impl_trait_outcome(line, resolved, context) {
             Some((name, true)) if private_traits.contains(&name) => Block::Other,
             Some(_) => Block::TraitImpl,
@@ -3454,9 +3450,12 @@ fn declaration_kind(
     None
 }
 
-/// What [`declaration_kind`] needs to judge an `impl <Trait> for <Type>` line: the
-/// crate-level roots [`impl_trait_outcome`] checks a scope-resolved path's first
-/// segment against, and the file-level floor it falls back to otherwise.
+/// What [`declaration_kind`] needs to judge an `impl <Trait> for <Type>` line: which
+/// trait names are private, and which path roots are external, each held as a
+/// crate-level pair and a file-level fallback pair. [`Self::private_traits`] and
+/// [`Self::external_roots`] pick the right half of each pair for one `resolved`
+/// answer, so `declaration_kind` and [`impl_trait_outcome`] read the same choice from
+/// one place rather than each testing `resolved.is_some()` on its own.
 struct TraitRootContext<'a> {
     /// Every non-public trait name this crate declares. See [`private_trait_names`].
     private_traits: &'a HashSet<String>,
@@ -3471,6 +3470,33 @@ struct TraitRootContext<'a> {
     external_roots_fallback: &'a HashSet<String>,
 }
 
+impl<'a> TraitRootContext<'a> {
+    /// `private_traits` when `resolved` exists, `private_traits_fallback` otherwise.
+    const fn private_traits(
+        &self,
+        resolved: Option<&crate::parse::ImplTraitPath>,
+    ) -> &'a HashSet<String> {
+        if resolved.is_some() {
+            self.private_traits
+        } else {
+            self.private_traits_fallback
+        }
+    }
+
+    /// `external_roots` when `resolved` exists, `external_roots_fallback` otherwise —
+    /// the same resolved/fallback split as [`Self::private_traits`].
+    const fn external_roots(
+        &self,
+        resolved: Option<&crate::parse::ImplTraitPath>,
+    ) -> &'a HashSet<String> {
+        if resolved.is_some() {
+            self.external_roots
+        } else {
+            self.external_roots_fallback
+        }
+    }
+}
+
 /// The trait name an `impl` line names, and whether it can resolve to a trait this
 /// crate declares.
 ///
@@ -3480,13 +3506,16 @@ struct TraitRootContext<'a> {
 /// not cover: one inside a function body, or one in a file that failed to parse.
 ///
 /// A name `resolved` finds shadowed by a local module, or absolute, decides locality on
-/// its own, whatever `context.external_roots` says of its first segment — see
-/// [`crate::parse::ImplTraitPath`].
+/// its own, whatever the external roots say of its first segment — see
+/// [`crate::parse::ImplTraitPath`]. A `self`/`super`/`crate` first segment never
+/// matches either root set, since neither ever names one: such a path is local by
+/// construction, with no special case needed here.
 fn impl_trait_outcome(
     line: &str,
     resolved: Option<&crate::parse::ImplTraitPath>,
     context: &TraitRootContext<'_>,
 ) -> Option<(String, bool)> {
+    let external_roots = context.external_roots(resolved);
     if let Some(resolved) = resolved {
         let name = resolved.segments.last()?.clone();
         let qualified = resolved.segments.len() > 1;
@@ -3496,11 +3525,10 @@ fn impl_trait_outcome(
                 || resolved
                     .segments
                     .first()
-                    .is_none_or(|first| !context.external_roots.contains(first)));
+                    .is_none_or(|first| !external_roots.contains(first)));
         return Some((name, local));
     }
-    impl_trait_name(line, context.external_roots_fallback)
-        .map(|(name, local)| (name.to_owned(), local))
+    impl_trait_name(line, external_roots).map(|(name, local)| (name.to_owned(), local))
 }
 
 /// The name a `trait` declaration names. Also whether it is `pub`.
