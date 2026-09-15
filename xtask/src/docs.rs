@@ -8749,6 +8749,77 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_the_clones_own_end_tag_is_visible_before_the_furthest_block_closes() {
+        // Codex, pull request #138, round 76, finding "Keep the adopted
+        // formatting clone addressable by its end tag": round 74's fix
+        // promoted the furthest block into `top`'s own place, discarding the
+        // clone's own tag identity along the way — so a second, legitimate end
+        // tag matching the clone (nested inside the furthest block, exactly as
+        // HTML5's adoption agency algorithm leaves it) matched neither `top`
+        // (now the furthest block's own name) nor any tracked descendant, and
+        // was left inert, wrongly keeping suppression alive until the furthest
+        // block's own close. `<b hidden><div>ignored</b>still
+        // hidden</b>decision-id headline</div>` has the clone opened by the
+        // first `</b>` still genuinely hidden ("still hidden" is its own
+        // text) — but the *second* `</b>` is the clone's own real close, and
+        // everything after it, up to `</div>`, is ordinary content: `div`
+        // was never itself marked `hidden`, only the clone nested inside it
+        // was.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><div>ignored</b>still hidden</b>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_inside_an_html_integration_point_using_a_character_reference_stays_hidden()
+     {
+        // Codex, pull request #138, round 76, finding "Decode the annotation
+        // encoding before namespace switching": `is_html_integration_point`
+        // compared `annotation-xml`'s raw, undecoded `encoding` attribute
+        // value against `text/html`/`application/xhtml+xml`, but a browser
+        // resolves an attribute's character references before comparing it
+        // against anything. `encoding="text&#47;html"` names `text/html`
+        // exactly as much as the literal spelling does, so `<script />`
+        // inside it is a real HTML integration point's descendant —
+        // self-closing is never honored there, so the slash is ignored and a
+        // genuine, unclosed `<script>` element opens, hiding everything up
+        // to its own literal `</script>`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><annotation-xml encoding=\"text&#47;html\"><script />{} {}</script></annotation-xml></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
     {
         // Codex, pull request #138, round 69, finding "Match integration points to

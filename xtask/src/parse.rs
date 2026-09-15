@@ -2751,12 +2751,22 @@ fn honors_self_closing_now(foreign_content: &[ForeignFrame]) -> bool {
 /// complete markup, rather than trusted from the name alone — any other encoding, or
 /// none, leaves its content ordinary `MathML`), and the `MathML` text integration
 /// points, which admit HTML content the same way.
+///
+/// The `encoding` value is decoded for character references before the comparison
+/// (Codex, pull request #138, round 76, "Decode the annotation encoding before
+/// namespace switching"): a browser resolves an attribute's value — references
+/// included — before comparing it against anything, the same way [`anchor_href`]'s
+/// own destination already has to be (round 44 on). `encoding="text&#47;html"` names
+/// `text/html` exactly as much as the literal spelling does, and comparing the raw,
+/// undecoded source text found no match, wrongly leaving `MathML` parsing (and its
+/// self-closing-honoring) active over what is really HTML integration-point content.
 fn is_html_integration_point(span: &str, name: &str) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "foreignobject" | "desc" => true,
         "annotation-xml" => attribute_value(span, "encoding").is_some_and(|value| {
-            value.eq_ignore_ascii_case("text/html")
-                || value.eq_ignore_ascii_case("application/xhtml+xml")
+            let decoded = decode_character_references(value);
+            decoded.eq_ignore_ascii_case("text/html")
+                || decoded.eq_ignore_ascii_case("application/xhtml+xml")
         }),
         name => is_mathml_text_integration_point(name),
     }
@@ -3569,15 +3579,6 @@ fn track_non_rendering_html(
                 // recovery invariants` has the clone's own suppression end at
                 // `</div>`, not run to end of document.
                 //
-                // Modeled by promoting that outermost descendant to the
-                // tracked `top` in `b`'s place, with whatever was nested
-                // inside *it* carried over as its own descendants: the clone
-                // needs no separate representation, because from here on its
-                // hidden lifetime and the furthest block's are the same
-                // lifetime, and the furthest block is a plain element the
-                // unconditional-close branch above already knows how to pop
-                // on its own matching close, "div" included.
-                //
                 // Not every nonempty descendant list has a *real* furthest
                 // block, though (Codex, pull request #138, round 75, "Require
                 // a real furthest block before preserving formatting"): HTML5
@@ -3589,12 +3590,47 @@ fn track_non_rendering_html(
                 // all, and the whole misnested run (every tracked descendant
                 // included) simply closes here, the same as the unconditional
                 // branch above.
+                //
+                // `top` is left exactly as it was — still `b`, the formatting
+                // element's own name, never overwritten with the furthest
+                // block's (Codex, round 76, "Keep the adopted formatting
+                // clone addressable by its end tag"): an earlier version
+                // promoted the furthest block into `top`'s place, which read
+                // as though the *furthest block itself* were the hidden
+                // thing, and discarded the clone's own tag identity in the
+                // process — so a second, legitimate `</b>` closing the clone
+                // (nested inside the furthest block, the same way any other
+                // descendant closes) matched neither `top` (now the furthest
+                // block's own name) nor any tracked descendant (cleared),
+                // and was left inert, wrongly keeping content hidden past the
+                // point the clone itself closed. `text <b hidden><div>ignored
+                // </b>still hidden</b>All 6 recovery invariants</div>` has
+                // the clone opened by the first `</b>` still genuinely hidden
+                // (`still hidden` is its own text, a child of the clone) —
+                // but the *second* `</b>` is the clone's own real close, and
+                // everything after it, up to the furthest block's own
+                // `</div>`, is ordinary, visible content: `div` was never
+                // itself marked `hidden`, only the clone nested inside it
+                // was.
+                //
+                // The furthest block is instead pushed onto `ancestors` —
+                // what it genuinely becomes the moment the clone opens: a
+                // real, ordinary, currently-open element the document's own
+                // stack holds, exactly like anything `track_ordinary_ancestor`
+                // already records. Its own end tag then closes the clone (and
+                // everything nested inside it) through the *existing*
+                // "unwind through a matching real ancestor" branch below —
+                // round 57's mechanism, met here rather than reimplemented —
+                // and the clone's own end tag closes through the ordinary
+                // `top`-matches-`closes_non_rendering_element` branch above,
+                // unconditionally, since a fresh clone starts with nothing
+                // nested inside it (`descendants` cleared along with the
+                // promotion) and so is never itself mistaken for still having
+                // *its own* misnested formatting exception to apply.
                 if let Some(pos) = descendants.iter().position(|name| is_special_element(name)) {
                     let furthest_block = descendants.remove(pos);
-                    descendants.drain(..pos);
-                    if let Some(slot) = stack.last_mut() {
-                        *slot = furthest_block;
-                    }
+                    descendants.clear();
+                    ancestors.push(furthest_block);
                 } else {
                     stack.pop();
                 }
