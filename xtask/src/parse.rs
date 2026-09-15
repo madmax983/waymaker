@@ -819,15 +819,9 @@ fn own_modules(items: &[syn::Item]) -> Vec<(String, &[syn::Item])> {
         .collect()
 }
 
-/// The type-parameter names `generics` declares. Lifetimes and const
-/// parameters are excluded: only a type parameter shares a namespace with a
-/// module or a `use` alias, so only a type parameter can shadow one.
-///
-/// Issue #181: a generic type parameter shadows a same-named sibling module
-/// or alias for the rest of the item that declares it — real Rust resolves
-/// a bare reference to the parameter, never to either. [`push_generic_shadow`]
-/// is the caller's half: it pushes this set and hands back how many names to
-/// pop once the item's body has been visited.
+/// The type-parameter names `generics` declares. Excludes lifetimes and
+/// const parameters: only a type parameter shares a namespace with a module
+/// or an alias, so only a type parameter can shadow one.
 fn generic_type_param_names(generics: &syn::Generics) -> Vec<String> {
     generics
         .params
@@ -839,55 +833,73 @@ fn generic_type_param_names(generics: &syn::Generics) -> Vec<String> {
         .collect()
 }
 
-/// Pushes `generics`'s own type-parameter names onto `shadow` and returns how
-/// many were added, so the caller can truncate the same count back off once
-/// it is done visiting that item's body (issue #181).
-fn push_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> usize {
+/// Adds `generics`'s own type-parameter names to `shadow` and returns how
+/// many were added, to truncate back off once the body is visited.
+///
+/// Additive, not a reset: an `impl`'s or a `trait`'s own methods really do
+/// see that block's generics, on top of any the method declares itself
+/// (issue #181). [`reset_generic_shadow`] is the sibling for every other
+/// item kind, which sees none of an enclosing scope's generics at all.
+fn extend_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> usize {
     let names = generic_type_param_names(generics);
     let added = names.len();
     shadow.extend(names);
     added
 }
 
-/// The five `syn::visit::Visit` overrides that push a generics-bearing
-/// item's own type-parameter names onto `self.shadow` before visiting its
-/// body, and pop them back off after (issue #181).
+/// Replaces `shadow` with `generics`'s own type-parameter names. Returns the
+/// old value, to restore once the body is visited.
 ///
-/// One macro rather than five methods copied into each visitor: every path-
-/// resolving visitor in this file needs the same five overrides, over its
-/// own `self.shadow` field, so a shared body keeps them from drifting apart
-/// and keeps each visitor's own `impl` short enough for
-/// `clippy::too_many_lines`.
+/// A nested `fn`, `impl`, `trait`, or `mod` inherits no generics from an
+/// enclosing item. Rustc says so directly: "nested items are independent
+/// from their parent item ... for name resolution" (`E0401`). Keeping the
+/// outer names here instead of a full reset would shadow a name real Rust
+/// still resolves through a sibling module or alias one level down (issue
+/// #181, Codex review of PR #195).
+fn reset_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> Vec<String> {
+    core::mem::replace(shadow, generic_type_param_names(generics))
+}
+
+/// The five `syn::visit::Visit` overrides that keep `self.shadow` correct
+/// across a generics-bearing item's own body (issue #181).
+///
+/// One macro, not five methods copied into each visitor. Every path-
+/// resolving visitor here needs the same five overrides, over its own
+/// `self.shadow` field. One shared body keeps them from drifting apart, and
+/// keeps each visitor's own `impl` short enough for `clippy::too_many_lines`.
+/// A visitor's own `visit_item_mod` stays outside this macro — each already
+/// has its own, for `self.stack` — but must reset `self.shadow` to empty
+/// around it too: a module inherits no generics either.
 macro_rules! shadow_generic_params {
     () => {
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-            let added = push_generic_shadow(&mut self.shadow, &node.sig.generics);
+            let outer = reset_generic_shadow(&mut self.shadow, &node.sig.generics);
             syn::visit::visit_item_fn(self, node);
-            self.shadow.truncate(self.shadow.len() - added);
+            self.shadow = outer;
         }
 
         fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-            let added = push_generic_shadow(&mut self.shadow, &node.sig.generics);
+            let added = extend_generic_shadow(&mut self.shadow, &node.sig.generics);
             syn::visit::visit_impl_item_fn(self, node);
             self.shadow.truncate(self.shadow.len() - added);
         }
 
         fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-            let added = push_generic_shadow(&mut self.shadow, &node.sig.generics);
+            let added = extend_generic_shadow(&mut self.shadow, &node.sig.generics);
             syn::visit::visit_trait_item_fn(self, node);
             self.shadow.truncate(self.shadow.len() - added);
         }
 
         fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-            let added = push_generic_shadow(&mut self.shadow, &node.generics);
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
             syn::visit::visit_item_impl(self, node);
-            self.shadow.truncate(self.shadow.len() - added);
+            self.shadow = outer;
         }
 
         fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-            let added = push_generic_shadow(&mut self.shadow, &node.generics);
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
             syn::visit::visit_item_trait(self, node);
-            self.shadow.truncate(self.shadow.len() - added);
+            self.shadow = outer;
         }
     };
 }
@@ -1079,7 +1091,11 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
             if let Some((_, items)) = node.content.as_ref() {
                 self.stack.push(items);
             }
+            // A module sees none of an enclosing item's generics either
+            // (issue #181): reset for its own traversal, restore after.
+            let outer_shadow = core::mem::take(&mut self.shadow);
             syn::visit::visit_item_mod(self, node);
+            self.shadow = outer_shadow;
             if pushed {
                 self.stack.pop();
             }
@@ -4343,7 +4359,11 @@ pub fn struct_literal_counts(
             // (Codex review) — so `block_items` is set aside for the module's own
             // traversal and restored once it is done, the same way `self.stack` is.
             let enclosing_block_items = core::mem::take(&mut self.block_items);
+            // A module sees none of an enclosing item's generics either
+            // (issue #181): reset for its own traversal, restore after.
+            let outer_shadow = core::mem::take(&mut self.shadow);
             syn::visit::visit_item_mod(self, node);
+            self.shadow = outer_shadow;
             self.block_items = enclosing_block_items;
             if pushed {
                 self.stack.pop();
@@ -4814,7 +4834,11 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
             if let Some((_, items)) = node.content.as_ref() {
                 self.stack.push(items);
             }
+            // A module sees none of an enclosing item's generics either
+            // (issue #181): reset for its own traversal, restore after.
+            let outer_shadow = core::mem::take(&mut self.shadow);
             syn::visit::visit_item_mod(self, node);
+            self.shadow = outer_shadow;
             if pushed {
                 self.stack.pop();
             }
@@ -14042,6 +14066,74 @@ mod generic_shadow_tests {
         assert_eq!(
             counts.total, 0,
             "a shadowed generic parameter's construction counted as the real type: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_fn_does_not_inherit_its_parents_shadowing_generic_parameter() {
+        // rustc's own words for this (`E0401`): "nested items are
+        // independent from their parent item ... for name resolution". A
+        // `fn` declared inside a generic function's body sees none of that
+        // function's generics, so `TimerSpec` inside it names the sibling
+        // module, and the module's alias must still resolve.
+        let code = "mod TimerSpec {\n    pub use core::future::Future as BestEffort;\n}\nfn \
+             outer<TimerSpec: Spec>() {\n    fn inner() {\n        let _ = \
+             TimerSpec::BestEffort;\n    }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future"]),
+            "a nested fn wrongly inherited its parent's shadow, hiding the real alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_mod_does_not_inherit_its_parents_shadowing_generic_parameter() {
+        // A module inherits no generics from any enclosing item. `inner`'s
+        // own `TimerSpec` submodule is what a bare reference inside it
+        // names, real Rust's own ordinary same-module lookup — unaffected
+        // by whatever `outer`'s generics would have shadowed.
+        let code = "fn outer<TimerSpec: Spec>() {\n    mod inner {\n        mod TimerSpec {\n    \
+             pub use core::future::Future as BestEffort;\n        }\n        fn g() {\n            \
+             let _ = TimerSpec::BestEffort;\n        }\n    }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future"]),
+            "a nested mod wrongly inherited its parent's shadow, hiding the real alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_impl_does_not_inherit_its_parents_shadowing_generic_parameter() {
+        // An `impl` block declared inside a generic function's body is
+        // its own item too, and sees none of that function's generics —
+        // only its own, if it declares any.
+        let code = "mod TimerSpec {\n    pub use core::future::Future as BestEffort;\n}\nfn \
+             outer<TimerSpec: Spec>() {\n    struct Holder;\n    impl Holder {\n        fn f(&self) \
+             {\n            let _ = TimerSpec::BestEffort;\n        }\n    }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future"]),
+            "a nested impl wrongly inherited its parent's shadow, hiding the real alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn struct_literal_counts_does_not_leak_shadowing_into_a_nested_fn() {
+        let code = "mod CheckedDispatch {\n    pub use Real as Sneaky;\n}\nfn \
+             outer<CheckedDispatch: Spec>() {\n    fn inner() {\n        let _ = \
+             CheckedDispatch::Sneaky {};\n    }\n}\n";
+        let counts =
+            struct_literal_counts(code, "Real", FnScope::None).expect("the fixture parses");
+        assert_eq!(
+            counts.total, 1,
+            "a nested fn wrongly inherited its parent's shadow, hiding the real construction: \
+             {counts:?}"
         );
     }
 }
