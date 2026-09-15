@@ -17564,6 +17564,79 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_procedural_attribute_on_a_trait_item_in_the_effect_protocol_file_is_reported() {
+        // Issue #186, finding 1: the attribute scan overrides `visit_item` and
+        // `visit_impl_item`, never `visit_trait_item`, so an attribute macro on a
+        // trait method's own declaration is invisible to it.
+        let source = tests_support::clean_effect_module()
+            + "trait Extra {\n    #[forge]\n    fn extra(&self);\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("forge")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_use_that_renames_something_to_an_allowed_derive_name_is_reported() {
+        // Issue #186, finding 2: `#[derive(Clone)]` resolves whatever `Clone` names
+        // in scope, and a `use ... as Clone;` can rebind that name to an arbitrary
+        // macro. The scan cannot tell a safe rebind from an unsafe one, so it refuses
+        // the file outright rather than trust the name.
+        let source = tests_support::clean_effect_module() + "use core::fmt::Debug as Clone;\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("Clone")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_unrenamed_import_of_an_allowed_derive_name_is_reported() {
+        // Correctness review of issue #186's own fix: without a `use`, `Debug` in
+        // scope is the compiler's own derive. `use forge::Debug;` — no `as` — rebinds
+        // it to whatever `forge` exports exactly as a renamed import would, so it is
+        // reported too, not only the renamed case
+        // `a_use_that_renames_something_to_an_allowed_derive_name_is_reported` covers.
+        let source = tests_support::clean_effect_module() + "use core::fmt::Debug;\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("Debug")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_glob_import_that_could_shadow_an_allowed_derive_name_is_reported() {
+        // Adversarial review of issue #186's own fix: a glob import can bring an item
+        // named `Clone` into scope with no `use ... Clone` or `as Clone` for the
+        // rename scan to see. This scan cannot tell what a glob exports, so it fails
+        // closed the same way `trait_implementors`'s own `GLOB_IMPORT_MARKER` already
+        // does for a handwritten `impl` (issue #109).
+        let source = tests_support::clean_effect_module() + "use core::fmt::*;\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("Clone")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_import_naming_no_derive_is_not_reported() {
+        // The positive half of issue #186's second finding: an import that does not
+        // rebind one of the allowed derive names must stay legal, or the check is
+        // wider than the risk it closes.
+        let source = tests_support::clean_effect_module() + "use core::fmt::Debug as Formatter;\n";
+        let details = effect_details(&source);
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("attribute or derive")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_missing_effect_protocol_fails_closed() {
         let details: Vec<String> = check_effect_protocol(&[])
             .into_iter()
