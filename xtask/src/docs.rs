@@ -8610,6 +8610,76 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_the_furthest_block_of_an_adopted_formatting_element_closes_still_counts() {
+        // Codex, pull request #138, round 74, finding "Pop adopted formatting content
+        // when its block closes": round 73's fix correctly left a misnested formatting
+        // element's suppression open past its own stray end tag, but never closed it
+        // again — the real adoption-agency clone HTML5 builds is reparented as a new
+        // child of the "furthest block" (the outermost element opened between the
+        // formatting element and the point of misnesting), so it closes when *that*
+        // element does. `<b hidden><div>ignored</b></div>decision-id headline` has the
+        // clone's own hidden lifetime end at `</div>`, not run to end of document —
+        // leaving `top` on the tracked stack forever, as round 73's fix alone did,
+        // wrongly kept everything after `</div>` hidden too.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><div>ignored</b></div>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_non_breaking_space_in_a_nested_tag_name_stays_hidden() {
+        // Codex, pull request #138, round 74, finding "Use HTML whitespace when
+        // delimiting tag names": `markup_tag_name` used `char::is_whitespace`, which
+        // treats a non-breaking space (U+00A0) as whitespace, where HTML5's own
+        // tokenizer does not — a non-breaking space right after a tag name stays part
+        // of it. `<div><span\u{A0} hidden>ignored</span>decision-id
+        // headline</div>` has the real, hidden element's tag name as `span\u{A0}`, so
+        // the later, literal `</span>` never matches it — a browser leaves it open
+        // until the enclosing `</div>` closes both together. Reading the name with
+        // `char::is_whitespace` truncated it to plain `span`, which the literal
+        // `</span>` *does* match, wrongly ending suppression there and exposing the id
+        // and headline that follow. `span\u{A0}` itself is never recognized by
+        // `pulldown-cmark` as an HTML tag opener on its own — CommonMark's own
+        // tag-open grammar requires real ASCII whitespace in that position too — so
+        // this is nested inside a real, ASCII-only `<div>` block, reached the way this
+        // scanner's own internal tag search finds it within an already-open block
+        // rather than through a fresh per-tag `pulldown-cmark` event.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span\u{A0} hidden>ignored</span>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
     {
         // Codex, pull request #138, round 69, finding "Match integration points to

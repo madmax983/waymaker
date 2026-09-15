@@ -3434,12 +3434,30 @@ fn track_non_rendering_html(
                 // A *formatting* element's own end tag does not close it while
                 // something opened after it is still open (Codex, pull request
                 // #138, round 73, "Preserve hidden formatting after
-                // adoption-agency closes"), met here for a self-contained
-                // inline construct — see `next_non_rendering_marker`'s own twin
-                // fix for the reasoning. Left as a no-op: `top` stays on
-                // `stack`, and this construct's own markup is still consumed by
-                // the caller (the final `true` below), the same as any other
-                // closing tag that matches nothing this scan may act on.
+                // adoption-agency closes") — but the clone HTML5's adoption
+                // agency algorithm builds is not left open forever either
+                // (Codex, round 74, "Pop adopted formatting content when its
+                // block closes"): it is reparented as a new child of the
+                // "furthest block" — the outermost element opened between the
+                // formatting element and the point of misnesting — so closing
+                // *that* element closes the clone right along with it, the
+                // same way closing any other element closes whatever is
+                // nested inside it. `<b hidden><div>ignored</b></div>All 6
+                // recovery invariants` has the clone's own suppression end at
+                // `</div>`, not run to end of document.
+                //
+                // Modeled by promoting that outermost descendant to the
+                // tracked `top` in `b`'s place, with whatever was nested
+                // inside *it* carried over as its own descendants: the clone
+                // needs no separate representation, because from here on its
+                // hidden lifetime and the furthest block's are the same
+                // lifetime, and the furthest block is a plain element the
+                // unconditional-close branch above already knows how to pop
+                // on its own matching close, "div" included.
+                let furthest_block = descendants.remove(0);
+                if let Some(slot) = stack.last_mut() {
+                    *slot = furthest_block;
+                }
             } else if let Some(next_tag) = opens_any_tag(html) {
                 if implicitly_closed_by(&top, &next_tag) {
                     // Codex, pull request #138, round 48, "Honor implicit closes
@@ -3632,11 +3650,26 @@ const HTML_BLOCK_TAG_NAMES: &[&str] = &[
 
 /// The tag name an opening or closing tag span (`<div ...>` or `</div>`) names, without
 /// the angle brackets, slash or any attributes.
+///
+/// HTML5's own five-byte ASCII whitespace set, not [`char::is_whitespace`] (Codex, pull
+/// request #138, round 74, "Use HTML whitespace when delimiting tag names"): the
+/// tokenizer's "tag name state" only ends a name on tab, LF, FF, CR or space — a
+/// non-breaking space (U+00A0) is Unicode whitespace but not one of the five, so it
+/// stays *part of* the name. `<div\u{A0} hidden>` (the gap after `div` is a non-breaking
+/// space followed by a real one) therefore opens an element whose real tag name is
+/// `div\u{A0}`, which a later, literal `</div>` never matches — a browser leaves it
+/// open, and its content stays hidden until a `</div\u{A0}>` this scanner will almost
+/// certainly never see. Reading the name with `char::is_whitespace` stopped at the
+/// non-breaking space instead, truncating it to plain `div` — a name the later
+/// `</div>` *does* match, wrongly ending the hidden region and exposing the marker
+/// after it.
 fn markup_tag_name(span: &str) -> &str {
     let rest = span.strip_prefix('<').unwrap_or(span);
     let rest = rest.strip_prefix('/').unwrap_or(rest);
     let end = rest
-        .find(|character: char| character.is_whitespace() || character == '/' || character == '>')
+        .find(|character: char| {
+            is_html_whitespace(character) || character == '/' || character == '>'
+        })
         .unwrap_or(rest.len());
     &rest[..end]
 }
