@@ -3626,7 +3626,13 @@ it as redeliverable the same way could strand a run's only exit for ever. Wideni
 reserve a second time, for a kind whose own retry-safety turns out to depend on the relative
 sizes of a workflow's declared `Bounds` — `RunStarted`'s in particular, since
 `run_input_bytes` can dwarf everything else `Reserve::for_layout` prices — is what
-`redeliverable_kind`'s narrower scope avoids rather than chases. See
+`redeliverable_kind`'s narrower scope avoids rather than chases. A third finding on the same
+mechanism is filed rather than fixed here: `redelivery_slack` is unversioned across a
+firmware upgrade, since `Reserve` is recomputed fresh from `Bounds` on every boot and nothing
+about it is on media, so a schedule admitted by firmware that predates this fix carries no
+record of the weaker guarantee it left behind — see issue
+[#188](https://github.com/madmax983/waymaker/issues/188), filed rather than fixed because no
+device has ever run this firmware to make the scenario reachable today. See
 [ADR 0049](docs/adr/0049-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
 
 Issue #99 then closes the route Codex found on issue #32's fourth review round. A

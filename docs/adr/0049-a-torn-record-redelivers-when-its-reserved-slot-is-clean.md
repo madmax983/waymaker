@@ -197,6 +197,21 @@ for, or `waymaker-drive` falling back to `continue_as_new` on a `NearCapacity` r
 meets after redelivery — which is rung 0.4's dispatcher, the same standing as every other
 "nothing obliges a future dispatcher to..." limitation this codebase already records.
 
+`redelivery_slack` is also unversioned across a firmware upgrade, which Codex found as a
+third instance of this same shape and which this ADR does not attempt to close. `Reserve` is
+recomputed fresh from `Bounds` and `BankLayout` on every boot — nothing about it is on media —
+so a schedule admitted by firmware that predates this fix leaves only the *old*, weaker
+guarantee behind it. Firmware containing this fix, booting later, has no way to tell that
+apart from a schedule its own formula admitted: `Recovery` and `Scan` decode bytes and a seal,
+never a reserve, and `recovery-surface` pins that surface deliberately narrow. If such a
+schedule's outcome then tears, the same stranding this ADR closes for a single firmware
+version can reopen across two. Nothing in this repository has ever run on a board, so no
+device exists today whose journal a pre-#95 firmware wrote — filed as issue
+[#188](https://github.com/madmax983/waymaker/issues/188) rather than fixed here, because
+closing it needs either a wire-format change recording what an admission-time reserve
+guaranteed, or `Recovery` gaining a dependency on `Reserve` it does not have today — new
+infrastructure, not a term this ADR's arithmetic is missing.
+
 ## Alternatives considered
 
 **Carry the outstanding `(RunId, EffectSeq)` into the next run's header, and let
