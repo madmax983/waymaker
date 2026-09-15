@@ -13814,7 +13814,7 @@ pub enum UnresolvedArmCause {
     /// them — so that `pattern_literal` resolving no value from it is not evidence the
     /// arm is *not* part of a table, the identical standing [`Self::GuardCall`] already
     /// has for a guard equality this scan cannot evaluate. See
-    /// [`pattern_has_ambiguous_discriminating_fields`].
+    /// `pattern_has_ambiguous_discriminating_fields`.
     AmbiguousFields,
 }
 
