@@ -5872,5 +5872,36 @@ can find still counts every real construction.
 `a_super_qualified_alias_target_reached_through_nested_module_descent_still_counts`
 and its control,
 `a_super_qualified_alias_target_reached_through_nested_module_descent_that_resolves_elsewhere_does_not_count`,
-are the regression. No new ADR: nothing here moves a must-not-own cell, a dependency
-edge, or a rule id.
+are the regression.
+
+A further round found a twelfth, and it is a different class from every one before it:
+not a missing branch under an unevaluated `cfg`, but a block-local alias's own target
+resolved against the wrong scope entirely. A block-local `use good as traits;` declared
+in an outer block, referenced from a nested inner block that later redeclares its own,
+unrelated `mod good`, still names the *outer* `good` — confirmed against real `rustc`,
+twice: once at crate scope and once at block scope, both printing the outer binding's
+own marker. `block_items` had always been one flat, growing list — every enclosing
+block's own items concatenated, with no record of which block declared which item — so
+resolving an alias's own target reused the same flat list the *reference* site sees,
+letting a block nested more deeply than the alias's own declaration shadow a name the
+alias itself could never have resolved to. `resolve_local_alias_chain` (the
+deterministic resolver) carried the identical bug, for the identical reason: both
+functions treated every enclosing block as one merged scope rather than a stack of
+separate ones, so the combined `resolved_elsewhere || path_could_reach_target(..)`
+this search's own answer is `or`ed into missed the real construction either way — not
+the narrower "the backstop lags the deterministic resolver" standing this family's own
+docs excuse elsewhere, but a shared defect in the actual gate.
+`block_items` is now a stack, `&[Vec<&'a syn::Item>]`, one entry per enclosing block
+rather than one flattened list, threaded through both resolvers. `live_block_declarations`
+pairs each live declaration with the depth it was found at, and both
+`resolve_local_alias_chain` and `try_block_local_candidates` narrow the stack to
+`blocks[..=depth]` before resolving that declaration's own target on the next hop —
+bounding a further lookup to the declaration's own scope and everything enclosing it,
+never a block only the reference site could see.
+`a_block_local_alias_target_resolves_at_its_own_declaration_block_despite_a_later_shadow`
+and its control,
+`a_block_local_alias_target_shadowed_at_its_own_declaration_block_does_not_count`, are
+the regression — both RED against the pre-fix code, in opposite directions (a missed
+count and an over-count), confirming the flat list got both scenarios wrong rather than
+merely one. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.

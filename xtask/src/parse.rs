@@ -781,7 +781,7 @@ pub fn generic_assoc_type_bindings_naming(
         // resolve through, and the block-local `use`/`type` aliases visible at the current
         // point — a binding's value is exactly as aliasable as a struct literal's path.
         stack: Vec<&'ast [syn::Item]>,
-        block_items: Vec<&'ast syn::Item>,
+        block_items: Vec<Vec<&'ast syn::Item>>,
         // Generic type-parameter names in scope at the current point (issue #181), same
         // shape as `struct_literal_counts`'s own `Literals`.
         shadow: Vec<String>,
@@ -837,10 +837,9 @@ pub fn generic_assoc_type_bindings_naming(
                     _ => None,
                 })
                 .collect();
-            let pushed = own_items.len();
-            self.block_items.extend(own_items);
+            self.block_items.push(own_items);
             syn::visit::visit_block(self, node);
-            self.block_items.truncate(self.block_items.len() - pushed);
+            self.block_items.pop();
         }
 
         // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
@@ -883,14 +882,16 @@ pub fn generic_assoc_type_bindings_naming(
     Ok(visitor.found)
 }
 
-/// The `use` and `type` aliases `block` declares directly in its own statements — not in a
-/// nested block, which gets its own scope when [`struct_literal_counts`]'s visitor reaches it.
-/// Chases `name` through the `use`/`type` aliases declared directly in `items` — the
-/// function-local declarations of every block enclosing the point a lookup started from
-/// (issue #92, Codex's fifth round), accumulated flat rather than as separate per-block
-/// scopes, since a block inherits its enclosing scope's aliases in real Rust where a module
-/// does not (issue #109 review). Searched from the end, so a more deeply nested block's own
-/// declaration shadows a same-named one further out.
+/// Chases `name` through the `use`/`type` aliases declared directly in `blocks` — one entry
+/// per block enclosing the point a lookup started from, outermost first (issue #92, Codex's
+/// fifth round; issue #109 review: a block inherits its enclosing scope's aliases in real
+/// Rust where a module does not, so every enclosing block's own declarations are searched,
+/// innermost first). Kept as a stack of separate per-block scopes rather than one flattened
+/// list (issue #197, Codex review of the PR): resolving a chained hop has to stay within the
+/// block that declared the alias just followed, or a block nested more deeply than that
+/// declaration — visible only because the *lookup* started further in, not because the alias
+/// itself could ever have seen it — could shadow the alias's own target with an unrelated,
+/// later declaration real Rust never lets it reach.
 ///
 /// Scoped to a block's own item declarations only: a `mod` block declared inside a function
 /// body is not descended into by name the way [`resolve_segments`] does for a file's own
@@ -904,28 +905,55 @@ pub fn generic_assoc_type_bindings_naming(
 /// caller used to treat a block-local chain's leftover head as final rather than feeding it
 /// on to the module resolver, so `type Inner = Outer;` beside a module-level
 /// `type Outer = Foo;` left `Inner {}` resolved only as far as `Outer`).
-fn resolve_local_alias_chain(items: &[&syn::Item], name: &str) -> Option<(Vec<String>, bool)> {
-    // `own_aliases`, not `collect_item_aliases`: a block's own declarations are exactly
-    // one scope, the same as a module's, and reading through a `mod` nested in this block
-    // would let that inner module's private alias shadow the outer, real one (Codex
-    // review) — a bare `S {}` outside `mod hidden { type S = Other; }` still means
-    // whatever `S` resolves to in the enclosing block, never `hidden`'s own.
-    let aliases = own_aliases(items.iter().copied());
+fn resolve_local_alias_chain(
+    blocks: &[Vec<&syn::Item>],
+    name: &str,
+) -> Option<(Vec<String>, bool)> {
     let mut segments = vec![name.to_owned()];
     let mut resolved_any = false;
     let mut absolute = false;
-    let bound = aliases.len().saturating_add(1);
+    // How much of `blocks` a further hop may still search: starts at every
+    // enclosing block, and narrows to the block that declared the alias just
+    // followed (inclusive) before the next hop runs. A block nested more
+    // deeply than an alias's own declaration is not part of the scope that
+    // alias's own right-hand side was resolved in, whatever block the lookup
+    // that reached the alias started from (issue #197, Codex review of the
+    // PR: a block-local alias declared in an outer block, referenced from a
+    // nested inner block that shadows the alias's own target name, still
+    // resolved through the inner block's shadow — confirmed against real
+    // `rustc` that the alias's target is fixed at the alias's own scope).
+    let mut visible = blocks.len();
+    let bound = blocks.iter().map(Vec::len).sum::<usize>().saturating_add(1);
     for _ in 0..=bound {
         let Some(first) = segments.first().cloned() else {
             break;
         };
-        let Some(alias) = aliases
+        // Innermost visible block first, and within one block the
+        // last-declared match, matching this function's own prior flat,
+        // reverse-order search exactly — `own_aliases`, not
+        // `collect_item_aliases`: a block's own declarations are exactly one
+        // scope, the same as a module's, and reading through a `mod` nested
+        // in this block would let that inner module's private alias shadow
+        // the outer, real one (Codex review) — a bare `S {}` outside `mod
+        // hidden { type S = Other; }` still means whatever `S` resolves to
+        // in the enclosing block, never `hidden`'s own.
+        let Some((depth, alias)) = blocks
+            .get(..visible)
+            .unwrap_or(blocks)
             .iter()
+            .enumerate()
             .rev()
-            .find(|candidate| candidate.local == first)
+            .find_map(|(depth, items)| {
+                own_aliases(items.iter().copied())
+                    .into_iter()
+                    .rev()
+                    .find(|candidate| candidate.local == first)
+                    .map(|alias| (depth, alias))
+            })
         else {
             break;
         };
+        visible = depth + 1;
         let mut resolved = alias.target.clone();
         resolved.extend(segments.drain(1..));
         segments = resolved;
@@ -3982,7 +4010,7 @@ fn resolve_impl_trait_path(
         };
     };
     let scope_refs: Vec<&syn::Item> = scope.iter().collect();
-    if let Some((mut resolved, absolute)) = resolve_local_alias_chain(&scope_refs, &first) {
+    if let Some((mut resolved, absolute)) = resolve_local_alias_chain(&[scope_refs], &first) {
         resolved.extend(segments.into_iter().skip(1));
         // Real Rust resolves a `use` item's own right-hand side the same way any
         // path is resolved: a local item first, the extern prelude only once none
@@ -4650,11 +4678,13 @@ pub struct LiteralCounts {
 // file's own line-count lint (`clippy::too_many_lines`). Its behavior did not change.
 struct Literals<'ast> {
     stack: Vec<&'ast [syn::Item]>,
-    // The function-local `use`/`type` aliases of every block enclosing the current
-    // point, flat and cumulative rather than a stack of separate scopes — a block
-    // inherits its enclosing scope's aliases in real Rust, unlike a module (issue #92,
-    // Codex's fifth round; issue #109 review).
-    block_items: Vec<&'ast syn::Item>,
+    // A stack of the function-local items of every block enclosing the current
+    // point, outermost first — one entry per block rather than one flat list
+    // (issue #197, Codex review of the PR), so a further hop resolving a
+    // block-local alias's own target can be restricted to that alias's own
+    // declaration block and everything enclosing it, never a block nested more
+    // deeply that only the *lookup's* own starting point could see.
+    block_items: Vec<Vec<&'ast syn::Item>>,
     // Generic type-parameter names in scope at the current point (issue
     // #181), same shape as `block_items`: pushed on entering a
     // generics-bearing item, truncated back off on the way out.
@@ -4726,12 +4756,15 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         // A function-local `use` or `type` alias is visible only inside the block
         // that declares it, and inherited by anything nested within it (issue #92,
         // Codex's fifth round) — unlike a module, which never inherits an outer
-        // scope's aliases just by being written inside it. `block_items` therefore
-        // stays one flat, growing list: this block's own item declarations are
-        // appended so they are searched first (and so shadow a same-named one
-        // further out — see `resolve_local_alias_chain`), and exactly that many are
-        // truncated back off on the way out, restoring the parent's view for a
-        // sibling block.
+        // scope's aliases just by being written inside it. `block_items` is a
+        // stack, one entry per block: this block's own item declarations are
+        // pushed as their own entry, searched innermost first (see
+        // `resolve_local_alias_chain` and `live_block_declarations`), and popped
+        // back off on the way out, restoring the parent's view for a sibling
+        // block — kept a stack of separate scopes rather than one flattened list
+        // so a further hop resolving one alias's own target can be bounded to
+        // that alias's own declaration block (issue #197, Codex review of the
+        // PR).
         let own_items: Vec<&'ast syn::Item> = node
             .stmts
             .iter()
@@ -4740,10 +4773,9 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
                 _ => None,
             })
             .collect();
-        let pushed = own_items.len();
-        self.block_items.extend(own_items);
+        self.block_items.push(own_items);
         syn::visit::visit_block(self, node);
-        self.block_items.truncate(self.block_items.len() - pushed);
+        self.block_items.pop();
     }
 
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
@@ -4985,7 +5017,7 @@ impl<'a> AliasLookupCache<'a> {
 fn path_could_reach_target<'a>(
     path: &syn::Path,
     stack: &[&'a [syn::Item]],
-    block_items: &[&'a syn::Item],
+    block_items: &[Vec<&'a syn::Item>],
     shadow: &[String],
     target: &str,
     budget: usize,
@@ -5147,7 +5179,7 @@ fn try_alias_candidates<'a>(
     stack: &[&'a [syn::Item]],
     scope: usize,
     entered: &[&'a [syn::Item]],
-    block_items: &[&'a syn::Item],
+    block_items: &[Vec<&'a syn::Item>],
     innermost_scope: usize,
     next_block_eligible: bool,
     target: &str,
@@ -5209,10 +5241,25 @@ fn try_alias_candidates<'a>(
     false
 }
 
+/// One live block-local declaration of a name — an item, paired with the
+/// depth (an index into a `block_items` stack) of the block that declares
+/// it. The depth is what a further hop resolving *this declaration's own
+/// target* has to be bounded to (issue #197, Codex review of the PR): a
+/// block nested more deeply than the declaration itself is not part of the
+/// scope its own right-hand side was resolved in, whatever block the
+/// lookup that reached it started from — confirmed against real `rustc`
+/// that a block-local alias's own target is fixed at the alias's own
+/// declaration point, never re-resolved against a shadow only the
+/// reference site could see.
+struct LiveDeclaration<'a> {
+    depth: usize,
+    item: &'a syn::Item,
+}
+
 /// The `use`/`type` alias and `mod` declarations of `first` in `block_items`
 /// that are actually live from the construction site this search started
-/// from — searched innermost to outermost (`block_items`' own append order
-/// is outer-to-inner, so this reads it in reverse) and stopping at, and
+/// from — searched innermost block to outermost, and within one block in
+/// declaration order (`own_aliases`' own tie-break) — and stopping at, and
 /// including, the first declaration that is *unconditional*: no
 /// `#[cfg(..)]` of its own at all.
 ///
@@ -5237,86 +5284,44 @@ fn try_alias_candidates<'a>(
 /// when the walk exhausts `block_items` without ever finding an
 /// unconditional declaration.
 fn live_block_declarations<'a>(
-    block_items: &[&'a syn::Item],
+    block_items: &[Vec<&'a syn::Item>],
     first: &str,
-) -> (Vec<&'a syn::Item>, bool) {
+) -> (Vec<LiveDeclaration<'a>>, bool) {
     let mut live = Vec::new();
-    for item in block_items.iter().rev() {
-        if has_cfg_test(item_attrs(item)) {
-            continue;
-        }
-        let names_first = match item {
-            syn::Item::Mod(module) => ident_name(&module.ident) == first,
-            _ => own_aliases(core::iter::once(*item))
-                .iter()
-                .any(|alias| alias.local == first),
-        };
-        if !names_first {
-            continue;
-        }
-        live.push(*item);
-        if !has_any_cfg(item_attrs(item)) {
-            return (live, false);
+    for (depth, items) in block_items.iter().enumerate().rev() {
+        for &item in items.iter().rev() {
+            if has_cfg_test(item_attrs(item)) {
+                continue;
+            }
+            let names_first = match item {
+                syn::Item::Mod(module) => ident_name(&module.ident) == first,
+                _ => own_aliases(core::iter::once(item))
+                    .iter()
+                    .any(|alias| alias.local == first),
+            };
+            if !names_first {
+                continue;
+            }
+            live.push(LiveDeclaration { depth, item });
+            if !has_any_cfg(item_attrs(item)) {
+                return (live, false);
+            }
         }
     }
     (live, true)
 }
 
-/// [`segments_could_reach_target`]'s block-local module search — split out to
-/// stay under this file's own line-count lint. `None` when no live
-/// declaration in `live_items` is a module named `first`, so the caller can
-/// tell "nothing claimed this name" apart from "something claimed it and
-/// none of the branches reached `target`" — the same distinction
-/// [`try_alias_candidates`]'s own empty candidate list already lets a
-/// caller read from `resolved_elsewhere`. `block_items` — the full,
-/// unrestricted list — is threaded through to the recursive call
-/// unchanged: [`live_block_declarations`]'s own shadowing answer is about
-/// `first` alone, and a further hop resolves its own, different name
-/// against the whole scope again.
-#[allow(clippy::too_many_arguments)]
-fn try_block_module_candidates<'a>(
-    live_items: &[&'a syn::Item],
-    block_items: &[&'a syn::Item],
-    first: &str,
-    remaining: &[String],
-    stack: &[&'a [syn::Item]],
-    scope: usize,
-    innermost_scope: usize,
-    target: &str,
-    budget: &mut usize,
-    cache: &mut AliasLookupCache<'a>,
-) -> Option<bool> {
-    let block_modules: Vec<&'a [syn::Item]> = own_modules(live_items.iter().copied())
-        .into_iter()
-        .filter(|(name, _)| name == first)
-        .map(|(_, module_items)| module_items)
-        .collect();
-    if block_modules.is_empty() {
-        return None;
-    }
-    Some(block_modules.into_iter().any(|module_items| {
-        segments_could_reach_target(
-            remaining.to_vec(),
-            stack,
-            scope,
-            &[module_items],
-            block_items,
-            innermost_scope,
-            false,
-            false,
-            target,
-            budget,
-            cache,
-        )
-    }))
-}
-
 /// [`segments_could_reach_target`]'s own block-local search — split out to
-/// stay under this file's own line-count lint. Tries a block-local alias
-/// named `first` among `live_items`, then — since neither rules the other
-/// out under an unevaluated `cfg` — a block-local `mod` of the same name
-/// among `live_items` too. `live_items` is [`live_block_declarations`]'s
-/// own shadowing-aware subset, never the full `block_items` list.
+/// stay under this file's own line-count lint. Tries, for each of
+/// [`live_block_declarations`]'s own live entries, a block-local alias
+/// named `first` and — since neither rules the other out under an
+/// unevaluated `cfg` — a block-local `mod` of the same name.
+///
+/// Each declaration's own recursive resolution is bounded to
+/// `&block_items[..=declaration.depth]`, never the full stack: a further
+/// hop resolving that declaration's own target must not see a block
+/// nested more deeply than the declaration itself — see
+/// [`LiveDeclaration`]'s own docs.
 ///
 /// `Some(true)` once either reaches `target`; `Some(false)` when at least
 /// one candidate of either kind exists but none reaches it, so the caller
@@ -5326,8 +5331,8 @@ fn try_block_module_candidates<'a>(
 /// [`segments_could_reach_target`]'s own docs.
 #[allow(clippy::too_many_arguments)]
 fn try_block_local_candidates<'a>(
-    live_items: &[&'a syn::Item],
-    block_items: &[&'a syn::Item],
+    live_items: &[LiveDeclaration<'a>],
+    block_items: &[Vec<&'a syn::Item>],
     first: &str,
     rest: &[String],
     stack: &[&'a [syn::Item]],
@@ -5339,50 +5344,63 @@ fn try_block_local_candidates<'a>(
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
 ) -> Option<bool> {
-    let block_candidates: Vec<UseAlias> = own_aliases(live_items.iter().copied())
-        .into_iter()
-        .filter(|candidate| candidate.local == first)
-        .collect();
-    let mut claimed = !block_candidates.is_empty();
-    if try_alias_candidates(
-        block_candidates,
-        rest,
-        stack,
-        scope,
-        entered,
-        block_items,
-        innermost_scope,
-        block_eligible,
-        target,
-        budget,
-        cache,
-    ) {
-        return Some(true);
-    }
-    // A `mod` declared directly inside a function body is legal Rust,
-    // qualifiable from within that same body — confirmed against real
-    // `rustc` — and visible only here, the same reach a block-local alias
-    // has (issue #197, Codex review of the PR: module descent read only
-    // the enclosing scope's own items, so a block-local `mod` was invisible
-    // to it even though a block-local alias of the same name was already
-    // tried). A one-segment path names an item, not a module to step into.
-    if !rest.is_empty() {
-        if let Some(reached) = try_block_module_candidates(
-            live_items,
-            block_items,
-            first,
-            rest,
+    let mut claimed = false;
+    for declaration in live_items {
+        let own_scope = block_items.get(..=declaration.depth).unwrap_or(block_items);
+        let alias_candidates: Vec<UseAlias> = own_aliases(core::iter::once(declaration.item))
+            .into_iter()
+            .filter(|candidate| candidate.local == first)
+            .collect();
+        if !alias_candidates.is_empty() {
+            claimed = true;
+            if try_alias_candidates(
+                alias_candidates,
+                rest,
+                stack,
+                scope,
+                entered,
+                own_scope,
+                innermost_scope,
+                block_eligible,
+                target,
+                budget,
+                cache,
+            ) {
+                return Some(true);
+            }
+        }
+        // A `mod` declared directly inside a function body is legal Rust,
+        // qualifiable from within that same body — confirmed against real
+        // `rustc` — and visible only here, the same reach a block-local
+        // alias has (issue #197, Codex review of the PR: module descent
+        // read only the enclosing scope's own items, so a block-local
+        // `mod` was invisible to it even though a block-local alias of the
+        // same name was already tried). A one-segment path names an item,
+        // not a module to step into.
+        if rest.is_empty() {
+            continue;
+        }
+        let Some((_, module_items)) = own_modules(core::iter::once(declaration.item))
+            .into_iter()
+            .find(|(name, _)| name == first)
+        else {
+            continue;
+        };
+        claimed = true;
+        if segments_could_reach_target(
+            rest.to_vec(),
             stack,
             scope,
+            &[module_items],
+            own_scope,
             innermost_scope,
+            false,
+            false,
             target,
             budget,
             cache,
         ) {
-            claimed = true;
-            if reached {
-                return Some(true);
-            }
+            return Some(true);
         }
     }
     claimed.then_some(false)
@@ -5394,7 +5412,7 @@ fn segments_could_reach_target<'a>(
     stack: &[&'a [syn::Item]],
     mut scope: usize,
     entered: &[&'a [syn::Item]],
-    block_items: &[&'a syn::Item],
+    block_items: &[Vec<&'a syn::Item>],
     innermost_scope: usize,
     block_eligible: bool,
     shadowed: bool,
@@ -5546,7 +5564,7 @@ fn try_module_scope_candidates<'a>(
     stack: &[&'a [syn::Item]],
     scope: usize,
     entered: &[&'a [syn::Item]],
-    block_items: &[&'a syn::Item],
+    block_items: &[Vec<&'a syn::Item>],
     innermost_scope: usize,
     target: &str,
     budget: &mut usize,
@@ -15718,6 +15736,71 @@ mod cfg_alias_ambiguity_tests {
              type Unchecked = a::b::Marker;\n\
              fn forge() -> u8 {\n\
              \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_target_resolves_at_its_own_declaration_block_despite_a_later_shadow() {
+        // Codex review of PR #204: a block-local `use good as traits;` is
+        // declared in an outer block, and a nested inner block later
+        // re-declares its own, unrelated `mod good` before referencing
+        // `traits::Marker`. Confirmed against real `rustc`: `traits` was
+        // already bound to the *outer* `good` the moment the `use` was
+        // elaborated, so the reference inside the inner block still reaches
+        // the outer `good::Marker` — the inner block's own shadow is
+        // invisible to an alias declared before it existed, exactly as a
+        // module never inherits an outer scope's aliases in the other
+        // direction. The search used to resolve an alias's own target
+        // through the full, ambient block stack visible at the *reference*
+        // site rather than the stack visible at the alias's own declaration,
+        // so it followed the inner block's shadowing `good` instead.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   mod good {\n\
+             \x20       pub type Marker = CheckedDispatch;\n\
+             \x20   }\n\
+             \x20   use good as traits;\n\
+             \x20   {\n\
+             \x20       mod good {\n\
+             \x20           pub type Marker = Decoy;\n\
+             \x20       }\n\
+             \x20       let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_target_shadowed_at_its_own_declaration_block_does_not_count() {
+        // The control for the test above: with the *outer* `good::Marker`
+        // aliasing `Decoy` instead, the identical shape still resolves
+        // `traits::Marker` to the outer `good` — never the inner block's
+        // own `CheckedDispatch` — so it must not count. Closing the gap
+        // above must not turn into an over-count of every block-local
+        // alias regardless of which block it was really declared in.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   mod good {\n\
+             \x20       pub type Marker = Decoy;\n\
+             \x20   }\n\
+             \x20   use good as traits;\n\
+             \x20   {\n\
+             \x20       mod good {\n\
+             \x20           pub type Marker = CheckedDispatch;\n\
+             \x20       }\n\
+             \x20       let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   }\n\
              \x20   0\n\
              }",
             "CheckedDispatch",
