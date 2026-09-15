@@ -58,19 +58,62 @@ fn path_is_ident(path: &syn::Path, name: &str) -> bool {
     path.get_ident().is_some_and(|ident| ident_is(ident, name))
 }
 
-/// Whether `attrs` carries exactly `#[cfg(test)]`.
+/// Whether `attrs` carries a `#[cfg(..)]` that is guaranteed false whenever `test` is —
+/// the bare `#[cfg(test)]`, or a compound predicate built from it.
 ///
-/// The textual `without_test_modules` blanked on the substring `#[cfg(test)]`; the
-/// structural equivalent matches the attribute: path `cfg` with the single identifier
-/// `test` as its argument. `#[cfg(any(test, ...))]` is not the exact spelling and is not
-/// skipped — the textual version did not blank on it either.
+/// The textual `without_test_modules` blanked on the substring `#[cfg(test)]` alone, and
+/// this function used to match only that exact shape — `path_is_ident(attr.path(),
+/// "cfg")` with a bare `test` identifier as its whole argument, so `#[cfg(any(test))]`
+/// and `#[cfg(all(test, feature = "x"))]` fell through `parse_args::<syn::Ident>()`
+/// unparsed and answered `false`.
+///
+/// Found by Codex review of this change (PR #143), round 35: both compounds are exactly
+/// as test-only as the bare form — an `all(..)` naming `test` among its conjuncts can
+/// never hold without it, whatever else it also asks for, and an `any(..)` every one of
+/// whose branches is itself guaranteed test-only can only be satisfied under test — so a
+/// reached file gated with either spelling was still walked as production-reachable.
+/// [`meta_requires_test`] is the recursive predicate; `#[cfg(any(test, other))]` is
+/// deliberately *not* recognized, and must not be, because it is satisfiable under
+/// `other` alone — treating it as test-only would hide production-reachable code from
+/// every rule that reads this function's answer as "unreachable in a shipped build".
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         path_is_ident(attr.path(), "cfg")
             && attr
-                .parse_args::<syn::Ident>()
-                .is_ok_and(|ident| ident_is(&ident, "test"))
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|meta| meta_requires_test(&meta))
     })
+}
+
+/// [`has_cfg_test`]'s recursive half, over one `cfg` predicate rather than a whole
+/// attribute list.
+///
+/// A bare `test` is the base case. `all(..)` is true only when every one of its
+/// conjuncts is, so naming a predicate this function already recognizes as test-only
+/// anywhere in the list makes the whole `all(..)` test-only too, whatever the other
+/// conjuncts are. `any(..)` is true when at least one of its disjuncts is, so it is
+/// test-only only when *every* disjunct is — one branch this function cannot vouch for
+/// (a bare `feature = ".."`, a `not(..)`, or anything else) is a branch that can fire
+/// without `test`, and an empty `any()` is never true at all so it is not test-only
+/// either. Anything else — `not(..)` included, since a `not` making its argument require
+/// `test` does not make the negation require it — is read as unable to prove, matching
+/// this scan's own rule that guessing is how a broken input talks a check out of
+/// testing it.
+fn meta_requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path_is_ident(path, "test"),
+        syn::Meta::List(list) if path_is_ident(&list.path, "all") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|metas| metas.iter().any(meta_requires_test)),
+        syn::Meta::List(list) if path_is_ident(&list.path, "any") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|metas| !metas.is_empty() && metas.iter().all(meta_requires_test)),
+        _ => false,
+    }
 }
 
 /// The attributes on an item, whatever kind of item it is.
@@ -2233,8 +2276,26 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         // fully-specified expansion that never emits a freestanding item — a promise a
         // third-party or local `macro_rules!` invocation cannot make — so only a
         // macro that is not one of them fails closed.
+        //
+        // Round 35: naming a safe macro is not the same as vouching for its
+        // *arguments* — `syn` never parses a macro invocation's own tokens into
+        // structured syntax, they are an opaque `TokenStream`, and `#[allow(
+        // non_local_definitions)] const _: () = assert!({ impl Clone for
+        // super::Recovery { .. } true });` puts a real, globally-applying `impl`
+        // inside `assert!`'s own condition — a block is still a block whichever
+        // macro's arguments it sits inside, and this visitor never reaches inside one
+        // to see it. Reparsing every whitelisted macro's own grammar is not this
+        // module's to do — `assert!`, `matches!` and `write!` each take a different
+        // shape of arguments, one of them a pattern rather than an expression at all
+        // — so instead of trying, [`token_stream_contains_a_brace_group`] refuses the
+        // one thing every one of them shares: only a brace-delimited group can open a
+        // block, and only a block can carry an item statement, so a whitelisted
+        // macro's own tokens are trusted only when they carry no brace group at all,
+        // at any depth.
         fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
-            if !is_known_safe_expression_macro(&node.mac.path) {
+            if !is_known_safe_expression_macro(&node.mac.path)
+                || token_stream_contains_a_brace_group(node.mac.tokens.clone())
+            {
                 self.found = true;
             }
         }
@@ -2413,6 +2474,27 @@ fn is_known_safe_expression_macro(path: &syn::Path) -> bool {
     ];
     path.get_ident()
         .is_some_and(|ident| KNOWN_MACROS.contains(&ident_name(ident).as_str()))
+}
+
+/// Whether `tokens` contains a brace-delimited group anywhere, at any depth.
+///
+/// A macro invocation's own arguments are an opaque [`proc_macro2::TokenStream`] to
+/// `syn`'s visitor — it is never parsed into structured syntax the way an item, a
+/// statement or an ordinary expression is — so this is the one thing this module can
+/// still check about a whitelisted expression macro's own tokens without reparsing each
+/// macro's own grammar: only a `{ .. }` group can open a block, and only a block can
+/// carry an item statement, so tokens with no brace group anywhere cannot hide one.
+/// Round 35 of Codex review on this change (PR #143).
+fn token_stream_contains_a_brace_group(tokens: proc_macro2::TokenStream) -> bool {
+    tokens.into_iter().any(|tree| match tree {
+        proc_macro2::TokenTree::Group(group) => {
+            group.delimiter() == proc_macro2::Delimiter::Brace
+                || token_stream_contains_a_brace_group(group.stream())
+        }
+        proc_macro2::TokenTree::Ident(_)
+        | proc_macro2::TokenTree::Punct(_)
+        | proc_macro2::TokenTree::Literal(_) => false,
+    })
 }
 
 /// Whether `attrs` carries an `#[cfg(..)]` at all, whatever its condition, including one

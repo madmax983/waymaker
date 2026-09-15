@@ -4043,6 +4043,40 @@ root and `recovery` module and built, with `check-layering` catching both before
 injection was reverted — no external dependency was needed for either, unlike round
 33's two macro findings.
 
+Round 35 found two more, both against the fixes round 33 had just landed rather than
+against the alias-resolution machinery rounds 32 and 34 touched. The first is in
+`has_cfg_test` itself: it matched only the bare `#[cfg(test)]` spelling, so
+`#![cfg(any(test))]` and `#![cfg(all(test, feature = "x"))]` — both guaranteed false
+whenever `test` is, exactly as test-only as the bare form — fell through
+`parse_args::<syn::Ident>()` unparsed and answered `false`, leaving a file gated either
+way still walked as production-reachable. A new `meta_requires_test` recognizes both
+compounds recursively — an `all(..)` naming `test` among its conjuncts can never hold
+without it, and an `any(..)` every one of whose branches is itself test-only can only be
+satisfied under test — while deliberately leaving `#[cfg(any(test, other))]` alone,
+since it is satisfiable under `other` with no test anywhere and treating it as test-only
+would hide production-reachable code from every one of `has_cfg_test`'s 72 call sites,
+not only `recovery-surface`'s. The second is the gap round 33's own `visit_expr_macro`
+left in place while closing the position it was written for: naming a macro as safe
+vouches for nothing about its *arguments*, which `syn` never parses into structured
+syntax at all — they are an opaque token stream — so `#[allow(non_local_definitions)]
+const _: () = assert!({ impl Clone for super::Recovery { .. } true });` puts a real,
+globally-applying `impl` inside `assert!`'s own condition, invisible to a visitor that
+only ever asked whether the macro's *name* was one of the roughly thirty it trusts. A
+new `token_stream_contains_a_brace_group` refuses the one thing every whitelisted
+macro's grammar shares rather than reparsing each one's own — `assert!`, `matches!` and
+`write!` each take a different shape, one of them a pattern rather than an expression at
+all — since only a brace-delimited group can open a block and only a block can carry an
+item statement, so a whitelisted macro's tokens are trusted only when they carry no
+brace group anywhere, at any depth. Both were verified against real compilation: the
+`any`/`all` compounds were each injected as a genuinely test-gated child file into
+`waymaker-flash`'s own `recovery` module, built under both a production and a `cfg(test)`
+configuration to confirm the impl really exists only under the second and that
+`check-layering` correctly reports nothing for either — a negative result being the
+point, since a false accusation of a legitimate test-only impl is exactly what round 33
+introduced and this closes; and the `assert!`-hidden impl was injected unconditionally,
+confirmed to compile in a plain production build, and confirmed caught by
+`check-layering` before the injection was reverted.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

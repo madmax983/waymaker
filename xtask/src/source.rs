@@ -13506,6 +13506,134 @@ mod tests {
     }
 
     #[test]
+    fn a_brace_group_hidden_inside_a_known_safe_macros_own_arguments_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 35: naming a safe
+        // macro is not the same as vouching for its own arguments. `syn` never parses
+        // a macro invocation's tokens into structured syntax — they are an opaque
+        // token stream — so `#[allow(non_local_definitions)] const _: () =
+        // assert!({ impl Clone for super::Recovery { .. } true });` puts a real,
+        // globally-applying `impl` inside `assert!`'s own condition, and round 33's
+        // fix, having recognized `assert!` as safe, never looked inside its arguments
+        // at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#[allow(non_local_definitions)]\n",
+                "const _: () = assert!({\n",
+                "    impl Clone for super::Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            super::Recovery\n",
+                "        }\n",
+                "    }\n",
+                "    true\n",
+                "});\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_file_gated_with_a_compound_any_test_cfg_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 35: `#![cfg(any(test))]`
+        // is exactly as test-only as the bare `#![cfg(test)]` round 33 already
+        // recognized — `any(..)` with a single branch that is itself test-only can only
+        // be satisfied under test — but `has_cfg_test`'s old `parse_args::<syn::Ident>()`
+        // parse failed on anything but a bare identifier and silently answered `false`,
+        // so this spelling was still walked as production-reachable.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(any(test))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_file_gated_with_a_compound_all_test_cfg_is_not_read_as_production_reachable() {
+        // Found by Codex review of this change (PR #143), round 35, the other half of
+        // the same finding: `#![cfg(all(test, debug_assertions))]` can never hold
+        // without `test`, whatever its other conjunct asks for, so it is exactly as
+        // test-only as the bare form too.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(all(test, debug_assertions))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_file_gated_with_an_any_cfg_satisfiable_without_test_is_still_production_reachable() {
+        // The negative case: `#![cfg(any(test, feature = "x"))]` is satisfiable under
+        // `feature = "x"` alone, with no test anywhere, so it must stay
+        // production-reachable — round 35's widening recognizes only a predicate that
+        // is *guaranteed* false whenever `test` is, and treating this one as test-only
+        // would hide production-reachable code from every rule that reads
+        // `has_cfg_test`'s answer as "unreachable in a shipped build".
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "#![cfg(any(test, feature = \"x\"))]\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
     fn an_absolute_path_aliased_to_a_trait_in_the_same_file_is_rejected() {
         // Found by Codex review of this change (PR #143), round 34: `impl ::dep::C for
         // Recovery { .. }` is legal Rust — an absolute path reaches the extern prelude,
