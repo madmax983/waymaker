@@ -1556,6 +1556,28 @@ fn is_html_integration_point(span: &str, name: &str) -> bool {
     }
 }
 
+/// Whether `name` is one of the two integration points [`is_html_integration_point`]
+/// recognizes that belong to the *SVG* namespace specifically — `foreignObject` and
+/// `desc` — as opposed to `annotation-xml` (with a matching encoding) or one of
+/// `MathML`'s five text integration points, both `MathML`-only.
+fn is_svg_integration_point(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "foreignobject" | "desc")
+}
+
+/// Whether `foreign_content`'s innermost frame is genuinely being parsed in the SVG
+/// namespace, as opposed to `MathML`'s — `false` when nothing is open at all, which
+/// is `MathML`-or-neither's own safe default here, since every caller of this
+/// already requires `foreign_content` to be non-empty before asking. Classifies by
+/// the frame's own tracked name: `svg` and its two SVG-only integration points
+/// (`foreignObject`, `desc`) are SVG; a plain `math` root, `mglyph`/`malignmark`
+/// (`MathML`-only per WHATWG's own exception), `annotation-xml` and `MathML`'s five
+/// text integration points are all `MathML`.
+fn innermost_foreign_namespace_is_svg(foreign_content: &[ForeignFrame]) -> bool {
+    foreign_content.last().is_some_and(|frame| {
+        frame.name.eq_ignore_ascii_case("svg") || is_svg_integration_point(&frame.name)
+    })
+}
+
 /// Whether `name` is one of `MathML`'s five fixed "text integration points" — `mi`,
 /// `mo`, `mn`, `ms`, `mtext` — WHATWG's own term for the elements that admit ordinary
 /// HTML content the same way [`is_html_integration_point`] already checks. Factored
@@ -1885,7 +1907,10 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
                 ordinary_descendants: Vec::new(),
             });
         }
-    } else if !foreign_content.is_empty() && is_html_integration_point(span, name) {
+    } else if !foreign_content.is_empty()
+        && is_html_integration_point(span, name)
+        && is_svg_integration_point(name) == innermost_foreign_namespace_is_svg(foreign_content)
+    {
         // An HTML integration point is only ever real while it is genuinely being
         // inserted into the SVG or MathML namespace (Codex, round 68, "Require a
         // foreign namespace before opening integration frames") — `is_html_integration_point`
@@ -1897,6 +1922,16 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
         // hiding its own body — but opening an integration-point frame for it
         // regardless let the following `mglyph` exception wrongly re-enter
         // "MathML" that was never really open, treating `<script />` as bodyless.
+        //
+        // Namespace-matched, not merely non-empty (Codex, round 69, "Match
+        // integration points to their foreign namespace"): `foreignObject` is an
+        // integration point only in SVG, so `<math><foreignObject><script
+        // /></foreignObject></math>...` keeps real MathML parsing throughout —
+        // `foreignObject` is just an unrecognized MathML-namespaced element there,
+        // never switching to HTML rules — and the still-honored self-closing slash
+        // on `<script />` leaves it bodyless. Accepting any nonempty foreign stack
+        // wrongly opened an integration-point frame for it anyway, switching to
+        // HTML rules that read the same `<script />` as a real, unclosed script.
         if !self_closes_immediately {
             foreign_content.push(ForeignFrame {
                 name: name.to_ascii_lowercase(),
@@ -1920,12 +1955,20 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
             // `mglyph` once again a direct child of `mtext` — but appending `div`
             // without first popping the stale `p` left `ordinary_descendants`
             // nonempty, wrongly failing the `mglyph` exception's direct-child check.
-            while top
+            //
+            // Searched and truncated through the whole stack, not only its top
+            // (Codex, round 69, "Search through implicitly closed integration
+            // descendants") — the same "any other end tag"-shaped gap round 67
+            // found in `track_ordinary_ancestor` and round 68 found in the plain
+            // `descendants` stack: `<p><span><div>` has `div` implicitly close `p`
+            // two levels down, taking the intervening `span` with it, but checking
+            // only `.last()` (`span`) never finds the `p` at all.
+            if let Some(pos) = top
                 .ordinary_descendants
-                .last()
-                .is_some_and(|open| implicitly_closed_by(open, &lower))
+                .iter()
+                .rposition(|open| implicitly_closed_by(open, &lower))
             {
-                top.ordinary_descendants.pop();
+                top.ordinary_descendants.truncate(pos);
             }
             top.ordinary_descendants.push(lower);
         }

@@ -7959,6 +7959,80 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
+    {
+        // Codex, pull request #138, round 69, finding "Match integration points to
+        // their foreign namespace": round 68's fix required *some* foreign root be
+        // open before an integration-point frame could open, but never checked
+        // that the specific integration point belongs to the *right* one —
+        // `foreignObject` is an integration point only in SVG, not `MathML`.
+        // `<math><foreignObject><script /></foreignObject></math>decision-id
+        // headline` has no `<svg>` anywhere, so a real browser keeps real `MathML`
+        // parsing throughout — `foreignObject` is just an unrecognized
+        // `MathML`-namespaced element there, never switching to HTML rules — and
+        // the still-honored self-closing slash on `<script />` leaves it bodyless.
+        // Accepting any nonempty foreign stack wrongly opened an integration-point
+        // frame for it anyway, switching to HTML rules that read the same
+        // `<script />` as a real, unclosed script hiding the id and headline that
+        // follow instead of leaving them visible.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><foreignObject><script /></foreignObject></math>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_script_following_a_div_implicitly_closing_a_paragraph_two_descendants_deep_inside_mtext_still_counts()
+     {
+        // Codex, pull request #138, round 69, finding "Search through implicitly
+        // closed integration descendants": round 68's implicit-close-before-push
+        // fix for `ordinary_descendants` only ever checked its own top, the same
+        // gap round 68's *other* fix closed for the plain `descendants` stack.
+        // `<math><mtext><p><span><div></div><mglyph><script
+        // /></mglyph>decision-id headline</mtext></math>` has `<div>` implicitly
+        // close the ancestor `<p>` two levels down, taking the intervening
+        // `<span>` with it, so after `</div>` a browser has `mglyph` once again a
+        // direct child of `mtext` and its `<script />` is bodyless `MathML`
+        // content. Checking only `ordinary_descendants.last()` (`span`) never
+        // found the `p` at all, leaving both stale and wrongly failing `mglyph`'s
+        // direct-child check — reading the script as a real, unclosed HTML one
+        // that hides the id and headline that follow instead of leaving them
+        // visible.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><p><span><div></div><mglyph><script /></mglyph>{} {}</mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_hidden_in_a_section_after_a_div_implicitly_closes_a_paragraph_two_descendants_deep_stays_hidden()
      {
         // Codex, pull request #138, round 68, finding "Truncate through implicitly
