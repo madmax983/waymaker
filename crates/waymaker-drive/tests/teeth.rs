@@ -8,12 +8,12 @@
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
-use waymaker_core::{ActivityKind, EffectId, EffectSeq, KernelError, Outcome, RunId};
+use waymaker_core::{EffectId, EffectSeq, KernelError, Outcome, RunId};
 use waymaker_drive::demo::{
     BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_fault::{Device, FaultError};
@@ -277,13 +277,7 @@ impl Clocks for Greedy {
 }
 
 impl Activities for Greedy {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed {
         Performed::Completed(out.len().saturating_add(1))
     }
 }
