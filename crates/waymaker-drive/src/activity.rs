@@ -53,10 +53,19 @@ pub enum Performed {
 ///
 /// A reset in that window has two outcomes, and one of them is not a second attempt. A reset
 /// at a boundary between two storage operations leaves a whole journal, and the next boot
-/// redelivers. A reset *inside* the outcome frame or its seal leaves a torn tail with no
-/// append point, and [`Driver`](crate::Driver) refuses that bank rather than repairing it —
+/// redelivers. A reset *inside* the outcome frame or its seal usually leaves a torn tail with
+/// no append point, and [`Driver`](crate::Driver) refuses that bank rather than repairing it —
 /// so the effect happened, no record of it ever will, and the run stops. Recycling such a
 /// bank is §10's `continue_as_new`, which this driver does not perform.
+///
+/// One shape of that tear is not this. Issue #95: if the outcome's own frame body is whole —
+/// checksummed and complete — and only its padding and commit seal are still erased, recovery
+/// ignores the torn slot rather than refusing the bank, and the same append point opens up
+/// again. The effect redelivers under the identity it was dispatched with, exactly as the
+/// boundary-reset case above, rather than being forced into `continue_as_new`. A tear *inside*
+/// the commit seal itself is not this exception — those bytes are neither erased nor a real
+/// seal, so recovery still cannot tell an interrupted append from damage, and the bank is
+/// refused as before.
 ///
 /// Neither cause has a limit. Two resets that each redeliver perform the effect three
 /// times.

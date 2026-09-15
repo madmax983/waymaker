@@ -12,16 +12,18 @@ use core::mem;
 use waymaker_core::timer::{ClockCapability, ClockKind, Deadline, Timer, TimerSpec};
 use waymaker_core::version::{GateId, VersionRange};
 use waymaker_core::{
-    ActivityKind, EffectId, EffectRequest, Intent, KernelError, Next, Outcome, RecordRef,
-    ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve, VersionIntent,
-    VersionRequest,
+    ActivityKind, DecodeError, EffectId, EffectRequest, Intent, KernelError, Next, Outcome,
+    RecordRef, ReplayMachine, Resolve, RunId, TimerIntent, TimerRequest, TimerResolve,
+    VersionIntent, VersionRequest,
 };
 use waymaker_flash::append::{AppendError, Journal};
+use waymaker_flash::bank::{self, Authority, BankHeader, BankId, BankLayout};
 use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
-use waymaker_flash::frame;
+use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
-use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError};
+use waymaker_flash::recovery::{JournalRegion, Recovery, RecoveryError, RegionError};
 use waymaker_flash::storage::StableStorage;
+use waymaker_flash::swap::{Retired, Swap, SwapError, SwapStepError};
 
 use crate::activity::{Activities, Clocks, Performed};
 use crate::boundary::{Answered, Boundary, Handoff, Suspended};
@@ -39,11 +41,11 @@ pub enum Conclusion {
 
 /// How far one boot got.
 ///
-/// Three answers: the run reached a terminal record, an activity was not ready, or a
-/// deadline has not passed. The last two are both waits under a committed identity, kept
-/// apart because a caller acts on them differently — an activity may answer on the next
-/// pass, and a deadline will not answer before its own clock says so. There is no fourth —
-/// an error is the [`Err`] this is returned beside.
+/// Four answers: the run reached a terminal record, an activity was not ready, a deadline
+/// has not passed, or `continue_as_new` installed a new run. The middle two are both waits
+/// under a committed identity, kept apart because a caller acts on them differently — an
+/// activity may answer on the next pass, and a deadline will not answer before its own
+/// clock says so. There is no fifth — an error is the [`Err`] this is returned beside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Progress {
     /// The run has a terminal record, and the first `result_len` bytes of the caller's
@@ -80,6 +82,17 @@ pub enum Progress {
         clock_kind: ClockKind,
         /// Ticks of that clock still owed, as of this boot's last reading.
         remaining: u64,
+    },
+    /// [`Boundary::continue_as_new`] performed §10's swap. The run that asked is retired;
+    /// `run` is the one now installed.
+    ///
+    /// Only a driver [`at_bank`](Driver::at_bank) ever answers this — one
+    /// [`Driver::new`] cannot name the bank a swap would install into, and its
+    /// `continue_as_new` always refuses instead. The next boot of the same layout picks up
+    /// the newly authoritative bank on its own; nothing here schedules that boot.
+    Migrated {
+        /// The run [`continue_as_new`](Boundary::continue_as_new) installed.
+        run: RunId,
     },
 }
 
@@ -163,9 +176,10 @@ pub enum DriveError<E> {
     NoEffectOutstanding,
     /// §10's `continue_as_new` was asked of a driver that cannot swap banks.
     ///
-    /// See [`Boundary::continue_as_new`](crate::Boundary::continue_as_new): this driver is
-    /// pointed at a journal region rather than at a bank, so it cannot name the bank a swap
-    /// would install into.
+    /// See [`Boundary::continue_as_new`](crate::Boundary::continue_as_new): a driver built
+    /// with [`Driver::new`] is pointed at a journal region rather than at a bank, so it
+    /// cannot name the bank a swap would install into. A driver built with
+    /// [`Driver::at_bank`] never answers this.
     ContinueUnsupported,
     /// §10 refused the record, before the device was asked for anything.
     ///
@@ -182,6 +196,53 @@ pub enum DriveError<E> {
     /// makes the check structural, rather than a fact about this one caller — see
     /// [issue #92](https://github.com/madmax983/waymaker/issues/92).
     EffectInputMismatch,
+    /// A driver [`at_bank`](Driver::at_bank) found no bank a boot could start from.
+    ///
+    /// Neither bank carries a valid seal — the ordinary state of a device nothing has
+    /// provisioned yet. Provisioning the first bank is outside this driver.
+    NoAuthoritativeBank,
+    /// A driver [`at_bank`](Driver::at_bank) found both banks validly sealed at the same
+    /// generation.
+    ///
+    /// §02 decision 7 makes a new run authoritative on its own generation seal, and a seal
+    /// that repeats a generation seals nothing. No protocol this driver runs can produce
+    /// it; a reader that reports it anyway is reporting a device this driver did not write.
+    AmbiguousAuthority,
+    /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new)'s next run id would
+    /// wrap.
+    ///
+    /// §07's identity space is a `u64`. A device that reaches the ceiling refuses rather
+    /// than reissuing a run id it has already sealed a bank under.
+    RunIdExhausted,
+    /// §10's swap refused to begin.
+    Swap(SwapError),
+    /// §10's swap failed partway through a step.
+    ///
+    /// What is on media afterwards is deliberately not guessed at — see
+    /// [`SwapStepError`]'s own documentation. The retiring bank is untouched until the last
+    /// step, so the device still boots the old run either way.
+    SwapStep(SwapStepError<E>),
+    /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new)'s next run input is
+    /// wider than the run's own declared bound.
+    ///
+    /// Refused before the device is touched. `Swap::beginning`'s own gate only asks that
+    /// the header and one opening record fit the bank; it says nothing about the bound
+    /// *this* run priced its exits against, and installing a header wider than that bound
+    /// would price the new run's own journal below `Reserve::for_layout`'s floor —
+    /// stranding it the moment it is booted, with `DriveError::Reserve` on every boot after.
+    NextRunInputTooLong {
+        /// How many bytes the workflow passed.
+        bytes: usize,
+        /// The declared bound it was measured against.
+        bound: u16,
+    },
+    /// A bank's fully validated header names a journal layout this reader refuses.
+    ///
+    /// The seal and the header both checked out — this is not a device fault and no page
+    /// size fixes it — so it is deferred the same way a header too large for the caller's
+    /// page or one a device error kept from being read at all already are: ignored when the
+    /// other bank fully validates at a strictly higher generation, and reported otherwise.
+    Region(RegionError),
 }
 
 /// The two buffers a boot borrows.
@@ -207,15 +268,31 @@ pub struct Scratch<'a> {
     pub result: &'a mut [u8],
 }
 
+/// What a [`Driver`] is configured against.
+///
+/// Two shapes, kept apart rather than merged into one carrying an optional bank: a driver
+/// built with [`Driver::new`] is pointed at a fixed region and knows no bank at all, so its
+/// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) genuinely cannot swap.
+/// One built with [`Driver::at_bank`] carries a [`BankLayout`] instead and discovers its
+/// region afresh from the device at every [`boot`](Driver::boot) — which is what keeps
+/// that discovery from ever being a value this driver could be carrying stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pointing {
+    /// A fixed journal region, and the run it belongs to.
+    Region(JournalRegion, RunId),
+    /// A device's two-bank layout. [`boot`](Driver::boot) selects the authoritative bank
+    /// itself, every time.
+    Bank(BankLayout),
+}
+
 /// A synchronous driver for one run's journal.
 ///
-/// Configuration only: the region it drives and the run that owns it. Everything that
-/// changes lives in [`boot`](Self::boot)'s stack frame, which is what makes two boots of
-/// one driver two independent replays.
+/// Configuration only: what it is pointed at. Everything that changes lives in
+/// [`boot`](Self::boot)'s stack frame, which is what makes two boots of one driver two
+/// independent replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Driver<C: IntegrityCheck = Catalogued> {
-    region: JournalRegion,
-    run: RunId,
+    pointing: Pointing,
     reserve: Reserve,
     check: PhantomData<C>,
 }
@@ -225,6 +302,12 @@ impl Driver<Catalogued> {
     #[must_use]
     pub const fn new(region: JournalRegion, run: RunId, reserve: Reserve) -> Self {
         Self::with_integrity(region, run, reserve)
+    }
+
+    /// A driver over `layout`'s two banks, sealing with the shipped integrity check.
+    #[must_use]
+    pub const fn at_bank(layout: BankLayout, reserve: Reserve) -> Self {
+        Self::at_bank_with_integrity(layout, reserve)
     }
 }
 
@@ -236,8 +319,24 @@ impl<C: IntegrityCheck> Driver<C> {
     #[must_use]
     pub const fn with_integrity(region: JournalRegion, run: RunId, reserve: Reserve) -> Self {
         Self {
-            region,
-            run,
+            pointing: Pointing::Region(region, run),
+            reserve,
+            check: PhantomData,
+        }
+    }
+
+    /// [`at_bank`](Driver::at_bank), verifying and sealing with `C`.
+    ///
+    /// Design document §10, issue [#110](https://github.com/madmax983/waymaker/issues/110).
+    /// Every [`boot`](Self::boot) reads both banks' seals fresh and replays whichever is
+    /// authoritative, so `booted` is never a value this driver could be carrying stale from
+    /// an earlier boot — and this is the one shape whose
+    /// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) performs a real
+    /// swap rather than refusing.
+    #[must_use]
+    pub const fn at_bank_with_integrity(layout: BankLayout, reserve: Reserve) -> Self {
+        Self {
+            pointing: Pointing::Bank(layout),
             reserve,
             check: PhantomData,
         }
@@ -249,16 +348,28 @@ impl<C: IntegrityCheck> Driver<C> {
         self.reserve
     }
 
-    /// The journal this driver replays and extends.
+    /// The journal this driver replays and extends, for a driver pointed at a fixed region.
+    ///
+    /// [`None`] for a driver built with [`at_bank`](Driver::at_bank): its region is not
+    /// known until [`boot`](Self::boot) has read the device.
     #[must_use]
-    pub const fn region(&self) -> JournalRegion {
-        self.region
+    pub const fn region(&self) -> Option<JournalRegion> {
+        match self.pointing {
+            Pointing::Region(region, _) => Some(region),
+            Pointing::Bank(_) => None,
+        }
     }
 
-    /// The run this driver replays.
+    /// The run this driver replays, for a driver pointed at a fixed region.
+    ///
+    /// [`None`] for a driver built with [`at_bank`](Driver::at_bank): its run is not known
+    /// until [`boot`](Self::boot) has read the device.
     #[must_use]
-    pub const fn run(&self) -> RunId {
-        self.run
+    pub const fn run(&self) -> Option<RunId> {
+        match self.pointing {
+            Pointing::Region(_, run) => Some(run),
+            Pointing::Bank(_) => None,
+        }
     }
 
     /// One boot: recover, replay, and carry the run as far as it goes.
@@ -314,12 +425,48 @@ impl<C: IntegrityCheck> Driver<C> {
                 available: result.len(),
             });
         }
-        let mut machine = ReplayMachine::new(self.run);
+        let (region, run, bank) = match self.pointing {
+            Pointing::Region(region, run) => (region, run, None),
+            Pointing::Bank(layout) => {
+                let facts = select_bank::<S, C>(layout, storage, page)?;
+                // §10's `input` is durably recorded in the header for exactly this: an
+                // erased journal writes `RunStarted` from `workflow.identity()` alone, with
+                // nothing else to check it against, so a workflow booting the bank a swap
+                // just installed would otherwise be trusted to claim any input it liked.
+                verify_header_identity::<S, C, W>(layout, facts.id, storage, page, workflow)?;
+                let bank = BankContext {
+                    layout,
+                    booted: Authority::Bank {
+                        id: facts.id,
+                        generation: facts.generation,
+                    },
+                    run: facts.run,
+                    region: facts.region,
+                    align: facts.align,
+                    workflow_kind: facts.workflow_kind,
+                    workflow_version: facts.workflow_version,
+                    input_schema: facts.input_schema,
+                };
+                (facts.region, facts.run, Some(bank))
+            }
+        };
+        let mut machine = ReplayMachine::new(run);
         // `storage` moves in here rather than staying a field of `Context`: see `Source`'s
         // own documentation for why one caller cannot hold it in both places at once.
-        let mut source = Source::Scanning(Recovery::<_, C>::with_integrity(self.region, storage));
+        let mut source = Source::Scanning(Recovery::<_, C>::with_integrity(region, storage));
 
-        let recorded_version = begin(&mut source, &mut machine, workflow, page, self.reserve)?;
+        // A bank a swap installed but nothing has yet booted carries its intended version
+        // nowhere but its own immutable header — see `begin`'s own documentation of why an
+        // empty journal alone is the one case that still needs it.
+        let header_version = bank.as_ref().map(|context| context.workflow_version);
+        let recorded_version = begin(
+            &mut source,
+            &mut machine,
+            workflow,
+            page,
+            self.reserve,
+            header_version,
+        )?;
 
         let mut context = Context {
             activities: world,
@@ -328,7 +475,10 @@ impl<C: IntegrityCheck> Driver<C> {
             result,
             source,
             reserve: self.reserve,
+            bank,
             stop: None,
+            armed: None,
+            last_wait: None,
             pending: None,
             versions: workflow.identity().versions,
             recorded_version,
@@ -336,6 +486,490 @@ impl<C: IntegrityCheck> Driver<C> {
         let ended = workflow.run(&mut context);
         context.conclude(ended)
     }
+}
+
+/// What a bank-pointed driver knows about the bank it booted, kept for
+/// [`Boundary::continue_as_new`](crate::Boundary::continue_as_new).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BankContext {
+    layout: BankLayout,
+    booted: Authority,
+    run: RunId,
+    region: JournalRegion,
+    align: ProgramAlign,
+    workflow_kind: u16,
+    workflow_version: u16,
+    input_schema: u16,
+}
+
+/// One bank's generation and the scalar header facts a swap needs, once its seal has been
+/// validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BankFacts {
+    id: BankId,
+    generation: bank::Generation,
+    run: RunId,
+    region: JournalRegion,
+    align: ProgramAlign,
+    workflow_kind: u16,
+    workflow_version: u16,
+    input_schema: u16,
+}
+
+/// What [`read_bank`] learned about one bank.
+///
+/// Codex round 5 found that folding the third case into an immediate `Err` — as the two
+/// rounds before it both did, in two different ways — refuses a page too eagerly: a bank
+/// whose *own* header does not fit can still be safely ignored, if the *other* bank turns
+/// out to be a fully validated, higher-generation candidate. Whether that is so is not
+/// knowable until both banks have been looked at, so this carries the undecided case as a
+/// value for [`select_bank`] to weigh rather than deciding it here. Codex round 9 found the
+/// same shape of eagerness one step earlier: a bank whose header fails to *read* at all —
+/// a device fault confined to that bank, once its seal already answered with a claimed
+/// generation — was still an immediate `Err`, for the same reason and with the same fix.
+enum BankRead<E> {
+    /// A fully validated candidate, at the generation its own seal names.
+    Found(BankFacts),
+    /// Not a candidate at any generation — unsealed, or a header that fails to validate for
+    /// a reason no larger a page would ever fix.
+    Absent,
+    /// Genuinely sealed, at `claimed_generation`, but `page` was not large enough to read
+    /// and validate this bank's header. `needed` is the best figure available, rounded up to
+    /// a whole read unit so that a caller retrying with exactly `needed` bytes gets a `page`
+    /// this same rounding cannot then read back down to something smaller: the header's own
+    /// checksum-protected declared length, where enough of the header was readable to
+    /// checksum it, or just enough to read that much of the next attempt otherwise.
+    Oversized {
+        claimed_generation: bank::Generation,
+        needed: usize,
+    },
+    /// Genuinely sealed, at `claimed_generation`, but the device itself refused this bank's
+    /// header read — damage or a fault confined to this bank — or this firmware does not
+    /// read the wire format version this bank's header declares. Neither is fixable by a
+    /// larger `page`, unlike [`BankRead::Oversized`], so `error` carries forward unchanged
+    /// as what a caller sees if nothing rescues the boot, rather than being reported as a
+    /// size to grow.
+    Unreadable {
+        claimed_generation: bank::Generation,
+        error: DriveError<E>,
+    },
+}
+
+/// `len` rounded up to a whole number of `unit`s, or [`None`] on overflow.
+///
+/// `unit` is a power of two on every path that reaches here — [`Geometry`](waymaker_flash::storage::Geometry)
+/// refuses anything else — so this is an add and a mask rather than a division, the same
+/// shape `waymaker_flash::recovery`'s own private `round_up` is.
+fn round_up_to_unit(len: usize, unit: u32) -> Option<usize> {
+    let mask = (unit as usize).wrapping_sub(1);
+    len.checked_add(mask).map(|sum| sum & !mask)
+}
+
+/// Reads bank `id`'s header and seal, and says what it is worth.
+///
+/// A bank whose seal does not validate or whose header does not decode is not a candidate at
+/// any generation, exactly as [`bank::sealed_generation_with`] documents. This function only
+/// adds the two reads that answer is read *from* rather than handed in, and keeps the scalar
+/// fields [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) needs later.
+///
+/// # Errors
+///
+/// Only a real device error reading this bank's *seal* — there is no claimed generation yet
+/// to weigh a seal read's own failure against — or [`RecoveryError::PageTooSmall`] when
+/// `page` cannot even hold this bank's seal. Neither this bank's header failing to fit a
+/// large enough page, nor a device error reading it once its seal has already answered,
+/// ever fails this call outright — both are [`BankRead`] values for [`select_bank`] to weigh
+/// against the other bank instead.
+fn read_bank<S, C>(
+    layout: BankLayout,
+    id: BankId,
+    storage: &mut S,
+    page: &mut [u8],
+) -> Result<BankRead<S::Error>, DriveError<S::Error>>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+{
+    let region = layout.bank(id);
+    let payload_bytes = region.payload_bytes() as usize;
+    // §10's own writer programs the seal at [`ProgramAlign::round_up`] of `SEAL_BYTES`
+    // rather than `SEAL_BYTES` itself, and reads it back the same way here — a fixed
+    // `[u8; SEAL_BYTES]` local is not a multiple of every geometry's read unit, and a
+    // conforming `StableStorage` may refuse a read that is not one. The seal shares the one
+    // page this call was handed, the same way `swap`'s own writer shares it for the seal it
+    // programs, because a device's program unit has no upper bound this driver could give a
+    // fixed local of its own.
+    //
+    // It is read, and decoded to the scalar `Seal` it names, *before* the header ever
+    // touches `page` — Codex found both halves of what goes wrong when it is not. Decoded
+    // first, an invalid seal answers [`BankRead::Absent`] here without ever looking at this
+    // bank's header at all, so an unsealed bank — one a swap started staging and never
+    // finished sealing, say — can carry any header length whatsoever without costing this
+    // call anything: it was never a candidate, whatever its header says. And decoded to a
+    // value rather than kept as bytes, the seal's own share of `page` is free the moment
+    // this call is done with it, so the header read below gets the *whole* page rather than
+    // what a reservation for the seal left of it — which is what lets a page sized to hold a
+    // header exactly (and nothing besides, not even that bank's own seal) still read it.
+    let seal_len = region.seal_bytes() as usize;
+    let Some(seal_buf) = page.get_mut(..seal_len) else {
+        return Err(DriveError::Recovery(RecoveryError::PageTooSmall {
+            needed: seal_len,
+        }));
+    };
+    storage
+        .read(region.seal_offset(), seal_buf)
+        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
+    let Ok(seal) = bank::decode_seal_with::<C>(seal_buf) else {
+        return Ok(BankRead::Absent);
+    };
+
+    // A whole number of the device's own read units, exactly as `recovery::Scan::stage`
+    // already rounds its page down — Codex found that a header read sized to whatever `page`
+    // happened to leave, with no such rounding, could ask a conforming `StableStorage` for a
+    // length it refuses outright even when `page` had ample room for the header.
+    let read_unit = storage.geometry().read_size();
+    let page_bytes = u32::try_from(page.len()).unwrap_or(u32::MAX);
+    let capacity = page_bytes & !read_unit.wrapping_sub(1);
+    let header_len = (capacity.min(region.payload_bytes())) as usize;
+    let Some(header_buf) = page.get_mut(..header_len) else {
+        // Unreachable: `header_len <= page_bytes == page.len()` by construction above.
+        return Ok(BankRead::Absent);
+    };
+    // Codex found that a device error here — damage or a fault confined to this bank's
+    // header, with its seal already read and validated above — was still an immediate
+    // `Err`, aborting the whole boot before the other bank could be looked at. This bank's
+    // claimed generation is already in hand, so the same deferral `BankRead::Oversized`
+    // gives a header that fails to *decode* applies here to one that fails to *read* at all.
+    if let Err(error) = storage.read(region.base(), header_buf) {
+        return Ok(BankRead::Unreadable {
+            claimed_generation: seal.generation,
+            error: DriveError::Recovery(RecoveryError::Storage(error)),
+        });
+    }
+    // A header whose self-declared length reaches past what fit in `page` — as opposed to
+    // one this bank's own layout could never have held either, which `seal_for_with` below
+    // still catches on its own — is not refused outright here any more than treated as "not
+    // a candidate" outright. See this function's own `Errors` section and
+    // `BankRead::Oversized`. `header_len_of_with` peeks at only the header's own
+    // checksum-protected prefix, so it can answer even when the rest of the header — the
+    // input, the trailer — never fit at all.
+    if header_len < payload_bytes
+        && matches!(
+            bank::decode_header_with::<C>(header_buf),
+            Err(DecodeError::Truncated)
+        )
+    {
+        return Ok(match bank::header_len_of_with::<C>(header_buf) {
+            // The prefix itself checksums cleanly: this bank really is sealed, and only
+            // failed to fit because `page` did not reach far enough. `header_len_of_with`
+            // answers the *unpadded* frame length, which need not itself be a multiple of
+            // the read unit — Codex found that reporting it verbatim let a caller converge
+            // on a length this same rounding then read down again, forever. Rounded up, a
+            // caller that retries with exactly `needed` bytes gets a `page` this function's
+            // own rounding cannot shrink further.
+            Ok(needed) => BankRead::Oversized {
+                claimed_generation: seal.generation,
+                needed: round_up_to_unit(needed, read_unit)
+                    .unwrap_or(payload_bytes)
+                    .min(payload_bytes),
+            },
+            // Not even the checksum-protected prefix fit. Codex found that this bank's own
+            // ceiling was a poor answer here too: a caller with a page shorter than
+            // `HEADER_PREFIX_BYTES` learns nothing from being told to try a page several KiB
+            // wide when a page merely wide enough for the *prefix* would already answer this
+            // bank's real length on its very next call — the read that got this far already
+            // holds the header's own declared length ready to be reported, one retry away. A
+            // real, larger header cannot be ruled out either, so this is undecided rather
+            // than absent.
+            Err(DecodeError::Truncated) => BankRead::Oversized {
+                claimed_generation: seal.generation,
+                needed: round_up_to_unit(bank::HEADER_PREFIX_BYTES, read_unit)
+                    .unwrap_or(payload_bytes)
+                    .min(payload_bytes),
+            },
+            // Unreachable: `decode_header_with` just failed with `Truncated` on this exact
+            // buffer, which means its own prefix check already passed (a magic, a checksum
+            // and a version this firmware reads) before it ran out of room — so this
+            // buffer's prefix cannot fail those same checks a second time here.
+            Err(_) => BankRead::Absent,
+        });
+    }
+    // Codex round 10 found that `seal_for_with` decoding this header failed the same way
+    // for two different reasons this call folded into one: a header a bigger page or a
+    // healthy device could never rescue, and a header declaring a *wire* format version
+    // this firmware does not read (`reads_format_version`) — which a firmware elsewhere in
+    // the same fleet, at a different point in a rollout, both wrote and would read back.
+    // The second is exactly as deferrable as `BankRead::Oversized` and `Unreadable`: the
+    // seal above already named a claimed generation, and a bigger page cannot fix it, but
+    // the other bank fully validating at a higher generation still can.
+    let expected = match bank::seal_for_with::<C>(header_buf, seal.generation) {
+        Ok(expected) => expected,
+        Err(DecodeError::UnsupportedFormatVersion) => {
+            return Ok(BankRead::Unreadable {
+                claimed_generation: seal.generation,
+                error: DriveError::Recovery(RecoveryError::Decode(
+                    DecodeError::UnsupportedFormatVersion,
+                )),
+            });
+        }
+        Err(_) => return Ok(BankRead::Absent),
+    };
+    if expected != seal {
+        return Ok(BankRead::Absent);
+    }
+    let generation = seal.generation;
+    // The seal already names this exact header's digest, so this decode cannot fail.
+    // Treated as "not a candidate" rather than trusted, because the workspace denies both
+    // `unwrap` and `panic!` and a decoder walking bytes off a device is the last place to
+    // make an exception.
+    let Ok(header) = bank::decode_header_with::<C>(header_buf) else {
+        return Ok(BankRead::Absent);
+    };
+    // The seal and the header both checked out, so this bank's generation is not in
+    // question — only whether the journal layout its own header names is one this reader
+    // can use. Neither a bigger page nor a healthy device fixes that, but the other bank
+    // fully validating at a higher generation still can: the same deferral
+    // `BankRead::Oversized` and `BankRead::Unreadable` already give a header that cannot be
+    // read at all applies here to one that reads clean and names something unusable.
+    let journal = match JournalRegion::of(layout, id, &header) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return Ok(BankRead::Unreadable {
+                claimed_generation: generation,
+                error: DriveError::Region(error),
+            });
+        }
+    };
+    Ok(BankRead::Found(BankFacts {
+        id,
+        generation,
+        run: header.run,
+        region: journal,
+        align: header.align,
+        workflow_kind: header.workflow_kind,
+        workflow_version: header.workflow_version,
+        input_schema: header.input_schema,
+    }))
+}
+
+/// The error a bank not fully validated would answer with alone: [`BankRead::Oversized`]'s
+/// own [`RecoveryError::PageTooSmall`], or [`BankRead::Unreadable`]'s own device error
+/// unchanged. [`BankRead::Found`] and [`BankRead::Absent`] need no such reduction, since
+/// [`resolve_bank_read`] never reaches for this once either bank is one of those two.
+fn undecided_error<E>(needed_or_error: Result<usize, DriveError<E>>) -> DriveError<E> {
+    match needed_or_error {
+        Ok(needed) => DriveError::Recovery(RecoveryError::PageTooSmall { needed }),
+        Err(error) => error,
+    }
+}
+
+/// Between two banks that are each undecidable — too large for `page`, or a device error
+/// reading their header — the one whose seal claimed the *higher* generation is the one
+/// worth reporting: if it turns out genuine once given whatever it is missing, the guarded
+/// arms of [`resolve_bank_read`] already say the other bank's own answer never matters
+/// again. Codex found that reporting whichever bank needed *more* room, or an error from
+/// whichever bank happened to be checked first, could point a caller at a retired bank's
+/// own stale trouble instead of the real authority's.
+fn higher_claim<E>(
+    generation_a: bank::Generation,
+    error_a: Result<usize, DriveError<E>>,
+    generation_b: bank::Generation,
+    error_b: Result<usize, DriveError<E>>,
+) -> DriveError<E> {
+    if generation_a >= generation_b {
+        undecided_error(error_a)
+    } else {
+        undecided_error(error_b)
+    }
+}
+
+/// Weighs what [`read_bank`] learned about both banks into design document §10's selection
+/// rule.
+///
+/// Split out of [`select_bank`] so each of the shapes two [`BankRead`]s can take is a
+/// `match` arm rather than a nest of conditionals — see this function's own tests.
+fn resolve_bank_read<E>(a: BankRead<E>, b: BankRead<E>) -> Result<BankFacts, DriveError<E>> {
+    match (a, b) {
+        (BankRead::Found(a), BankRead::Found(b)) => {
+            match bank::select([Some(a.generation), Some(b.generation)]) {
+                Authority::Bank { id: BankId::A, .. } => Ok(a),
+                Authority::Bank { id: BankId::B, .. } => Ok(b),
+                Authority::Ambiguous { .. } => Err(DriveError::AmbiguousAuthority),
+                // Unreachable: both generations are `Some`, and `select` answers `Unsealed`
+                // only when neither is.
+                Authority::Unsealed => Err(DriveError::NoAuthoritativeBank),
+            }
+        }
+        (BankRead::Found(facts), BankRead::Absent) | (BankRead::Absent, BankRead::Found(facts)) => {
+            Ok(facts)
+        }
+        (BankRead::Absent, BankRead::Absent) => Err(DriveError::NoAuthoritativeBank),
+        // A fully validated bank against one this call could not decide, for either reason
+        // `BankRead` has: too large for `page`, or a device error reading its header. Codex
+        // round 9 found the second case was still an eager `Err` — a header that fails to
+        // *read* is exactly as safe to ignore as one that fails to *decode*, once the other
+        // bank fully validates at a strictly higher generation.
+        (
+            BankRead::Found(facts),
+            BankRead::Oversized {
+                claimed_generation, ..
+            }
+            | BankRead::Unreadable {
+                claimed_generation, ..
+            },
+        )
+        | (
+            BankRead::Oversized {
+                claimed_generation, ..
+            }
+            | BankRead::Unreadable {
+                claimed_generation, ..
+            },
+            BankRead::Found(facts),
+        ) if claimed_generation < facts.generation => Ok(facts),
+        (
+            BankRead::Oversized {
+                claimed_generation: generation_a,
+                needed: needed_a,
+            },
+            BankRead::Oversized {
+                claimed_generation: generation_b,
+                needed: needed_b,
+            },
+        ) => Err(higher_claim(
+            generation_a,
+            Ok(needed_a),
+            generation_b,
+            Ok(needed_b),
+        )),
+        (
+            BankRead::Unreadable {
+                claimed_generation: generation_a,
+                error: error_a,
+            },
+            BankRead::Unreadable {
+                claimed_generation: generation_b,
+                error: error_b,
+            },
+        ) => Err(higher_claim(
+            generation_a,
+            Err(error_a),
+            generation_b,
+            Err(error_b),
+        )),
+        (
+            BankRead::Oversized {
+                claimed_generation: generation_a,
+                needed,
+            },
+            BankRead::Unreadable {
+                claimed_generation: generation_b,
+                error,
+            },
+        )
+        | (
+            BankRead::Unreadable {
+                claimed_generation: generation_b,
+                error,
+            },
+            BankRead::Oversized {
+                claimed_generation: generation_a,
+                needed,
+            },
+        ) => Err(higher_claim(
+            generation_a,
+            Ok(needed),
+            generation_b,
+            Err(error),
+        )),
+        (BankRead::Oversized { needed, .. }, _) | (_, BankRead::Oversized { needed, .. }) => {
+            Err(DriveError::Recovery(RecoveryError::PageTooSmall { needed }))
+        }
+        (BankRead::Unreadable { error, .. }, _) | (_, BankRead::Unreadable { error, .. }) => {
+            Err(error)
+        }
+    }
+}
+
+/// Design document §10's selection rule, over a real device: which bank a
+/// [`Driver::at_bank`] boots, and the facts it needs from it.
+fn select_bank<S, C>(
+    layout: BankLayout,
+    storage: &mut S,
+    page: &mut [u8],
+) -> Result<BankFacts, DriveError<S::Error>>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+{
+    let a = read_bank::<S, C>(layout, BankId::A, storage, page)?;
+    let b = read_bank::<S, C>(layout, BankId::B, storage, page)?;
+    resolve_bank_read(a, b)
+}
+
+/// Refuses a boot whose workflow does not match what bank `id`'s own header declares.
+///
+/// [`begin`] makes the same comparison against the *journal*'s `RunStarted` record, but an
+/// erased journal has none — it writes one from `workflow.identity()` alone, with nothing
+/// else to check it against. A bank a swap just installed is exactly that: its header
+/// durably records the workflow and input `continue_as_new` was asked for, and until a
+/// first boot writes the opening record, `begin` cannot enforce it. This is the same
+/// comparison, against the header instead of the journal, so that recording stays enforced
+/// rather than becoming unreachable the moment it is written.
+///
+/// Kind and input only — never the header's own `workflow_version`, which is `begin`'s to
+/// admit instead, and differently depending on what it finds. This runs on *every* boot of a
+/// bank-pointed driver, not only a bank's first, and a run already under way has its version
+/// recorded where it matters: in the journal's own `RunStarted`, which `begin` admits
+/// directly, ignoring the header entirely. The header's version is a fact about the swap
+/// that installed the bank, not about the run, and it never changes again — an image whose
+/// admitted range has moved on from it while still admitting the run's own recorded version
+/// would otherwise be refused over a number nothing here still depends on. For the one case
+/// this function exists for — an erased journal, nothing recorded yet — the header's version
+/// is the *only* record of what this run was meant to be, and `begin` admits it before ever
+/// writing `identity.versions.current()` over it: Codex found that skipping this let an
+/// older, rolled-back image silently claim authorship of a run a newer image's swap had
+/// already named, the moment before that newer image's own first boot would have recorded
+/// it properly.
+fn verify_header_identity<S, C, W>(
+    layout: BankLayout,
+    id: BankId,
+    storage: &mut S,
+    page: &mut [u8],
+    workflow: &W,
+) -> Result<(), DriveError<S::Error>>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+    W: Workflow + ?Sized,
+{
+    let region = layout.bank(id);
+    // Rounded down to a whole read unit, exactly as `read_bank`'s own header read is —
+    // the same fix, for the same reason: a length `read_bank` never needed to round
+    // because `select_bank` already read this bank once, but this call reads it again
+    // with its own arithmetic and a conforming `StableStorage` does not know the two
+    // calls agree.
+    let read_unit = storage.geometry().read_size();
+    let page_bytes = u32::try_from(page.len()).unwrap_or(u32::MAX);
+    let capacity = page_bytes & !read_unit.wrapping_sub(1);
+    let header_len = (capacity.min(region.payload_bytes())) as usize;
+    let Some(header_buf) = page.get_mut(..header_len) else {
+        // Unreachable: `header_len <= page_bytes == page.len()` by construction above.
+        return Err(DriveError::NoAppendPoint);
+    };
+    storage
+        .read(region.base(), header_buf)
+        .map_err(|error| DriveError::Recovery(RecoveryError::Storage(error)))?;
+    let Ok(header) = bank::decode_header_with::<C>(header_buf) else {
+        // Unreachable: `select_bank` already decoded this exact bank successfully.
+        return Err(DriveError::NoAppendPoint);
+    };
+    let identity = workflow.identity();
+    let (workflow_kind, input) = (header.workflow_kind, header.input);
+    if workflow_kind != identity.kind || input != identity.input {
+        return Err(DriveError::NotThisWorkflow);
+    }
+    Ok(())
 }
 
 /// Design document §06 steps 1 and 2: the run's own record, from history or newly written.
@@ -349,6 +983,7 @@ fn begin<S, C, W>(
     workflow: &W,
     page: &mut [u8],
     reserve: Reserve,
+    header_version: Option<u16>,
 ) -> Result<u16, DriveError<S::Error>>
 where
     S: StableStorage,
@@ -400,6 +1035,20 @@ where
 
     // An erased journal. The run has to be recorded before anything can be scheduled
     // against it, and this is the one record the driver writes without the kernel asking.
+    //
+    // `header_version` is `Some` only for a bank-pointed driver, and only there does a
+    // still-empty journal have anything else durable to consult at all: the header a swap
+    // wrote. Codex found that skipping this let an older, rolled-back image boot such a
+    // bank on kind and input alone and silently record its own current version over one a
+    // newer image had already named — the header admits itself once a `RunStarted` exists
+    // to make that irreversible, but until then it is the one thing here that still depends
+    // on it.
+    if let Some(header_version) = header_version {
+        identity
+            .versions
+            .admits(header_version)
+            .map_err(DriveError::Kernel)?;
+    }
     let version = identity.versions.current();
     let record = RecordRef::RunStarted {
         workflow_kind: identity.kind,
@@ -698,6 +1347,26 @@ enum Stop<E> {
     },
     /// Something was refused.
     Failed(DriveError<E>),
+    /// `continue_as_new` installed a new run under this id.
+    Migrated(RunId),
+}
+
+/// What [`measure`] needs to re-evaluate a still-open deadline against a fresh clock
+/// reading, without asking [`ReplayMachine::timer_intent`] a second time.
+///
+/// A second ask of that method for a boundary already `AwaitingFiring` is not a
+/// re-measurement — `ReplayCursor::next_effect_id` refuses everything but `Replaying` and
+/// `Halted`, so it is the one call this driver must never repeat while a deadline is still
+/// open. This is what lets [`Context::decide_timer`] answer a repeated
+/// [`Boundary::wait`](crate::Boundary::wait) honestly instead: by calling [`measure`]
+/// again directly, over the same recorded `armed_at` and the same declared capability,
+/// exactly as a fresh boot's own [`TimerResolve::Rearm`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArmedTimer {
+    id: EffectId,
+    spec: TimerSpec,
+    capability: ClockCapability,
+    armed_at: u64,
 }
 
 /// The driver, as the workflow sees it.
@@ -708,7 +1377,38 @@ struct Context<'a, S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> 
     result: &'a mut [u8],
     source: Source<'a, S, C>,
     reserve: Reserve,
+    /// [`Some`] only for a driver built with [`Driver::at_bank`]. [`None`] here is what
+    /// makes [`Boundary::continue_as_new`](crate::Boundary::continue_as_new) refuse for a
+    /// driver [`Driver::new`] pointed at a fixed region.
+    bank: Option<BankContext>,
     stop: Option<Stop<S::Error>>,
+    /// The still-open deadline `stop`'s own [`Stop::WaitingUntil`] is waiting on, if any —
+    /// everything [`measure`] needs to re-read the clock without asking the kernel again.
+    ///
+    /// [`Some`] exactly when `stop` is `Some(Stop::WaitingUntil(..))` for the boundary this
+    /// holds, and [`None`] the moment that deadline is answered any other way. Kept apart
+    /// from `stop` itself because `Stop::WaitingUntil` is also [`Progress::WaitingUntil`]'s
+    /// source, which has no business carrying a [`TimerSpec`] or a [`ClockCapability`] a
+    /// caller never asked for.
+    armed: Option<ArmedTimer>,
+    /// [`Some`] exactly when the most recent [`Boundary`](crate::Boundary) call was a
+    /// [`Boundary::wait`](crate::Boundary::wait), naming the spec it asked for — kept so
+    /// [`Context::deadline_remaining`] can tell a repeat ask of the timer `armed` describes
+    /// from a caller that has moved on, to a different spec or to a different boundary
+    /// entirely.
+    ///
+    /// A `select!` above this boundary that drops a still-open timer future and polls a
+    /// fresh one over a different spec, or a different future altogether, does not close the
+    /// first boundary — its schedule record is already durable, and nothing but that same
+    /// spec can ever resolve it. Without this field, `deadline_remaining` had no way to see
+    /// that the halt it is about to report belongs to the timer the caller abandoned rather
+    /// than the one it just asked about, and reported the abandoned timer's frozen deadline
+    /// as the new request's own — arming a hardware alarm for a duration that never advances
+    /// and never resolves what was actually asked. Every other `Boundary` method clears it on
+    /// entry, so a `call`, `schedule`, `resolve`, `gate` or `continue_as_new` halt never
+    /// answers with a timer's deadline either, even while that timer's own boundary is still
+    /// the one `stop` reports.
+    last_wait: Option<TimerSpec>,
     /// The effect §07 step 3 committed, while a caller performs step 4 for itself.
     ///
     /// [`Boundary::call`] never uses it: that path holds the value on its own stack for
@@ -751,6 +1451,9 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                     remaining,
                 });
             }
+            // `swap_in` already asked `nothing_follows` before it touched the device —
+            // asking again here would be asking it of a bank this call just reclaimed.
+            Some(Stop::Migrated(run)) => return Ok(Progress::Migrated { run }),
             Some(Stop::Finished {
                 conclusion,
                 result_len,
@@ -1208,12 +1911,17 @@ enum TimerHalf<E> {
 /// precedes its committed intent, and this driver performs none for a deadline: it records
 /// the intent and then compares readings. A dispatcher that armed a hardware alarm would
 /// have a physical act to order, and that is rung 0.4's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is one of the driver's fields, destructured by its caller"
+)]
 fn arming<S, C, K>(
     source: &mut Source<'_, S, C>,
     machine: &mut ReplayMachine,
     clocks: &mut K,
     page: &mut [u8],
     stop: &mut Option<Stop<S::Error>>,
+    armed_timer: &mut Option<ArmedTimer>,
     id: EffectId,
     spec: TimerSpec,
 ) -> TimerDecision
@@ -1261,7 +1969,16 @@ where
     // defensively and masked the fault it was meant to leave visible. Re-arming a *recorded*
     // deadline is the only place a reset can have intervened, and that path still uses it.
     measure(
-        source, machine, page, stop, id, spec, capability, now, reading,
+        source,
+        machine,
+        page,
+        stop,
+        armed_timer,
+        id,
+        spec,
+        capability,
+        now,
+        reading,
     )
 }
 
@@ -1279,6 +1996,7 @@ fn measure<S, C>(
     machine: &mut ReplayMachine,
     page: &mut [u8],
     stop: &mut Option<Stop<S::Error>>,
+    armed_timer: &mut Option<ArmedTimer>,
     id: EffectId,
     spec: TimerSpec,
     capability: ClockCapability,
@@ -1298,6 +2016,7 @@ where
     let armed = match Timer::arm(spec, capability, armed_at) {
         Ok(armed) => armed,
         Err(error) => {
+            *armed_timer = None;
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
             return TimerDecision::Stop;
         }
@@ -1305,6 +2024,7 @@ where
     let elapsed = match armed.evaluate(reading) {
         Ok(deadline) => deadline,
         Err(error) => {
+            *armed_timer = None;
             *stop = Some(Stop::Failed(DriveError::Kernel(error)));
             return TimerDecision::Stop;
         }
@@ -1312,15 +2032,29 @@ where
     let Deadline::Elapsed = elapsed else {
         let Deadline::Remaining { ticks } = elapsed else {
             // Unreachable: `Deadline` has two shapes and the other is the arm above.
+            *armed_timer = None;
             *stop = Some(Stop::Failed(DriveError::Kernel(
                 KernelError::NondeterministicWorkflow,
             )));
             return TimerDecision::Stop;
         };
+        // Kept beside `stop`, not only in it: a repeated `wait()` for this same boundary
+        // must re-read the clock rather than repeat this answer, and `ReplayMachine`'s own
+        // cursor refuses a second `timer_intent` for as long as this deadline stays open —
+        // see `Context::decide_timer`'s own guard, and `ArmedTimer`'s documentation.
+        *armed_timer = Some(ArmedTimer {
+            id,
+            spec,
+            capability,
+            armed_at,
+        });
         *stop = Some(Stop::WaitingUntil(id, spec.clock_kind(), ticks));
         return TimerDecision::Stop;
     };
 
+    // Answered: whatever a further ask of this boundary meets from here is a fresh
+    // question, not a repeat of this one.
+    *armed_timer = None;
     let record = RecordRef::TimerFired { seq: id.seq };
     if let Err(error) = write(source, &record, page) {
         *stop = Some(Stop::Failed(error));
@@ -1333,11 +2067,75 @@ where
     TimerDecision::Passed
 }
 
+/// A repeat ask of the exact same still-open deadline, if `stop`/`armed_timer` show one.
+///
+/// [`None`] when this is not that case — no boundary is open, a different reason stopped
+/// this boot, or `spec` names a different deadline than the one recorded — so the caller
+/// falls through to its own, ordinary handling. [`Some`] when it is: an executor that
+/// suspended the core on a hardware alarm and re-polled the same task on the interrupt asks
+/// this boundary again rather than a fresh one, and it deserves an honest answer —
+/// re-measured against a fresh clock reading — not the stale halt `stop` already holds.
+///
+/// This is not [`ReplayMachine::timer_intent`] asked twice: `machine` and `source` are not
+/// touched unless the deadline has genuinely elapsed, in which case this is the same
+/// `TimerFired` transition a fresh boot's own [`TimerResolve::Rearm`] path takes from the
+/// identical `AwaitingFiring` state, reached without asking the kernel's intent question
+/// again. See [`ArmedTimer`]'s own documentation for why that call may never be repeated.
+fn remeasure_open_timer<S, C, K>(
+    source: &mut Source<'_, S, C>,
+    machine: &mut ReplayMachine,
+    clocks: &mut K,
+    page: &mut [u8],
+    stop: &mut Option<Stop<S::Error>>,
+    armed_timer: &mut Option<ArmedTimer>,
+    spec: TimerSpec,
+) -> Option<TimerDecision>
+where
+    S: StableStorage,
+    C: IntegrityCheck,
+    K: Clocks,
+{
+    if !matches!(stop, Some(Stop::WaitingUntil(..))) {
+        return None;
+    }
+    let armed_timer_value = (*armed_timer)?;
+    if spec != armed_timer_value.spec {
+        return None;
+    }
+    let Some(reading) = clocks.now(armed_timer_value.spec.clock_kind()) else {
+        *armed_timer = None;
+        *stop = Some(Stop::Failed(DriveError::ClockUnavailable));
+        return Some(TimerDecision::Stop);
+    };
+    // Cleared before the re-measurement, exactly as a fresh arming starts with `stop`
+    // unset: `measure` only ever sets it again for a deadline still remaining, so an
+    // elapsed answer here must not be reported through the stale `WaitingUntil` this call
+    // is about to replace.
+    *stop = None;
+    Some(measure(
+        source,
+        machine,
+        page,
+        stop,
+        armed_timer,
+        armed_timer_value.id,
+        armed_timer_value.spec,
+        armed_timer_value.capability,
+        armed_timer_value.armed_at,
+        reading,
+    ))
+}
+
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
     /// The kernel's answer for one timer boundary, with nothing borrowed from it.
     ///
     /// [`decide`](Self::decide)'s twin, row for row.
     fn decide_timer(&mut self, spec: TimerSpec) -> TimerDecision {
+        // Recorded before anything below can return early, so `deadline_remaining` always
+        // sees which spec this call was really about — including the mismatch case, where
+        // `remeasure_open_timer` leaves `armed` and `stop` holding an abandoned timer's
+        // state untouched.
+        self.last_wait = Some(spec);
         let Self {
             activities,
             machine,
@@ -1346,9 +2144,18 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             source,
             reserve,
             stop,
+            armed,
             pending,
             ..
         } = self;
+
+        // A repeat ask of the exact same still-open deadline re-measures the clock instead
+        // of repeating whatever `stop` already holds — see `remeasure_open_timer`.
+        if let Some(decision) =
+            remeasure_open_timer(source, machine, *activities, page, stop, armed, spec)
+        {
+            return decision;
+        }
 
         if stop.is_some() {
             return TimerDecision::Stop;
@@ -1392,7 +2199,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                 });
                 TimerDecision::Stop
             }
-            TimerHalf::Arm(id) => arming(source, machine, *activities, page, stop, id, spec),
+            TimerHalf::Arm(id) => arming(source, machine, *activities, page, stop, armed, id, spec),
             TimerHalf::Recorded => {
                 let resolved = match peek(source, page, *reserve) {
                     Err(error) => Err(error),
@@ -1427,6 +2234,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                             machine,
                             page,
                             stop,
+                            armed,
                             id,
                             recorded,
                             request.capability,
@@ -1633,6 +2441,123 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     }
 }
 
+impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S, A, C> {
+    /// §10's swap, performed end to end: retire this bank and install `input` as a new run
+    /// in the other one.
+    ///
+    /// [`DriveError::ContinueUnsupported`] for a driver not built with
+    /// [`Driver::at_bank`]. Otherwise every field a swap needs comes from `self.bank` —
+    /// read fresh from the device this same boot — or from `self.reserve`, so none of it
+    /// can be a value a caller carried in stale. Issue
+    /// [#110](https://github.com/madmax983/waymaker/issues/110).
+    fn swap_in(&mut self, input: &[u8]) -> Result<RunId, DriveError<S::Error>> {
+        let Some(bank) = self.bank else {
+            return Err(DriveError::ContinueUnsupported);
+        };
+        // §07's two halves were left out of order: an effect scheduled and not yet
+        // resolved has a durable schedule record in the bank this call is about to
+        // reclaim, and §10's swap forfeits an effect's identity on purpose only when a
+        // *crash* leaves one behind — never as the ordinary answer to a live call. Every
+        // other boundary method refuses the same way; this is the same refusal.
+        if self.pending.is_some() {
+            return Err(DriveError::EffectOutstanding);
+        }
+        // §10's reserve, consulted before the device is touched rather than left to a
+        // caller's discretion: the `Bounds` this run was priced against have to fit the
+        // bank the swap installs into, and both banks of one layout are the same size.
+        let recomputed =
+            Reserve::for_layout(self.reserve.bounds(), bank.layout).map_err(DriveError::Reserve)?;
+        // Codex found that stopping at the line above only proves `self.reserve`'s *bounds*
+        // fit this layout in the abstract — it says nothing about whether `self.reserve`
+        // itself was ever priced against it. A caller who built this driver with a reserve
+        // computed for another layout passes that check every time, and the swap below
+        // would go on to install a run whose very first boot then meets `Reserved::over`
+        // on the empty new journal and fails with `CapacityError::WrongDevice` — after the
+        // old run is already gone. Comparing the two values here, before anything is
+        // touched, is the same refusal `Reserved::over` would reach one boot later, just
+        // early enough to matter.
+        if recomputed != self.reserve {
+            return Err(DriveError::Reserve(CapacityError::WrongDevice));
+        }
+        // `Reserve::for_layout` prices the *bound* the run declared, not the bytes this
+        // call was actually handed — a header wider than that bound still fits
+        // `Swap::beginning`'s own, weaker gate, and installs a journal below
+        // `Reserve::for_layout`'s own floor, stranding the run it just started.
+        let bound = self.reserve.bounds().run_input_bytes;
+        if input.len() > usize::from(bound) {
+            return Err(DriveError::NextRunInputTooLong {
+                bytes: input.len(),
+                bound,
+            });
+        }
+        // §08's own rule for a run that says it is over, applied to the other way a run
+        // ends: a replay still short of the end of history has not earned the right to
+        // decide anything, migrating included — and unlike `Stop::Finished`'s check, this
+        // one has to run *before* the swap rather than after it, because `swap_in` is about
+        // to reclaim the only copy of whatever comes next. An earlier image that continued
+        // past this point and recorded more would be silently overwritten rather than
+        // reported, which is the nondeterminism `nothing_follows` exists to catch.
+        nothing_follows(&mut self.source, self.page)?;
+        let next_run = bank.run.successor().ok_or(DriveError::RunIdExhausted)?;
+        let Some(storage) = take_storage(&mut self.source) else {
+            return Err(DriveError::NoAppendPoint);
+        };
+        // A throwaway scan: `Swap::beginning` only reads its region back out of `retired`
+        // and then drops it, so this reborrow's life ends there and `storage` is free for
+        // `prepare` below. See `waymaker-flash`'s `swap` module for why the later steps
+        // take a fresh argument instead of keeping this one.
+        let retired =
+            Retired::Recovery(Recovery::<_, C>::with_integrity(bank.region, &mut *storage));
+        // The version this image writes into a new run, not the retiring bank's recorded
+        // one — `begin` makes the same choice for an erased journal. A next-run header
+        // stamped with the *retired* version would still validate today, against this same
+        // image's `verify_header_identity`; it only strands the run once a later image
+        // narrows `oldest` past a version that header never actually held any history under.
+        let next_header = BankHeader {
+            run: next_run,
+            align: bank.align,
+            workflow_kind: bank.workflow_kind,
+            workflow_version: self.versions.current(),
+            input_schema: bank.input_schema,
+            input,
+        };
+        let swap = Swap::beginning(bank.layout, bank.booted, bank.run, retired, next_header)
+            .map_err(DriveError::Swap)?;
+        let prepared = swap.prepare(storage).map_err(DriveError::SwapStep)?;
+        let staged = prepared.stage(self.page).map_err(DriveError::SwapStep)?;
+        let sealable = staged.payload_barrier().map_err(DriveError::SwapStep)?;
+        let installed = sealable.commit().map_err(DriveError::SwapStep)?;
+        // `commit` is the swap's own point of no return: `next_run` is durably sealed and
+        // authoritative from here whatever happens next, per `Installed::reclaim`'s own
+        // documented postcondition — on failure "the device has one authoritative bank as
+        // well: the new one". Reclaim only ever erases the *retiring* bank, so a failure
+        // here cannot put this migration in doubt; it is not this call's to report, and
+        // folding it into `DriveError::SwapStep` would tell the caller a migration failed
+        // that a fresh boot of this same layout would show had already happened. The stale
+        // bank left behind is not stranded either — the next swap's own `prepare` erases the
+        // bank it installs into unconditionally, before writing anything.
+        let _ = installed.reclaim();
+        Ok(next_run)
+    }
+}
+
+/// Takes the device out of `source`, whatever state it is in, and leaves
+/// [`Source::Taken`] behind.
+///
+/// [`None`] only for [`Source::Taken`] itself — every other state holds a device to give
+/// back. Used by [`Context::swap_in`], which is the boot's last act either way: nothing
+/// after it reads `source` again.
+const fn take_storage<'storage, S, C: IntegrityCheck>(
+    source: &mut Source<'storage, S, C>,
+) -> Option<&'storage mut S> {
+    match mem::replace(source, Source::Taken) {
+        Source::Scanning(recovery) => Some(recovery.into_storage()),
+        Source::Writing(storage, _reserved) => Some(storage),
+        Source::Spent(storage) => Some(storage),
+        Source::Taken => None,
+    }
+}
+
 impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     for Context<'_, S, A, C>
 {
@@ -1641,6 +2566,9 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn gate(&mut self, gate: GateId) -> Result<u16, Suspended> {
+        // Not a `wait`, so any deadline left over from an abandoned one no longer answers
+        // for this halt — see `deadline_remaining`'s own documentation.
+        self.last_wait = None;
         match self.decide_gate(gate) {
             GateDecision::Branch(version) => Ok(version),
             GateDecision::Stop => Err(Suspended::NEW),
@@ -1648,6 +2576,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn call(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Outcome<'_>, Suspended> {
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
         match self.decide(kind, input) {
             Decision::Replayed(conclusion, len) => Ok(self.observed(conclusion, len)),
             Decision::Dispatch(dispatchable) => self.dispatch(dispatchable, input),
@@ -1663,6 +2593,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn schedule(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Handoff<'_>, Suspended> {
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
         if self.pending.is_some() {
             if self.stop.is_none() {
                 self.stop = Some(Stop::Failed(DriveError::EffectOutstanding));
@@ -1687,6 +2619,8 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn resolve(&mut self, answered: Answered<'_>) -> Result<Outcome<'_>, Suspended> {
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
         let Some((conclusion, len)) = self.record_answer(answered) else {
             return Err(Suspended::NEW);
         };
@@ -1694,12 +2628,39 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn continue_as_new(&mut self, input: &[u8]) -> Suspended {
-        // `input` is §10's next run input. This driver reads it no further than here: it
-        // cannot name the bank the new run would be installed into.
-        let _ = input;
-        if self.stop.is_none() {
-            self.stop = Some(Stop::Failed(DriveError::ContinueUnsupported));
+        // Not a `wait`, for `gate`'s reason.
+        self.last_wait = None;
+        // §10's reserve names its own remedy: "stop scheduling, and either end the run or
+        // `continue_as_new`". A pre-mutation near-capacity refusal is that remedy offered
+        // and not yet taken, so a workflow that reacts to it by asking to migrate is not
+        // asking to override a stop this boot already committed to — it is exercising the
+        // one exit §10 reserved capacity for. Every other stop — a wait, a finished run, an
+        // unrelated failure, or a `continue_as_new` this same call already decided — still
+        // wins, because those are not offers open for the taking.
+        let reserved_rollover = matches!(
+            self.stop,
+            Some(Stop::Failed(DriveError::Capacity(Refusal::NearCapacity)))
+        );
+        if self.stop.is_none() || reserved_rollover {
+            self.stop = Some(match self.swap_in(input) {
+                Ok(run) => Stop::Migrated(run),
+                Err(error) => Stop::Failed(error),
+            });
         }
         Suspended::NEW
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        let Some(Stop::WaitingUntil(_, clock_kind, remaining)) = self.stop else {
+            return None;
+        };
+        // `armed`'s spec is the timer this halt is really waiting on. A caller that has
+        // moved on to a different spec — a `select!` that dropped this boundary's timer
+        // future for another — gets `None` rather than the abandoned timer's frozen
+        // deadline, which never advances and would otherwise be re-armed for ever.
+        match self.armed {
+            Some(armed) if self.last_wait == Some(armed.spec) => Some((clock_kind, remaining)),
+            _ => None,
+        }
     }
 }

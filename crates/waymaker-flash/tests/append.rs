@@ -448,16 +448,23 @@ fn a_seal_wider_than_the_devices_program_unit_is_written_and_read_back() {
 
 #[test]
 fn a_journal_opens_only_where_a_recovery_said_it_is_safe() {
-    // §10's anti-bricking rule as a constructor. Every ending but a clean one leaves
-    // programmed cells at the offset, and there is no other way to build a writer.
+    // §10's anti-bricking rule as a constructor: a journal opens only where recovery said
+    // an offset is erased media. A scan that has not finished has no append point either.
     let mut device = Nor::new(geometry());
     let region = region(256);
-
-    // A scan that has not finished has no append point either.
     let unfinished = Recovery::new(region, &mut device);
     assert!(Journal::after(unfinished).is_none());
+}
 
-    // A journal whose tail is a frame nobody sealed.
+#[test]
+fn an_unsealed_tail_with_nothing_programmed_past_its_slot_still_opens() {
+    // Issue #95: no writer starts a record before the one ahead of it has sealed, so an
+    // unsealed frame's reserved slot is the whole of what a crashed attempt touched. If
+    // every byte past that slot is erased — as it is here, since nothing followed — the
+    // record is ignored and the slot becomes the append point, and the same run keeps
+    // writing rather than being forced to `continue_as_new`.
+    let mut device = Nor::new(geometry());
+    let region = region(256);
     let mut journal = opened(&mut device, region);
     let mut page = [0_u8; PAGE];
     let staged = journal
@@ -467,10 +474,39 @@ fn a_journal_opens_only_where_a_recovery_said_it_is_safe() {
     // ... and the power went. The body is on media and the seal is not.
     let mut recovery = Recovery::new(region, &mut device);
     while recovery.next(&mut page).is_some() {}
+    assert_eq!(recovery.ending(), Some(Ending::Clean { append_at: 32 }));
+    assert!(
+        Journal::after(recovery).is_some(),
+        "an unsealed tail with an erased run past it is a safe append point"
+    );
+}
+
+#[test]
+fn an_unsealed_tail_with_something_programmed_in_its_slot_still_refuses() {
+    // The case issue #95 leaves alone: a byte inside the reserved slot — between the
+    // frame's own content and the end of its commit seal — is not erased, so this module
+    // cannot tell an interrupted append from damage — nothing legitimate should be there —
+    // and the bank is refused exactly as it always was.
+    let mut device = Nor::new(geometry());
+    let region = region(256);
+    let mut journal = opened(&mut device, region);
+    let mut page = [0_u8; PAGE];
+    let staged = journal
+        .stage(&mut device, &record(0), &mut page)
+        .expect("a legal stage");
+    drop(staged);
+    let padding_at = frame::body_len(&record(0), align()).expect("this record encodes");
+    let Some(cell) = device.media.get_mut(padding_at) else {
+        unreachable!("the seal starts well inside a 256-byte region")
+    };
+    *cell = 0x00;
+
+    let mut recovery = Recovery::new(region, &mut device);
+    while recovery.next(&mut page).is_some() {}
     assert_eq!(recovery.ending(), Some(Ending::Unsealed { at: 0 }));
     assert!(
         Journal::after(recovery).is_none(),
-        "an unsealed tail is not an append point"
+        "damage in the slot is not an append point"
     );
 }
 
@@ -563,12 +599,13 @@ fn a_payload_barrier_that_fails_leaves_nothing_that_can_be_sealed() {
         Some(AppendError::Storage(GeometryError::OutOfBounds))
     );
 
-    // The frame body is on media and its seal is not, which is exactly what recovery is
-    // required to refuse.
+    // The frame body is on media and its seal is not, which recovery ignores — and, since
+    // nothing else was ever written, treats as a safe append point rather than a refusal.
+    // See issue #95.
     assert_eq!(journal.offset(), 0, "an uncommitted record is not history");
     let (seen, ending) = recover(&mut device, region);
     assert!(seen.is_empty());
-    assert_eq!(ending, Some(Ending::Unsealed { at: 0 }));
+    assert_eq!(ending, Some(Ending::Clean { append_at: 32 }));
 }
 
 #[test]

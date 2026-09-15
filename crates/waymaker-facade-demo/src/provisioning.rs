@@ -33,7 +33,7 @@ use waymaker_core::{ActivityKind, Outcome};
 use waymaker_drive::{Boundary, Identity, Suspended, Workflow};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
-use waymaker_embassy::{ActivityDispatcher, Decode, Journal};
+use waymaker_embassy::{ActivityDispatcher, Alarm, Decode, Journal, NoAlarm};
 use waymaker_flash::capacity::Bounds;
 
 use crate::facade::Bridge;
@@ -146,12 +146,13 @@ pub enum ProvisionError {
 pub async fn provision<D, J>(
     ctx: &mut Ctx<'_, D, J>,
     input: ProvisionInput<'_>,
+    alarm: &mut dyn Alarm,
 ) -> Result<(), ProvisionError>
 where
     D: ActivityDispatcher,
     J: Journal,
 {
-    ctx.timer(WINDOW).await;
+    ctx.timer(WINDOW, alarm).await;
 
     let mut attempt: u32 = 0;
     let token = loop {
@@ -183,6 +184,8 @@ pub struct Provisioning<D> {
     dispatcher: D,
     input: [u8; DEVICE_ID_BYTES],
     out: [u8; OUT_BYTES],
+    /// No board here has a countdown peripheral wired to arm. See [`NoAlarm`].
+    alarm: NoAlarm,
 }
 
 /// How wide the context buffer must be: the wider of the run's two bounds.
@@ -203,6 +206,7 @@ impl<D> Provisioning<D> {
             dispatcher,
             input: device_id,
             out: [0; OUT_BYTES],
+            alarm: NoAlarm,
         }
     }
 
@@ -233,7 +237,11 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
             let mut bridge = Bridge::over(boundary);
             let mut ctx = Ctx::new(&mut bridge, &mut self.dispatcher, &mut self.out);
             let polled = {
-                let mut future = pin!(provision(&mut ctx, ProvisionInput::at(&self.input)));
+                let mut future = pin!(provision(
+                    &mut ctx,
+                    ProvisionInput::at(&self.input),
+                    &mut self.alarm
+                ));
                 future.as_mut().poll(&mut Task::from_waker(Waker::noop()))
             };
             // The recorded ending outranks the poll. See `Ota::run`: `TerminalFuture` never
@@ -316,7 +324,11 @@ waymaker_core::assert_context_size!(ProvisioningContext<'static>);
 /// See [`ota`](crate::ota)'s copy of this helper for why: `make` is never called, and a
 /// function pointer is what lets inference give `F` from the signature.
 const fn returned_future_bytes<F: Future>(
-    _make: fn(&'static mut ProvisioningContext<'static>, ProvisionInput<'static>) -> F,
+    _make: fn(
+        &'static mut ProvisioningContext<'static>,
+        ProvisionInput<'static>,
+        &'static mut dyn Alarm,
+    ) -> F,
 ) -> usize {
     size_of::<F>()
 }

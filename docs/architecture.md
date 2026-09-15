@@ -237,8 +237,16 @@ content is the frame's own `frame_crc` with bit 7 of each byte cleared, repeated
 unit, and the cleared bit is what makes the promise checkable. No byte of a seal is ever
 `0xFF`, so an erased program unit is never a seal and a seal interrupted part-way through its
 own program always ends in erased bytes. `waymaker-flash`'s `append` module is the writer
-that cannot take the two steps out of order, and `Ending::Unsealed` is what a reader reports
-when it meets a frame with no seal over it.
+that cannot take the two steps out of order. A reader that meets a frame with no seal over it
+ignores it and reports `Ending::Clean` past the frame's reserved slot when the record is an
+outcome — `EffectCompleted`, `EffectFailed` or `TimerFired`, the only three kinds §10's
+capacity reserve prices a wasted retry for — and every byte from the frame's own unpadded
+length to the end of that slot — the padding and the seal, never the frame body, which a
+checksum-valid unsealed frame always has programmed — is erased, issue #95, since no writer
+ever starts the next record before this one has sealed. Every other kind, and any outcome
+whose slot is not fully erased, still ends the scan as `Ending::Unsealed`: a byte in that
+range is neither erased nor a real seal, and an interrupted append cannot be told from
+damage.
 
 Between the frame and its seal is padding, up to the device's program granularity from §12's
 `Geometry`. It is written as `0xFF`, which an erased NOR cell already holds, and it is never
@@ -487,10 +495,15 @@ flowchart TB
   len -- "sound" --> frame["read the record · decode_with"]
   frame -- "malformed · integrity-failed" --> damaged
   frame -- "a sound frame" --> seal["commit_seal_holds · the program unit after the padding"]
-  seal -- "no seal, a torn one, or another frame's" --> unsealed(["Unsealed · no append offset"])
   seal -- "unknown record kind" --> damaged
   seal -- "a committed record" --> yield["yield it · offset += padded stride + one seal"]
   yield --> read
+  seal -- "no seal, a torn one, or another frame's" --> outcome{"an outcome? · EffectCompleted, EffectFailed, TimerFired"}
+  outcome -- "no · RunStarted, a schedule, a marker, a terminal" --> unsealed(["Unsealed · no append offset"])
+  outcome -- "yes" --> slot["[frame_len, stride) erased? · issue #95"]
+  slot -- "yes · nothing past the frame body was ever touched" --> ignore["ignore it, offset += stride"]
+  ignore --> read
+  slot -- "no · a byte is neither erased nor a real seal" --> unsealed
   read -- "read failed" --> incomplete
 ```
 
@@ -498,11 +511,26 @@ Out-of-sequence is the one of §09's four stop conditions that is not drawn here
 is not a fact about the bytes: `waymaker_core::ReplayCursor` owns it, a caller pairs the two,
 and a caller that stops pumping gets no append offset because an unfinished scan has none.
 The other three are all in the picture, and *unsealed* is the one issue
-[#24](https://github.com/madmax983/waymaker/issues/24) added: a frame body with no commit
-seal over it is a frame whose writer never reached §07 step 3, so the record was never
-committed and never dispatched. Before the seal existed a torn tail and a damaged frame
+[#24](https://github.com/madmax983/waymaker/issues/24) added: a frame with no commit seal
+over it is a frame whose writer never reached §07 step 3, so the record was never *committed*
+— but for a schedule record that is also never dispatched, where for a completion record the
+effect had already run by the time this write was attempted (§07 dispatches at step 4, the
+completion write is steps 5 to 7). Before the seal existed a torn tail and a damaged frame
 stopped the scan in the same place, which is what §14 requires either way — what the seal
-adds is the ability to say which of the two happened.
+adds is the ability to say which of the two happened. Issue
+[#95](https://github.com/madmax983/waymaker/issues/95) then split *unsealed* itself in two,
+for an outcome record alone: a clean `[frame_len, stride)` on an `EffectCompleted`,
+`EffectFailed` or `TimerFired` is an interrupted attempt that touched nothing past its own
+reserved slot, so the record is ignored and the slot becomes the append point rather than a
+dead end — the same run redelivers under its original identity. A slot with a real,
+programmed byte in that range — neither erased nor a whole seal — is still `Unsealed` with no
+append offset, exactly as before: recovery genuinely cannot tell an interrupted append from
+damage there. So is *every* unsealed non-outcome record, whatever its slot holds:
+`RunStarted`, a schedule, a version marker and a terminal record all still refuse the bank the
+way every unsealed frame once did, because §10's capacity reserve prices a wasted retry for
+none of them — an outcome's own retry is the one case a schedule's admission already pays for
+(`Reserve::exit_bytes_after`'s `redelivery_slack`), and reusing that argument for a kind
+nothing prices was Codex's own finding on review of this diagram's first version.
 
 ## Crash injection
 

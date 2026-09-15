@@ -179,28 +179,34 @@ fn a_scan_walks_a_sealed_record_and_ends_cleanly() {
 }
 
 #[test]
-fn a_scan_refuses_a_frame_whose_seal_never_landed() {
+fn a_scan_ignores_a_frame_whose_seal_never_landed_and_ends_where_its_slot_did() {
+    // Issue #95: no writer starts a record before the one ahead of it has sealed, so the
+    // frame's reserved slot is the whole of what an interrupted attempt touched. Nothing
+    // follows it here, so the record is ignored — never yielded — and history ends at the
+    // slot rather than before it, which is what lets the same run keep its identity.
     let align = align(4);
-    let (mut journal, body, _written) = one_record(align);
+    let (mut journal, body, written) = one_record(align);
     for slot in journal.iter_mut().skip(body).take(frame::seal_bytes(align)) {
         *slot = ERASED_BYTE;
     }
     let mut scan = Scan::new(&journal, align);
-    assert_eq!(scan.next(), Some(Err(DecodeError::Unsealed)));
+    assert_eq!(scan.next(), None);
     assert_eq!(
         scan.offset(),
-        0,
-        "history ends before the frame that was never committed"
+        written,
+        "history ends past the slot the uncommitted frame reserved"
     );
-    assert_eq!(scan.next(), None, "the scan is fused");
 }
 
 #[test]
-fn a_scan_refuses_a_frame_sealed_for_a_different_frame() {
+fn a_scan_still_refuses_a_frame_sealed_for_a_different_frame() {
+    // Unlike an erased or a torn seal slot, this one is fully *programmed* — with a seal
+    // that holds for some other record, the shape of a writer that seals what it *meant* to
+    // write rather than what landed. No crash leaves a slot like this, and issue #95's fix
+    // does not apply to it: the slot is not erased, so this reader cannot tell it from
+    // damage, and it is refused exactly as it always was.
     let align = align(4);
     let (mut journal, body, _written) = one_record(align);
-    // The seal a writer would have computed for some other record — the shape of a writer
-    // that seals what it *meant* to write rather than what landed.
     let elsewhere = frame::commit_seal(0xDEAD_BEEF);
     for (at, slot) in journal
         .iter_mut()
@@ -212,6 +218,33 @@ fn a_scan_refuses_a_frame_sealed_for_a_different_frame() {
     }
     let mut scan = Scan::new(&journal, align);
     assert_eq!(scan.next(), Some(Err(DecodeError::Unsealed)));
+    assert_eq!(scan.offset(), 0);
+}
+
+#[test]
+fn a_scan_refuses_an_unsealed_frame_with_something_programmed_in_its_slot() {
+    // The case issue #95 leaves alone: a byte inside the reserved slot — between the
+    // frame's own content and the end of its commit seal — is not erased, so this reader
+    // cannot tell an interrupted append from damage — nothing legitimate should be there —
+    // and the frame is refused exactly as it always was.
+    let align = align(4);
+    let (mut journal, body, _written) = one_record(align);
+    for slot in journal.iter_mut().skip(body).take(frame::seal_bytes(align)) {
+        *slot = ERASED_BYTE;
+    }
+    let Some(cell) = journal.get_mut(body) else {
+        unreachable!("the seal starts well inside the fixture")
+    };
+    *cell = 0x00;
+
+    let mut scan = Scan::new(&journal, align);
+    assert_eq!(scan.next(), Some(Err(DecodeError::Unsealed)));
+    assert_eq!(
+        scan.offset(),
+        0,
+        "history ends before the frame that was never committed"
+    );
+    assert_eq!(scan.next(), None, "the scan is fused");
 }
 
 #[test]

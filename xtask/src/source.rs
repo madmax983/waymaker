@@ -317,6 +317,23 @@ mod bare_metal_tests {
     }
 
     #[test]
+    fn a_rig_source_that_grows_an_allocator_is_caught() {
+        // Issue #82. `waymaker-rig` is firmware, not host code: ADR 0021 says a rig that
+        // can only run on a host is a simulation wearing a rig's name. It is one of the
+        // three crates in `NO_STD_TEST_SUPPORT_CRATES`, so this scan must name it, not
+        // only `waymaker-drive`.
+        let violations = check_layer_sources_are_bare_metal(&[source(
+            "waymaker-rig",
+            "crates/waymaker-rig/src/run.rs",
+            "extern crate alloc;\n",
+        )]);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].rule, "crate-attributes");
+        assert_eq!(violations[0].subject, "waymaker-rig");
+        assert!(violations[0].detail.contains("run.rs"), "{violations:?}");
+    }
+
+    #[test]
     fn a_host_side_test_support_crate_is_left_alone() {
         // `waymaker-fault` models media in a `Vec` and `waymaker-spec` enumerates a state
         // space. Asking either for `#![no_std]` would be asking it to stop doing its job.
@@ -4258,6 +4275,41 @@ pub const EFFECT_PROOF_FIELDS: &[&str] = &["bytes", "id", "intent", "request"];
 /// caller hand `Activities::perform` a pair the check never vouched for.
 pub const EFFECT_NO_SELF_LITERAL: [&str; 3] = ["CheckedDispatch", "DurableIntent", "Dispatchable"];
 
+/// Attribute names `effect.rs` may carry without further scrutiny, because the compiler
+/// interprets every one of them directly — none has a macro behind it that could expand
+/// into a construction site.
+///
+/// `cfg_attr` is deliberately absent: it can emit an arbitrary attribute, and `effect.rs`
+/// has no legitimate use for one today, so it is refused rather than classified recursively.
+pub const EFFECT_ALLOWED_ATTRIBUTES: &[&str] = &[
+    "allow", "cfg", "deny", "doc", "forbid", "ignore", "must_use", "test", "warn",
+];
+
+/// `#[derive(..)]` names `effect.rs` may carry: the compiler's own derives that add no
+/// constructor.
+///
+/// Each of these expands to a trait `impl` for the deriving type alone and can add no
+/// method, no construction and no field rewrite. `Default` is deliberately absent even
+/// though the compiler interprets it directly with no macro behind it: unlike every derive
+/// on this list, it *does* construct a new value, so `#[derive(Default)]` on a proof type
+/// would be a second, public constructor — `CheckedDispatch::default()` — invisible to
+/// `EFFECT_NO_SELF_LITERAL` and `CHECKED_DISPATCH_CONSTRUCTION` alike, neither of which
+/// looks for a construction site the compiler generates rather than one written in source.
+/// A custom derive is a second, unexamined kind of gap — an external expansion, the shape
+/// issue [#92](https://github.com/madmax983/waymaker/issues/92)'s macro-invocation round
+/// closed for a bang macro and this round closes for a derive — and this list closes both
+/// by naming only derives that are neither.
+pub const EFFECT_ALLOWED_DERIVES: &[&str] = &[
+    "Clone",
+    "Copy",
+    "Debug",
+    "Eq",
+    "Hash",
+    "Ord",
+    "PartialEq",
+    "PartialOrd",
+];
+
 /// The type that owns each body §07's storage steps happen in, and that body's name.
 ///
 /// The owner is load-bearing. `braced_body` takes the *first* match in the file, so a private
@@ -4435,7 +4487,10 @@ pub const BANK_ROUTING_PATH: &str = "waymaker-flash/src/bank.rs";
 /// statement about each body rather than the loosest thing true of all of them.
 pub const BANK_SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
     ("encode_header_with", &["header_check", "frame_check"]),
-    ("decode_header_with", &["header_check", "frame_check"]),
+    // The prefix's own seal is computed in `verify_header_prefix_with`, which this delegates
+    // to; this body's own direct call is the trailer's, over the input `verify_header_prefix_with`
+    // already admitted.
+    ("decode_header_with", &["frame_check"]),
     ("encode_seal_with", &["header_check"]),
     ("decode_seal_with", &["header_check"]),
     ("seal_for_with", &["frame_check"]),
@@ -4446,6 +4501,14 @@ pub const BANK_SEALING_FUNCTIONS: &[(&str, &[&str])] = &[
     // function generic over the check to be accounted for. A body that started computing a
     // seal here would be a row somebody has to widen.
     ("sealed_generation_with", &[]),
+    // The one place a header prefix's own seal is computed. `decode_header_with` and
+    // `header_len_of_with` both come through here rather than each destructuring the prefix
+    // for themselves.
+    ("verify_header_prefix_with", &["header_check"]),
+    // Routes by delegation, the same shape as `frame::frame_len_of_with`: it asks
+    // `verify_header_prefix_with` for the prefix and computes a length from the field that
+    // check already admitted, without a checksum call of its own.
+    ("header_len_of_with", &[]),
 ];
 
 /// The one function permitted to call the checksum module from the codec, and what it may
@@ -6171,7 +6234,7 @@ pub const CODEC_DEPENDENCIES: &[&str] = &["postcard", "serde"];
 /// function.
 pub const VERSION_ROUTING_BODIES: &[(&str, &str)] = &[
     ("waymaker-flash/src/frame.rs", "verify_header_with"),
-    ("waymaker-flash/src/bank.rs", "decode_header_with"),
+    ("waymaker-flash/src/bank.rs", "verify_header_prefix_with"),
 ];
 
 /// The predicate every version decision goes through.
@@ -6859,9 +6922,17 @@ const FUTURE_POLL: &str = "poll";
 
 /// Every method the durable half declares.
 ///
-/// Four, one per thing a workflow can ask for. A fifth is a question the façade would be
-/// answering for itself.
-pub const CTX_JOURNAL_SURFACE: &[&str] = &["continue_as_new", "resolve", "schedule", "wait"];
+/// Five. Four are one per thing a workflow can ask for. The fifth, `deadline_remaining`, is
+/// not a new question: it reads back how long a halt already recorded still has to wait, so
+/// the façade's timer future can arm an alarm instead of asking the durable half again
+/// straight away. A sixth would be a question the façade could answer for itself.
+pub const CTX_JOURNAL_SURFACE: &[&str] = &[
+    "continue_as_new",
+    "deadline_remaining",
+    "resolve",
+    "schedule",
+    "wait",
+];
 
 /// What the façade may not name, and why.
 ///
@@ -7809,10 +7880,9 @@ fn check_no_hidden_state(
 /// under `cfg(test)` discharges nothing about the code that ships.
 ///
 /// What it cannot see is a protocol step added from another file — it pins one file, exactly
-/// as `capacity-reserve`, `recovery-surface` and `storage-contract` each do — a method a
-/// macro expands to, and whether the barriers are real, which is §12's contract and
-/// `waymaker-conformance`'s across-reset witness. The crash windows are
-/// `crates/waymaker-drive/tests/crash.rs`.
+/// as `capacity-reserve`, `recovery-surface` and `storage-contract` each do — and whether the
+/// barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset
+/// witness. The crash windows are `crates/waymaker-drive/tests/crash.rs`.
 #[must_use]
 pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violation> {
     const RULE: &str = "effect-protocol";
@@ -7840,6 +7910,8 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     violations.extend(check_checked_dispatch_construction(&source.contents));
     violations.extend(check_effect_proof_fields_are_not_rebound(&source.contents));
     violations.extend(check_no_projected_type_aliases(&source.contents));
+    violations.extend(check_effect_invokes_no_macro(&source.contents));
+    violations.extend(check_effect_attributes_are_audited(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
@@ -8211,6 +8283,92 @@ fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
                      {EFFECT_PROTOCOL_PATH}: `<T as Trait>::Assoc` can name any struct the \
                      trait's `impl` chooses, which no construction pin here can follow, so \
                      the alias itself is refused"
+                ),
+            )]
+        }
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
+}
+
+/// `effect.rs` invokes no macro at all, outside `#[cfg(test)]`.
+///
+/// `syn::Visit` treats a macro's token body as opaque, whether it is a `macro_rules!`
+/// definition or a plain invocation of one defined anywhere else in the crate — a local
+/// `escape_hatch!()` and an inherited `emit!(CheckedDispatch { intent, bytes })` are the
+/// same blind spot under two spellings, and a ban that reads only the identifier
+/// `macro_rules` catches the first and not the second (Codex's fifteenth round on issue
+/// #92: "fresh evidence after the local-macro fix" was exactly this — an invocation of a
+/// macro defined in `lib.rs` or another ancestor scope). [`crate::parse::invokes_any_macro`]
+/// is the one check that closes both at once, the same shape as the qualified
+/// associated-type-projection ban just above: a hard refusal of an unauditable construct
+/// rather than an attempt to see through it.
+fn check_effect_invokes_no_macro(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::invokes_any_macro(contents) {
+        Ok(false) => Vec::new(),
+        Ok(true) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} invokes a macro: whether it is defined locally or \
+                 elsewhere, its token body can expand a `CheckedDispatch` literal or a \
+                 proof-field rebinding where no scan here can read it"
+            ),
+        )],
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
+}
+
+/// `effect.rs` carries no attribute outside `EFFECT_ALLOWED_ATTRIBUTES`, and no
+/// `#[derive(..)]` naming anything outside `EFFECT_ALLOWED_DERIVES`, anywhere in the file
+/// outside `#[cfg(test)]`.
+///
+/// A procedural attribute macro or a custom derive is not a `syn::Macro` invocation at all —
+/// it is a `syn::Attribute` — so `check_effect_invokes_no_macro` just above, however
+/// exhaustive over every invocation shape, cannot see one: Codex found this the round after
+/// that check closed, since `#[forge]` on a method or `#[derive(Forge)]` on a struct expands
+/// in its own defining crate with nothing here able to read what comes out. The same hard
+/// refusal this file already gives a macro invocation and a qualified associated-type
+/// projection applies here: every attribute is required to be one the compiler itself
+/// interprets with no macro behind it, rather than an attempt to resolve what an unfamiliar
+/// name expands to.
+fn check_effect_attributes_are_audited(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::unaudited_attributes(
+        contents,
+        EFFECT_ALLOWED_ATTRIBUTES,
+        EFFECT_ALLOWED_DERIVES,
+    ) {
+        Ok(found) if found.is_empty() => Vec::new(),
+        Ok(mut found) => {
+            found.sort_unstable();
+            found.dedup();
+            vec![Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{found:?} is an attribute or derive {EFFECT_PROTOCOL_PATH} does not \
+                     interpret itself: a procedural macro or a custom derive can expand into \
+                     a `CheckedDispatch` literal or a proof-field rebinding where no scan \
+                     here can read it"
                 ),
             )]
         }
@@ -11143,7 +11301,7 @@ mod deferred_answer_pins {
         assert!(
             violations
                 .iter()
-                .any(|v| v.detail.contains("decode_header_with")
+                .any(|v| v.detail.contains("verify_header_prefix_with")
                     && v.detail.contains("does not reach")),
             "a decoder that stopped asking went unseen: {violations:?}"
         );
@@ -12865,6 +13023,106 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_macro_rules_in_the_effect_protocol_file_is_reported() {
+        // Codex: `syn::Visit` never descends into a `macro_rules!` body, so a local macro
+        // expanding to `CheckedDispatch { intent, bytes }` builds the pinned type at a
+        // construction site none of the scans above can see. Refused outright, the same
+        // shape `ctx-facade` already refuses for the same reason.
+        let source = tests_support::clean_effect_module()
+            + "macro_rules! escape_hatch {\n    () => {};\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("invokes a macro")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_invocation_in_the_effect_protocol_file_is_reported() {
+        // Codex's fifteenth round: banning the `macro_rules` identifier catches only a
+        // *definition*, not an invocation of a macro defined anywhere else in the crate —
+        // `emit!(CheckedDispatch { intent, bytes })` spells no such identifier at all, and
+        // its token body is exactly as opaque to `syn::Visit` as a local definition's.
+        let source =
+            tests_support::clean_effect_module() + "fn extra() {\n    let _ = format!(\"x\");\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("invokes a macro")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_procedural_attribute_in_the_effect_protocol_file_is_reported() {
+        // Codex's sixteenth round: `#[forge]` is a `syn::Attribute`, not a `syn::Macro`
+        // invocation, so `invokes_any_macro`'s `visit_macro` override never sees it — an
+        // attribute macro can rewrite the item it decorates from its own defining crate,
+        // invisible to this file's unexpanded tokens.
+        let source =
+            tests_support::clean_effect_module() + "#[forge]\nfn extra() {\n    let _ = 1;\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("forge")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_custom_derive_in_the_effect_protocol_file_is_reported() {
+        // The `derive` half of the same gap: `#[derive(Forge)]` is a procedural macro too,
+        // and a plain allowlist of the identifier `derive` would wave every entry in it
+        // through, custom derives included.
+        let source = tests_support::clean_effect_module() + "#[derive(Forge)]\nstruct Extra;\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("Forge")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_effect_protocol_std_derives_are_not_reported() {
+        // The positive half: the file's own real derives — `Clone, Copy, Debug`, and so on
+        // on `EffectId`, `ActivityKind`, etc. — must stay legal, or the allowlist is too
+        // narrow for the file it is pinned against. `Default` is not among them: it is the
+        // one derive on the compiler's own list that constructs, so it is refused rather
+        // than allowed — `a_derive_default_on_a_proof_type_is_reported`, below, is its own
+        // negative half.
+        let source = tests_support::clean_effect_module()
+            + "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]\n\
+               struct Extra;\n";
+        let details = effect_details(&source);
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("attribute or derive")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_derive_default_on_a_proof_type_is_reported() {
+        // Codex's review of issue #92's merge (round 4 of the macro/derive family): `Default`
+        // used to sit on `EFFECT_ALLOWED_DERIVES` beside `Clone` and `Debug`, but unlike every
+        // other entry it *constructs* — `#[derive(Default)]` on `CheckedDispatch` or
+        // `DurableIntent` would generate `CheckedDispatch::default()`, a second public
+        // constructor neither `EFFECT_NO_SELF_LITERAL` nor `CHECKED_DISPATCH_CONSTRUCTION`
+        // looks for, since both scan for a construction site written in source rather than one
+        // the compiler generates. The ban is file-wide rather than scoped to the three proof
+        // types, matching every other refusal in this family.
+        let source = tests_support::clean_effect_module() + "#[derive(Default)]\nstruct Extra;\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("Default")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_missing_effect_protocol_fails_closed() {
         let details: Vec<String> = check_effect_protocol(&[])
             .into_iter()
@@ -12976,6 +13234,28 @@ mod deferred_answer_pins {
             + "pub(crate) fn forge(intent: DurableIntent) -> CheckedDispatch<'static> {\n\
                \x20   type Unchecked<'a> = CheckedDispatch<'a>;\n\
                \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("uninspected route")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_local_alias_of_a_module_level_alias_is_reported() {
+        // Codex, issue #92's post-merge review: `type Outer<'a> = CheckedDispatch<'a>;` at
+        // module scope, with a helper's own body declaring `type Inner<'a> = Outer<'a>;`.
+        // `resolve_local_alias_chain` correctly stops at `Outer` — a block only ever
+        // searches its own aliases — but the caller used to treat that as the final answer
+        // instead of feeding it on to the module-level resolver, so `Inner { .. }` was never
+        // counted as `CheckedDispatch`.
+        let source = tests_support::clean_effect_module()
+            + "type Outer<'a> = CheckedDispatch<'a>;\n\
+               pub(crate) fn forge(intent: DurableIntent) -> Outer<'static> {\n\
+               \x20   type Inner<'a> = Outer<'a>;\n\
+               \x20   Inner { intent, bytes: &[] }\n}\n";
         let details = effect_details(&source);
         assert!(
             details

@@ -59,6 +59,8 @@ be superseded.
 | [0048](0048-the-rigs-four-owed-rows-close-on-authority-not-a-mark.md) | The rig's four owed rows close on authority, not a mark | accepted |
 | [0049](0049-an-unserviceable-kind-is-an-answer-not-a-record.md) | An unserviceable kind is an answer, not a record | accepted |
 | [0050](0050-a-durable-intent-carries-its-request-and-perform-checks-it.md) | A durable intent carries its request, and `perform` checks it | accepted |
+| [0051](0051-an-alarm-is-armed-on-a-halt-and-a-driver-at-a-bank-can-swap.md) | An alarm is armed on a halt, and a driver at a bank can swap | accepted |
+| [0052](0052-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md) | A torn record redelivers when its reserved slot is clean | accepted |
 
 ## Reading the numbers
 
@@ -78,7 +80,7 @@ In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
 0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033 → 0034 →
 0035 → 0036 → 0037 → 0038 → 0039 → 0040 → 0041 → 0042 → 0043 → 0044 → 0045 → 0046 → 0047 →
-0048 → 0049 → 0050.
+0048 → 0049 → 0050 → 0051 → 0052.
 
 ## Writing one
 

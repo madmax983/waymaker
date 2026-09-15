@@ -191,6 +191,145 @@ iterating past two or three rounds and open an issue once a fourth still finds r
 rather than continue an unbounded loop. They are tracked in issue
 [#171](https://github.com/madmax983/waymaker/issues/171) instead.
 
+**An eleventh round, on the merge of this branch with a concurrent one, found a gap in the
+tenth's own fix: a compound assignment.** `dispatch.intent.request.kind ^= 1;` rewrites
+`kind` in place, and `note`'s chain walk covers it once reached — but `visit_expr_assign`
+was the only route that called `note` at all, and `syn` does not parse `+=`, `^=` or the
+other eight compound-assignment operators as an `Expr::Assign`. Each is a `BinOp` on an
+`Expr::Binary`, a different node the visitor never visited. `mutated_field_names` now also
+visits `Expr::Binary` and calls `note` on the left operand for any of the ten assignment
+operators, leaving an ordinary binary expression (`x.field + 1`, which reads and rewrites
+nothing) untouched.
+
+**A twelfth round found a gap in the eleventh's own review, not its fix: destructuring
+assignment.** `(dispatch.bytes,) = (replacement,);` is still an `Expr::Assign` — `note` is
+still called on its left side — but that left side is `Expr::Tuple`, not `Expr::Field`, and
+`note`'s chain walk starts by checking for `Expr::Field` and does nothing at all otherwise.
+A field buried inside a tuple, array or struct-literal destructuring target was invisible
+the same way a compound-assignment target had been. `note` now recurses into each element
+of a tuple or array and each field's value in a struct literal — arbitrarily nested, since a
+tuple can hold another tuple — before falling back to the field-chain walk, so
+`(x, (dispatch.bytes,)) = (x, (replacement,));` is still caught two levels down.
+
+**A thirteenth round found a gap in the tenth round's own chain walk, not in the eleventh's
+or twelfth's fixes: a parenthesized ancestor.** `(dispatch.intent.request).kind = x;` is a
+plain field assignment, and its outermost field is `kind` — not a guarded name — but
+`intent` and `request` are guarded ancestors in the same chain, which is exactly what the
+tenth round's walk exists to catch. The walk is `while let Expr::Field(field) = current {
+.. current = &field.base; }`, and here `field.base` is an `Expr::Paren` rather than another
+`Expr::Field`, so the loop stopped there and never saw either ancestor. The walk now
+unwraps `Expr::Paren` and `Expr::Group` as it descends, the same two wrappers
+`type_alias_target` already unwraps for the sixth round's reason, so a doubly parenthesized
+ancestor (`((dispatch.intent).request).kind = x;`) still resolves in two hops. This is the
+third round of Codex findings since this branch's merge with a concurrent one, and this
+project's own review-depth guidance is to stop past two or three rounds and open an issue
+once a fourth still finds real bugs — so a fourteenth finding of this shape goes to issue
+[#171](https://github.com/madmax983/waymaker/issues/171) rather than a fourteenth round here.
+
+**Review of the merge itself found a separate bug in code the merge introduced, not in
+`mutated_field_names`'s own chain above: a nested module's alias leaking into a block's
+lookup.** `resolve_local_alias_chain` was written to keep issue #92's function-local
+type-alias resolution working after issue #169's rewrite of `struct_literal_counts` onto a
+stack of raw `&[syn::Item]` slices rather than precomputed alias lists. It resolved a
+block's own aliases by calling `collect_item_aliases`, which recurses into any `mod` the
+block declares — the right behaviour for a whole-file alias index, wrong for a block-local
+one. A block declaring both `type S = Foo;` directly and `mod hidden { type S = Bar; }`
+alongside it had `hidden`'s own `S` collected into the same flat list as the block's own, so
+a bare `S {}` outside `hidden` could resolve through the nested module's private alias
+rather than the block's real one — exactly the leak `own_aliases`'s own doc comment already
+states a module-level lookup must not have. `own_aliases` is generalized to take any
+`&syn::Item` iterator instead of only a `&[syn::Item]` slice, and `resolve_local_alias_chain`
+now calls it in place of `collect_item_aliases` — the same non-recursive, own-level-only
+collection a module lookup already gets, reused rather than reimplemented.
+`a_nested_modules_alias_does_not_leak_into_the_enclosing_blocks_lookup` is the regression,
+confirmed RED against the unpatched lookup.
+
+**Review of that fix found the inverse leak in the same round: a block's own alias leaking
+into a nested module's lookup.** `visit_item_mod`, the `Literals` visitor's own traversal of
+a nested `mod`, pushed the module's items onto `self.stack` and popped them on the way out
+for module-level scoping, but never touched `self.block_items` — so a block's own local
+`type`/`use` aliases stayed visible while the visitor descended into a `mod` declared
+directly inside that block, even though real Rust never lets a nested module inherit an
+enclosing function body's local items, the mirror image of the leak above. A block declaring
+`type S = Foo;` directly and, alongside it, `mod hidden { pub struct S; fn make() -> S { S
+{} } }` had `hidden::make`'s own `S {}` resolve through the outer block's alias to `Foo`,
+when `hidden` should never see that alias at all. `visit_item_mod` now sets `block_items`
+aside with `core::mem::take` before descending into the module and restores it once the
+descent returns, the same discipline `self.stack`'s own push/pop already has.
+`a_blocks_local_alias_does_not_leak_into_a_nested_module` is the regression, confirmed RED
+against the unpatched visitor.
+
+**Codex then found a gap in a different mechanism, not in the alias scanner's scope
+discipline at all.** `syn::Visit` never descends into a `macro_rules!` body — to a
+syntax-only scan it is an opaque token stream — so a local macro defined and invoked inside
+`effect.rs` and expanding to `CheckedDispatch { intent, bytes }` builds the pinned type at a
+construction site none of `struct_literal_counts`'s callers, nor any check built on it, can
+see. Expanding or inspecting a macro body was rejected for the reason resolving a qualified
+associated-type projection already was earlier in this same file's history: it needs
+machinery — real macro expansion — this scanner does not have. `check_effect_types` now
+refuses `effect.rs` outright over a bare `macro_rules` identifier instead, the same
+construct `ctx-facade` already refuses in its own two pinned files for the identical reason:
+a scanner cannot expand a macro, so it refuses the construct rather than trying to see
+through it. `a_macro_rules_in_the_effect_protocol_file_is_reported` is the regression,
+confirmed RED against the unpatched rule.
+
+**Codex found the gap that ban left open in the same round.** Reading the `macro_rules`
+identifier catches a *definition*, not an *invocation* of a macro defined anywhere else in
+the crate — `emit!(CheckedDispatch { intent, bytes })` spells no such identifier at all, and
+its token body is exactly as opaque to `syn::Visit` as a local definition's. `syn::Macro` is
+the one type every invocation site shares — `ItemMacro`, `StmtMacro`, `ExprMacro`,
+`TypeMacro` and `PatMacro` each carry one — so `crate::parse::invokes_any_macro` overrides
+`visit_macro` once instead, which catches all five invocation shapes, `macro_rules!`
+included, without naming any of them individually; the identifier-only check in
+`check_effect_types` is retired in its favour. `effect.rs` now refuses the file outright over
+any macro use at all, outside `#[cfg(test)]`. `a_macro_invocation_in_the_effect_protocol_file_is_reported`
+is the regression, confirmed RED against the identifier-only check.
+
+**A third round in the same family found the shape neither of the first two catches.** An
+attribute macro or a custom derive is a `syn::Attribute`, not a `syn::Macro` invocation, so
+`invokes_any_macro`'s `visit_macro` override — however exhaustive over every invocation shape
+— never sees `#[forge]` on a method or `#[derive(Forge)]` on a struct: each expands in its
+own defining crate with nothing here able to read what comes out. `crate::parse::unaudited_attributes`
+closes it the same way as the two before it — a hard refusal rather than an attempt to
+resolve what an unfamiliar name expands to — requiring every attribute in `effect.rs` to be
+one of a fixed set the compiler itself interprets with no macro behind it
+(`source::EFFECT_ALLOWED_ATTRIBUTES`), and a `#[derive(..)]` to name only the compiler's own
+derives (`source::EFFECT_ALLOWED_DERIVES`), each name in the list checked on its own since
+one attribute can mix an inert compiler derive with a custom one. `cfg_attr` is refused
+outright rather than classified recursively, since it can emit an arbitrary attribute and
+`effect.rs` has no legitimate use for one today. Three rounds deep in this macro-opacity
+family — this project's own review-depth guidance is to stop past two or three rounds and
+open an issue once a fourth still finds real bugs — so a fourth finding of this shape goes to
+a new issue rather than a fourth round here.
+`a_procedural_attribute_in_the_effect_protocol_file_is_reported` and
+`a_custom_derive_in_the_effect_protocol_file_is_reported` are the regressions, confirmed RED
+against the unpatched rule.
+
+**A fourth round found two more real gaps in that same check, both left open.** An attribute
+macro on a trait member is invisible to `unaudited_attributes`, which visits `syn::Item` and
+`syn::ImplItem` but never `syn::TraitItem`; and a `use malicious::Forge as Clone;` import
+shadows the allowlisted derive name `Clone` with no way for a name-only comparison to tell.
+Per this project's own review-depth guidance, both are tracked in issue
+[#186](https://github.com/madmax983/waymaker/issues/186) rather than fixed in this change.
+
+**The same round found a real, fixable bug back in the alias-scoping mechanism instead.**
+`resolve_local_alias_chain` correctly stops at the end of a block's own aliases — a block-local
+`type Inner = Outer;` beside a *module*-level `type Outer = Foo;` — but the caller took that
+partial chain as final rather than feeding it on to `resolve_segments`'s own module-level
+lookup, so `Inner {}` was resolved only as far as `Outer`. `resolve_local_alias_chain` now
+reports whether its own chain ended on an absolute alias (already fully resolved, mirroring
+`resolve_segments`'s leading-colon short-circuit) or simply ran out of block-local names — in
+which case the leftover head is resolved again through `resolve_segments_from`, the
+module-lookup half of `resolve_segments` split out for reuse, a no-op when the name is not
+itself a module-level alias. `a_function_local_alias_of_a_module_level_alias_still_resolves`
+and `a_checked_dispatch_built_through_a_local_alias_of_a_module_level_alias_is_reported` are
+the regressions, confirmed RED against the unpatched caller. A second finding in the same
+round — two mutually exclusive `#[cfg(..)]`-gated `type` aliases sharing one name, where
+`own_aliases` skips only `#[cfg(test)]` and lets whichever is declared last win regardless of
+which a real build compiles — is not fixed: it is the pre-existing, accepted "`cfg` is not
+evaluated" limitation this file's own module documentation already states for every scanner
+in this family, named here rather than chased as a new gap.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
