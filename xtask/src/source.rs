@@ -10590,7 +10590,22 @@ fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
                     // inside a `const` initializer applies here: reasoning about which
                     // calls are safe to fold is not attempted, and a match built from arms
                     // shaped this way is reported outright rather than read as unresolved.
-                    if numbered.iter().any(|arm| arm.guard_unresolved_call) {
+                    //
+                    // Codex's next-round finding: `(0, 0)` through `(3, 3)` over a
+                    // two-field tuple scrutinee has two non-catch-all fields in every
+                    // arm, so `pattern_literal` resolves no value from any of them and
+                    // the same three checks below all bail the same way, whatever
+                    // `rustc` itself folds the Cartesian product into at compile time.
+                    // The identical refusal applies: which field (or combination) a
+                    // table would be keyed on is not decoded, and a match built from
+                    // arms shaped this way is reported outright. Both findings are one
+                    // check now, over `FoundArm::unresolved_cause`, since
+                    // `struct_excessive_bools` refused a fourth field alongside
+                    // `is_wild` and `unsigned`.
+                    if numbered
+                        .iter()
+                        .any(|arm| arm.unresolved_cause != crate::parse::UnresolvedArmCause::None)
+                    {
                         return true;
                     }
                     // Codex's next-round finding: `_x if flag => 999, 0 => .., 1 => .., 2
@@ -28729,6 +28744,42 @@ mod deferred_answer_pins {
             violations
                 .iter()
                 .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_two_field_tuple_scrutinee_is_reported() {
+        // Codex's finding: `match (nibble & 3, (nibble >> 2) & 3) { (0, 0) => .., .. (3, 3)
+        // => .., _ => .. }` has two non-catch-all fields in every one of its sixteen
+        // numbered arms, so `single_discriminating_field` answers `None` for each of them
+        // — it refuses to guess which field a table would be keyed on — and
+        // `pattern_literal` resolves no value from any of them, the identical silence a
+        // guard-dispatched table already produces. Every one of `missing_value`,
+        // `compact_window_with_gaps` and `dense_power_of_two_stride` bails on the first
+        // arm they meet, so no contiguous sub-slice was ever found dense and
+        // `has_dense_arm_patterns` returned `false`, approving the table unseen — even
+        // though `rustc` still lowers the Cartesian product to a real indexed table.
+        // Verified against real rustc, warning-free (`rustc --edition 2021 -C
+        // opt-level=z`): this exact match compiles clean with no `unreachable_patterns`
+        // or dead-code warning, over every one of the sixteen `(hi, lo)` pairs `nibble &
+        // 15` can produce.
+        let source = format!(
+            "{}\nconst fn dense_table_over_a_two_field_tuple(nibble: u32) -> u32 {{\n    \
+             match (nibble & 3, (nibble >> 2) & 3) {{\n        (0, 0) => 0,\n        \
+             (0, 1) => 1,\n        (0, 2) => 2,\n        (0, 3) => 3,\n        \
+             (1, 0) => 4,\n        (1, 1) => 5,\n        (1, 2) => 6,\n        \
+             (1, 3) => 7,\n        (2, 0) => 8,\n        (2, 1) => 9,\n        \
+             (2, 2) => 10,\n        (2, 3) => 11,\n        (3, 0) => 12,\n        \
+             (3, 1) => 13,\n        (3, 2) => 14,\n        (3, 3) => 15,\n        \
+             _ => 15,\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 17-arm dense match")),
             "{violations:?}"
         );
     }

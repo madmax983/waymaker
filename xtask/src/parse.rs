@@ -13770,23 +13770,52 @@ pub struct FoundArm {
     /// tell the two apart before it decides whether wrapping past `i128::MIN` means
     /// anything at all.
     pub unsigned: bool,
-    /// Whether the arm carries a guard that both failed to resolve to a value at all and
-    /// names a call this scan does not evaluate — `x if x == index(0)` among them, `index`
-    /// a `const fn` this scan refuses to interpret the body of.
+    /// Why [`pattern`](Self::pattern) is empty when it is not simply that the arm is a
+    /// genuine catch-all — a distinction `pattern` being empty cannot carry on its own,
+    /// since both an arm this scan cannot evaluate and a vacuous, harmless one produce
+    /// the identical empty `Vec`. See [`UnresolvedArmCause`].
+    pub unresolved_cause: UnresolvedArmCause,
+}
+
+/// [`FoundArm::unresolved_cause`]'s own vocabulary.
+///
+/// Why an arm's pattern resolved to no values, when that silence should not be read as
+/// evidence the arm is *not* part of a dense table `rustc` still compiles. A struct
+/// field for each of these was tried first and clippy's own `struct_excessive_bools`
+/// refused a fourth alongside `is_wild` and `unsigned` — the same "consider ...
+/// refactoring bools into two-variant enums" its own message suggests, met here with a
+/// third variant because two independent reasons already existed before this one was
+/// added.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedArmCause {
+    /// The pattern resolved as this scan's own logic says it should — either it names
+    /// values, or it is a genuine catch-all that matches everything and so needs none.
+    None,
+    /// The arm carries a guard that both failed to resolve to a value at all and names
+    /// a call this scan does not evaluate — `x if x == index(0)` among them, `index` a
+    /// `const fn` this scan refuses to interpret the body of.
     ///
-    /// Codex's finding: a table dispatched entirely through arms shaped this way — a plain
-    /// binding pattern, refutable only by its own guard — resolves to an empty `pattern` on
-    /// every arm, the identical shape `_x if flag => 999`'s single barrier arm already
-    /// produces. But there the numbered arms *after* the barrier still carried literal
-    /// patterns of their own; here every arm is a barrier, so `missing_value`,
-    /// `compact_window_with_gaps` and `dense_power_of_two_stride` each bail on the first
-    /// empty pattern they meet and no contiguous sub-slice is ever found dense, exactly as
-    /// [`const_call_initializer_uses`] already refuses to reason about which `const`
-    /// initializer calls are safe to fold rather than guessing. This field is the same
-    /// refusal one level over: a guard equality this scan cannot evaluate because a call
-    /// sits inside it is not evidence the arm is *not* part of a table, so a caller treats
-    /// it as evidence that it might be — reported outright rather than silently passed.
-    pub guard_unresolved_call: bool,
+    /// Codex's finding: a table dispatched entirely through arms shaped this way — a
+    /// plain binding pattern, refutable only by its own guard — resolves to an empty
+    /// `pattern` on every arm, the identical shape `_x if flag => 999`'s single barrier
+    /// arm already produces. But there the numbered arms *after* the barrier still
+    /// carried literal patterns of their own; here every arm is a barrier, so
+    /// `missing_value`, `compact_window_with_gaps` and `dense_power_of_two_stride` each
+    /// bail on the first empty pattern they meet and no contiguous sub-slice is ever
+    /// found dense, exactly as [`const_call_initializer_uses`] already refuses to
+    /// reason about which `const` initializer calls are safe to fold rather than
+    /// guessing. This variant is the same refusal one level over: a guard equality this
+    /// scan cannot evaluate because a call sits inside it is not evidence the arm is
+    /// *not* part of a table, so a caller treats it as evidence that it might be —
+    /// reported outright rather than silently passed.
+    GuardCall,
+    /// The arm's own pattern names two or more fields that are not themselves
+    /// irrefutable — `(0, 0)` through `(3, 3)` over a two-field tuple scrutinee among
+    /// them — so that `pattern_literal` resolving no value from it is not evidence the
+    /// arm is *not* part of a table, the identical standing [`Self::GuardCall`] already
+    /// has for a guard equality this scan cannot evaluate. See
+    /// [`pattern_has_ambiguous_discriminating_fields`].
+    AmbiguousFields,
 }
 
 /// Every `match` expression `contents` declares, anywhere one can appear, outside
@@ -19216,33 +19245,123 @@ fn resolve_qself_associated_const(
 /// [ADR 0010]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md
 const MAX_RANGE_PATTERN_VALUES: usize = 4096;
 
-/// The single field of `elems` that is not itself irrefutable — `_`, or an unguarded
-/// binding naming no known constant, via the exact same test [`is_catchall_pattern`]
-/// applies to a whole arm's own pattern — or `None` when zero or more than one field
-/// qualifies.
-///
-/// A tuple, tuple-struct, named-field struct, or slice pattern with any number of
-/// fields, all but one of them a catch-all, is exactly as dense a table row as that one
-/// field alone: `rustc` still indexes on the one field that actually varies and ignores
-/// every field that always matches — a field's own *name*, where it has one, plays no
-/// part in this, only whether its subpattern is irrefutable. Two or more non-catch-all
-/// fields is genuinely ambiguous — nothing here says which one a table would be keyed on
-/// — and is refused the same as zero, rather than guessing.
-fn single_discriminating_field<'a>(
+/// How many of `elems` are not themselves irrefutable — `_`, or an unguarded binding
+/// naming no known constant, via the exact same test [`is_catchall_pattern`] applies to
+/// a whole arm's own pattern — counted only as far as telling zero, one and more than
+/// one apart, which is all either of this type's two callers ever needs.
+enum DiscriminatingFields<'a> {
+    /// Every field is itself irrefutable — a pattern like `(_, _)` that matches
+    /// everything regardless of which value the tuple actually holds.
+    None,
+    /// Exactly one field is not irrefutable, named here — a tuple, tuple-struct,
+    /// named-field struct or slice pattern with any number of fields, all but one of
+    /// them a catch-all, is exactly as dense a table row as that one field alone:
+    /// `rustc` still indexes on the one field that actually varies and ignores every
+    /// field that always matches.
+    One(&'a syn::Pat),
+    /// Two or more fields are not irrefutable — `rustc` can still index a dense table
+    /// on the Cartesian product of every varying field, but which field (or which
+    /// combination) a table would be keyed on is genuinely ambiguous from the pattern
+    /// alone, and is not decoded here.
+    Many,
+}
+
+/// [`DiscriminatingFields`] of `elems` — `single_discriminating_field`'s own counting
+/// loop, and [`has_multiple_discriminating_fields`]'s, factored into one function so
+/// the two callers agree on what "more than one" means without a second copy of the
+/// loop.
+fn discriminating_fields<'a>(
     elems: impl IntoIterator<Item = &'a syn::Pat>,
     resolve: &Resolve<'_>,
-) -> Option<&'a syn::Pat> {
+) -> DiscriminatingFields<'a> {
     let mut found: Option<&syn::Pat> = None;
     for elem in elems {
         if is_catchall_pattern(elem, false, resolve) {
             continue;
         }
         if found.is_some() {
-            return None;
+            return DiscriminatingFields::Many;
         }
         found = Some(elem);
     }
-    found
+    found.map_or(DiscriminatingFields::None, DiscriminatingFields::One)
+}
+
+/// The single field of `elems` that is not itself irrefutable, or `None` when zero or
+/// more than one field qualifies — [`DiscriminatingFields::One`] alone, since a caller
+/// resolving one field's own value has no use for the other two answers.
+///
+/// Two or more non-catch-all fields is genuinely ambiguous — nothing here says which
+/// one a table would be keyed on — and is refused the same as zero, rather than
+/// guessing.
+fn single_discriminating_field<'a>(
+    elems: impl IntoIterator<Item = &'a syn::Pat>,
+    resolve: &Resolve<'_>,
+) -> Option<&'a syn::Pat> {
+    match discriminating_fields(elems, resolve) {
+        DiscriminatingFields::One(pat) => Some(pat),
+        DiscriminatingFields::None | DiscriminatingFields::Many => None,
+    }
+}
+
+/// Whether `elems` names two or more fields that are not themselves irrefutable —
+/// [`DiscriminatingFields::Many`] alone, the genuinely ambiguous case
+/// [`single_discriminating_field`] refuses rather than the harmless, vacuous one where
+/// every field is a catch-all.
+///
+/// Codex's finding: `(0, 0)` through `(3, 3)` over a two-field tuple scrutinee, each
+/// arm masking off a different half of one integer, has two non-catch-all fields in
+/// every arm — `single_discriminating_field` answers `None` for every one of them, for
+/// the identical reason it refuses to guess which field a table would be keyed on, and
+/// [`pattern_literal`] resolves no value at all from any of them. But `rustc` does not
+/// share that caution: it still lowers a match built this way to the identical indexed
+/// table a one-field selector gets, keyed on the Cartesian product of every field that
+/// varies, and a real device pays for the table whether or not this scan can decode
+/// which field it is keyed on. This is what [`pattern_has_ambiguous_discriminating_fields`]
+/// checks for, so a match built entirely from arms shaped this way is reported outright
+/// — the same standing [`UnresolvedArmCause::GuardCall`] already gives a guard
+/// equality this scan cannot evaluate — rather than read as silently unresolved and
+/// let through as though it named no values at all.
+fn has_multiple_discriminating_fields<'a>(
+    elems: impl IntoIterator<Item = &'a syn::Pat>,
+    resolve: &Resolve<'_>,
+) -> bool {
+    matches!(
+        discriminating_fields(elems, resolve),
+        DiscriminatingFields::Many
+    )
+}
+
+/// Whether `pattern` is a compound pattern — a tuple, tuple-struct, named-field struct,
+/// slice, or an or-pattern over one of those — naming two or more fields that are not
+/// themselves irrefutable, recursively through every wrapper [`pattern_literal`] itself
+/// sees through (an at-binding's subpattern, a reference, parentheses, and every
+/// alternative of an or-pattern). See [`has_multiple_discriminating_fields`] for what
+/// this is refusing to guess and why.
+fn pattern_has_ambiguous_discriminating_fields(pattern: &syn::Pat, resolve: &Resolve<'_>) -> bool {
+    match pattern {
+        syn::Pat::Ident(named) => named.subpat.as_ref().is_some_and(|(_, subpat)| {
+            pattern_has_ambiguous_discriminating_fields(subpat, resolve)
+        }),
+        syn::Pat::Reference(reference) => {
+            pattern_has_ambiguous_discriminating_fields(&reference.pat, resolve)
+        }
+        syn::Pat::Paren(paren) => pattern_has_ambiguous_discriminating_fields(&paren.pat, resolve),
+        syn::Pat::TupleStruct(tuple_struct) => {
+            has_multiple_discriminating_fields(&tuple_struct.elems, resolve)
+        }
+        syn::Pat::Tuple(tuple) => has_multiple_discriminating_fields(&tuple.elems, resolve),
+        syn::Pat::Struct(pat_struct) => has_multiple_discriminating_fields(
+            pat_struct.fields.iter().map(|field| field.pat.as_ref()),
+            resolve,
+        ),
+        syn::Pat::Slice(pat_slice) => has_multiple_discriminating_fields(&pat_slice.elems, resolve),
+        syn::Pat::Or(or_pattern) => or_pattern
+            .cases
+            .iter()
+            .any(|case| pattern_has_ambiguous_discriminating_fields(case, resolve)),
+        _ => false,
+    }
 }
 
 fn pattern_literal(
@@ -19768,7 +19887,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
         is_wild: false,
         call: call_shape_of(&block_as_expr(&node.then_branch), resolve),
         unsigned: first_unsigned,
-        guard_unresolved_call: false,
+        unresolved_cause: UnresolvedArmCause::None,
     }];
     let mut current = node;
     loop {
@@ -19785,7 +19904,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
                     is_wild: false,
                     call: call_shape_of(&block_as_expr(&next_if.then_branch), resolve),
                     unsigned: next_unsigned,
-                    guard_unresolved_call: false,
+                    unresolved_cause: UnresolvedArmCause::None,
                 });
                 current = next_if;
             }
@@ -19795,7 +19914,7 @@ fn extract_if_chain(node: &syn::ExprIf, resolve: &Resolve<'_>) -> Option<(String
                     is_wild: true,
                     call: call_shape_of(&block_as_expr(&else_block.block), resolve),
                     unsigned: false,
-                    guard_unresolved_call: false,
+                    unresolved_cause: UnresolvedArmCause::None,
                 });
                 break;
             }
@@ -21500,12 +21619,27 @@ impl<'ast> syn::visit::Visit<'ast> for MatchVisitor {
             let guard_unresolved_call = arm.guard.as_ref().is_some_and(|(_, guard_expr)| {
                 guard_value.is_none() && expr_contains_call(guard_expr)
             });
+            // Codex's finding: `(0, 0)` through `(3, 3)` over a two-field tuple
+            // scrutinee has two non-catch-all fields in every arm, so
+            // `pattern_literal` resolves no value from any of them — the identical
+            // silence a guard-dispatched table already produces, and the identical
+            // reason: `single_discriminating_field` refuses to guess which field a
+            // table would be keyed on, not that `rustc` declines to build one anyway.
+            let ambiguous_discriminating_fields =
+                pattern_has_ambiguous_discriminating_fields(&arm.pat, &resolve);
+            let unresolved_cause = if guard_unresolved_call {
+                UnresolvedArmCause::GuardCall
+            } else if ambiguous_discriminating_fields {
+                UnresolvedArmCause::AmbiguousFields
+            } else {
+                UnresolvedArmCause::None
+            };
             arms.push(FoundArm {
                 pattern: pattern_literal(&arm.pat, &resolve, &self.qualified),
                 is_wild,
                 call: call_shape_of(&arm.body, &resolve),
                 unsigned: scrutinee_unsigned || pattern_is_definitely_unsigned(&arm.pat, &resolve),
-                guard_unresolved_call,
+                unresolved_cause,
             });
             if is_wild {
                 break;
