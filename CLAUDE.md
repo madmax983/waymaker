@@ -1844,12 +1844,17 @@ it disagreed with is consumed, so a diverging replay cannot dispatch; see
 holds all five, two of them settled with evidence and three of them open with the rung that
 owns each and what would close it. The integrity check is
 [ADR 0010](docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md) — CRC-32/ISO-HDLC
-and CRC-16/CCITT-FALSE, table-free, decided on measurements taken on `thumbv6m-none-eabi`
-rather than on preference — and the metadata a scheduled effect carries is
+and CRC-16/CCITT-FALSE, table-free at the time, decided on measurements taken on
+`thumbv6m-none-eabi` rather than on preference (issue #153 and
+[ADR 0045](docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md), far
+below, later supersede the table-free half for `crc32` alone, once a profile of this
+workspace's own workloads made the table worth it) — and the metadata a scheduled effect
+carries is
 [ADR 0011](docs/adr/0011-a-scheduled-effect-records-a-length-and-a-digest.md), which fixes it
 at a sequence, a kind, a length and a digest. Each answer has a rule holding it: a checksum
-that changed polynomial or grew a table fails `integrity-check`, and a fifth field on
-`EffectScheduled` fails `effect-scheduled-fields`.
+that changed polynomial fails `integrity-check`, and so does one that grew a table outside
+the one exception ADR 0045 later carves out, and a fifth field on `EffectScheduled` fails
+`effect-scheduled-fields`.
 Issue #17 then asked ADR 0010's answer to be *held* rather than assumed:
 [ADR 0012](docs/adr/0012-the-integrity-check-is-swappable-behind-a-trait-and-the-seal-widths-are-not.md)
 puts the two seals behind `waymaker-flash`'s `IntegrityCheck` trait, binds the shipped

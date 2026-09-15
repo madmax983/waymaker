@@ -22965,6 +22965,40 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_a_labelled_block_setup_statement_is_reported() {
+        // Codex's finding: `'value: { let x = n; break 'value x; }` is two statements rather
+        // than the one `evaluate_labelled_block`'s own exact-one-statement match required —
+        // the identical gap `evaluate_loop` had before its own setup-statement fix, one
+        // construct over. `evaluate_labelled_block` now walks every statement before the
+        // break through `resolve_block_sequential` the same way, before resolving the break
+        // expression against whatever that walk bound. Verified against real rustc,
+        // warning-free: `x` is `n` for every `n` in `0..8`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..8u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = 'value: {{ let x = {n}u8; break 'value x; }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_labelled_block_setup_statement(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        _ => 8,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_fp_category_variants_is_reported() {
         // Codex's finding: `core::num::FpCategory`'s five variants named the identical gap
         // `core::sync::atomic::Ordering`'s own fix closed one enum over — resolved to

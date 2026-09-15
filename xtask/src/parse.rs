@@ -6341,19 +6341,63 @@ fn evaluate_loop(expr_loop: &syn::ExprLoop, resolve: &Resolve<'_>) -> Option<i12
 /// labelled-loop fix only ever touched `Expr::Loop`; `Expr::Block`'s own guard refuses
 /// *every* labelled block unconditionally, `evaluate_block` included, so every one of a
 /// table's numbered arms spelled this way stayed unresolved. Scoped identically to
-/// `evaluate_loop`: any other body shape — more than one statement, an unlabelled break, one
-/// naming a different label — stays unresolved rather than guessed at.
+/// `evaluate_loop`: an unlabelled break, or one naming a different label, stays unresolved
+/// rather than guessed at.
+///
+/// Codex's next-round finding: `'value: { let x = n; break 'value x; }` is two statements
+/// rather than the one this used to require — a `let` setting up the value a trailing,
+/// unconditional, same-labelled `break` then returns — the identical gap `evaluate_loop` had
+/// before its own setup-statement fix. The block's statements *before* the break are now
+/// walked through [`resolve_block_sequential`] the identical way, and the break expression is
+/// resolved against whatever that walk bound.
 fn evaluate_labelled_block(block_expr: &syn::ExprBlock, resolve: &Resolve<'_>) -> Option<i128> {
     let label = block_expr.label.as_ref()?;
-    let [syn::Stmt::Expr(syn::Expr::Break(break_expr), _)] = block_expr.block.stmts.as_slice()
-    else {
+    let stmts = production_stmts(&block_expr.block);
+    let (last, rest) = stmts.split_last()?;
+    let syn::Stmt::Expr(syn::Expr::Break(break_expr), _) = last else {
         return None;
     };
     let break_label = break_expr.label.as_ref()?;
     if break_label.ident != label.name.ident {
         return None;
     }
-    literal_or_const_value(break_expr.expr.as_ref()?, resolve)
+    let mut local_types = std::collections::HashMap::new();
+    let mut resolved = std::collections::HashMap::new();
+    resolve_block_sequential(
+        rest,
+        resolve,
+        &mut local_types,
+        &mut resolved,
+        &mut ShadowSnapshot::new(),
+    )?;
+    let block_resolve_value = |path: &syn::Path| {
+        path.get_ident()
+            .map(ident_name)
+            .and_then(|candidate| resolved.get(&candidate).copied())
+            .or_else(|| (resolve.value)(path))
+    };
+    let block_resolve_unsigned = |path: &syn::Path| {
+        resolved_local_name(path, &resolved).map_or_else(
+            || (resolve.unsigned)(path),
+            |candidate| {
+                local_types
+                    .get(&candidate)
+                    .is_some_and(|name| is_unsigned_type_name(name))
+            },
+        )
+    };
+    let block_resolve_width = |path: &syn::Path| {
+        resolved_local_name(path, &resolved).map_or_else(
+            || (resolve.width)(path),
+            |candidate| local_types.get(&candidate).map(String::as_str),
+        )
+    };
+    let block_resolve = Resolve {
+        value: &block_resolve_value,
+        unsigned: &block_resolve_unsigned,
+        width: &block_resolve_width,
+    };
+    literal_or_const_value(break_expr.expr.as_ref()?, &block_resolve)
 }
 
 /// [`literal_or_const_value`]'s own value for `expr_match`, once its scrutinee resolves
