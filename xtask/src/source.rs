@@ -22053,6 +22053,86 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_adding_an_unsuffixed_bitwise_not_to_a_path_is_reported() {
+        // Codex's finding: `const Pn: u8 = !255 + n;` names a bare, unsuffixed negation that
+        // is not the *whole* initializer but one operand of a binary expression — the
+        // previous fix's own check only fired when `expr` itself, after stripping
+        // parentheses, was `Expr::Unary`, so `!255 + n` (an `Expr::Binary`) declined
+        // regardless of the declared type sitting right there on `Pn`. Real Rust propagates
+        // the declaration's own expected type into both operands of an arithmetic binary the
+        // same way it does the initializer as a whole, so this operand is rewritten to
+        // `!(255 as u8) + n` — the shape `evaluate_bitwise_not` already resolves on its own
+        // — before being handed to the ordinary binary evaluator. Verified against real
+        // rustc: `!255 + n` for `n` in `0..=14` is the dense `0..14` sequence the outer
+        // match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(constants, "    const P{n}: u8 = !255 + {n};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_unsuffixed_bitwise_not_in_a_binary(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_while_let_bound_body_is_reported() {
+        // Codex's finding: `while let x @ 1 = y { out = x - 1 + n; y = 0; }` binds `x`
+        // through the loop's own condition — but `evaluate_while_loop` reduced that
+        // condition to a plain boolean through `literal_or_const_value`'s existing
+        // `Expr::Let` case, which only ever answers "did it match," and then ran the body
+        // against the *outer* resolver alone, where `x` does not exist. `evaluate_if_let`'s
+        // own fix for the identical gap is reused here: the scrutinee and the match are
+        // decided through the same resolver the plain condition already uses (so `y`'s
+        // current, mutated value is what the pattern is checked against on every
+        // iteration), and the body runs with a resolver that answers for `x` and falls back
+        // to the outer one for everything else. Verified against real rustc, warning-free:
+        // `y` starts at `1`, the loop runs exactly once (`y` is reset to `0` inside the
+        // body), and the body's own `out = x - 1 + n;` makes the whole function the identity
+        // on `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut y = 1u8; let mut out = 100u8; while let \
+                 x @ 1 = y {{ out = x - 1 + {n}; y = 0; }} out }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_while_let_bound_body(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_with_an_if_let_bound_then_branch_is_reported() {
         // Codex's finding: `if let x @ 0 = 0u8 { x } else { 100 }` selects the `then`
         // branch, whose own body reads `x` — a name only the condition's own `Expr::Let`

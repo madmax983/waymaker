@@ -4087,6 +4087,67 @@ fn evaluate_while_loop(
             unsigned: &condition_resolve_unsigned,
             width: &condition_resolve_width,
         };
+        // Codex's finding: `while let x @ 1 = y { .. }` reduced its own condition to a
+        // boolean through `literal_or_const_value`'s existing `Expr::Let` case — correct as
+        // far as it goes, but that case only ever answers "did it match," with nowhere to
+        // put the pattern's own bound name once it has. The body then ran against the plain
+        // `resolve`, exactly as if the pattern had bound nothing, so a body reading `x` at
+        // all left the whole loop unresolved. `evaluate_if_let`'s own fix for the identical
+        // gap is reused here rather than duplicated blind: the scrutinee and the match are
+        // both decided through `condition_resolve` (so `y`'s own current, possibly-mutated
+        // value is what the pattern is checked against, exactly as the plain condition below
+        // already is), and the bound name is answered by a resolver whose *fallback* is the
+        // plain `resolve` — composing with `resolve_block_sequential`'s own priority of
+        // `resolved`/`local_types` first, this resolver second, the same way the non-`let`
+        // branch below already relies on.
+        if let syn::Expr::Let(let_expr) = strip_parens(&while_expr.cond) {
+            let scrutinee = literal_or_const_value(&let_expr.expr, &condition_resolve)?;
+            if !match_arm_matches_constant(&let_expr.pat, scrutinee, &condition_resolve)? {
+                return Some(());
+            }
+            let bound = pattern_bindings(&let_expr.pat, &condition_resolve);
+            let is_bound = |path: &syn::Path| -> bool {
+                path.get_ident().is_some_and(|ident| bound.contains(&ident))
+            };
+            let bound_unsigned_value =
+                !bound.is_empty() && is_definitely_unsigned(&let_expr.expr, &condition_resolve);
+            let bound_width_value = (!bound.is_empty())
+                .then(|| expr_declared_width(&let_expr.expr, &condition_resolve))
+                .flatten();
+            let bound_value = |path: &syn::Path| -> Option<i128> {
+                if is_bound(path) {
+                    return Some(scrutinee);
+                }
+                (resolve.value)(path)
+            };
+            let bound_unsigned = |path: &syn::Path| -> bool {
+                if is_bound(path) {
+                    return bound_unsigned_value;
+                }
+                (resolve.unsigned)(path)
+            };
+            let bound_width = |path: &syn::Path| -> Option<&str> {
+                if is_bound(path) {
+                    return bound_width_value.as_deref();
+                }
+                (resolve.width)(path)
+            };
+            let let_resolve = Resolve {
+                value: &bound_value,
+                unsigned: &bound_unsigned,
+                width: &bound_width,
+            };
+            let mut shadow_snapshot = std::collections::HashMap::new();
+            resolve_block_sequential(
+                &production_stmts(&while_expr.body),
+                &let_resolve,
+                local_types,
+                resolved,
+                &mut shadow_snapshot,
+            )?;
+            restore_shadow_snapshot(local_types, resolved, shadow_snapshot);
+            continue;
+        }
         let condition = literal_or_const_value(&while_expr.cond, &condition_resolve)?;
         if condition == 0 {
             return Some(());
@@ -5174,6 +5235,47 @@ fn resolve_declared_initializer(
         return Some(value);
     }
     let width = declared_type?;
+    if let Some(rewritten) = cast_bare_negation_to_width(expr, width) {
+        return literal_or_const_value(&rewritten, resolve);
+    }
+    // Codex's finding: `const Pn: u8 = !255 + n;` names a bare negation that is not the
+    // *whole* initializer but one operand of a binary expression wrapping it — the shape
+    // above alone still declines it, because `expr` itself is `Expr::Binary`, not
+    // `Expr::Unary`. Real Rust propagates the declaration's own expected type into *both*
+    // operands of an arithmetic binary the identical way it does for the initializer as a
+    // whole, so each operand gets the same rewrite tried on it independently; an operand
+    // that already resolves on its own (`n`, a literal or a path) is left untouched, and the
+    // reconstructed binary is handed back to `literal_or_const_value`'s own `Expr::Binary`
+    // dispatch rather than evaluated here, so `Add`/`Sub`/`Mul` and every other operator
+    // still go through the identical width- and sign-aware evaluator every other binary
+    // expression does.
+    let syn::Expr::Binary(binary) = strip_parens(expr) else {
+        return None;
+    };
+    let left = cast_bare_negation_to_width(&binary.left, width);
+    let right = cast_bare_negation_to_width(&binary.right, width);
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+    let mut rewritten = binary.clone();
+    if let Some(left) = left {
+        rewritten.left = Box::new(left);
+    }
+    if let Some(right) = right {
+        rewritten.right = Box::new(right);
+    }
+    literal_or_const_value(&syn::Expr::Binary(rewritten), resolve)
+}
+
+/// Rewrites a bare, unsuffixed bitwise-NOT — `!255`, with no cast and no path of its own to
+/// name a width — into `!(255 as width)`, the one shape [`evaluate_bitwise_not`] already
+/// resolves on its own (a cast as the operand being negated) but could never reach unaided,
+/// because the width really is nowhere in `!255` itself: only in the declaration this is
+/// part of the initializer of. `None` for anything else — a suffixed literal, a cast, or a
+/// path already have their own way to state a width and need no rewriting, and a caller
+/// combining this with an operand that already resolves on its own leaves that operand
+/// untouched.
+fn cast_bare_negation_to_width(expr: &syn::Expr, width: &str) -> Option<syn::Expr> {
     let syn::Expr::Unary(unary) = strip_parens(expr) else {
         return None;
     };
@@ -5191,9 +5293,18 @@ fn resolve_declared_initializer(
     if !int.suffix().is_empty() {
         return None;
     }
-    let ty = syn::parse_str::<syn::Type>(width).ok()?;
-    let raw = lit_value(&syn::Lit::Int(int.clone()))?;
-    apply_integer_cast(!raw, &ty)
+    let ty: syn::Type = syn::parse_str(width).ok()?;
+    let cast_operand = syn::Expr::Cast(syn::ExprCast {
+        attrs: Vec::new(),
+        expr: Box::new(operand.clone()),
+        as_token: syn::Token![as](proc_macro2::Span::call_site()),
+        ty: Box::new(ty),
+    });
+    Some(syn::Expr::Unary(syn::ExprUnary {
+        attrs: unary.attrs.clone(),
+        op: unary.op,
+        expr: Box::new(cast_operand),
+    }))
 }
 
 /// `expr`'s own integer value: a bare literal, however based or suffixed, seen through a
