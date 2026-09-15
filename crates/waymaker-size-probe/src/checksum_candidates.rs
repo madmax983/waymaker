@@ -22,10 +22,12 @@
 //! Both candidates below stay exactly as ADR 0010 left them —
 //! the comparison this file exists to reproduce is ADR 0010's bitwise-versus-table
 //! trade-off, and changing either candidate's body to match the current `crc.rs` would
-//! make that comparison a comparison against itself. `shipped` on each, in
-//! `xtask::size::CHECKSUM_CANDIDATES`, now means "the algorithm ADR 0010 chose", not "the
+//! make that comparison a comparison against itself. `adr0010_shipped` on each, in
+//! `xtask::size::CHECKSUM_CANDIDATES`, means "the algorithm ADR 0010 chose", not "the
 //! bytes `crc.rs` currently computes with" — CRC-32/ISO-HDLC and CRC-16/CCITT-FALSE are
-//! still both true today, only bitwise no longer is.
+//! still both true today, only bitwise no longer is. The field used to be named plain
+//! `shipped`, which is exactly the claim that stopped being true; it was renamed once a
+//! report reader had no way to tell the two apart from the rendered output alone.
 //!
 //! # Why five functions and not one call each
 //!
