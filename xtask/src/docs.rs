@@ -7737,6 +7737,83 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_after_a_div_implicitly_closes_a_tracked_descendant_paragraph_stays_hidden()
+    {
+        // Codex, pull request #138, round 66, finding "Apply implicit closes to
+        // tracked hidden descendants": pushing a new opening tag onto the
+        // descendant stack never first checked whether it implicitly closes the
+        // descendant already on top of it — the same discipline round 62 gave
+        // `track_ordinary_ancestor` for `ancestors`, never extended to this stack.
+        // `<div><span hidden><p><div></p></div>decision-id headline</span></div>`
+        // has the inner `<div>` implicitly close the open `<p>` — HTML5's own
+        // "close a p element" rule — so a browser recovers from the stray `</p>`
+        // that follows without it affecting anything, and only the later `</div>`
+        // closes the real, surviving `div`. Appending `div` without first popping
+        // the stale `p` left both on the stack, so the stray `</p>` matched `p`
+        // and — searching and truncating through the match, round 65's own fix —
+        // took the real `div` down with it, leaving the following `</div>` to
+        // match nothing here and fall through to `ancestors`, where the *outer*
+        // `div` happened to share its name, force-closing the hidden `span` early
+        // and exposing the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden><p><div></p></div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_after_an_inline_div_implicitly_closes_a_tracked_descendant_paragraph_stays_hidden()
+     {
+        // Codex, pull request #138, round 66, finding "Apply implicit closes to
+        // tracked hidden descendants", met here for `track_non_rendering_html`'s
+        // own self-contained-`Event::InlineHtml` twin of the fix above — "including
+        // in the inline tracker" was the finding's own second half. `text
+        // <div><span hidden><p><div></p></div>decision-id headline</span></div>`
+        // has the same construct as the block-level test, reached through a
+        // paragraph's inline HTML events instead of one raw HTML line: the inner
+        // `<div>` implicitly closes the open `<p>`, a browser recovers from the
+        // stray `</p>` that follows, and only the later `</div>` closes the real,
+        // surviving `div`. Without popping the stale `p` first, the stray `</p>`
+        // took the real `div` down with it here too, leaving the following
+        // `</div>` to fall through to `ancestors`, where the *outer* `div`
+        // happened to share its name — force-closing the hidden `span` (via
+        // `stack.clear()`) before the id and headline text was even reached, so it
+        // read as ordinary visible text rather than hidden `span` content.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <div><span hidden><p><div></p></div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_hidden_in_a_span_after_a_div_implicitly_closes_a_sibling_paragraph_stays_hidden()
     {
         // Codex, pull request #138, round 62, finding "Remove implicitly closed

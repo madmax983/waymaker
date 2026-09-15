@@ -2189,6 +2189,17 @@ fn track_non_rendering_html(
                     // own `</mark>` later matched neither `top` nor any known
                     // descendant and fell through to the `ancestors` check, where an
                     // *outer* `<mark>` happened to share its name.
+                    //
+                    // Applies its own implicit closes to the descendant stack first
+                    // (Codex, round 66, "Apply implicit closes to tracked hidden
+                    // descendants"), met here for a self-contained inline construct —
+                    // see `next_non_rendering_marker`'s own twin fix for the reasoning.
+                    while descendants
+                        .last()
+                        .is_some_and(|open| implicitly_closed_by(open, &next_tag))
+                    {
+                        descendants.pop();
+                    }
                     descendants.push(next_tag);
                 }
             } else if let Some(name) = html
@@ -2919,6 +2930,26 @@ fn next_non_rendering_marker(
             // skipping it unconditionally left that close unmatched by anything,
             // falling through to the `ancestors` check where an outer element could
             // share its name and be mistaken for it.
+            //
+            // Applies its own implicit closes to the descendant stack first (Codex,
+            // round 66, "Apply implicit closes to tracked hidden descendants"), the
+            // same discipline `track_ordinary_ancestor` already applies to
+            // `ancestors` (round 62): `<span hidden><p><div></p></div>...` has the
+            // inner `<div>` implicitly close the open `<p>` — HTML5's own "close a p
+            // element" rule — so a browser recovers from the stray `</p>` that
+            // follows without it affecting anything, and only the later `</div>`
+            // closes the real, surviving `div`. Appending `div` without first
+            // popping the stale `p` left both on the stack, so the stray `</p>`
+            // matched `p` and, via `rposition`'s search, truncated the *real* `div`
+            // away with it — leaving the following `</div>` to match nothing here
+            // and fall through to `ancestors`, where the outer element happened to
+            // share its name.
+            while descendants
+                .last()
+                .is_some_and(|open| implicitly_closed_by(open, &name))
+            {
+                descendants.pop();
+            }
             descendants.push(name);
         }
         // Not relevant to `top` — carry its own namespace effect forward (a no-op for
