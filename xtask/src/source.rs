@@ -17540,6 +17540,26 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_proof_field_rebind_hidden_behind_a_macro_is_reported() {
+        // Issue #189: `mutated_field_names` alone cannot see a rebind hidden in a
+        // macro's tokens. See `crate::parse::raw_identifier_tests::
+        // a_rebind_hidden_inside_a_macro_invocation_is_invisible_to_this_scan_alone`.
+        // The macro ban just above already refuses this file over any macro at
+        // all. So a macro that hides a rebind is still caught.
+        let source = tests_support::clean_effect_module()
+            + "macro_rules! rebind {\n    ($p:expr, $v:expr) => { $p = $v };\n}\n\
+               fn tamper(dispatch: &mut CheckedDispatch<'_>, other: &[u8]) {\n    \
+               rebind!(dispatch.bytes, other);\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("invokes a macro")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn a_procedural_attribute_in_the_effect_protocol_file_is_reported() {
         // Codex's sixteenth round: `#[forge]` is a `syn::Attribute`, not a `syn::Macro`
         // invocation, so `invokes_any_macro`'s `visit_macro` override never sees it — an

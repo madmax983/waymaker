@@ -752,6 +752,183 @@ macro_rules! shadow_generic_params {
     };
 }
 
+/// The visitor behind [`generic_assoc_type_bindings_naming`], split out so that function
+/// stays under this file's own line-count lint (`clippy::too_many_lines`) — the same
+/// shape [`struct_literal_counts`] already uses for the identical reason.
+struct AssocBindings<'a, 'ast> {
+    names: &'a [&'a str],
+    found: Vec<String>,
+    // Mirrors `struct_literal_counts`'s own `Literals`: the module stack an alias may
+    // resolve through, and the block-local `use`/`type` aliases visible at the current
+    // point — a binding's value is exactly as aliasable as a struct literal's path.
+    stack: Vec<&'ast [syn::Item]>,
+    block_items: Vec<&'ast syn::Item>,
+    // Generic type-parameter names in scope at the current point (issue #181), the
+    // same field every other `resolve_segments` caller carries: a bound's own value can
+    // itself be a generic parameter, and a parameter named `CheckedDispatch` is not the
+    // real type.
+    shadow: Vec<String>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if has_cfg_test(item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if has_cfg_test(impl_item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        if has_cfg_test(trait_item_attrs(node)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, node);
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let pushed = node.content.is_some();
+        if let Some((_, items)) = node.content.as_ref() {
+            self.stack.push(items);
+        }
+        let enclosing_block_items = core::mem::take(&mut self.block_items);
+        // A module sees none of an enclosing item's generics either (issue #181):
+        // reset for its own traversal, restore after.
+        let outer_shadow = core::mem::take(&mut self.shadow);
+        syn::visit::visit_item_mod(self, node);
+        self.shadow = outer_shadow;
+        self.block_items = enclosing_block_items;
+        if pushed {
+            self.stack.pop();
+        }
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        let own_items: Vec<&'ast syn::Item> = node
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                syn::Stmt::Item(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        let pushed = own_items.len();
+        self.block_items.extend(own_items);
+        syn::visit::visit_block(self, node);
+        self.block_items.truncate(self.block_items.len() - pushed);
+    }
+
+    shadow_generic_params!();
+
+    // Unlike `struct_literal_counts` and `resolved_path_uses`, this scan reads an
+    // assoc-type binding on *every* generics-bearing item, not only a function, an
+    // `impl` or a `trait` — `struct Wrapper<T: Alias<Dispatch = X>>` is exactly the
+    // shape this function exists to check. So a struct's, an enum's, a union's or a
+    // generic `type` alias's own parameters need the same enter/restore `shadow`
+    // handling the macro above gives a function, an `impl` and a `trait` (Codex
+    // review of #189: a module-level `type Hidden = CheckedDispatch;` beside
+    // `struct Wrapper<Hidden: Alias<Dispatch = Hidden>>;` resolved `Hidden` through
+    // the module alias instead of seeing it shadowed by the struct's own parameter).
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_item_struct(self, node);
+        self.shadow = outer;
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_item_enum(self, node);
+        self.shadow = outer;
+    }
+
+    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_item_union(self, node);
+        self.shadow = outer;
+    }
+
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_item_type(self, node);
+        self.shadow = outer;
+    }
+
+    // A generic associated type's own parameters, e.g. `type Assoc<U>: Bound<Value =
+    // X>;`. Additive, not a reset (Codex review of PR #201, second round): a GAT is a
+    // *member* of its trait or impl, so it sees that item's own generics too, the same
+    // way `visit_impl_item_fn`/`visit_trait_item_fn` above do for an ordinary method.
+    fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
+        let added = extend_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_trait_item_type(self, node);
+        self.shadow.truncate(self.shadow.len() - added);
+    }
+
+    fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+        let added = extend_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_impl_item_type(self, node);
+        self.shadow.truncate(self.shadow.len() - added);
+    }
+
+    // `syn::ItemTraitAlias` (`trait Foo<T: Bound<Assoc = X>> = Bar;`, not stable Rust
+    // today) carries its own `generics` too, and `syn` parses it as a real, structured
+    // item — unlike a generic `const` item, whose syntax `syn` cannot parse at all and
+    // falls back to an opaque `Item::Verbatim` for, so no visitor ever reaches its
+    // bounds structurally and no override is needed there. A top-level item resets,
+    // the same as a struct, an enum, a union or a `type` alias.
+    fn visit_item_trait_alias(&mut self, node: &'ast syn::ItemTraitAlias) {
+        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_item_trait_alias(self, node);
+        self.shadow = outer;
+    }
+
+    // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
+    // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
+    // shape `Iterator<Item = u8>`'s syntax can take.
+    fn visit_assoc_type(&mut self, node: &'ast syn::AssocType) {
+        if let Some(path) = type_alias_path(&node.ty) {
+            // Codex review of #189: `resolve_segments`/`resolve_segments_from` leave
+            // a shadowed head segment as written, so the answer is the bare
+            // parameter name — not the real type it happens to share a spelling
+            // with. `T: Alias<Dispatch = CheckedDispatch>` where `CheckedDispatch`
+            // is a sibling generic parameter names that parameter, not the guarded
+            // struct, so a shadowed head segment is excluded before the comparison
+            // below rather than matched on the string alone.
+            let shadowed = path.segments.first().is_some_and(|segment| {
+                self.shadow
+                    .iter()
+                    .any(|name| *name == ident_name(&segment.ident))
+            });
+            if !shadowed {
+                let local = (path.leading_colon.is_none() && path.segments.len() == 1)
+                    .then(|| path.segments.first())
+                    .flatten()
+                    .map(|segment| ident_name(&segment.ident))
+                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
+                let resolved = match local {
+                    Some((segments, true)) => segments,
+                    Some((segments, false)) => {
+                        resolve_segments_from(segments, &self.stack, &self.shadow)
+                    }
+                    None => resolve_segments(path, &self.stack, &self.shadow),
+                };
+                if let Some(name) = resolved
+                    .last()
+                    .filter(|last| self.names.contains(&last.as_str()))
+                {
+                    self.found.push(name.clone());
+                }
+            }
+        }
+        syn::visit::visit_assoc_type(self, node);
+    }
+}
+
 /// Every name in `names` that a generic parameter's own trait bound binds an associated
 /// type to, anywhere `contents` declares one, outside `#[cfg(test)]`.
 ///
@@ -774,103 +951,6 @@ pub fn generic_assoc_type_bindings_naming(
     contents: &str,
     names: &[&str],
 ) -> Result<Vec<String>, syn::Error> {
-    struct AssocBindings<'a, 'ast> {
-        names: &'a [&'a str],
-        found: Vec<String>,
-        // Mirrors `struct_literal_counts`'s own `Literals`: the module stack an alias may
-        // resolve through, and the block-local `use`/`type` aliases visible at the current
-        // point — a binding's value is exactly as aliasable as a struct literal's path.
-        stack: Vec<&'ast [syn::Item]>,
-        block_items: Vec<&'ast syn::Item>,
-        // Generic type-parameter names in scope at the current point (issue #181), same
-        // shape as `struct_literal_counts`'s own `Literals`.
-        shadow: Vec<String>,
-    }
-
-    impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
-        fn visit_item(&mut self, node: &'ast syn::Item) {
-            if has_cfg_test(item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_item(self, node);
-        }
-
-        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
-            if has_cfg_test(impl_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, node);
-        }
-
-        fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
-            if has_cfg_test(trait_item_attrs(node)) {
-                return;
-            }
-            syn::visit::visit_trait_item(self, node);
-        }
-
-        shadow_generic_params!();
-
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            let pushed = node.content.is_some();
-            if let Some((_, items)) = node.content.as_ref() {
-                self.stack.push(items);
-            }
-            let enclosing_block_items = core::mem::take(&mut self.block_items);
-            // A module sees none of an enclosing item's generics either (issue #181):
-            // reset for its own traversal, restore after.
-            let outer_shadow = core::mem::take(&mut self.shadow);
-            syn::visit::visit_item_mod(self, node);
-            self.shadow = outer_shadow;
-            self.block_items = enclosing_block_items;
-            if pushed {
-                self.stack.pop();
-            }
-        }
-
-        fn visit_block(&mut self, node: &'ast syn::Block) {
-            let own_items: Vec<&'ast syn::Item> = node
-                .stmts
-                .iter()
-                .filter_map(|stmt| match stmt {
-                    syn::Stmt::Item(item) => Some(item),
-                    _ => None,
-                })
-                .collect();
-            let pushed = own_items.len();
-            self.block_items.extend(own_items);
-            syn::visit::visit_block(self, node);
-            self.block_items.truncate(self.block_items.len() - pushed);
-        }
-
-        // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
-        // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
-        // shape `Iterator<Item = u8>`'s syntax can take.
-        fn visit_assoc_type(&mut self, node: &'ast syn::AssocType) {
-            if let Some(path) = type_alias_path(&node.ty) {
-                let local = (path.leading_colon.is_none() && path.segments.len() == 1)
-                    .then(|| path.segments.first())
-                    .flatten()
-                    .map(|segment| ident_name(&segment.ident))
-                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
-                let resolved = match local {
-                    Some((segments, true)) => segments,
-                    Some((segments, false)) => {
-                        resolve_segments_from(segments, &self.stack, &self.shadow)
-                    }
-                    None => resolve_segments(path, &self.stack, &self.shadow),
-                };
-                if let Some(name) = resolved
-                    .last()
-                    .filter(|last| self.names.contains(&last.as_str()))
-                {
-                    self.found.push(name.clone());
-                }
-            }
-            syn::visit::visit_assoc_type(self, node);
-        }
-    }
-
     let file = parse_rust(contents)?;
     let mut visitor = AssocBindings {
         names,
@@ -4128,6 +4208,12 @@ fn pattern_binds_a_name(pat: &syn::Pat) -> bool {
 /// rather than a silent gap, the same standing `wire-format`'s literal comparison and
 /// `effect-scheduled-fields`'s name comparison already have.
 ///
+/// Issue #189: a rebind hidden inside a macro's own tokens is invisible to every route
+/// above. `syn` does not expand a macro — see [`invokes_any_macro`]'s own doc comment.
+/// This function has one caller. That caller's file, `effect.rs`, already refuses any
+/// macro at all outside `#[cfg(test)]`, through [`invokes_any_macro`]. So a macro that
+/// hides a rebind is still caught, before this gap can matter.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
@@ -4644,8 +4730,10 @@ pub struct LiteralCounts {
     pub inside: usize,
 }
 
-// `struct_literal_counts`'s own visitor. It moved out to module scope, to stay under this
-// file's own line-count lint (`clippy::too_many_lines`). Its behavior did not change.
+/// The visitor behind `struct_literal_counts`, split out so the counting function
+/// below stays under this file's own line-count lint (`clippy::too_many_lines`) —
+/// the established shape for this file: a nested `impl` counted toward its owning
+/// function's own line count, so the fix is the split, not a suppression.
 struct Literals<'ast> {
     stack: Vec<&'ast [syn::Item]>,
     // The function-local `use`/`type` aliases of every block enclosing the current
@@ -13957,6 +14045,110 @@ mod raw_identifier_tests {
     }
 
     #[test]
+    fn a_structs_own_generic_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        // Codex review of PR #201: a struct's, an enum's, a union's and a generic
+        // `type` alias's own parameters were not tracked as `shadow`, only a
+        // function's, an `impl`'s and a `trait`'s. `Hidden` here is the struct's own
+        // parameter, not the module-level alias of the same name — the struct never
+        // binds `Dispatch` to the real `CheckedDispatch`.
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             pub struct Wrapper<Hidden: Alias<Dispatch = Hidden>>(Hidden);",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_enums_own_generic_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             pub enum Wrapper<Hidden: Alias<Dispatch = Hidden>> { V(Hidden) }",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_unions_own_generic_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             pub union Wrapper<Hidden: Alias<Dispatch = Hidden>> { v: Hidden }",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_type_aliass_own_generic_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             pub type Wrapper<Hidden: Alias<Dispatch = Hidden>> = Hidden;",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_shadowed_generic_parameter_named_like_the_guarded_type_is_not_reported() {
+        // Codex review of PR #201: `resolve_segments`/`resolve_segments_from` leave a
+        // shadowed head segment unresolved, so the bare name comes back unchanged and
+        // still equals the guarded name by coincidence. `CheckedDispatch` here is a
+        // sibling generic parameter, never the real struct.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn forge<CheckedDispatch, T: Alias<Dispatch = CheckedDispatch>>() {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_associated_types_own_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        // Codex review of PR #201, second round: a generic associated type's own
+        // parameters were not tracked either. `Hidden` here is the GAT's own
+        // parameter, not the module-level alias of the same name.
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             trait Wrapper { type Assoc<Hidden: Alias<Dispatch = Hidden>>; }",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_impls_generic_associated_types_own_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             impl Wrapper for Forge { type Assoc<Hidden: Alias<Dispatch = Hidden>> = Hidden; }",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_trait_aliass_own_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        // `trait Foo<T> = Bar;` is not stable Rust, but `syn` parses it as a real,
+        // structured item — unlike a generic `const` item, which `syn` cannot parse at
+        // all and falls back to an opaque `Item::Verbatim` for, so it never reaches
+        // this scan's `visit_assoc_type` in the first place and needs no shadow
+        // handling here.
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             trait Wrapper<Hidden: Alias<Dispatch = Hidden>> = Forge;",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
     fn an_assignment_beneath_a_guarded_ancestor_field_is_reported() {
         // Codex, issue #92's tenth round: `dispatch.intent.request.kind = x;` assigns to
         // `kind`, not to a guarded name directly — but `intent` and `request` are both
@@ -14074,6 +14266,26 @@ mod raw_identifier_tests {
         let mut sorted = found;
         sorted.sort_unstable();
         assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_rebind_hidden_inside_a_macro_invocation_is_invisible_to_this_scan_alone() {
+        // Issue #189: a macro's token body is opaque to `syn`. This scan reads
+        // real `syn::Expr`/`syn::Pat` nodes only, so a rebind inside a macro is
+        // outside its reach. `effect.rs`, this function's one caller, closes the
+        // gap one level up: it refuses any macro at all outside `#[cfg(test)]`.
+        // See `source::deferred_answer_pins::
+        // a_proof_field_rebind_hidden_behind_a_macro_is_reported`.
+        let found = mutated_field_names(
+            "macro_rules! rebind {\n\
+             \x20   ($p:expr, $v:expr) => { $p = $v };\n\
+             }\n\
+             fn tamper(dispatch: &mut Foo, other: u8) {\n\
+             \x20   rebind!(dispatch.bytes, other);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
