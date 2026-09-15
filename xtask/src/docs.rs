@@ -7598,6 +7598,42 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_a_nested_div_split_across_a_line_break_stays_hidden() {
+        // Codex, pull request #138, round 64, finding "Persist hidden descendants
+        // across raw-HTML lines": `next_non_rendering_marker`'s own `descendants` —
+        // the ordinary elements opened directly under the currently tracked hidden
+        // element — was a fresh, empty list on every call, and `pulldown-cmark`
+        // fires one `Event::Html` per raw HTML source line, so an element opened on
+        // one line and closed on the next had its own open forgotten the moment
+        // the first line's call returned. `<div><span hidden><div>\n
+        // </div>decision-id headline</span></div>` has the inner `<div>` opened on
+        // line one and closed on line two: with no memory that it was ever open,
+        // the closing `</div>` on line two matched neither `top` (`span`) nor any
+        // known descendant, so it fell through to the `ancestors` check — where the
+        // *outer* `<div>` happened to share its name — and was misread as that real
+        // outer ancestor closing, ending the hidden `span` two levels early and
+        // exposing the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden><div>\n</div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_hidden_in_a_span_after_a_div_implicitly_closes_a_sibling_paragraph_stays_hidden()
     {
         // Codex, pull request #138, round 62, finding "Remove implicitly closed

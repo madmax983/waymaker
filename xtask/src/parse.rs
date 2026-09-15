@@ -929,6 +929,12 @@ pub enum InlineCode {
 /// avoid two fields fusing across a same-line comment); this function does not
 /// require it.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one already-reviewed per-event dispatch; bundling round 64's persisted \
+              non-rendering descendants into `NestedHtmlContext` pushed the `Event::Html` \
+              arm three lines past the limit"
+)]
 pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
     use std::fmt::Write as _;
@@ -978,6 +984,8 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     // `track_non_rendering_html`'s own doc comment.
     let mut foreign_content: Vec<ForeignFrame> = Vec::new();
     let mut ancestors: Vec<String> = Vec::new(); // Codex, round 56: `track_ordinary_ancestor`.
+    // Codex, round 64: per-level non-rendering descendants — see `NestedHtmlContext`.
+    let mut non_rendering_descendants: Vec<Vec<String>> = Vec::new();
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
@@ -1103,8 +1111,11 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
-                    &mut foreign_content,
-                    &mut ancestors,
+                    &mut NestedHtmlContext {
+                        foreign_content: &mut foreign_content,
+                        ancestors: &mut ancestors,
+                        descendants: &mut non_rendering_descendants,
+                    },
                 );
                 if !container_hidden {
                     append_visible_html(&mut out, &html, spans);
@@ -2720,6 +2731,7 @@ fn next_non_rendering_marker(
     top: &str,
     foreign_content: &mut Vec<ForeignFrame>,
     ancestors: &mut Vec<String>,
+    descendants: &mut Vec<String>,
 ) -> Option<NonRenderingAdvance> {
     if !non_rendering_element_nests(top) {
         // A raw-text element's body is opaque to tag parsing altogether — a browser is
@@ -2737,8 +2749,12 @@ fn next_non_rendering_marker(
     // never appears here at all, since consuming its own opening tag happened at the
     // top level, before `top` was ever pushed; only a child opened after `top`, while
     // this very walk is what is scanning past it, is recorded. That is exactly the
-    // distinction the closing-tag arm below needs to draw.
-    let mut descendants: Vec<String> = Vec::new();
+    // distinction the closing-tag arm below needs to draw. Owned by the caller and
+    // resynced to `top`'s own level rather than declared fresh here (Codex, round 64,
+    // "Persist hidden descendants across raw-HTML lines") — a child opened on one
+    // `Event::Html` line and closed on the next used to be forgotten the moment this
+    // function returned, so its own later close fell through to the `ancestors` check
+    // below and could be misread as a real outer element genuinely closing instead.
     // `ancestors` is `visible_html_ranges`' (or `hide_non_rendering_in_html_line`'s)
     // own persistent record of which ordinary elements are genuinely still open
     // *outside* `top` — maintained at the top level as their markup is consumed,
@@ -2861,14 +2877,33 @@ fn next_non_rendering_marker(
     }
 }
 
-/// `foreign_content` and `ancestors` bundled into one parameter, only to keep
-/// [`advance_past_non_rendering`] under clippy's parameter-count limit (Codex, pull
-/// request #138, round 56) — the two are otherwise independent state, each documented
-/// at its own declaration site (`track_foreign_content_depth`,
-/// `track_ordinary_ancestor`).
+/// `foreign_content`, `ancestors` and `descendants` bundled into one parameter, only to
+/// keep [`advance_past_non_rendering`] (and, since round 64, [`visible_html_ranges`])
+/// under clippy's parameter-count limit (Codex, pull request #138, round 56) — the
+/// three are otherwise independent state, each documented at its own declaration site
+/// (`track_foreign_content_depth`, `track_ordinary_ancestor`,
+/// [`next_non_rendering_marker`]'s own doc comment).
 struct NestedHtmlContext<'a> {
     foreign_content: &'a mut Vec<ForeignFrame>,
     ancestors: &'a mut Vec<String>,
+    /// One entry per currently open non-rendering level (`open_non_rendering`'s own
+    /// depth), each the ordinary elements opened directly under *that* level — the
+    /// per-line-call-local `descendants` [`next_non_rendering_marker`] used to declare
+    /// for itself, persisted across `Event::Html` lines the same way `foreign_content`
+    /// and `ancestors` already are (Codex, round 64, "Persist hidden descendants
+    /// across raw-HTML lines"): `<div><span hidden><div>` split across a line break
+    /// from its own `</div>decision-id headline</span></div>` had the inner `<div>`'s
+    /// own open forgotten the moment its line's call returned, so the closing `</div>`
+    /// on the next line found no evidence it was a real nested child and fell through
+    /// to `ancestors`, where the *outer* `<div>` happened to share its name — reading
+    /// a nested child's own close as the real outer ancestor's, and ending the hidden
+    /// `span` two levels early. Resynced to `open_non_rendering`'s current length at
+    /// the top of every [`advance_past_non_rendering`] call rather than mirrored at
+    /// every individual push/pop site: a level newly opened (by this scan or by an
+    /// interleaved `Event::InlineHtml` construct sharing the same stack) starts with
+    /// no known descendants, which is the same safe default an empty local `descendants`
+    /// already was, and a level that has closed is simply not read again.
+    descendants: &'a mut Vec<Vec<String>>,
 }
 
 /// `in_html_comment` and `in_cdata` bundled into one parameter, only to keep
@@ -2918,12 +2953,24 @@ fn advance_past_non_rendering(
     // arbitrary `hidden`-suppressed name, and a borrow of its last element would
     // still be live across the `stack.push`/`stack.pop` calls below.
     let top = stack.last()?.clone();
+    // Resynced to `stack`'s own depth on every call rather than mirrored at every
+    // individual push/pop site (Codex, round 64, "Persist hidden descendants across
+    // raw-HTML lines") — a level `stack` gained since the last call (whether pushed by
+    // this same scan or by an interleaved `Event::InlineHtml` construct sharing the
+    // stack) starts with no known descendants, the same safe default a fresh local
+    // `Vec::new()` already was, and a level `stack` lost is simply dropped.
+    while context.descendants.len() < stack.len() {
+        context.descendants.push(Vec::new());
+    }
+    context.descendants.truncate(stack.len());
+    let descendants = context.descendants.last_mut()?;
     match next_non_rendering_marker(
         line,
         cursor,
         &top,
         context.foreign_content,
         context.ancestors,
+        descendants,
     ) {
         Some(NonRenderingAdvance::Comment(start)) => {
             let Some(end) = find_comment_close(line, start) else {
@@ -3234,8 +3281,7 @@ fn visible_html_ranges(
     open_non_rendering: &mut Vec<String>,
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
-    foreign_content: &mut Vec<ForeignFrame>,
-    ancestors: &mut Vec<String>,
+    context: &mut NestedHtmlContext<'_>,
 ) -> Vec<VisibleHtmlSpan> {
     let mut spans = Vec::new();
     // Resolved before anything else, ahead of even `pending_tag` (Codex, pull request
@@ -3263,7 +3309,7 @@ fn visible_html_ranges(
     // everything up to its resolution (this line's own bytes) is markup the same way
     // any other tag's is, never visible text (Codex, round 41, finding 1).
     if let Some(pending) = pending_tag.take() {
-        match resolve_pending_tag(line, open_non_rendering, foreign_content, pending) {
+        match resolve_pending_tag(line, open_non_rendering, context.foreign_content, pending) {
             Ok(end) => cursor = end,
             Err(unresolved) => {
                 *pending_tag = Some(unresolved);
@@ -3309,8 +3355,9 @@ fn visible_html_ranges(
                 pending_tag,
                 pending_raw_text_close,
                 &mut NestedHtmlContext {
-                    foreign_content,
-                    ancestors,
+                    foreign_content: context.foreign_content,
+                    ancestors: context.ancestors,
+                    descendants: context.descendants,
                 },
             ) {
                 Some(end) => {
@@ -3327,8 +3374,9 @@ fn visible_html_ranges(
             open_construct,
             pending_tag,
             &mut NestedHtmlContext {
-                foreign_content,
-                ancestors,
+                foreign_content: context.foreign_content,
+                ancestors: context.ancestors,
+                descendants: context.descendants,
             },
             &mut spans,
         ) {
@@ -5941,6 +5989,11 @@ pub fn visible_source(contents: &str) -> String {
     // and `foreign_content` are (Codex, pull request #138, round 56, "Ignore closes
     // that do not match a real ancestor").
     let mut ancestors: Vec<String> = Vec::new();
+    // One entry per currently open non-rendering level, carried across `Event::Html`
+    // lines the same way `foreign_content` and `ancestors` already are (Codex, round
+    // 64, "Persist hidden descendants across raw-HTML lines") — see
+    // `NestedHtmlContext`'s own doc comment.
+    let mut non_rendering_descendants: Vec<Vec<String>> = Vec::new();
     let mut in_cdata = false; // Codex, round 57: carried the same way, see `OpenConstructState`.
     // A comment nested inside an open `<template>`, kept apart from the block-comment
     // search below: that is a document-wide search over already-*closed* blocks, not a
@@ -6008,6 +6061,7 @@ pub fn visible_source(contents: &str) -> String {
                     &mut in_template_comment,
                     &mut foreign_content,
                     &mut ancestors,
+                    &mut non_rendering_descendants,
                     &mut in_cdata,
                     &mut hidden,
                 );
@@ -6117,6 +6171,7 @@ fn hide_non_rendering_in_html_line(
     in_template_comment: &mut bool,
     foreign_content: &mut Vec<ForeignFrame>,
     ancestors: &mut Vec<String>,
+    non_rendering_descendants: &mut Vec<Vec<String>>,
     in_cdata: &mut bool,
     hidden: &mut Vec<(usize, usize)>,
 ) {
@@ -6171,6 +6226,7 @@ fn hide_non_rendering_in_html_line(
                 &mut NestedHtmlContext {
                     foreign_content,
                     ancestors,
+                    descendants: non_rendering_descendants,
                 },
             ) {
                 Some(end) => {
@@ -6311,6 +6367,10 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // element (Codex, pull request #138, round 56, "Ignore closes that do not match
     // a real ancestor") — see `track_ordinary_ancestor`'s own doc comment.
     let mut ancestors: Vec<String> = Vec::new();
+    // One entry per currently open non-rendering level (Codex, round 64, "Persist
+    // hidden descendants across raw-HTML lines") — see `NestedHtmlContext`'s own doc
+    // comment.
+    let mut non_rendering_descendants: Vec<Vec<String>> = Vec::new();
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         let hidden = in_fence
@@ -6331,8 +6391,11 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
-                    &mut foreign_content,
-                    &mut ancestors,
+                    &mut NestedHtmlContext {
+                        foreign_content: &mut foreign_content,
+                        ancestors: &mut ancestors,
+                        descendants: &mut non_rendering_descendants,
+                    },
                 );
             }
             // A fenced block or blockquote opening while an item is being collected
@@ -6575,6 +6638,10 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
     // element (Codex, pull request #138, round 56, "Ignore closes that do not match
     // a real ancestor") — see `track_ordinary_ancestor`'s own doc comment.
     let mut ancestors: Vec<String> = Vec::new();
+    // One entry per currently open non-rendering level (Codex, round 64, "Persist
+    // hidden descendants across raw-HTML lines") — see `NestedHtmlContext`'s own doc
+    // comment.
+    let mut non_rendering_descendants: Vec<Vec<String>> = Vec::new();
     let mut collecting = false;
     let mut current = String::new();
     let mut lines = Vec::new();
@@ -6595,8 +6662,11 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
-                    &mut foreign_content,
-                    &mut ancestors,
+                    &mut NestedHtmlContext {
+                        foreign_content: &mut foreign_content,
+                        ancestors: &mut ancestors,
+                        descendants: &mut non_rendering_descendants,
+                    },
                 );
             }
             // `<br>` is a real line break, this collector's own twin of
@@ -6670,6 +6740,12 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
 /// Fenced code blocks and blockquotes are hidden, for [`markdown_prose`]'s reason: a real
 /// table quoted inside either must not stand in for the document's own.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one already-reviewed per-event dispatch; bundling round 64's persisted \
+              non-rendering descendants into `NestedHtmlContext` pushed the `Event::Html` \
+              arm three lines past the limit"
+)]
 pub fn table_rows(contents: &str) -> Vec<String> {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -6714,6 +6790,8 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // element (Codex, pull request #138, round 56, "Ignore closes that do not match
     // a real ancestor") — see `track_ordinary_ancestor`'s own doc comment.
     let mut ancestors: Vec<String> = Vec::new();
+    // Codex, round 64: per-level non-rendering descendants — see `NestedHtmlContext`.
+    let mut non_rendering_descendants: Vec<Vec<String>> = Vec::new();
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
         let hidden = in_fence
@@ -6731,8 +6809,11 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                     &mut open_non_rendering_tag,
                     &mut pending_tag,
                     &mut pending_raw_text_close,
-                    &mut foreign_content,
-                    &mut ancestors,
+                    &mut NestedHtmlContext {
+                        foreign_content: &mut foreign_content,
+                        ancestors: &mut ancestors,
+                        descendants: &mut non_rendering_descendants,
+                    },
                 );
             }
             Event::Start(Tag::CodeBlock(kind)) => {
