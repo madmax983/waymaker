@@ -156,7 +156,16 @@ fn variant_build_dir(build_dir: &Path, variant: &str) -> PathBuf {
 const STRIP_NOTHING: &str = "profile.release.strip=\"none\"";
 
 /// The version stamped into the JSON report.
-const REPORT_SCHEMA: u64 = 3;
+///
+/// Codex's finding: renaming `ChecksumCandidate::shipped` to `adr0010_shipped` changed
+/// what a schema-3 report's own `checksum_candidates` entries look like, but the schema
+/// number stayed 3 — so a report a pre-rename build wrote, still carrying `shipped`,
+/// passed the schema check and only then failed with a field-not-found error, which
+/// reads as a malformed report rather than as the version mismatch it actually is.
+/// Bumped to 4, the same way a report from an older schema is already refused rather
+/// than misread: `--report` fails closed on the schema number itself, not on whichever
+/// field a shape change happened to touch.
+const REPORT_SCHEMA: u64 = 4;
 
 /// The row every other row is an increment on: an image with no Waymaker in it.
 pub const BASELINE_ROW: &str = "baseline";
@@ -5803,6 +5812,41 @@ mod tests {
         let refusal = SizeReport::from_json(&document.to_string())
             .expect_err("an older schema must not be read");
         assert!(refusal.to_string().contains("schema"), "{refusal}");
+    }
+
+    #[test]
+    fn a_pre_rename_schema_3_report_is_refused_on_its_schema_not_its_field_name() {
+        // Codex's finding: renaming `ChecksumCandidate::shipped` to `adr0010_shipped`
+        // changed a schema-3 report's own shape without moving the schema number, so a
+        // report a pre-rename build wrote — still carrying `shipped` on every checksum
+        // candidate — passed the schema check and then failed with a field-not-found
+        // error, which reads as a malformed report rather than as the version mismatch
+        // it actually is. `REPORT_SCHEMA` moved to 4 over this rename, the same way an
+        // older schema is already refused rather than misread — this constructs the
+        // exact shape a pre-rename build would have written (schema 3, `shipped` rather
+        // than `adr0010_shipped`) and requires the refusal to name the schema, not the
+        // field.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&full_report(512, 0, 512, 0).to_json())
+                .expect("the report should be JSON");
+        let object = document.as_object_mut().expect("a report is an object");
+        object.insert("schema".to_owned(), Value::from(3_u64));
+        object.insert(
+            "checksum_candidates".to_owned(),
+            serde_json::json!([{
+                "name": "crc32-iso-hdlc-bitwise",
+                "shipped": true,
+                "text": 52,
+                "rodata": 0,
+            }]),
+        );
+        let refusal = SizeReport::from_json(&document.to_string())
+            .expect_err("a pre-rename schema-3 report must not be read");
+        assert!(refusal.to_string().contains("schema"), "{refusal}");
+        assert!(
+            !refusal.to_string().contains("adr0010_shipped"),
+            "{refusal}"
+        );
     }
 
     #[test]
