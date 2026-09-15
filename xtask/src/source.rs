@@ -28785,6 +28785,42 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_a_two_field_tuple_nested_in_a_one_tuple_is_reported() {
+        // Codex's finding: `((0, 0),)` through `((3, 3),)` — the same ambiguous
+        // two-field inner tuple wrapped in an outer one-tuple — has exactly *one*
+        // non-catch-all field at the outer level (the inner tuple as a whole), so the
+        // round-19 fix's own `has_multiple_discriminating_fields` answered `false` for
+        // the outer pattern and never looked inside that one field to see that *it* is
+        // ambiguous. `pattern_literal` does not stop there either: its own `Pat::Tuple`
+        // case recurses into the single field with a plain call to `pattern_literal`,
+        // which is exactly what finds the inner tuple's real, two-field ambiguity and
+        // returns nothing from it — so every arm's `pattern` was still empty and
+        // `unresolved_cause` stayed `None`. `compound_pattern_is_ambiguous` now recurses
+        // through `pattern_has_ambiguous_discriminating_fields` the identical way.
+        // Verified against real rustc, warning-free (`rustc --edition 2021 -C
+        // opt-level=z`): this exact nested match compiles clean with no
+        // `unreachable_patterns` or dead-code warning.
+        let source = format!(
+            "{}\nconst fn dense_table_over_a_nested_two_field_tuple(nibble: u32) -> u32 \
+             {{\n    match ((nibble & 3, (nibble >> 2) & 3),) {{\n        ((0, 0),) => 0,\n        \
+             ((0, 1),) => 1,\n        ((0, 2),) => 2,\n        ((0, 3),) => 3,\n        \
+             ((1, 0),) => 4,\n        ((1, 1),) => 5,\n        ((1, 2),) => 6,\n        \
+             ((1, 3),) => 7,\n        ((2, 0),) => 8,\n        ((2, 1),) => 9,\n        \
+             ((2, 2),) => 10,\n        ((2, 3),) => 11,\n        ((3, 0),) => 12,\n        \
+             ((3, 1),) => 13,\n        ((3, 2),) => 14,\n        ((3, 3),) => 15,\n        \
+             _ => 15,\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 17-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_assigning_an_unsuffixed_bitwise_not_to_a_typed_local_is_reported()
      {
         // Codex's finding: `{ let mut x: u8 = 99; let _old = x; x = !255 + n; x }` names a

@@ -19267,9 +19267,8 @@ enum DiscriminatingFields<'a> {
 }
 
 /// [`DiscriminatingFields`] of `elems` — `single_discriminating_field`'s own counting
-/// loop, and [`has_multiple_discriminating_fields`]'s, factored into one function so
-/// the two callers agree on what "more than one" means without a second copy of the
-/// loop.
+/// loop, and [`compound_pattern_is_ambiguous`]'s, factored into one function so the two
+/// callers agree on what "more than one" means without a second copy of the loop.
 fn discriminating_fields<'a>(
     elems: impl IntoIterator<Item = &'a syn::Pat>,
     resolve: &Resolve<'_>,
@@ -19304,10 +19303,10 @@ fn single_discriminating_field<'a>(
     }
 }
 
-/// Whether `elems` names two or more fields that are not themselves irrefutable —
-/// [`DiscriminatingFields::Many`] alone, the genuinely ambiguous case
-/// [`single_discriminating_field`] refuses rather than the harmless, vacuous one where
-/// every field is a catch-all.
+/// Whether a compound pattern's own `elems` are ambiguous — [`DiscriminatingFields::Many`]
+/// outright, the genuinely ambiguous case [`single_discriminating_field`] refuses rather
+/// than the harmless, vacuous one where every field is a catch-all — or reduce to a
+/// single discriminating field that is itself ambiguous one level down.
 ///
 /// Codex's finding: `(0, 0)` through `(3, 3)` over a two-field tuple scrutinee, each
 /// arm masking off a different half of one integer, has two non-catch-all fields in
@@ -19322,22 +19321,35 @@ fn single_discriminating_field<'a>(
 /// — the same standing [`UnresolvedArmCause::GuardCall`] already gives a guard
 /// equality this scan cannot evaluate — rather than read as silently unresolved and
 /// let through as though it named no values at all.
-fn has_multiple_discriminating_fields<'a>(
+///
+/// Codex's next-round finding: `((0, 0),)` through `((3, 3),)` — the same ambiguous
+/// inner tuple wrapped in an outer one-tuple — has exactly *one* non-catch-all field at
+/// this level (the inner tuple as a whole), so a first version of this check answered
+/// `false` for the outer pattern and never looked inside the one field it found to see
+/// that *it* is ambiguous. [`pattern_literal`] does not stop there either: its own
+/// `Pat::Tuple` case recurses into that single field with a plain call to
+/// `pattern_literal`, which is exactly what finds the inner tuple's real, two-field
+/// ambiguity and returns nothing from it. This function now recurses the identical way,
+/// through [`pattern_has_ambiguous_discriminating_fields`] rather than stopping at
+/// "found exactly one field".
+fn compound_pattern_is_ambiguous<'a>(
     elems: impl IntoIterator<Item = &'a syn::Pat>,
     resolve: &Resolve<'_>,
 ) -> bool {
-    matches!(
-        discriminating_fields(elems, resolve),
-        DiscriminatingFields::Many
-    )
+    match discriminating_fields(elems, resolve) {
+        DiscriminatingFields::Many => true,
+        DiscriminatingFields::One(pat) => pattern_has_ambiguous_discriminating_fields(pat, resolve),
+        DiscriminatingFields::None => false,
+    }
 }
 
 /// Whether `pattern` is a compound pattern — a tuple, tuple-struct, named-field struct,
 /// slice, or an or-pattern over one of those — naming two or more fields that are not
-/// themselves irrefutable, recursively through every wrapper [`pattern_literal`] itself
-/// sees through (an at-binding's subpattern, a reference, parentheses, and every
-/// alternative of an or-pattern). See [`has_multiple_discriminating_fields`] for what
-/// this is refusing to guess and why.
+/// themselves irrefutable, at this level or at any depth [`pattern_literal`] would
+/// itself recurse through — including every wrapper `pattern_literal` sees through (an
+/// at-binding's subpattern, a reference, parentheses, and every alternative of an
+/// or-pattern). See [`compound_pattern_is_ambiguous`] for what this is refusing to
+/// guess and why.
 fn pattern_has_ambiguous_discriminating_fields(pattern: &syn::Pat, resolve: &Resolve<'_>) -> bool {
     match pattern {
         syn::Pat::Ident(named) => named.subpat.as_ref().is_some_and(|(_, subpat)| {
@@ -19348,14 +19360,14 @@ fn pattern_has_ambiguous_discriminating_fields(pattern: &syn::Pat, resolve: &Res
         }
         syn::Pat::Paren(paren) => pattern_has_ambiguous_discriminating_fields(&paren.pat, resolve),
         syn::Pat::TupleStruct(tuple_struct) => {
-            has_multiple_discriminating_fields(&tuple_struct.elems, resolve)
+            compound_pattern_is_ambiguous(&tuple_struct.elems, resolve)
         }
-        syn::Pat::Tuple(tuple) => has_multiple_discriminating_fields(&tuple.elems, resolve),
-        syn::Pat::Struct(pat_struct) => has_multiple_discriminating_fields(
+        syn::Pat::Tuple(tuple) => compound_pattern_is_ambiguous(&tuple.elems, resolve),
+        syn::Pat::Struct(pat_struct) => compound_pattern_is_ambiguous(
             pat_struct.fields.iter().map(|field| field.pat.as_ref()),
             resolve,
         ),
-        syn::Pat::Slice(pat_slice) => has_multiple_discriminating_fields(&pat_slice.elems, resolve),
+        syn::Pat::Slice(pat_slice) => compound_pattern_is_ambiguous(&pat_slice.elems, resolve),
         syn::Pat::Or(or_pattern) => or_pattern
             .cases
             .iter()
