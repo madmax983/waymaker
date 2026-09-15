@@ -1789,6 +1789,15 @@ Stated so that nobody mistakes silence for coverage:
   build. What it cannot see is a document read against a *different* checkout than the one
   on disk: the comparison is against *this* workspace's `cargo metadata`, not against
   whatever commit actually produced the document.
+- **That a row's own `ram` and `bss` figures are honest.** Issue
+  [#172](https://github.com/madmax983/waymaker/issues/172): `shortfalls` refuses a row
+  whose `ram` reads smaller than its own `bss` plus `data`. `bss` and `data` are writable,
+  non-thread-local sections, and `ram` counts both. `shortfalls` also refuses a gated row
+  whose `ram` reads smaller than the baseline's — `flash`'s own rule, one section over.
+  Neither check can catch a row that reports `0 B` of `ram` and `bss` together. `0 B` is
+  this engine's real, current figure today (ADR 0035). A report of `0` is not proof of a
+  lie. Mirroring flash's floor here would fail every honest report the gate produces. This
+  process has no real build to check a self-reported figure against.
 - **That the façade registers a wakeup, for an activity.** §05's Owns cell for
   `waymaker-embassy` names wakeups, and this crate registers none of its own for an
   activity: it plumbs the task's waker to `ActivityDispatcher::poll_dispatch`, which is the
@@ -4491,3 +4500,18 @@ layer down, in `crates/waymaker-flash/tests/swap.rs` and `crates/waymaker-fault/
 unmodified. Measured cost: zero bytes on every `cargo xtask size` row, and zero heap blocks
 on `cargo xtask profile`. See
 [ADR 0051](docs/adr/0051-an-alarm-is-armed-on-a-halt-and-a-driver-at-a-bank-can-swap.md).
+
+Issue #172 closes a gap found in review of issue #115's own fix. `SizeReport::shortfalls`
+held a gated row's `flash` to two floors. It held `ram`/`bss` to none. A hand-edited row
+could report `ram: 0, bss: 0` and pass every check. That deflates `runtime_ram_total`'s
+composed figure. Mirroring flash's "cannot cost nothing" floor was rejected. `0 B` is this
+engine's real, current statics figure, and that floor would fail every honest report. Two
+narrower checks close what a check can close without a real build.
+`row_reading_shortfalls` refuses a row whose `ram` reads smaller than its own `bss` plus
+`data`. `bss` and `data` are writable, non-thread-local sections, and `ram` counts both.
+So a smaller `ram` is an internal contradiction, not a guess. A gated row's `ram` may also
+not read smaller than the baseline's — flash's own rule, one section over. Neither check
+can tell an honest `ram: 0, bss: 0` row from a forged one. That gap stays open. It is
+documented in `runtime_ram_total`'s own doc comment and in
+[what is not checked](#what-is-not-checked). No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
