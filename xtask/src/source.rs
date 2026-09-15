@@ -8207,6 +8207,7 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     violations.extend(check_checked_dispatch_construction(&source.contents));
     violations.extend(check_effect_proof_fields_are_not_rebound(&source.contents));
     violations.extend(check_no_projected_type_aliases(&source.contents));
+    violations.extend(check_no_generic_assoc_type_bindings(&source.contents));
     violations.extend(check_effect_invokes_no_macro(&source.contents));
     violations.extend(check_effect_attributes_are_audited(&source.contents));
     violations.extend(check_effect_steps(&code));
@@ -8580,6 +8581,44 @@ fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
                      {EFFECT_PROTOCOL_PATH}: `<T as Trait>::Assoc` can name any struct the \
                      trait's `impl` chooses, which no construction pin here can follow, so \
                      the alias itself is refused"
+                ),
+            )]
+        }
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
+}
+
+/// `effect.rs` binds no generic parameter's associated type to a guarded name.
+///
+/// `T: Alias<Dispatch = CheckedDispatch<'a>>` writes the guarded name directly in the
+/// bound, but a construction site spelled `T::Dispatch { .. }` never spells
+/// `CheckedDispatch` — the construction pins above compare a literal's last path segment,
+/// and `Dispatch` is not `CheckedDispatch`. So the binding itself is refused, the same way
+/// a projected `type` alias is refused just above (issue #184).
+fn check_no_generic_assoc_type_bindings(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::generic_assoc_type_bindings_naming(contents, &EFFECT_NO_SELF_LITERAL) {
+        Ok(found) if found.is_empty() => Vec::new(),
+        Ok(mut found) => {
+            found.sort_unstable();
+            found.dedup();
+            vec![Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "a generic parameter's own bound binds an associated type to \
+                     {found:?} in {EFFECT_PROTOCOL_PATH}: a construction site spelled \
+                     `T::Assoc {{ .. }}` never names the guarded type, so the binding \
+                     itself is refused"
                 ),
             )]
         }
@@ -17810,6 +17849,27 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("Unchecked") && detail.contains("projection")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_generic_associated_type_binding_is_reported() {
+        // Issue #184: a function's own generic parameter can bind an associated type to
+        // a guarded name directly — `T: Alias<Dispatch = CheckedDispatch<'a>>` — and a
+        // construction site spelled `T::Dispatch { .. }` never spells `CheckedDispatch`
+        // at all, so the construction pin's name comparison could not see it.
+        let source = tests_support::clean_effect_module()
+            + "pub(crate) fn forge<'a, T: Alias<'a, Dispatch = CheckedDispatch<'a>>>(\n\
+               \x20   intent: DurableIntent,\n\
+               \x20   bytes: &'a [u8],\n\
+               ) -> T::Dispatch {\n\
+               \x20   T::Dispatch { intent, bytes }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("CheckedDispatch") && detail.contains("associated type")
+            }),
             "{details:?}"
         );
     }

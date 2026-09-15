@@ -579,26 +579,30 @@ fn collect_item_aliases<'a>(
     }
 }
 
-/// `ty`'s segments, if `ty` is a plain type path with no `<T as Trait>::` qualifier.
-fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
+/// `ty`'s path, if `ty` is a plain type path with no `<T as Trait>::` qualifier.
+///
+/// `(CheckedDispatch<'a>)` is valid Rust — `#[allow(unused_parens)]` even lets it through
+/// `-D warnings` — and `syn` keeps the parens as their own node rather than discarding
+/// them, so the path underneath is invisible without unwrapping one more layer.
+/// `Type::Group` is the same shape, for a macro's own hygiene grouping. Both recurse, so
+/// `((CheckedDispatch))` unwraps to the same target in two hops.
+fn type_alias_path(ty: &syn::Type) -> Option<&syn::Path> {
     match ty {
-        syn::Type::Path(type_path) if type_path.qself.is_none() => Some(
-            type_path
-                .path
-                .segments
-                .iter()
-                .map(|segment| ident_name(&segment.ident))
-                .collect(),
-        ),
-        // `(CheckedDispatch<'a>)` is valid Rust — `#[allow(unused_parens)]` even lets it
-        // through `-D warnings` — and `syn` keeps the parens as their own node rather than
-        // discarding them, so the path underneath is invisible without unwrapping one more
-        // layer. `Type::Group` is the same shape, for a macro's own hygiene grouping. Both
-        // recurse, so `((CheckedDispatch))` unwraps to the same target in two hops.
-        syn::Type::Paren(inner) => type_alias_target(&inner.elem),
-        syn::Type::Group(inner) => type_alias_target(&inner.elem),
+        syn::Type::Path(type_path) if type_path.qself.is_none() => Some(&type_path.path),
+        syn::Type::Paren(inner) => type_alias_path(&inner.elem),
+        syn::Type::Group(inner) => type_alias_path(&inner.elem),
         _ => None,
     }
+}
+
+/// `ty`'s segments, if `ty` is a plain type path with no `<T as Trait>::` qualifier.
+fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
+    type_alias_path(ty).map(|path| {
+        path.segments
+            .iter()
+            .map(|segment| ident_name(&segment.ident))
+            .collect()
+    })
 }
 
 /// `ty`, or a type it wraps in parens or a macro's hygiene grouping, names an associated-type
@@ -687,6 +691,125 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 
     let file = parse_rust(contents)?;
     let mut visitor = QSelfAliases { found: Vec::new() };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
+/// Every name in `names` that a generic parameter's own trait bound binds an associated
+/// type to, anywhere `contents` declares one, outside `#[cfg(test)]`.
+///
+/// `T: Alias<Dispatch = CheckedDispatch<'a>>` writes the guarded name directly in the
+/// bound. A construction site spelled `T::Dispatch { .. }` never spells `CheckedDispatch`
+/// — [`struct_literal_counts`] compares a literal's last path segment, and `Dispatch` is
+/// not `CheckedDispatch` — so the binding is invisible to every construction pin built on
+/// it (issue #184). This needs no type inference: the bound's value is the guarded name in
+/// the source text, or a `use`/`type` alias of it, resolved the same way
+/// [`struct_literal_counts`] resolves a struct literal's own path — a plain `type Hidden =
+/// CheckedDispatch;` beside the bound is not enough to hide it. So a matching binding is
+/// reported on its own, the same way [`qself_type_alias_names`] refuses an unresolvable
+/// `type` alias on its own — a caller refuses the file outright rather than trying to
+/// prove the binding reaches a construction site.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn generic_assoc_type_bindings_naming(
+    contents: &str,
+    names: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    struct AssocBindings<'a, 'ast> {
+        names: &'a [&'a str],
+        found: Vec<String>,
+        // Mirrors `struct_literal_counts`'s own `Literals`: the module stack an alias may
+        // resolve through, and the block-local `use`/`type` aliases visible at the current
+        // point — a binding's value is exactly as aliasable as a struct literal's path.
+        stack: Vec<&'ast [syn::Item]>,
+        block_items: Vec<&'ast syn::Item>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+            if has_cfg_test(trait_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_trait_item(self, node);
+        }
+
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            let pushed = node.content.is_some();
+            if let Some((_, items)) = node.content.as_ref() {
+                self.stack.push(items);
+            }
+            let enclosing_block_items = core::mem::take(&mut self.block_items);
+            syn::visit::visit_item_mod(self, node);
+            self.block_items = enclosing_block_items;
+            if pushed {
+                self.stack.pop();
+            }
+        }
+
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            let own_items: Vec<&'ast syn::Item> = node
+                .stmts
+                .iter()
+                .filter_map(|stmt| match stmt {
+                    syn::Stmt::Item(item) => Some(item),
+                    _ => None,
+                })
+                .collect();
+            let pushed = own_items.len();
+            self.block_items.extend(own_items);
+            syn::visit::visit_block(self, node);
+            self.block_items.truncate(self.block_items.len() - pushed);
+        }
+
+        // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
+        // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
+        // shape `Iterator<Item = u8>`'s syntax can take.
+        fn visit_assoc_type(&mut self, node: &'ast syn::AssocType) {
+            if let Some(path) = type_alias_path(&node.ty) {
+                let local = (path.leading_colon.is_none() && path.segments.len() == 1)
+                    .then(|| path.segments.first())
+                    .flatten()
+                    .map(|segment| ident_name(&segment.ident))
+                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
+                let resolved = match local {
+                    Some((segments, true)) => segments,
+                    Some((segments, false)) => resolve_segments_from(segments, &self.stack),
+                    None => resolve_segments(path, &self.stack),
+                };
+                if let Some(name) = resolved
+                    .last()
+                    .filter(|last| self.names.contains(&last.as_str()))
+                {
+                    self.found.push(name.clone());
+                }
+            }
+            syn::visit::visit_assoc_type(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = AssocBindings {
+        names,
+        found: Vec::new(),
+        stack: vec![&file.items],
+        block_items: Vec::new(),
+    };
     visitor.visit_file(&file);
     Ok(visitor.found)
 }
@@ -12627,8 +12750,9 @@ mod raw_identifier_tests {
     //! every other parser in this file against the same rule.
     use super::{
         FnScope, child_modules, declares_test, fn_declaration_count, future_trait_implementors,
-        inner_attributes, mutated_field_names, name_uses, qself_type_alias_names,
-        resolved_path_uses, struct_literal_counts, trait_impls, use_aliases,
+        generic_assoc_type_bindings_naming, inner_attributes, mutated_field_names, name_uses,
+        qself_type_alias_names, resolved_path_uses, struct_literal_counts, trait_impls,
+        use_aliases,
     };
 
     #[test]
@@ -13225,6 +13349,99 @@ mod raw_identifier_tests {
         // it to the alias's own declared parameters rather than guessing further.
         let found =
             qself_type_alias_names("type Unchecked = Via::Dispatch;").expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_binding_an_associated_type_to_a_guarded_name_is_reported() {
+        // Issue #184: `T: Alias<'a, Dispatch = CheckedDispatch<'a>>` writes the guarded
+        // name directly in the bound, so `T::Dispatch { .. }` builds it under a name the
+        // construction pin never compares.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn forge<'a, T: Alias<'a, Dispatch = CheckedDispatch<'a>>>() -> T::Dispatch {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_type_alias_of_a_guarded_name_is_reported() {
+        // Adversarial review of issue #184's own fix: `type Hidden = CheckedDispatch;`
+        // beside `T: Alias<Dispatch = Hidden>` writes an unguarded name at the binding's
+        // own syntactic position, and a scan that only read that position outright would
+        // miss it. Resolved through the same `use`/`type` alias chain
+        // `struct_literal_counts` already chases for a struct literal's own path.
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             pub fn forge<T: Alias<Dispatch = Hidden>>() -> T::Dispatch {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_use_alias_of_a_guarded_name_is_reported() {
+        let found = generic_assoc_type_bindings_naming(
+            "use CheckedDispatch as Hidden;\n\
+             pub fn forge<T: Alias<Dispatch = Hidden>>() -> T::Dispatch {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_binding_an_associated_type_to_an_unguarded_name_is_not_reported() {
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn forge<T: Alias<Dispatch = Plain>>() -> T::Dispatch {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_where_clause_binding_an_associated_type_to_a_guarded_name_is_reported() {
+        // The same binding, spelled in a `where` clause rather than inline on the
+        // parameter — both are `TypeParamBound`s, so one visitor override reaches both.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn forge<T>() -> T::Dispatch where T: Alias<Dispatch = CheckedDispatch> {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn an_impls_own_generic_bound_binding_an_associated_type_is_reported() {
+        let found = generic_assoc_type_bindings_naming(
+            "impl<T: Alias<Dispatch = CheckedDispatch>> Forge<T> {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_parenthesized_associated_type_binding_value_is_reported() {
+        let found = generic_assoc_type_bindings_naming(
+            "#[allow(unused_parens)]\npub fn forge<T: Alias<Dispatch = (CheckedDispatch)>>() {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_binding_under_cfg_test_is_not_reported() {
+        let found = generic_assoc_type_bindings_naming(
+            "#[cfg(test)]\nmod tests {\n    \
+             pub fn forge<T: Alias<Dispatch = CheckedDispatch>>() {}\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
     }
 
