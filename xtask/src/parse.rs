@@ -117,6 +117,17 @@ fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
     }
 }
 
+/// The attributes on a foreign item, whatever kind of item it is.
+fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
 /// Strips a raw marker from every identifier in `stream`.
 ///
 /// `#![allow(r#missing_docs)]` renders as `allow(r#missing_docs)` through
@@ -400,10 +411,38 @@ fn resolve_segments(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
 /// uses throughout — so that shape falls through to the plain "no matching alias, take
 /// the last segment" branch below instead, unchanged from before this round.
 fn lookup_candidate(segments: &[String]) -> Option<(&str, &[String])> {
-    match segments {
-        [first, second, tail @ ..] if first == "self" => Some((second, tail)),
+    match strip_self_prefix(segments) {
         [first, tail @ ..] => Some((first, tail)),
         [] => None,
+    }
+}
+
+/// `segments`, with a leading `self` qualifier stripped off when at least one more
+/// segment follows it — a lone `self` with nothing after it is left alone, the same
+/// edge case [`lookup_candidate`]'s own second arm already leaves unchanged.
+fn strip_self_prefix(segments: &[String]) -> &[String] {
+    match segments {
+        [first, rest @ ..] if first == "self" && !rest.is_empty() => rest,
+        _ => segments,
+    }
+}
+
+/// [`lookup_candidate`]'s two-segment twin: the joined name a qualified path through
+/// a directly nested inline module has to match against
+/// [`direct_scope_module_aliases`]'s synthetic `mod_name::exported_name` aliases,
+/// and what follows it. `None` when fewer than two segments remain after stripping a
+/// leading `self`, the same way [`lookup_candidate`] answers `None` only when none
+/// remain at all.
+///
+/// Found by Codex review of this change (PR #143), round 28: `traits::C` is an
+/// ordinary identifier (`traits`) followed by another, and [`lookup_candidate`] alone
+/// only ever looks up the first — so a path qualified by a sibling module's own name
+/// had no alias to match against at all, and fell through to reporting the bare,
+/// still-aliased last segment.
+fn qualified_candidate(segments: &[String]) -> Option<(String, &[String])> {
+    match strip_self_prefix(segments) {
+        [first, second, tail @ ..] => Some((format!("{first}::{second}"), tail)),
+        _ => None,
     }
 }
 
@@ -499,27 +538,48 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
                     continue;
                 }
             }
-            let Some((candidate, tail)) = lookup_candidate(&current) else {
+            if current.is_empty() {
                 continue;
-            };
-            let matching: Vec<&UseAlias> = aliases
-                .iter()
-                .filter(|alias| alias.local == candidate)
-                .collect();
-            if matching.is_empty() {
+            }
+            // Round 28: a qualified two-segment candidate is tried *before* the
+            // plain single-segment one, because `traits::C` — where `traits` is a
+            // sibling inline module registering `C` as one of its own aliases via
+            // `direct_scope_module_aliases` — has to be looked up as the joined
+            // name `traits::C`, not as the bare identifier `traits` (which no
+            // ordinary `use` or `type` alias is ever named after). Both are tried
+            // rather than the first alone, exactly as this function already tries
+            // every alias sharing one local name: a plain single-segment alias and
+            // a qualified one could both exist for unrelated reasons, and either
+            // resolving to the trait being searched for is enough.
+            let mut matched = false;
+            if let Some((joined, tail)) = qualified_candidate(&current) {
+                for alias in aliases.iter().filter(|alias| alias.local == joined) {
+                    matched = true;
+                    if finished.len() + next.len() >= MAX_CANDIDATES {
+                        finished.push(UNRESOLVED_DERIVE.to_owned());
+                        continue;
+                    }
+                    let mut resolved = alias.target.clone();
+                    resolved.extend(tail.iter().cloned());
+                    next.push(resolved);
+                }
+            }
+            if let Some((candidate, tail)) = lookup_candidate(&current) {
+                for alias in aliases.iter().filter(|alias| alias.local == candidate) {
+                    matched = true;
+                    if finished.len() + next.len() >= MAX_CANDIDATES {
+                        finished.push(UNRESOLVED_DERIVE.to_owned());
+                        continue;
+                    }
+                    let mut resolved = alias.target.clone();
+                    resolved.extend(tail.iter().cloned());
+                    next.push(resolved);
+                }
+            }
+            if !matched {
                 if let Some(last) = current.last() {
                     finished.push(last.clone());
                 }
-                continue;
-            }
-            for alias in matching {
-                if finished.len() + next.len() >= MAX_CANDIDATES {
-                    finished.push(UNRESOLVED_DERIVE.to_owned());
-                    continue;
-                }
-                let mut resolved = alias.target.clone();
-                resolved.extend(tail.iter().cloned());
-                next.push(resolved);
             }
         }
         frontier = next;
@@ -615,6 +675,25 @@ fn direct_scope_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> V
                         // to a real name resolves to `UNRESOLVED_DERIVE` rather than to
                         // the qualifier-stripped associated type name.
                         vec![UNRESOLVED_DERIVE.to_owned()]
+                    } else if target
+                        .path
+                        .segments
+                        .iter()
+                        .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+                    {
+                        // Round 28 of Codex review on this change (PR #143): `type
+                        // Identity<T> = T; type R = Identity<super::Recovery>;` is legal
+                        // Rust whose target names a real generic alias with an argument
+                        // substituted in — reading only the segments' own identifiers and
+                        // discarding `<super::Recovery>` resolved `R` to `Identity`'s own
+                        // declared target, `T`, rather than to the type actually
+                        // substituted in. This module does not perform generic
+                        // substitution — that is real type-checking, not parsing — so an
+                        // alias target carrying a generic argument anywhere along its path
+                        // fails closed to `UNRESOLVED_DERIVE` the same way a projected
+                        // associated type already does, rather than silently resolving
+                        // through the unparameterized definition.
+                        vec![UNRESOLVED_DERIVE.to_owned()]
                     } else {
                         target
                             .path
@@ -665,7 +744,50 @@ fn direct_scope_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> V
 /// or `type` body is not a scope boundary in Rust: an item declared inside one still
 /// resolves names through the enclosing module's own imports).
 fn module_scope_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAlias> {
-    direct_scope_aliases(items)
+    let items: Vec<&syn::Item> = items.into_iter().collect();
+    direct_scope_aliases(items.iter().copied())
+        .into_iter()
+        .chain(direct_scope_module_aliases(items.iter().copied()))
+        .collect()
+}
+
+/// Every alias reachable through one level of qualification by a directly nested
+/// inline module's own name.
+///
+/// Found by Codex review of this change (PR #143), round 28: `mod traits { pub use
+/// core::clone::Clone as C; } impl traits::C for super::Recovery { .. }` is legal
+/// Rust, and a qualified trait path naming `traits::C` had no alias to resolve
+/// against — `every_resolution` only ever looked up a *single* segment as a
+/// candidate, so `traits` (an ordinary identifier, not `self`/`crate`/`super`) fell
+/// through to the "no matching alias, take the last segment" branch and reported the
+/// bare, still-aliased name `C` rather than the real trait. This registers `traits::C`
+/// as a synthetic alias for whatever `C` itself resolves to inside `traits`' own
+/// scope, so a path qualified by a sibling module's name can be looked up the same
+/// way an unqualified one already is. One level only: a module nested inside `traits`
+/// is not walked, matching how deep this round's own finding reaches.
+fn direct_scope_module_aliases<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+) -> Vec<UseAlias> {
+    let mut aliases = Vec::new();
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let Some((_, nested)) = module.content.as_ref() else {
+            continue;
+        };
+        let name = ident_name(&module.ident);
+        for alias in direct_scope_aliases(nested) {
+            aliases.push(UseAlias {
+                local: format!("{name}::{}", alias.local),
+                target: alias.target,
+            });
+        }
+    }
+    aliases
 }
 
 /// Strips any number of redundant `(..)` wrappers from a type, so `(Recovery)` and
@@ -1280,6 +1402,34 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
                 return;
             }
             syn::visit::visit_trait_item(self, item);
+        }
+
+        // Round 28: the same gap as round 27's, one level of subitem further —
+        // `#[cfg(test)] field: imported_type_macro!()` on a production struct's or
+        // union's field, a `#[cfg(test)]`-gated enum variant, and a `#[cfg(test)]`
+        // foreign item each carry their own gate that the default traversal walks
+        // straight past, since `syn::visit::Visit` dispatches each through its own
+        // method (`visit_field`, `visit_variant`, `visit_foreign_item`) rather than
+        // back through `visit_item` or `visit_impl_item`/`visit_trait_item`.
+        fn visit_field(&mut self, field: &'ast syn::Field) {
+            if has_cfg_test(&field.attrs) {
+                return;
+            }
+            syn::visit::visit_field(self, field);
+        }
+
+        fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+            if has_cfg_test(&variant.attrs) {
+                return;
+            }
+            syn::visit::visit_variant(self, variant);
+        }
+
+        fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+            if has_cfg_test(foreign_item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_foreign_item(self, item);
         }
 
         fn visit_item_macro(&mut self, _node: &'ast syn::ItemMacro) {

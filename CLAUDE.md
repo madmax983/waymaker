@@ -3466,6 +3466,36 @@ ships with nothing generated at all. The visitor gained `visit_impl_item` and
 `visit_trait_item` overrides, mirroring its existing `visit_item` one, backed by a new
 `trait_item_attrs` alongside the existing `impl_item_attrs`.
 
+Round 28 found three more. The first was the same macro-visitor gap one subitem
+further: `#[cfg(test)] field: generate_type!()` on a production struct's field, an
+enum variant, and a foreign item each carry their own gate the visitor still walked
+past, since `syn::visit::Visit` dispatches each of those through its own method
+(`visit_field`, `visit_variant`, `visit_foreign_item`) rather than through any of the
+three overrides round 27 added. All three gained the same `has_cfg_test`-and-return
+guard, the last backed by a new `foreign_item_attrs`. The second: `type Identity<T> =
+T; type R = Identity<super::Recovery>; impl Clone for R { .. }` is legal Rust whose
+alias target names a real generic alias with an argument substituted in —
+`direct_scope_aliases`'s `Item::Type` arm read only the target path's segment
+identifiers, discarding `<super::Recovery>`, so `R` resolved to `Identity`'s own
+declared target, `T`, rather than to the type actually substituted in, and the alias
+was silently accepted as not `Clone` instead of failing closed. This module does not
+perform generic substitution — that is real type-checking, not parsing — so an alias
+target carrying a generic argument anywhere along its path now fails closed to
+`UNRESOLVED_DERIVE`, the same way a projected associated type already does. The
+third: `mod traits { pub use core::clone::Clone as C; } impl traits::C for
+super::Recovery { .. }` is legal Rust, and the qualified trait path `traits::C` had
+no alias to resolve against at all — `every_resolution` only ever looked up a single
+segment as a candidate, so the ordinary identifier `traits` fell through to the "no
+matching alias, take the last segment" branch and reported the bare, still-aliased
+name `C` rather than `Clone`. A new `direct_scope_module_aliases` registers
+`traits::C` as a synthetic alias for whatever `C` resolves to inside `traits`' own
+scope (one level of qualification only, matching how deep this round's finding
+reaches), folded into `module_scope_aliases` alongside the existing
+`direct_scope_aliases`; a new `qualified_candidate` — `lookup_candidate`'s two-segment
+twin, both built over an extracted `strip_self_prefix` — is tried before the plain
+single-segment lookup at every hop, branching over both rather than stopping at the
+first the way this scan's other duplicate-candidate cases already do.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

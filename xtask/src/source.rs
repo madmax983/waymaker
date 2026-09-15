@@ -12457,6 +12457,103 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_impl_reached_through_a_sibling_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 28: `mod traits {
+        // pub use core::clone::Clone as C; } impl traits::C for super::Recovery {
+        // .. }` is legal Rust, and the qualified trait path `traits::C` had no alias
+        // to resolve against — `every_resolution` only ever looked up a single
+        // segment as a candidate, so `traits` fell through to the "no matching
+        // alias, take the last segment" branch and reported the bare, still-aliased
+        // name `C` rather than `Clone`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    pub use core::clone::Clone as C;\n",
+                "}\n",
+                "impl traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_macro_in_a_cfg_test_gated_field_does_not_trip_the_recovery_pin() {
+        // Found by Codex review of this change (PR #143), round 28: the same gap as
+        // round 27's, one subitem further — `#[cfg(test)] field:
+        // generate_type_round28!()` on a production struct's field carries its own
+        // gate that `declares_item_macro`'s visitor walked straight past, since
+        // `syn::visit::Visit` dispatches a field through `visit_field` rather than
+        // through `visit_item`, `visit_impl_item` or `visit_trait_item`.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+            "\n",
+            "#[allow(dead_code)]\n",
+            "struct HasTestOnlyField {\n",
+            "    #[cfg(test)]\n",
+            "    field: generate_type_round28!(),\n",
+            "}\n",
+        )));
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_through_a_generic_type_alias_argument_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 28: `type
+        // Identity<T> = T; type R = Identity<super::Recovery>; impl Clone for R {
+        // .. }` is legal Rust whose target names a real generic alias with an
+        // argument substituted in, but `direct_scope_aliases`'s `Item::Type` arm
+        // read only the target path's segment identifiers, discarding
+        // `<super::Recovery>` — so `R` resolved to `Identity`'s own declared target,
+        // `T`, rather than to the type actually substituted in, and the alias was
+        // silently accepted as not `Clone` instead of failing closed.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "type Identity<T> = T;\n",
+                "type R = Identity<super::Recovery>;\n",
+                "impl Clone for R {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);
