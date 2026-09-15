@@ -462,14 +462,22 @@ All 10 failure rows, with the id to cite when a change touches one:
 | `history-capacity-reached` | History capacity reached | `history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new` | Driven |
 | `replay-divergence` | Replay divergence | `replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched` | Driven |
 
-Row 5 does not hold as §14 writes it. It says "redeliver": a torn completion leaves no append
-point ([ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)),
-so the driver and the rig both refuse the bank. The test asserts the refusal beside the two
-halves that do hold: the torn completion is ignored and no partial bytes reach the workflow.
-The run's continuation is §10's `continue_as_new`, a new run under a new id, so an effect
-performed before the crash is performed again under another `(RunId, EffectSeq)`. That is the
-duplicate `stable-redelivery` forbids, and it is issue
-[#95](https://github.com/madmax983/waymaker/issues/95).
+Row 5 now holds as §14 writes it. It says "redeliver": no writer starts a record before the
+one ahead of it has sealed, so a torn completion's own reserved slot is the whole of what an
+interrupted attempt touched, and issue [#95](https://github.com/madmax983/waymaker/issues/95)
+teaches recovery to look — if every byte from the frame's own unpadded length to the end of
+that slot is erased (the padding and the seal, never the frame body itself, which a
+checksum-valid unsealed frame always has programmed), the record is ignored and the slot
+becomes the append point, so the same run redelivers the effect under its own identity rather
+than being forced into §10's `continue_as_new`. The effect already ran by the time a
+completion record is written, so nothing about `durable-intent-before-effect` changes; what
+changes is that the run keeps the `(RunId, EffectSeq)` the duplicate `stable-redelivery`
+forbids would otherwise cost it. A tear *inside* the commit seal itself is not this fix's —
+the bytes there are neither erased nor a real seal, so recovery still cannot tell an
+interrupted append from damage — and that half of the row still refuses, exactly as
+[ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)
+says of a bank recovery cannot vouch for. The test sweeps both outcomes. See
+[ADR 0052](docs/adr/0052-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
 
 Issue [#96](https://github.com/madmax983/waymaker/issues/96) closed the four rows the rig
 used to owe. Rows 7 and 8 needed a workload that rolls over: `Rig::iterate_until_rollover`
@@ -2522,11 +2530,13 @@ drives two runs for the sixth, and requires the rig's census to refuse at the se
 is the honest shape of a rig with no swap workload. The `failure-matrix` rule holds the five
 places a row lives to one table, and the `matrix` stage runs both halves as a check of their
 own. One finding came out of writing the rows down rather than out of reading the code: §14
-row 5 says a torn completion is redelivered, and under ADR 0018 it cannot be, in this bank or
-by this rig; the table above says `continue_as_new` instead, which forfeits the effect's
-identity, and issue #95 and
-[ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
-record it.
+row 5 says a torn completion is redelivered, and at the time neither this bank nor this rig
+could — recovery had no way to tell an interrupted append from damage, so both refused the
+bank, and the table's own continuation was `continue_as_new`, a new run that forfeits the
+effect's identity. [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
+recorded the deviation; issue #95 and
+[ADR 0052](docs/adr/0052-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
+close most of it, below.
 
 Issue #32 opens rung 0.5, and what it asks for is one sentence from §11 made structural: a
 delay that needs a clock which survives power loss is never quietly served by one that does
@@ -3584,6 +3594,77 @@ about `Sealable` or `Staged` grew to make any of this easier: `commit-discipline
 else," and a `storage_mut` accessor tried against both was rejected by the gate for exactly
 that reason.
 
+Issue #95 then closes most of §14 row 5's deviation, which issue #31's own table had left
+open with no plan to close it: a torn completion left a journal with no append point, so the
+bank was refused and the run's only way on was `continue_as_new` — a new run under a new
+`RunId`, which is the duplicate `stable-redelivery` exists to forbid, on an effect that had
+already physically run. No writer starts a record before the one ahead of it has sealed —
+`waymaker-flash`'s own append discipline, unchanged since issue #24 — so an unsealed record's
+reserved slot, its padded body and its commit seal, is the whole of what an interrupted
+attempt ever touched. `Recovery::next` and `Scan::next` both now look: if every byte between
+the frame's own unpadded length and the end of that slot is erased, the record is ignored —
+never yielded — and the scan carries on scanning *past* the slot rather than stopping there,
+which is what lets a *later* boot's own committed history be found rather than hidden behind
+a slot no scan ever gets past. The bounded check is deliberate and is not the same question as
+"is the rest of the region erased": a reader walked at a wider granularity than a journal was
+written at computes a slot that runs past real, committed records, and checking only the
+unpadded frame's own bytes is what still refuses that case rather than silently accepting a
+miscomputed slot that happens to land on erased media further out —
+`a_scan_at_a_larger_alignment_than_the_writer_used_is_caught_by_the_seal` is the regression
+that found the wider check wrong before this one replaced it. A tear *inside* the commit seal
+itself is unaffected: those bytes are neither erased nor a real seal, so recovery still cannot
+tell an interrupted append from damage, and the bank is still refused exactly as
+[ADR 0018](docs/adr/0018-recovery-is-a-position-and-only-erased-media-is-an-append-point.md)
+says of media nothing legitimate should be in. `waymaker-drive`'s and `waymaker-rig`'s own
+row-5 tests sweep both outcomes rather than only the one that used to hold.
+The fix is scoped to an outcome rather than generic over every record kind — the first
+version of this issue let any unsealed frame be ignored, and Codex's review of it found the
+scope was the mistake. `frame::redeliverable_kind` answers `true` for exactly
+`EffectCompleted`, `EffectFailed` and `TimerFired`, read from the same decode `sealed` already
+needs to check the seal, so neither `Recovery` nor `Scan` pays for a second call to
+`frame::decode_with::<C>` to ask. Every other kind — `RunStarted`, a schedule, a version
+marker, a terminal record — still ends the scan as `Ending::Unsealed` when its seal does not
+hold, exactly as it always did: losing a schedule is free by row 5's own argument (an
+unsealed schedule's effect was never dispatched either way), but losing a *terminal* record
+this way is not, and neither is losing `RunStarted` in general — see the capacity paragraph
+below for why. `Recovery::next`'s one call to `frame::decode_with::<C>` is kept in a private
+`sealed` helper for the `integrity-check` routing pin's sake, and the loop this needed is
+bounded the same way every offset advance in this module already is — by `stride > 0` — so a
+chain of ignored slots from repeated crashes still terminates over a region of finite length.
+Costs 100 B of layers for the recovery fix and 44 B more for `redeliverable_kind`, 12964 B of
+13312 with 348 B left and no raise asked for; runtime RAM and kernel state are unmoved,
+because nothing here grows what `Recovery` carries between calls. `waymaker-spec`'s ghost
+model is untouched: it already treats the two-barrier write as coarser than this — see
+[what is not checked](#what-is-not-checked)'s note that the model "has no transition for the
+state §07's payload barrier creates" — so this is a fact about bytes the model was never
+fine-grained enough to see change.
+
+Redelivering an outcome in place moved a cost that used to be absorbed by starting a fresh
+run: the bytes a torn, ignored attempt consumes cannot be reclaimed on NOR, and §10's capacity
+reserve priced a schedule against only the *real* outcome that would eventually land, not
+against one that might be wasted first. `Reserve::exit_bytes_after`'s
+`EffectScheduled`/`TimerScheduled` arm and `Reserve::for_layout`'s floor both now reserve one
+extra outcome's worth — `redelivery_slack` — so a single tear at the reserve boundary cannot
+strand the run: without it, dispatch happens on `Ending::Clean`, before capacity is ever
+checked, so the activity would be redelivered on every later boot while the retry that has to
+record its outcome refused with `NearCapacity` forever. One wasted attempt is tolerated, not
+an unbounded number, matching this codebase's other single-crash guarantees;
+`a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry` drives exactly that
+shape end to end. Codex found this on review of the fix above, and then found the same shape
+a second time against a *terminal* record: nothing prices a terminal's own retry, so treating
+it as redeliverable the same way could strand a run's only exit for ever. Widening the
+reserve a second time, for a kind whose own retry-safety turns out to depend on the relative
+sizes of a workflow's declared `Bounds` — `RunStarted`'s in particular, since
+`run_input_bytes` can dwarf everything else `Reserve::for_layout` prices — is what
+`redeliverable_kind`'s narrower scope avoids rather than chases. A third finding on the same
+mechanism is filed rather than fixed here: `redelivery_slack` is unversioned across a
+firmware upgrade, since `Reserve` is recomputed fresh from `Bounds` on every boot and nothing
+about it is on media, so a schedule admitted by firmware that predates this fix carries no
+record of the weaker guarantee it left behind — see issue
+[#188](https://github.com/madmax983/waymaker/issues/188), filed rather than fixed because no
+device has ever run this firmware to make the scenario reachable today. See
+[ADR 0052](docs/adr/0052-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
+
 Issue #99 then closes the route Codex found on issue #32's fourth review round. A
 `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec`, reached
 through an aliased `use`, named no forbidden identifier and changed no surface. So
@@ -3596,6 +3677,7 @@ record carries — are pinned on their own, by name and value (`source::CLOCK_KI
 A renumbering is now a build failure rather than a round-trip test that stays green.
 `effect-protocol` and `kernel-boundary` shared the same blind spot — an associated constant
 is neither a function nor a member — and gained the same ban for their own pinned types.
+
 Issue #97 closes a gap Codex found in the `failure-matrix` rule itself: a row test under
 `#[cfg_attr(.., ignore)]` is a test the compiler can skip, and the old scan refused only a
 direct `#[ignore]` or `#[cfg(..)]`, so such a test still vouched for its row. The scanner's

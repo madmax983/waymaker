@@ -53,13 +53,23 @@
 //!
 //! | After | Still owed |
 //! | --- | --- |
-//! | `EffectScheduled`, `TimerScheduled` | an outcome, then a terminal record |
+//! | `EffectScheduled`, `TimerScheduled` | one wasted outcome attempt, an outcome, then a terminal record |
 //! | `RunStarted`, `EffectCompleted`, `EffectFailed`, `TimerFired`, `VersionMarker` | a terminal record |
 //! | `RunCompleted`, `RunFailed` | nothing |
 //!
 //! A timer is priced at an effect's figure rather than its own. A `TimerFired` has no
 //! payload, so it is never wider than an outcome priced at `effect_result_bytes`: the
 //! reserve holds back a few bytes more than a timer needs and never fewer.
+//!
+//! The extra outcome is issue [#95](https://github.com/madmax983/waymaker/issues/95)'s:
+//! recovery can ignore one torn, otherwise-clean outcome attempt and redeliver the effect in
+//! the same run rather than losing the bank, but the bytes that attempt cost cannot be
+//! reclaimed on NOR. Pricing only the real outcome would let a single tear at the reserve
+//! boundary strand the run for ever — dispatch happens on a clean recovery, before capacity
+//! is ever checked, so the activity would be redelivered on every later boot while the retry
+//! that has to record its outcome never fits. One wasted attempt is tolerated, not an
+//! unbounded number: a second tear on the retry itself is outside what this reserve covers,
+//! the same standing as this codebase's other single-crash guarantees.
 //!
 //! # Where the gate is
 //!
@@ -347,8 +357,10 @@ impl Refusal {
 ///   the layout's program granularity — padded and sealed, which is what a record really
 ///   occupies.
 /// * [`tail_bytes`](Self::tail_bytes) is what an outstanding effect still owes: an outcome
-///   and then a terminal record. It is the largest [`exit_bytes_after`](Self::exit_bytes_after)
-///   can answer.
+///   and then a terminal record. It is *not* the largest
+///   [`exit_bytes_after`](Self::exit_bytes_after) can answer — a schedule record's own arm
+///   adds one more worst-case outcome on top of it, issue #95's redelivery slack, so
+///   `tail_bytes` plus one outcome is the true ceiling.
 /// * A reserve exists only for a layout that can hold it. [`for_layout`](Self::for_layout)
 ///   refuses the rest, so a `Reserve` in hand is a promise that has already been checked
 ///   against a bank.
@@ -459,12 +471,23 @@ impl Reserve {
         };
 
         let tail = narrow(outcome).saturating_add(narrow(terminal));
-        // The opening record, one effect scheduled and resolved, and the exit. Every other
-        // combination is smaller: an effect's outcome and the terminal record after it *are*
-        // the tail, so `start + schedule + tail` dominates both `start + terminal` and the
-        // tail alone.
+        // One extra outcome's worth, on top of the tail. Issue #95 lets recovery ignore a
+        // torn, otherwise-clean outcome attempt and keep the same run going rather than
+        // losing the bank — but the bytes that attempt consumed cannot be reclaimed on NOR.
+        // Without this, a single torn outcome write can permanently strand the run: dispatch
+        // happens on `Ending::Clean`, before capacity is ever checked, so the activity is
+        // redelivered while the retry that has to record its outcome no longer fits. Priced
+        // here and applied again in `exit_bytes_after`'s `EffectScheduled`/`TimerScheduled`
+        // arm — one wasted attempt tolerated, matching this codebase's other single-crash
+        // guarantees rather than an unbounded one.
+        let redelivery_slack = narrow(outcome);
+        // The opening record, one effect scheduled and resolved, the exit, and the slack
+        // above. Every other combination is smaller: an effect's outcome and the terminal
+        // record after it *are* the tail, so `start + schedule + tail + slack` dominates
+        // both `start + terminal` and the tail alone.
         let floor = narrow(start)
             .saturating_add(narrow(schedule))
+            .saturating_add(redelivery_slack)
             .saturating_add(tail);
         let Some(needed) = narrow(rollover).checked_add(floor) else {
             return Err(CapacityError::ReserveDoesNotFit);
@@ -540,8 +563,18 @@ impl Reserve {
             // refusal slightly early in the last moments of a bank's life, which is the safe
             // direction, and it is what keeps this a two-term sum rather than a three-term
             // one on a firmware with a 12 KiB code budget.
+            //
+            // One more `outcome_bytes` beyond the tail, for the same reason `for_layout`'s
+            // `redelivery_slack` prices it into the floor: issue #95 can ignore one torn
+            // outcome attempt and redeliver the effect in place, and the bytes that attempt
+            // cost are gone for this bank's life. Without the extra term, a single tear at
+            // the reserve boundary strands the run — every later boot redelivers (dispatch
+            // happens on `Ending::Clean`, before capacity is checked) and every retry meets
+            // the same `NearCapacity` refusal, so the activity is re-performed forever with
+            // no way to ever record its outcome. One wasted attempt tolerated, not an
+            // unbounded number, matching this codebase's other single-crash guarantees.
             RecordRef::EffectScheduled { .. } | RecordRef::TimerScheduled { .. } => {
-                self.tail_bytes()
+                self.tail_bytes().saturating_add(self.outcome_bytes)
             }
             RecordRef::RunStarted { .. }
             | RecordRef::EffectCompleted { .. }
@@ -885,7 +918,7 @@ mod tests {
                 input_len: 0,
                 input_crc: 0,
             }),
-            reserve.tail_bytes()
+            reserve.tail_bytes().saturating_add(reserve.outcome_bytes)
         );
         assert_eq!(
             owes(&RecordRef::RunStarted {
@@ -964,7 +997,7 @@ mod tests {
         );
         assert_eq!(
             reserve.floor_bytes,
-            narrow(start) + narrow(schedule) + reserve.tail_bytes()
+            narrow(start) + narrow(schedule) + reserve.outcome_bytes + reserve.tail_bytes()
         );
         assert!(reserve.floor_bytes > reserve.tail_bytes());
     }

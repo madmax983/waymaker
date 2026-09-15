@@ -389,8 +389,14 @@ struct Census {
     dispatched_then_power_lost: usize,
     scans_that_refused: usize,
     torn_records: usize,
-    /// Runs where a record is torn and the scan does *not* refuse, or the other way round.
-    torn_and_refused_disagreed: usize,
+    /// Runs where the scan refused and the ledger says nothing was torn — always a bug: a
+    /// refusal must be explained by a real tear.
+    refused_without_tearing: usize,
+    /// Runs where a record is torn and the scan does *not* refuse it — issue #95's outcome:
+    /// no writer starts a record before the one ahead of it has sealed, so a tear at or
+    /// before the torn record's own padded length leaves an erased run behind it, and the
+    /// scan now ignores the record and keeps the append point rather than refusing the bank.
+    torn_and_recovered: usize,
     empty_recoveries: usize,
     full_recoveries: usize,
     /// Which of §09's six record kinds the generator actually drew.
@@ -509,8 +515,11 @@ fn the_oracle_holds_over_random_histories_on_random_geometries_at_every_crash_po
             if torn {
                 census.torn_records += 1;
             }
-            if refused != torn {
-                census.torn_and_refused_disagreed += 1;
+            if refused && !torn {
+                census.refused_without_tearing += 1;
+            }
+            if torn && !refused {
+                census.torn_and_recovered += 1;
             }
         }
     }
@@ -569,16 +578,23 @@ fn assert_the_sweep_covered_something(census: &Census) {
         census.torn_records > 0,
         "no crash point tore a record in half across the whole sweep"
     );
-    // The two counters above are the same measurement taken from opposite ends — the ledger
-    // says a record is half on media, the scan says a frame does not verify — and over the
-    // whole sweep they agree exactly. That equivalence is the interesting property, and
-    // asserting it is what stops these being one check written twice: a codec that accepted
-    // a torn frame, or a harness that stopped noticing one, breaks it from its own side.
+    // A refusal must still be explained by a real tear — that direction of the old
+    // equivalence still holds, and a codec that refused a whole record for no reason would
+    // break it. What no longer holds since issue #95 is the other direction: no writer
+    // starts a record before the one ahead of it has sealed, so a tear at or before the
+    // record's own padded length leaves nothing but an erased run behind it, and the scan
+    // now ignores such a record rather than refusing the bank. Both outcomes are counted
+    // rather than only the first, so a version that stopped reaching the second — silently
+    // narrowing the fix back to a refusal — would be caught by the sweep going quiet.
     assert_eq!(
-        census.torn_and_refused_disagreed, 0,
-        "a torn record and a journal the scan refuses stopped being the same thing in {} \
-         runs",
-        census.torn_and_refused_disagreed
+        census.refused_without_tearing, 0,
+        "the scan refused a record the ledger says was never torn, in {} runs",
+        census.refused_without_tearing
+    );
+    assert!(
+        census.torn_and_recovered > 0,
+        "no crash point tore a record and had the scan recover past it, so issue #95's fix \
+         is untested here"
     );
     assert!(
         census.scans_that_refused > 0,
