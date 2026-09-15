@@ -5158,24 +5158,39 @@ fn try_alias_candidates<'a>(
         );
         let mut resolved = alias.target;
         resolved.extend(rest.iter().cloned());
-        if resolved.last().is_some_and(|last| last.as_str() == target) {
-            return true;
+        if alias.absolute {
+            // Past a leading `::` the path names the extern prelude directly,
+            // not another local alias this scan can chase further — the same
+            // short-circuit [`resolve_segments`]'s own absolute-alias check
+            // takes, so this is the one candidate shape a plain name
+            // comparison is still the whole answer for.
+            if resolved.last().is_some_and(|last| last.as_str() == target) {
+                return true;
+            }
+            continue;
         }
-        if !alias.absolute
-            && segments_could_reach_target(
-                resolved,
-                stack,
-                scope,
-                entered,
-                block_items,
-                innermost_scope,
-                next_block_eligible && !qualified,
-                false,
-                target,
-                budget,
-                cache,
-            )
-        {
+        // Recurse rather than accepting `resolved`'s own last segment by
+        // name alone: that name may itself be a further local alias whose
+        // own target resolves elsewhere (issue #197, Codex review of the
+        // PR — `type CheckedDispatch = Decoy;` beside a `Marker` alias
+        // that names `CheckedDispatch` made `Marker` count as reaching the
+        // guarded type by text, even though `CheckedDispatch`'s own alias
+        // sends every real build to `Decoy` instead). Recursing lets
+        // [`segments_could_reach_target`]'s own base case decide, the same
+        // way it already would for a name with no alias at all.
+        if segments_could_reach_target(
+            resolved,
+            stack,
+            scope,
+            entered,
+            block_items,
+            innermost_scope,
+            next_block_eligible && !qualified,
+            false,
+            target,
+            budget,
+            cache,
+        ) {
             return true;
         }
     }
@@ -5223,6 +5238,19 @@ fn segments_could_reach_target<'a>(
 
     let rest = segments.get(1..).unwrap_or_default();
 
+    // Whether `first` names anything this search already tried to resolve —
+    // a block-local alias, a module-scope alias, or a same-named module —
+    // regardless of whether that attempt reached `target`. The closing
+    // fallback below is sound only when nothing has claimed `first`: a name
+    // that *is* aliased or *is* a module never names the pinned type
+    // directly, so a resolution that already ran and failed must not be
+    // second-guessed by comparing the unresolved text again (issue #197,
+    // Codex review of the PR: `traits::Marker`, whose own alias always
+    // resolves to `Decoy`, still counted as reaching a target spelled
+    // "Marker" — the tail of the untouched, pre-resolution path — even
+    // though the module descent below had already shown it does not).
+    let mut resolved_elsewhere = false;
+
     // Block-local aliases are not cached: `block_items` has no one contiguous
     // scope to key a cache entry on, and it is small — one construction site's
     // own enclosing blocks. Not shadow-gated — see this function's own docs. A
@@ -5233,6 +5261,7 @@ fn segments_could_reach_target<'a>(
             .into_iter()
             .filter(|candidate| candidate.local == first)
             .collect();
+        resolved_elsewhere |= !block_candidates.is_empty();
         if try_alias_candidates(
             block_candidates,
             rest,
@@ -5262,6 +5291,7 @@ fn segments_could_reach_target<'a>(
         .filter(|candidate| candidate.local == first)
         .cloned()
         .collect();
+    resolved_elsewhere |= !module_alias_candidates.is_empty();
     if try_alias_candidates(
         module_alias_candidates,
         rest,
@@ -5289,6 +5319,7 @@ fn segments_could_reach_target<'a>(
             .filter(|(name, _)| *name == first)
             .map(|(_, module_items)| *module_items)
             .collect();
+        resolved_elsewhere |= !modules.is_empty();
         for module_items in modules {
             if segments_could_reach_target(
                 remaining.clone(),
@@ -5308,7 +5339,7 @@ fn segments_could_reach_target<'a>(
         }
     }
 
-    segments.last().is_some_and(|last| last.as_str() == target)
+    !resolved_elsewhere && segments.last().is_some_and(|last| last.as_str() == target)
 }
 
 /// Something [`struct_literal_counts`] can count literals inside of, with the
@@ -15156,6 +15187,100 @@ mod cfg_alias_ambiguity_tests {
              \x20   0\n\
              }",
             "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_scope_alias_whose_target_is_itself_shadowed_does_not_count() {
+        // Codex review of PR #204: an alias candidate's own resolved segments
+        // were compared against `target` by name alone, before recursing to
+        // check whether that name was itself further aliased away. `Marker`
+        // resolves to `CheckedDispatch` under one cfg branch, but
+        // `CheckedDispatch` is itself a local alias for `Decoy` in the same
+        // module, so `Marker` never really constructs the guarded type under
+        // any configuration.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   type CheckedDispatch = Decoy;\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type Marker = CheckedDispatch;\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   type Marker = Decoy;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_scope_alias_that_really_reaches_the_target_still_counts() {
+        // The control for the test above: with no further alias shadowing
+        // `CheckedDispatch`'s own name, the live branch really does
+        // construct it.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type Marker = CheckedDispatch;\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   type Marker = Decoy;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_scope_alias_that_resolves_away_does_not_count_its_own_written_name() {
+        // Codex review of PR #204: after module descent found a real alias
+        // for the qualified path's own tail, and that alias did not reach
+        // `target`, the caller's own final fallback still compared the
+        // untouched, unresolved segments against `target` — so
+        // `traits::Marker`, which real Rust always resolves through
+        // `Marker`'s own alias to `Decoy`, counted as reaching a target
+        // literally spelled "Marker", a name it never constructs.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   pub type Marker = Decoy;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "Marker",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_scope_alias_still_reaches_the_name_it_really_resolves_to() {
+        // The control for the test above: the same fixture, asking whether
+        // the qualified path reaches the name its alias really resolves to.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   pub type Marker = Decoy;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = traits::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "Decoy",
             FnScope::None,
         )
         .expect("the fixture parses");

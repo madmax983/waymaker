@@ -5751,5 +5751,33 @@ lets `self::A` see. `try_alias_candidates` now withholds `block_eligible` from a
 whose own target begins `self`/`super`, the same test every other qualified path in this
 search is already held to. `a_block_local_alias_to_a_self_qualified_path_does_not_chain_through_a_shadow`
 and its control, `a_block_local_alias_to_a_bare_name_still_chains_through_a_shadow`, are the
-regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
-id.
+regression.
+
+The same round found two more, both about the opposite danger from every fix before them:
+not a missed count, but a name accepted before the search had actually shown it reaches
+`target`. The first is in `try_alias_candidates`'s own fast path: it compared an alias
+candidate's *resolved* segments against `target` by name and returned `true` on a match,
+without asking whether that name was itself a further local alias whose own target
+resolves elsewhere — `type CheckedDispatch = Decoy;` beside a `#[cfg(feature = "a")] type
+Marker = CheckedDispatch;` made `Marker` count as reaching the guarded type under that
+feature, even though `CheckedDispatch`'s own alias sends every real build to `Decoy`
+instead. The fast path is now kept only for an *absolute* alias, whose own target reaches
+past every local scope by construction — every other candidate recurses into
+`segments_could_reach_target` instead, letting that function's own base case decide the
+same way it already would for a name with no alias at all.
+`a_module_scope_alias_whose_target_is_itself_shadowed_does_not_count` and its control,
+`a_module_scope_alias_that_really_reaches_the_target_still_counts`, are the regression.
+
+The second is a level up, in `segments_could_reach_target`'s own closing fallback: once
+module descent had tried a same-named module and found it did not reach `target`, the
+caller's own fallback still compared the *untouched, pre-resolution* segments' last piece
+against `target` by name — so `traits::Marker`, whose own alias always resolves to
+`Decoy`, counted as reaching a target literally spelled `"Marker"`, the tail of the path
+as written, a name it never actually constructs. The fallback now fires only when nothing
+already claimed `first` — no block-local alias, no module-scope alias, and no same-named
+module — because a name any of those three explains is never a bare, direct reference,
+whatever its own resolution turned out to answer.
+`a_module_scope_alias_that_resolves_away_does_not_count_its_own_written_name` and its
+control, `a_module_scope_alias_still_reaches_the_name_it_really_resolves_to`, are the
+regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.
