@@ -2534,6 +2534,118 @@ fn is_formatting_element(name: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
+/// The HTML5 "special" category (Codex, pull request #138, round 75, "Require a
+/// real furthest block before preserving formatting"): the adoption agency
+/// algorithm's furthest-block search only ever promotes a node from this category —
+/// an ordinary phrasing/inline descendant like `<span>` or `<mark>` never qualifies,
+/// however deeply the misnesting reaches. When no descendant opened after a
+/// misnested formatting element is one of these, there is no furthest block at all,
+/// and HTML5's own "no furthest block" case simply pops every node from the current
+/// one down through the formatting element — the same as an ordinary close, with no
+/// clone and nothing preserved past it. `<b hidden><span>ignored</b>All 6 recovery
+/// invariants</span>` has `span` as `b`'s only descendant; `span` is not special, so
+/// `</b>` closes both `span` and `b` together and the suffix is visible immediately,
+/// not latched open until `</span>`.
+///
+/// Deliberately not [`HTML_BLOCK_TAG_NAMES`]: that list is `CommonMark`'s own type-6
+/// block-tag categorization, built for a different question (does a bare tag name
+/// start a raw HTML *block*) and neither a subset nor a superset of this one —
+/// `legend`, `optgroup`, `option`, `search` and `dialog` are on that list and not in
+/// HTML5's special category, while `br`, `button`, `img`, `input`, `object`,
+/// `pre`, `script`, `select`, `style`, `template`, `textarea` and several others are
+/// special and never appear there.
+const SPECIAL_ELEMENTS: &[&str] = &[
+    "address",
+    "applet",
+    "area",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "bgsound",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hgroup",
+    "hr",
+    "html",
+    "iframe",
+    "img",
+    "input",
+    "keygen",
+    "li",
+    "link",
+    "listing",
+    "main",
+    "marquee",
+    "menu",
+    "meta",
+    "nav",
+    "noembed",
+    "noframes",
+    "noscript",
+    "object",
+    "ol",
+    "p",
+    "param",
+    "plaintext",
+    "pre",
+    "script",
+    "section",
+    "select",
+    "source",
+    "style",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "template",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+    "wbr",
+    "xmp",
+];
+
+/// Whether `name` is one of [`SPECIAL_ELEMENTS`], case-insensitively.
+fn is_special_element(name: &str) -> bool {
+    SPECIAL_ELEMENTS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
 /// Whether `name` is one of the two HTML5 foreign-content namespace roots — SVG and
 /// `MathML` — the only place ordinary HTML still honors a trailing `/` in
 /// `<tag ... />` as bodyless, XML-style self-closing syntax (Codex, pull request
@@ -3391,6 +3503,16 @@ fn opens_hidden_element(line: &str) -> Option<String> {
 /// matches neither `opens_non_rendering_element` nor `closes_non_rendering_element`
 /// nor `opens_any_tag` (all three read "opens", and a close is never an open) — so
 /// without this, `stack` stayed at `["em"]` through end of document.
+///
+/// That unwind is gated by `ancestors_are_in_scope`, `next_non_rendering_marker`'s
+/// own template-scope check (Codex, pull request #138, round 75, "Keep inline
+/// template content isolated from outer ancestors") — round 72 added it there but
+/// not here, leaving this function's own copy of the same unwind reachable through
+/// `template` regardless: `<template>` content is HTML5's one exception, parsed on
+/// its own, wholly separate stack of open elements a real outer ancestor cannot
+/// reach in and close, any more than something inside can reach out.
+///
+/// `text <div><template>ignored</div>decision-id headline</template></div>` has the leading text force every tag through `Event::InlineHtml`, and its stray inner `</div>` matched the real, outer `div` still in `ancestors` and force-closed `template` early, exposing the marker `</template>` should have kept inert.
 fn track_non_rendering_html(
     html: &str,
     stack: &mut Vec<String>,
@@ -3419,6 +3541,7 @@ fn track_non_rendering_html(
     // across the `push`/`pop` calls below.
     match stack.last().cloned() {
         Some(top) if non_rendering_element_nests(&top) => {
+            let ancestors_are_in_scope = !top.eq_ignore_ascii_case("template");
             let Some(descendants) = descendants_stack.last_mut() else {
                 return true;
             };
@@ -3454,9 +3577,26 @@ fn track_non_rendering_html(
                 // lifetime, and the furthest block is a plain element the
                 // unconditional-close branch above already knows how to pop
                 // on its own matching close, "div" included.
-                let furthest_block = descendants.remove(0);
-                if let Some(slot) = stack.last_mut() {
-                    *slot = furthest_block;
+                //
+                // Not every nonempty descendant list has a *real* furthest
+                // block, though (Codex, pull request #138, round 75, "Require
+                // a real furthest block before preserving formatting"): HTML5
+                // only promotes a descendant from [`SPECIAL_ELEMENTS`], the
+                // outermost one there is if any qualifies, discarding
+                // whatever ordinary, non-special descendants came before it —
+                // they were never going to keep the clone alive on their own.
+                // When none of them qualify there is no furthest block at
+                // all, and the whole misnested run (every tracked descendant
+                // included) simply closes here, the same as the unconditional
+                // branch above.
+                if let Some(pos) = descendants.iter().position(|name| is_special_element(name)) {
+                    let furthest_block = descendants.remove(pos);
+                    descendants.drain(..pos);
+                    if let Some(slot) = stack.last_mut() {
+                        *slot = furthest_block;
+                    }
+                } else {
+                    stack.pop();
                 }
             } else if let Some(next_tag) = opens_any_tag(html) {
                 if implicitly_closed_by(&top, &next_tag) {
@@ -3512,7 +3652,7 @@ fn track_non_rendering_html(
                     // descendants") — see `next_non_rendering_marker`'s own twin
                     // fix for the reasoning.
                     descendants.truncate(pos);
-                } else if ancestors.contains(&name) {
+                } else if ancestors_are_in_scope && ancestors.contains(&name) {
                     // Round 57's "Unwind all elements through a matching ancestor",
                     // met here for a self-contained inline construct rather than a
                     // byte-by-byte walk: a closing tag matching neither `top` nor
@@ -3520,7 +3660,9 @@ fn track_non_rendering_html(
                     // element genuinely known to be open outside it, force-closes
                     // everything nested inside — the whole tracked stack, not only
                     // `top` — the same "pop everything nested inside a closing
-                    // ancestor's end tag" a real HTML5 parser does.
+                    // ancestor's end tag" a real HTML5 parser does. Only while
+                    // `top` is itself part of that same, real stack (round 75) —
+                    // see `ancestors_are_in_scope`'s own doc comment above.
                     stack.clear();
                     descendants.clear();
                     while ancestors.pop().as_deref() != Some(name.as_str()) {}

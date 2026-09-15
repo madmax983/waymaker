@@ -8680,6 +8680,75 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_misnested_formatting_element_with_no_special_descendant_is_visible() {
+        // Codex, pull request #138, round 75, finding "Require a real furthest
+        // block before preserving formatting": round 74's fix promoted *any*
+        // nonempty descendant list to a furthest block, but HTML5's adoption
+        // agency algorithm only ever promotes a descendant from the "special"
+        // category — an ordinary phrasing element like `<span>` never qualifies,
+        // however deeply the misnesting reaches. `<b hidden><span>ignored</b>
+        // decision-id headline</span>` has `span` as `b`'s only descendant; since
+        // `span` is not special, there is no furthest block at all, and HTML5's
+        // own "no furthest block" case pops both `span` and `b` together when
+        // `</b>` is reached — the suffix is visible immediately, not latched
+        // open until a `</span>` that never legitimately reopens anything.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><span>ignored</b>{} {}</span>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_inside_an_inline_template_stays_hidden_past_a_stray_ancestor_close() {
+        // Codex, pull request #138, round 75, finding "Keep inline template
+        // content isolated from outer ancestors": `next_non_rendering_marker`
+        // (round 72) gates its "unwind through a matching real ancestor" branch
+        // with `ancestors_are_in_scope`, refusing to let a real outer ancestor's
+        // close reach into an open `<template>` — but `track_non_rendering_html`,
+        // the same unwind's self-contained-inline-construct twin, carried no such
+        // gate. A leading text prefix forces every tag on the line through
+        // `Event::InlineHtml`: `text <div><template>ignored</div>decision-id
+        // headline</template></div>` has a stray `</div>` inside the template
+        // match the real, outer `div` still in `ancestors` and wrongly
+        // force-close `template` — and the suppression along with it — early,
+        // exposing the id and headline that follow even though they are still
+        // genuinely inside `<template>` content, isolated on its own separate
+        // stack a real ancestor's end tag cannot reach into.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <div><template>ignored</div>{} {}</template></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
     {
         // Codex, pull request #138, round 69, finding "Match integration points to
