@@ -8424,6 +8424,116 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_self_closing_script_following_a_nested_same_named_svg_root_still_counts()
+    {
+        // Codex, pull request #138, round 72, finding "Distinguish nested foreign
+        // elements from namespace frames": a same-named foreign element nested
+        // inside a foreign root is a real, separately open element — HTML5's own
+        // open-element stack has a distinct entry for it — and its own close has
+        // to unwind that entry rather than being read as the enclosing root's own
+        // close just because the two share a name. `<svg><svg></svg><script
+        // /><text>decision-id headline</text></svg>` has the inner, ordinary
+        // `<svg>` close only itself; the outer root stays open, self-closing
+        // stays honored, and `<script />` is bodyless. Matching the closing tag
+        // against frame names before any tracked descendant found the outer
+        // root's own frame by that same name and popped it — ending foreign
+        // content two elements early, so the now-unclosed `<script>` (no longer
+        // self-closing, since self-closing is honored only inside foreign
+        // content) swallowed the `<text>` and the id and headline inside it to
+        // end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><svg></svg><script /><text>{} {}</text></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_beneath_a_nested_integration_point_stays_hidden() {
+        // Codex, pull request #138, round 72, finding "Require foreign parsing
+        // before opening integration frames": an integration point switches
+        // parsing of its own descendants from foreign-content rules to HTML
+        // ones — a transition that can only happen once. An integration-point-
+        // shaped tag reached while already inside HTML content (the innermost
+        // open frame's own self-closing already not honored) is itself just an
+        // ordinary, unrecognized HTML element, not a second switch into HTML
+        // rules. `<math><mtext><mtext><mglyph><script />decision-id
+        // headline</script></mglyph></mtext></mtext></math>` has the inner
+        // `mtext`, `mglyph` and `script` all parsed as ordinary HTML — the slash
+        // on `script` ignored, its body real and hidden. Matching on namespace
+        // alone let the inner `mtext` reopen a second integration-point frame,
+        // whose empty `ordinary_descendants` then let the `mglyph` exception
+        // wrongly re-enter MathML, treating `<script />` as bodyless and
+        // exposing the id and headline after it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><mtext><mglyph><script />{} {}</script></mglyph></mtext></mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_a_template_past_an_unmatched_ancestor_close_stays_hidden() {
+        // Codex, pull request #138, round 72, finding "Respect HTML scope
+        // boundaries when unwinding hidden content": an ancestor name being
+        // present is not sufficient for an end tag to reach it across an HTML
+        // scope boundary. `<div><template>ignored</div>decision-id
+        // headline</template></div>` has the inner `</div>` match nothing on
+        // template content's own, separate stack of open elements — a real
+        // outer `div` genuinely open around the `<template>` itself is not
+        // reachable from inside it — so it is a stray, unmatched end tag, left
+        // inert, and the id and headline after it stay inside the still-open
+        // `<template>`, hidden until its own literal close. Matching the stray
+        // `</div>` against `ancestors` (positive evidence the real, outer `div`
+        // is genuinely open) wrongly read that as `top` itself closing too,
+        // ending the hidden template region early and exposing the marker.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><template>ignored</div>{} {}</template></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
     {
         // Codex, pull request #138, round 69, finding "Match integration points to

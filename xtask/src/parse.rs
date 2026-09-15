@@ -2896,6 +2896,29 @@ fn is_foreign_breakout_tag(span: &str, name: &str) -> bool {
 fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFrame>) {
     let name = markup_tag_name(span);
     if span.starts_with("</") {
+        let lower = name.to_ascii_lowercase();
+        // The innermost frame's own tracked descendants are searched *before* the
+        // frame stack itself (Codex, pull request #138, round 72, "Distinguish
+        // nested foreign elements from namespace frames"): a same-named element
+        // genuinely nested inside a foreign root or integration point is a real,
+        // separately open element — HTML5's own open-element stack has a distinct
+        // entry for it — and its own close has to unwind *that* entry rather than
+        // being read as the enclosing frame's close just because the two share a
+        // name. `<svg><svg></svg><script /><text>...` has the inner, ordinary
+        // `<svg>` recorded as a descendant of the outer root; checking frame names
+        // first found the outer root's own frame by that same name and popped it —
+        // ending foreign content two elements early — rather than closing only the
+        // inner element and leaving the outer root, and the still-honored
+        // self-closing rule that follows from it, genuinely open.
+        if let Some(top) = foreign_content.last_mut()
+            && let Some(pos) = top
+                .ordinary_descendants
+                .iter()
+                .rposition(|open| *open == lower)
+        {
+            top.ordinary_descendants.truncate(pos);
+            return;
+        }
         // A closing tag that mismatches the innermost frame still closes a real,
         // currently open *ancestor* frame — not only the innermost one (Codex,
         // round 63, "Pop through matching foreign-content ancestors"): HTML5's
@@ -2916,18 +2939,6 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
             .rposition(|frame| frame.name.eq_ignore_ascii_case(name))
         {
             foreign_content.truncate(pos);
-        } else if let Some(top) = foreign_content.last_mut() {
-            // A close for an ordinary element opened directly under the
-            // innermost frame (Codex, pull request #138, round 61) — tracked
-            // only so the `mglyph`/`malignmark` direct-child check below can
-            // tell whether anything else is currently open between it and an
-            // enclosing MathML text integration point. Truncated through the
-            // match, the same "close only what actually opened" discipline
-            // every other tracked stack here already follows.
-            let lower = name.to_ascii_lowercase();
-            if top.ordinary_descendants.contains(&lower) {
-                while top.ordinary_descendants.pop().as_deref() != Some(lower.as_str()) {}
-            }
         }
         return;
     }
@@ -3017,6 +3028,7 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
     } else if !foreign_content.is_empty()
         && is_html_integration_point(span, name)
         && is_svg_integration_point(name) == innermost_foreign_namespace_is_svg(foreign_content)
+        && honors_self_closing_now(foreign_content)
     {
         // An HTML integration point is only ever real while it is genuinely being
         // inserted into the SVG or MathML namespace (Codex, round 68, "Require a
@@ -3039,6 +3051,22 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
         // on `<script />` leaves it bodyless. Accepting any nonempty foreign stack
         // wrongly opened an integration-point frame for it anyway, switching to
         // HTML rules that read the same `<script />` as a real, unclosed script.
+        //
+        // Genuinely still in foreign content, not merely somewhere under an open
+        // root (Codex, round 72, "Require foreign parsing before opening
+        // integration frames"): an integration point switches parsing of its own
+        // descendants *from* foreign-content rules *to* HTML ones, which is a
+        // transition that can only happen once — an integration-point-shaped tag
+        // reached while already inside HTML content (the innermost open frame's
+        // own `honors_self_closing` already false) is itself just an ordinary,
+        // unrecognized HTML element, not a second switch into HTML rules.
+        // `<math><mtext><mtext><mglyph><script />...` has the inner `mtext`,
+        // `mglyph` and `script` all parsed as ordinary HTML — the slash on
+        // `script` ignored, its body real and hidden — but matching on namespace
+        // alone let the inner `mtext` reopen an integration-point frame, and the
+        // `mglyph` exception after it wrongly re-entered MathML, exposing the
+        // script body the same two-step way round 68's own fix closed for a
+        // *plain* HTML ancestor with no enclosing root at all.
         if !self_closes_immediately {
             foreign_content.push(ForeignFrame {
                 name: name.to_ascii_lowercase(),
@@ -3046,12 +3074,29 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
                 ordinary_descendants: Vec::new(),
             });
         }
-    } else if !honors_self_closing_now(foreign_content)
-        && !is_void_element(&name.to_ascii_lowercase())
-    {
-        // An ordinary tag opened while under an HTML integration point's "in html
-        // content" rules — recorded on the innermost frame alone (Codex, round 61),
-        // so a later `mglyph`/`malignmark` can tell it is no longer a direct child.
+    } else if honors_self_closing_now(foreign_content) {
+        // A tag reached here while genuinely still inside foreign content is not a
+        // root, an `mglyph`/`malignmark` exception, or a real integration-point
+        // switch — it is an ordinary, unrecognized element of the *current*
+        // namespace (Codex, round 72, finding 1's open-tag half, closing the other
+        // side of "Distinguish nested foreign elements from namespace frames"):
+        // self-closing has already returned above, so it stays genuinely open and
+        // needs the same record an HTML-mode descendant gets, or its own later
+        // close (handled by the closing-tag arm's own descendant search above) has
+        // nothing to match and falls through to closing the enclosing root by
+        // name instead. Foreign content has no optional-tag or void-element rules
+        // of its own — every non-self-closing tag opens for real, `is_void_element`
+        // included, unlike the ordinary-HTML branch just below — so this is
+        // recorded unconditionally rather than filtered the way that branch is.
+        if let Some(top) = foreign_content.last_mut() {
+            top.ordinary_descendants.push(name.to_ascii_lowercase());
+        }
+    } else if !is_void_element(&name.to_ascii_lowercase()) {
+        // Otherwise `foreign_content` is empty or the innermost frame is an
+        // integration point — an ordinary tag opened under an HTML integration
+        // point's "in html content" rules, or at the document's own top level —
+        // recorded on the innermost frame alone (Codex, round 61), so a later
+        // `mglyph`/`malignmark` can tell it is no longer a direct child.
         if let Some(top) = foreign_content.last_mut() {
             let lower = name.to_ascii_lowercase();
             // Applies its own implicit closes to the frame's own descendant stack
@@ -3992,6 +4037,24 @@ fn next_non_rendering_marker(
             RawTextClose::Pending(quote) => NonRenderingAdvance::PendingClose(quote),
         });
     }
+    // Whether `ancestors` — the document's own, real element stack, maintained
+    // outside `top` entirely — is reachable from inside `top` at all (Codex, pull
+    // request #138, round 72, "Respect HTML scope boundaries when unwinding hidden
+    // content"). `top` here is either an ordinary element the `hidden` attribute
+    // suppressed — ordinary content, fully part of the document's own stack, where
+    // a real outer ancestor's end tag legitimately reaches in and closes it exactly
+    // as it would any other nested element — or `template`, whose content HTML5
+    // parses on its own, wholly separate stack of open elements, starting empty.
+    // Only the second creates a real scope boundary: a `<template>` element's own
+    // ancestors are not reachable from inside its content, by name or otherwise,
+    // any more than something inside could reach out and close one of them.
+    // `<div><template>ignored</div>decision-id headline</template></div>` has the
+    // inner `</div>` match nothing on template content's own stack — stray, left
+    // inert — so `top` stays open until its own literal `</template>`; treating it
+    // as reaching the real, outer `div` (as an earlier version did, with no
+    // exception for `template`) read that as evidence `top` itself must have
+    // closed too, ending the hidden region early and exposing the marker after it.
+    let ancestors_are_in_scope = !top.eq_ignore_ascii_case("template");
     let mut cursor = cursor;
     // Ordinary elements opened *during this walk*, nested inside `top` (Codex, pull
     // request #138, round 55, "Unwind hidden descendants when an ancestor closes") —
@@ -4016,10 +4079,10 @@ fn next_non_rendering_marker(
     // saw it) is exactly as unmatched by that test, and elimination wrongly closed
     // `top` for those too (Codex, pull request #138, round 56, "Ignore closes that
     // do not match a real ancestor"). Only a name found at the top of `ancestors` —
-    // positive evidence of a real, currently-open outer element — now closes `top`;
-    // anything else is left inert, matching HTML5's own "any other end tag"
-    // algorithm, which ignores a token with no matching open element anywhere on the
-    // stack rather than guessing.
+    // positive evidence of a real, currently-open outer element — now closes `top`,
+    // and only while `ancestors_are_in_scope`; anything else is left inert, matching
+    // HTML5's own "any other end tag" algorithm, which ignores a token with no
+    // matching open element anywhere on the (in-scope) stack rather than guessing.
     loop {
         let comment = find_comment_opener(line, cursor);
         let Some((start, end)) = find_any_tag(line, cursor) else {
@@ -4061,7 +4124,10 @@ fn next_non_rendering_marker(
                 // nested child closing when it was really the real outer ancestor
                 // sharing that div's name.
                 descendants.truncate(pos);
-            } else if !descendants.contains(&name) && ancestors.contains(&name) {
+            } else if ancestors_are_in_scope
+                && !descendants.contains(&name)
+                && ancestors.contains(&name)
+            {
                 // Matches neither `top` nor anything this walk watched open inside
                 // it, but does match *some* element genuinely known to be open
                 // *outside* it — not necessarily the nearest one, since a real
@@ -4076,6 +4142,12 @@ fn next_non_rendering_marker(
                 // inside a closing ancestor's end tag, however many layers deep,
                 // which is why every entry through the match — not just the
                 // matched one — is popped here, and `top` closes along with them.
+                //
+                // Only while `top` is itself part of that same, real stack (Codex,
+                // round 72, "Respect HTML scope boundaries when unwinding hidden
+                // content"): `template` content is HTML5's one exception, parsed
+                // on its own separate stack a real outer ancestor cannot reach —
+                // see `ancestors_are_in_scope`'s own doc comment above.
                 while ancestors.pop().as_deref() != Some(name.as_str()) {}
                 return Some(NonRenderingAdvance::Close(end));
             }
@@ -4083,14 +4155,15 @@ fn next_non_rendering_marker(
             // is genuinely open — an out-of-order close inside a genuine nested
             // child, or a wholly unmatched stray tag — and is left inert, the same
             // as HTML5's own tokenizer does for an end tag with no matching open
-            // element anywhere on the stack.
+            // element anywhere on the (in-scope) stack.
         } else if implicitly_closed_by(top, &name) {
             return Some(NonRenderingAdvance::Close(start));
-        } else if let Some(closed_ancestor) = ancestors
-            .iter()
-            .rev()
-            .find(|ancestor| implicitly_closed_by(ancestor, &name))
-            .cloned()
+        } else if ancestors_are_in_scope
+            && let Some(closed_ancestor) = ancestors
+                .iter()
+                .rev()
+                .find(|ancestor| implicitly_closed_by(ancestor, &name))
+                .cloned()
         {
             // An opening tag can implicitly close an *ancestor* genuinely open
             // outside `top`, not only `top` itself (Codex, pull request #138,
@@ -4106,7 +4179,11 @@ fn next_non_rendering_marker(
             // search walks `ancestors` innermost first — the same "nearest open
             // instance" a real stack-based algorithm finds — and truncates
             // through the match the same way an *explicit* ancestor close
-            // already does (round 57).
+            // already does (round 57). Gated by `ancestors_are_in_scope` for the
+            // same reason the explicit close above is (round 72): an opening tag
+            // inside `template` content cannot reach out and implicitly close a
+            // real ancestor of the `<template>` element any more than an
+            // explicit end tag inside it can.
             while ancestors.pop().as_deref() != Some(closed_ancestor.as_str()) {}
             return Some(NonRenderingAdvance::Close(start));
         } else if matches!(
