@@ -15320,6 +15320,44 @@ mod block_local_item_shadow_tests {
             "an inner block's own shadow reached back into an outer alias's target: {counts:?}"
         );
     }
+
+    #[test]
+    fn a_deeper_blocks_own_struct_does_not_outrank_an_outer_alias_of_the_same_name() {
+        // Codex review of this change (PR #203): a residual, not fixed here.
+        // `resolve_local_alias_chain` finds the outer `type Alias = ...`
+        // before `block_shadow` is ever consulted, so the inner block's
+        // own `struct Alias;` does not win the way real Rust says it
+        // should. `own_aliases` never reads a struct/enum/union
+        // declaration at all, so telling the two apart needs each one
+        // paired with the depth it was declared at — machinery this fix
+        // does not add. This is an over-count, not a missed one, which is
+        // the safe side for a construction pin (see
+        // `alias_could_reach_target`'s own doc). Pinned so a future
+        // change cannot silently flip it to a missed count instead.
+        let code = "fn f() {\n    type Alias = Disallowed;\n    {\n        struct Alias;\n        \
+             let _ = Alias {};\n    }\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn alias_could_reach_target_does_not_consult_block_shadow_either() {
+        // Codex review of this change (PR #203): the same residual met a
+        // second way. The deterministic resolution correctly leaves
+        // `Alias` unresolved here — `resolve_with_block_alias` finds no
+        // local alias for it and falls to `resolve_segments`, which does
+        // check `block_shadow`. But `alias_could_reach_target` (issue
+        // #185's own fallback) reads only `own_aliases`, which is blind to
+        // the same block-local struct, so it still finds the module-level
+        // `use` and counts anyway. Also an over-count, also pinned rather
+        // than fixed for the same reason.
+        let code = "use Disallowed as Alias;\nfn f() {\n    struct Alias;\n    let _ = Alias \
+             {};\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
 }
 
 #[cfg(test)]

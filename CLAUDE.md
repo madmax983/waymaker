@@ -1341,6 +1341,21 @@ Stated so that nobody mistakes silence for coverage:
   answer, checking the target against *its own declaration site's* shadow rather
   than none at all, needs each block-local item paired with a shadow snapshot taken
   where it was declared, and this fix does not add that.
+  `resolve_local_alias_chain` and `alias_could_reach_target` — the two routes
+  `struct_literal_counts` and `generic_assoc_type_bindings_naming` resolve a
+  block-local reference through — read only `own_aliases`,
+  which has never read a `struct`/`enum`/`union` declaration; neither consults
+  `block_shadow`. So an outer `type Alias = Disallowed;` still answers for a bare
+  `Alias` a deeper block shadows with a struct of its own, and a module-level
+  `use Disallowed as Alias;` still answers the same way through
+  `alias_could_reach_target`'s own fallback. The precise fix needs each
+  declaration — alias or item — paired with the depth it was made at; a shortcut
+  (block-local items always win) was checked against the reverse nesting and found
+  to turn an over-count into a missed one, which is the direction a construction
+  pin must never move in. Both routes exist only for those two construction pins,
+  where an extra count is accepted and a missed one is not, so both stay
+  over-counting — pinned by a test rather than chased into a fix likelier to trade
+  one gap for a worse one (Codex review of PR #203, round 3).
   A `struct`, `enum`, `union` or `type` alias
   can declare its own generic type parameter too, and none of the five overrides tracks one:
   a residual narrower than the block-local-item gap issue #193 closed, left stated rather
@@ -5741,3 +5756,23 @@ do, rather than checking against the wrong site's shadow. [What is not checked](
 now names the residual this still leaves: the precise fix would check a target
 against *its own* declaration-site shadow, which needs each block-local item
 paired with a shadow snapshot this change does not add.
+
+A third round found two more, both real, both left as documented residuals rather
+than fixed: `resolve_local_alias_chain` and `alias_could_reach_target` — the two
+routes `struct_literal_counts` and `generic_assoc_type_bindings_naming` resolve a
+block-local reference through — read only `own_aliases`, which is blind to a
+`struct`/`enum`/`union` declaration the same way it always was; neither consults
+`block_shadow` at all. So an outer block's `type Alias = Disallowed;` still answers
+for a bare `Alias` inside a deeper block that shadows it with a struct of its own,
+and a module-level `use Disallowed as Alias;` still answers the same way even when
+a block-local `struct Alias;` genuinely shadows it. Telling the two apart needs each
+declaration — alias or item — paired with the depth it was made at, compared
+against the other; a first attempt at a shortcut (treat `block_shadow` as always
+winning) was checked against the reverse nesting and found to turn the fix into a
+worse bug — a *missed* count, where the current behavior is only an *extra* one.
+Both routes exist solely for `struct_literal_counts` and
+`generic_assoc_type_bindings_naming`, both construction pins, where an extra count
+is the accepted-safe direction and a missed one is the danger this file's own
+`alias_could_reach_target` doc already states — so both are pinned by a test
+showing the current, over-counting behavior stays exactly what it is, rather than
+chased into a fix likely to trade one review round for a worse one.
