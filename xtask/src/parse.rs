@@ -1429,7 +1429,7 @@ fn resolve_segments(
 ///
 /// See [`resolve_segments`] for what `shadow` and `block_shadow` are.
 fn resolve_segments_from(
-    mut segments: Vec<String>,
+    segments: Vec<String>,
     stack: &[&[syn::Item]],
     shadow: &[String],
     block_shadow: &[String],
@@ -1445,6 +1445,23 @@ fn resolve_segments_from(
     {
         return segments;
     }
+    resolve_segments_loop(segments, stack)
+}
+
+/// [`resolve_segments_from`]'s own resolution loop, run once its shadow check has
+/// already passed (or been skipped — see [`resolve_with_block_alias`]).
+///
+/// Split out for issue #193, Codex review of PR #203: a block-local alias's own
+/// *target* is source text written where the alias was declared, not where it is
+/// used, so it must not be checked against the *use* site's `block_shadow` — the
+/// same reason this loop's own alias substitutions, a few lines down, are never
+/// re-checked against `shadow`/`block_shadow` after they fire. Resolving a target
+/// against its declaration site's own shadow, rather than skipping the check
+/// entirely, would be the precise answer; it needs each block-local item paired
+/// with a shadow snapshot taken when it was declared, which is real estate this
+/// fix does not add — see [`resolve_with_block_alias`] for where that residual is
+/// recorded.
+fn resolve_segments_loop(mut segments: Vec<String>, stack: &[&[syn::Item]]) -> Vec<String> {
     let mut scope = stack.len().saturating_sub(1);
     // `None` while resolution is still on the lexical ancestor stack;
     // `Some(items)` once it has stepped into a sibling module by name
@@ -1540,6 +1557,18 @@ fn resolve_segments_from(
 /// path this same way — a construction site's own path, or an associated-type
 /// binding's value — so this is the one place that logic lives, which is also what
 /// keeps both visitors' own methods under `clippy::too_many_lines` (issue #193).
+///
+/// A local alias's own *target* — the right-hand side of `type Local = Wrapper::X;`
+/// — is resolved through [`resolve_segments_loop`] directly, skipping the shadow
+/// check `resolve_segments`/`resolve_segments_from` open with. Codex review of PR
+/// #203: that text was written where the alias was declared, and a block nested
+/// deeper than the declaration — one that shadows `Wrapper` with a struct of its
+/// own — must not stop the target from resolving through the real module just
+/// because the *use* site sits inside that deeper block. The residual this still
+/// leaves: the target is resolved with no shadow check at all, rather than the
+/// declaration site's own — the same accepted shape [`resolve_segments_loop`]'s own
+/// alias substitutions already have. A construction pin's failure mode is a missed
+/// count, not an extra one, so resolving too eagerly here is the safe direction.
 fn resolve_with_block_alias(
     path: &syn::Path,
     stack: &[&[syn::Item]],
@@ -1559,8 +1588,9 @@ fn resolve_with_block_alias(
         // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
         Some((segments, true)) => segments,
         // Ran out of block-local aliases: the leftover head may itself be a
-        // module-level alias — `resolve_segments_from` is a no-op if it is not.
-        Some((segments, false)) => resolve_segments_from(segments, stack, shadow, block_shadow),
+        // module-level alias — `resolve_segments_loop` is a no-op if it is not.
+        // No shadow check here: see this function's own doc.
+        Some((segments, false)) => resolve_segments_loop(segments, stack),
         None => resolve_segments(path, stack, shadow, block_shadow),
     };
     (resolved, first)
@@ -15245,6 +15275,25 @@ mod block_local_item_shadow_tests {
         assert!(
             paths.iter().any(|path| path.segments == ["Real"]),
             "a struct gated by a non-test cfg wrongly shadowed a production reference: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_deeper_blocks_shadow_does_not_reach_back_into_an_aliass_own_target() {
+        // Codex review of this change (PR #203): `Local`'s own target,
+        // `Wrapper::Sneaky`, is source text written where `Local` was
+        // declared — outside the inner block. A struct the *inner* block
+        // declares must not stop that target from resolving through the
+        // real module just because `Local` happens to be used from
+        // inside that inner block.
+        let code = "mod Wrapper {\n    pub use Real as Sneaky;\n}\nfn f() {\n    type Local = \
+             Wrapper::Sneaky;\n    {\n        struct Wrapper;\n        let _ = Local {};\n    \
+             }\n}\n";
+        let counts =
+            struct_literal_counts(code, "Real", FnScope::None).expect("the fixture parses");
+        assert_eq!(
+            counts.total, 1,
+            "an inner block's own shadow reached back into an outer alias's target: {counts:?}"
         );
     }
 }

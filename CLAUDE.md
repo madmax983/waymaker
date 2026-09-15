@@ -1330,6 +1330,17 @@ Stated so that nobody mistakes silence for coverage:
   module namespace `resolve_segments`'s callers resolve in, so it cannot shadow a path any
   of them reads — issue #193's own reproducer names one only as part of the `let _ = ...`
   statement that reads the already-shadowed struct, not as a second shadowing mechanism.
+  A block-local `use`/`type` alias's own *target* is resolved with no shadow check at
+  all, in either list: Codex found that checking it against the *use* site's
+  `block_shadow` let a deeper block's own shadow reach back into an alias declared
+  outside it, which is wrong in the other direction (`type Local = Wrapper::X;`
+  declared before a nested block's own `struct Wrapper;` must still resolve through
+  the real `Wrapper` when `Local` is used inside that block). `resolve_segments_loop`
+  closes that by never re-checking an alias's own substituted text, matching what
+  this scanner's own module-level alias-chasing already does — but the precise
+  answer, checking the target against *its own declaration site's* shadow rather
+  than none at all, needs each block-local item paired with a shadow snapshot taken
+  where it was declared, and this fix does not add that.
   A `struct`, `enum`, `union` or `type` alias
   can declare its own generic type parameter too, and none of the five overrides tracks one:
   a residual narrower than the block-local-item gap issue #193 closed, left stated rather
@@ -5709,3 +5720,24 @@ did before this change: the fix widens what a *scanner* resolves, and no product
 file in this workspace happens to declare a block-local item sharing a sibling
 module's or alias's name today. No new ADR: nothing here moves a must-not-own cell,
 a dependency edge, or a rule id.
+
+Codex review of the pull request found two more real gaps, both fixed on this same
+branch before it merged. The first: `block_item_shadow_names` excluded only a
+`#[cfg(test)]`-gated declaration, so one behind any other condition —
+`#[cfg(feature = "x")]`, say — still shadowed unconditionally, even in a build where
+it does not exist. Shadowing suppresses a real resolution, the opposite of what
+`own_aliases` does by keeping an alias behind an unevaluated `cfg` available, so the
+safe reading is the opposite too: switched to `has_any_cfg`, the same distinction
+`struct_derives` already draws for the same reason. The second is sharper: a
+block-local alias's own target — the right-hand side of `type Local = Wrapper::X;`
+— was being checked against the *use* site's `block_shadow`, so a block nested
+*deeper* than `Local`'s own declaration, one that shadows `Wrapper` with a struct of
+its own, stopped `Local` from resolving through the real module even though
+`Wrapper` genuinely named that module where the alias was written. `resolve_segments_from`
+is now two functions: the shadow check, and `resolve_segments_loop` underneath it,
+which a block-local alias's leftover head calls directly — skipping the check
+entirely, the same way this scanner's own module-level alias substitutions already
+do, rather than checking against the wrong site's shadow. [What is not checked](#what-is-not-checked)
+now names the residual this still leaves: the precise fix would check a target
+against *its own* declaration-site shadow, which needs each block-local item
+paired with a shadow snapshot this change does not add.
