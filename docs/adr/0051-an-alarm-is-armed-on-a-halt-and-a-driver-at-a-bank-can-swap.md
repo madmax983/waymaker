@@ -1,4 +1,4 @@
-# 0050. An alarm is armed on a halt, and a driver at a bank can swap
+# 0051. An alarm is armed on a halt, and a driver at a bank can swap
 
 - Status: Accepted
 - Date: 2026-09-14

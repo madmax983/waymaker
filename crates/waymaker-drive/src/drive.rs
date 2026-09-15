@@ -27,7 +27,7 @@ use waymaker_flash::swap::{Retired, Swap, SwapError, SwapStepError};
 
 use crate::activity::{Activities, Clocks, Performed};
 use crate::boundary::{Answered, Boundary, Handoff, Suspended};
-use crate::effect::{Dispatchable, Effect, Resolution, Resolved, Scheduled};
+use crate::effect::{Dispatchable, Effect, InputMismatch, Resolution, Resolved, Scheduled};
 use crate::workflow::Workflow;
 
 /// How a run ended, without the bytes it ended with.
@@ -188,6 +188,14 @@ pub enum DriveError<E> {
     /// the run for ever, because §08 has no edge from an unresolved effect to a terminal
     /// record, and re-performs the effect on every boot after it.
     Capacity(Refusal),
+    /// §07 step 4 was asked to dispatch input that disagrees with what step 3 committed.
+    ///
+    /// Unreachable on this driver's own path. `decide` checks the request against history
+    /// before a `Dispatchable` exists. So a boundary call and its own schedule record can
+    /// never disagree here. [`Dispatchable::perform`](crate::Dispatchable::perform) is what
+    /// makes the check structural, rather than a fact about this one caller — see
+    /// [issue #92](https://github.com/madmax983/waymaker/issues/92).
+    EffectInputMismatch,
     /// A driver [`at_bank`](Driver::at_bank) found no bank a boot could start from.
     ///
     /// Neither bank carries a valid seal — the ordinary state of a device nothing has
@@ -1716,7 +1724,14 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
                             // it is about to dispatch is outstanding, exactly as the
                             // scheduled path leaves it in `Spent` for `Context::dispatch`.
                             *source = Source::Spent(storage);
-                            Decision::Dispatch(Effect::over(id.run, writer).redelivering(id.seq))
+                            // `request` is this boot's own call. `machine.intent` above
+                            // already checked it against the schedule record — the
+                            // `Half::Recorded` arm is reached only when it agreed. Passing
+                            // `request` through binds the redelivered identity to the kind
+                            // and input the record names. No second read of media is needed.
+                            Decision::Dispatch(
+                                Effect::over(id.run, writer).redelivering(id.seq, request),
+                            )
                         }
                         Err(error) => {
                             *stop = Some(Stop::Failed(error));
@@ -1741,7 +1756,6 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
     fn dispatch(
         &mut self,
         dispatchable: Dispatchable<C>,
-        kind: ActivityKind,
         input: &[u8],
     ) -> Result<Outcome<'_>, Suspended> {
         let Self {
@@ -1768,15 +1782,22 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Context<'_, S,
             return Err(Suspended::NEW);
         };
 
-        // §07 step 4. Matched once. A second match would need an arm for `Pending`, which
-        // cannot be reached here — and an unreachable arm that picks a record kind is a wrong
-        // default waiting for the day it is reachable.
-        let answered = match activities.perform(intent, kind, input, out) {
-            Performed::Completed(produced) => Some((produced, false)),
-            Performed::Failed(produced) => Some((produced, true)),
-            Performed::Exhausted => None,
-            Performed::Pending => {
+        // §07 step 4. `Dispatchable::perform` checks `input` against what step 3 committed,
+        // before `activities` is asked anything. It reads the kind from `intent`, not from
+        // a second argument — issue #92's guarantee. This check is unreachable here:
+        // `decide` already checked `input` against history before this point. But the gate
+        // makes that true by construction, not by review alone. Matched once. A second
+        // match would need an arm for `Pending`, which cannot be reached here.
+        let answered = match dispatchable.perform(&mut **activities, input, out) {
+            Ok(Performed::Completed(produced)) => Some((produced, false)),
+            Ok(Performed::Failed(produced)) => Some((produced, true)),
+            Ok(Performed::Exhausted) => None,
+            Ok(Performed::Pending) => {
                 *stop = Some(Stop::Waiting(intent.id()));
+                return Err(Suspended::NEW);
+            }
+            Err(InputMismatch) => {
+                *stop = Some(Stop::Failed(DriveError::EffectInputMismatch));
                 return Err(Suspended::NEW);
             }
         };
@@ -2549,7 +2570,7 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     fn call(&mut self, kind: ActivityKind, input: &[u8]) -> Result<Outcome<'_>, Suspended> {
         match self.decide(kind, input) {
             Decision::Replayed(conclusion, len) => Ok(self.observed(conclusion, len)),
-            Decision::Dispatch(dispatchable) => self.dispatch(dispatchable, kind, input),
+            Decision::Dispatch(dispatchable) => self.dispatch(dispatchable, input),
             Decision::Stop => Err(Suspended::NEW),
         }
     }
