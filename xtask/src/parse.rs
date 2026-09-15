@@ -846,6 +846,22 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
         self.shadow = outer;
     }
 
+    // A generic associated type's own parameters, e.g. `type Assoc<U>: Bound<Value =
+    // X>;`. Additive, not a reset (Codex review of PR #201, second round): a GAT is a
+    // *member* of its trait or impl, so it sees that item's own generics too, the same
+    // way `visit_impl_item_fn`/`visit_trait_item_fn` above do for an ordinary method.
+    fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
+        let added = extend_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_trait_item_type(self, node);
+        self.shadow.truncate(self.shadow.len() - added);
+    }
+
+    fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+        let added = extend_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_impl_item_type(self, node);
+        self.shadow.truncate(self.shadow.len() - added);
+    }
+
     // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
     // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
     // shape `Iterator<Item = u8>`'s syntax can take.
@@ -14048,6 +14064,31 @@ mod raw_identifier_tests {
         // sibling generic parameter, never the real struct.
         let found = generic_assoc_type_bindings_naming(
             "pub fn forge<CheckedDispatch, T: Alias<Dispatch = CheckedDispatch>>() {}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_associated_types_own_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        // Codex review of PR #201, second round: a generic associated type's own
+        // parameters were not tracked either. `Hidden` here is the GAT's own
+        // parameter, not the module-level alias of the same name.
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             trait Wrapper { type Assoc<Hidden: Alias<Dispatch = Hidden>>; }",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_impls_generic_associated_types_own_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             impl Wrapper for Forge { type Assoc<Hidden: Alias<Dispatch = Hidden>> = Hidden; }",
             &["CheckedDispatch"],
         )
         .expect("the fixture parses");
