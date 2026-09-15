@@ -7380,15 +7380,72 @@ fn if_chain_condition_value(
     let left_value = literal_or_const_value(&binary.left, resolve);
     let right_value = literal_or_const_value(&binary.right, resolve);
     match (left_value, right_value) {
+        (None, Some(value)) => {
+            if let Some(xor_scrutinee) = xor_equals_zero_scrutinee(&binary.left, value, resolve) {
+                return Some(xor_scrutinee);
+            }
+            Some((
+                strip_parens(&binary.left).to_token_stream().to_string(),
+                value,
+                is_definitely_unsigned(&binary.right, resolve),
+            ))
+        }
+        (Some(value), None) => {
+            if let Some(xor_scrutinee) = xor_equals_zero_scrutinee(&binary.right, value, resolve) {
+                return Some(xor_scrutinee);
+            }
+            Some((
+                strip_parens(&binary.right).to_token_stream().to_string(),
+                value,
+                is_definitely_unsigned(&binary.left, resolve),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `unresolved_side == 0`'s own alternate spelling of an equality test, when
+/// `unresolved_side` is itself `scrutinee ^ value` — real Rust's XOR-based equality check,
+/// equivalent bit for bit to `scrutinee == value` for any integer width or signedness, and a
+/// real shape a hand-written lookup-table ladder can spell an equality test as. `other_side_value`
+/// is the value [`if_chain_condition_value`]'s own outer `==` already resolved the *other*
+/// side to; this shape means nothing unless that value is exactly zero.
+///
+/// Codex's finding: `(n ^ 0) == 0`, `(n ^ 1) == 0`, .. names an equality ladder whose every
+/// link's own unresolved side is `(n ^ k)` for a *different* `k`, so
+/// `if_chain_condition_value`'s own token-text comparison across links never matched — each
+/// link's own "scrutinee" read as `n ^ 0`, `n ^ 1`, and so on, never twice the same text, even
+/// though every link tests the identical `n` against a different value. The real scrutinee is
+/// the XOR's own *other* operand's token text — exactly one of the two must resolve as a
+/// constant, the identical "exactly one side is the value" shape `if_chain_condition_value`
+/// already requires of the outer `==` — and the value each link tests against is that
+/// resolved XOR operand, not the zero the outer `==` compares to.
+fn xor_equals_zero_scrutinee(
+    unresolved_side: &syn::Expr,
+    other_side_value: i128,
+    resolve: &Resolve<'_>,
+) -> Option<(String, i128, bool)> {
+    if other_side_value != 0 {
+        return None;
+    }
+    let syn::Expr::Binary(xor) = strip_parens(unresolved_side) else {
+        return None;
+    };
+    if !matches!(xor.op, syn::BinOp::BitXor(_)) {
+        return None;
+    }
+    let left_value = literal_or_const_value(&xor.left, resolve);
+    let right_value = literal_or_const_value(&xor.right, resolve);
+    match (left_value, right_value) {
         (None, Some(value)) => Some((
-            strip_parens(&binary.left).to_token_stream().to_string(),
+            strip_parens(&xor.left).to_token_stream().to_string(),
             value,
-            is_definitely_unsigned(&binary.right, resolve),
+            is_definitely_unsigned(&xor.right, resolve),
         )),
         (Some(value), None) => Some((
-            strip_parens(&binary.right).to_token_stream().to_string(),
+            strip_parens(&xor.right).to_token_stream().to_string(),
             value,
-            is_definitely_unsigned(&binary.left, resolve),
+            is_definitely_unsigned(&xor.left, resolve),
         )),
         _ => None,
     }

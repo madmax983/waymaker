@@ -19031,6 +19031,37 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_if_chain_with_xor_equals_zero_links_is_reported() {
+        // Codex's finding: `if (n ^ 0) == 0 { .. } else if (n ^ 1) == 0 { .. } else { .. }`
+        // names an equality ladder whose every link's own unresolved side is `(n ^ k)` for a
+        // different `k` — `if_chain_condition_value`'s own token-text comparison across
+        // links never matched, since each link's own "scrutinee" read as `n ^ 0`, `n ^ 1`,
+        // and so on, never twice the same text, even though every link tests the identical
+        // `n` against a different value and `(n ^ k) == 0` is bit-for-bit equivalent to `n
+        // == k`. `xor_equals_zero_scrutinee` now recognises this shape: the real scrutinee
+        // is the XOR's own unresolved operand, and the value each link tests against is the
+        // XOR's own resolved operand rather than the zero the outer `==` names. Verified
+        // against real rustc, warning-free, and by disassembly that a fifteen-case `u8`
+        // ladder of this exact shape still emits a sixty-byte `.Lswitch.table`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn xor_equals_zero_if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn xor_equals_zero_if_chain_table(nibble: u8) -> u32 {\n    \
+             if (nibble ^ 0) == 0 {\n        xor_equals_zero_if_chain_helper(0)\n    } else \
+             if (nibble ^ 1) == 0 {\n        xor_equals_zero_if_chain_helper(1)\n    } else \
+             if (nibble ^ 2) == 0 {\n        xor_equals_zero_if_chain_helper(2)\n    } else \
+             {\n        xor_equals_zero_if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_guard_ordering_an_upper_half_u128_value_does_not_wrongly_prune_a_live_arm() {
         // Codex's next-round finding: an upper-half `u128` value (above `i128::MAX`) is
         // stored here as its own two's-complement bit pattern reinterpreted as a
