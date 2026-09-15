@@ -862,6 +862,18 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
         self.shadow.truncate(self.shadow.len() - added);
     }
 
+    // `syn::ItemTraitAlias` (`trait Foo<T: Bound<Assoc = X>> = Bar;`, not stable Rust
+    // today) carries its own `generics` too, and `syn` parses it as a real, structured
+    // item — unlike a generic `const` item, whose syntax `syn` cannot parse at all and
+    // falls back to an opaque `Item::Verbatim` for, so no visitor ever reaches its
+    // bounds structurally and no override is needed there. A top-level item resets,
+    // the same as a struct, an enum, a union or a `type` alias.
+    fn visit_item_trait_alias(&mut self, node: &'ast syn::ItemTraitAlias) {
+        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+        syn::visit::visit_item_trait_alias(self, node);
+        self.shadow = outer;
+    }
+
     // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
     // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
     // shape `Iterator<Item = u8>`'s syntax can take.
@@ -14089,6 +14101,22 @@ mod raw_identifier_tests {
         let found = generic_assoc_type_bindings_naming(
             "type Hidden = CheckedDispatch;\n\
              impl Wrapper for Forge { type Assoc<Hidden: Alias<Dispatch = Hidden>> = Hidden; }",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_trait_aliass_own_parameter_shadows_a_module_alias_of_a_guarded_name() {
+        // `trait Foo<T> = Bar;` is not stable Rust, but `syn` parses it as a real,
+        // structured item — unlike a generic `const` item, which `syn` cannot parse at
+        // all and falls back to an opaque `Item::Verbatim` for, so it never reaches
+        // this scan's `visit_assoc_type` in the first place and needs no shadow
+        // handling here.
+        let found = generic_assoc_type_bindings_naming(
+            "type Hidden = CheckedDispatch;\n\
+             trait Wrapper<Hidden: Alias<Dispatch = Hidden>> = Forge;",
             &["CheckedDispatch"],
         )
         .expect("the fixture parses");
