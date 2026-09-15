@@ -5930,3 +5930,50 @@ Both resolvers already agree on the honest answer: `consume_scope_prefix` leaves
 segment, exactly as `resolve_segments_from` does — this is a shared, deliberate limit
 rather than a gap where the backstop trails the deterministic path. No new ADR: nothing
 here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a fourteenth, on two Codex findings from PR #204 itself: an
+unconditional module-scope alias or type declaration beside a `#[cfg]`-gated duplicate
+of the exact same name, in the exact same scope, is not a live/live ambiguity the way
+two declarations under mutually exclusive `cfg` flags are — confirmed against real
+`rustc`, twice: the feature-off build compiles with only the unconditional declaration,
+and the feature-on build fails outright with `E0428` ("the name `Unchecked` is defined
+multiple times"), so the conditional declaration is never reachable in any real,
+successful build and treating it as a second live candidate is an over-count, the
+opposite of the missed-count direction this scanner's own fail-closed rule usually
+guards against — and equally worth closing, since an over-count under an exact-count
+gate rejects valid code rather than only missing a forgery. `declares_name` and
+`live_named_items_in_scope` are the shared primitive: the latter scans a *whole* scope
+for an unconditional match — rather than stopping at the first found walking in one
+direction, which Codex's own sharper, block-scope finding shows depends on declaration
+order for a question real Rust does not — and treats it, once found, as the only live
+declaration of that name in the scope. `live_block_declarations` calls it once per
+block depth, innermost to outermost, stopping at the first unconditional match; and
+`AliasLookupCache` moves from per-scope to per-(scope, name) caching, since which
+declarations are live is now itself a function of the name being looked up rather than
+only of the scope. `try_module_scope_candidates` and its two new cache methods,
+`live_aliases_of`/`live_modules_of`, are the module-scope backstop's own callers.
+
+Fixing only that backstop left the block-scope finding open, and a RED test caught it
+before the fix was ever committed: `struct_literal_counts`'s own *deterministic*
+resolvers — `resolve_local_alias_chain` at block scope and `resolve_segments_from` at
+module scope — had always picked among several same-named declarations by declaration
+order alone (last-declared wins at block scope, first-declared wins at module scope),
+with no regard for which one a real build could ever have. So an unconditional
+declaration textually *after* a `#[cfg]`-gated duplicate was silently outvoted by one
+that can never coexist with it — and because the visitor consults the fail-closed
+backstop only when the deterministic answer disagrees with the target, a wrongly
+confident deterministic pick short-circuits before the backstop is ever asked. The
+module-scope regression test had passed the backstop alone only because its own
+declaration order happened to already agree with `.find()`'s first-match rule — the
+unconditional alias was written first — not because the resolver was correct; reversing
+that order reproduces the identical bug one scope up. `preferred_alias` is the fix,
+shared by both resolvers: within one scope, it prefers an unconditional declaration
+outright over every conditional one, falling back to each resolver's own prior
+tie-break only when none is unconditional — a case still genuinely ambiguous under a
+`cfg` this scanner cannot evaluate, and still left to `path_could_reach_target`'s own
+separate, fail-closed search to catch what one deterministic pick still might miss.
+`an_unconditional_module_scope_alias_excludes_a_same_scope_cfg_duplicate` and
+`an_unconditional_block_local_alias_excludes_a_same_scope_cfg_duplicate_regardless_of_order`
+are the regression, both RED against the pre-fix code — the first by coincidence of
+ordering once `preferred_alias` did not yet exist, the second unconditionally. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.

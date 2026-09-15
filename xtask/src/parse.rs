@@ -929,14 +929,14 @@ fn resolve_local_alias_chain(
             break;
         };
         // Innermost visible block first, and within one block the
-        // last-declared match, matching this function's own prior flat,
-        // reverse-order search exactly — `own_aliases`, not
-        // `collect_item_aliases`: a block's own declarations are exactly one
-        // scope, the same as a module's, and reading through a `mod` nested
-        // in this block would let that inner module's private alias shadow
-        // the outer, real one (Codex review) — a bare `S {}` outside `mod
-        // hidden { type S = Other; }` still means whatever `S` resolves to
-        // in the enclosing block, never `hidden`'s own.
+        // unconditional declaration if one exists, else the last-declared
+        // match (issue #197) — `own_aliases`, not `collect_item_aliases`:
+        // a block's own declarations are exactly one scope, the same as a
+        // module's, and reading through a `mod` nested in this block would
+        // let that inner module's private alias shadow the outer, real one
+        // (Codex review) — a bare `S {}` outside `mod hidden { type S =
+        // Other; }` still means whatever `S` resolves to in the enclosing
+        // block, never `hidden`'s own.
         let Some((depth, alias)) = blocks
             .get(..visible)
             .unwrap_or(blocks)
@@ -944,11 +944,7 @@ fn resolve_local_alias_chain(
             .enumerate()
             .rev()
             .find_map(|(depth, items)| {
-                own_aliases(items.iter().copied())
-                    .into_iter()
-                    .rev()
-                    .find(|candidate| candidate.local == first)
-                    .map(|alias| (depth, alias))
+                preferred_alias(items.iter().copied(), &first, true).map(|alias| (depth, alias))
             })
         else {
             break;
@@ -1403,10 +1399,11 @@ fn resolve_segments_from(
         let Some(first) = segments.first().cloned() else {
             break;
         };
-        if let Some(alias) = own_aliases(items)
-            .iter()
-            .find(|candidate| candidate.local == first)
-        {
+        // Prefers an unconditional declaration over a `#[cfg]`-gated
+        // duplicate of the same name in this same scope, over the first
+        // match by declaration order when none is unconditional (issue
+        // #197) — see `preferred_alias`.
+        if let Some(alias) = preferred_alias(items.iter(), &first, false) {
             let mut resolved = alias.target.clone();
             resolved.extend(segments.drain(1..));
             segments = resolved;
@@ -4933,41 +4930,74 @@ fn scope_key(items: &[syn::Item]) -> ScopeKey {
     (items.as_ptr() as usize, items.len())
 }
 
-/// Caches [`own_aliases`]/[`own_modules`] for one scope, keyed by [`scope_key`].
+/// Caches the *live* `use`/`type` aliases and sibling modules named `first`
+/// in one scope, keyed by [`scope_key`] and `first` together.
 ///
 /// Many construction sites of one name can share the same scope and the same
 /// ambiguous alias — every literal in a `for` loop, say. Without this cache, every one
 /// of them re-walks that scope's items from scratch (issue #197, Codex review: this
 /// measured seconds on a file with many ambiguous aliases and many literals). One
 /// cache is shared across every search [`path_could_reach_target`] runs for one
-/// [`struct_literal_counts`] visitor, so a scope's aliases and modules are each
-/// computed once no matter how many construction sites or branches revisit it.
+/// [`struct_literal_counts`] visitor, so one (scope, name) pair's live aliases and
+/// modules are each computed once no matter how many construction sites or branches
+/// revisit it — keyed by name, not by scope alone, because [`live_named_items_in_scope`]'s
+/// own shadowing rule is a per-name answer: caching a whole scope's *unfiltered*
+/// alias and module lists, the way an earlier version of this cache did, could not
+/// tell an unconditional declaration of one name from a `#[cfg]`-gated duplicate of
+/// it after the fact — issue #197, Codex review of the PR, is why the cache moved
+/// from that shape to this one.
 ///
-/// One scope's own sibling modules, cached — a name and its items. See
+/// One scope's own sibling modules, cached — already filtered to `first`. See
 /// [`AliasLookupCache`].
-type CachedModules<'a> = std::rc::Rc<[(String, &'a [syn::Item])]>;
+type CachedModules<'a> = std::rc::Rc<[&'a [syn::Item]]>;
 
 /// Holds no block-local lookup: [`segments_could_reach_target`]'s `block_items` is a
 /// scattered slice of references, not one contiguous scope, so it has no single
-/// address to key a cache entry on.
+/// address to key a cache entry on — [`live_block_declarations`] runs it uncached.
 #[derive(Default)]
 struct AliasLookupCache<'a> {
-    aliases: std::collections::HashMap<ScopeKey, std::rc::Rc<[UseAlias]>>,
-    modules: std::collections::HashMap<ScopeKey, CachedModules<'a>>,
+    aliases: std::collections::HashMap<(ScopeKey, String), std::rc::Rc<[UseAlias]>>,
+    modules: std::collections::HashMap<(ScopeKey, String), CachedModules<'a>>,
 }
 
 impl<'a> AliasLookupCache<'a> {
-    fn aliases_of(&mut self, items: &'a [syn::Item]) -> std::rc::Rc<[UseAlias]> {
+    /// The live `use`/`type` aliases in `items` whose local name is `first` —
+    /// see [`live_named_items_in_scope`] for what "live" excludes.
+    fn live_aliases_of(&mut self, items: &'a [syn::Item], first: &str) -> std::rc::Rc<[UseAlias]> {
         self.aliases
-            .entry(scope_key(items))
-            .or_insert_with(|| own_aliases(items.iter()).into())
+            .entry((scope_key(items), first.to_owned()))
+            .or_insert_with(|| {
+                let (live_items, _) =
+                    live_named_items_in_scope(items.iter(), |item| declares_name(item, first));
+                own_aliases(live_items.iter().copied())
+                    .into_iter()
+                    .filter(|candidate| candidate.local == first)
+                    .collect::<Vec<_>>()
+                    .into()
+            })
             .clone()
     }
 
-    fn modules_of(&mut self, items: &'a [syn::Item]) -> CachedModules<'a> {
+    /// The live sibling modules in `items` named `first` — see
+    /// [`live_named_items_in_scope`] for what "live" excludes.
+    fn live_modules_of(&mut self, items: &'a [syn::Item], first: &str) -> CachedModules<'a> {
         self.modules
-            .entry(scope_key(items))
-            .or_insert_with(|| own_modules(items).into())
+            .entry((scope_key(items), first.to_owned()))
+            .or_insert_with(|| {
+                let (live_items, _) =
+                    live_named_items_in_scope(items.iter(), |item| declares_name(item, first));
+                live_items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        syn::Item::Mod(module) => module
+                            .content
+                            .as_ref()
+                            .map(|(_, mod_items)| mod_items.as_slice()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            })
             .clone()
     }
 }
@@ -5256,12 +5286,102 @@ struct LiveDeclaration<'a> {
     item: &'a syn::Item,
 }
 
+/// Whether `item` declares `first` — as a `mod` by that name, or as the
+/// local name of a `use`/`type` alias. The one predicate [`live_named_items_in_scope`]
+/// and [`live_block_declarations`] both key their shadowing rule on: real Rust
+/// refuses two items of one name in one scope together (`E0428`/`E0255`)
+/// whichever kinds they are, so a `mod X` and a `type X = ..` in the same
+/// scope collide exactly as two aliases would.
+fn declares_name(item: &syn::Item, first: &str) -> bool {
+    match item {
+        syn::Item::Mod(module) => ident_name(&module.ident) == first,
+        _ => own_aliases(core::iter::once(item))
+            .iter()
+            .any(|alias| alias.local == first),
+    }
+}
+
+/// Picks which of `items`' own `use`/`type` aliases named `first` is the
+/// deterministic resolution answer — [`resolve_local_alias_chain`]'s and
+/// [`resolve_segments_from`]'s own single-alias pick, corrected for the same
+/// shadowing rule [`live_named_items_in_scope`] applies: an unconditional
+/// declaration is the only one a real build can ever have alongside a
+/// `#[cfg]`-gated duplicate of the same name in this same scope
+/// (`E0428`/`E0255`), so it is preferred outright over every conditional
+/// one (issue #197, Codex review of the PR: the deterministic resolvers
+/// picked among same-named aliases by declaration order alone — last
+/// declared at block scope, first declared at module scope — with no
+/// regard for which one a real build could ever have, so an unconditional
+/// alias declared *after* a `#[cfg]`-gated duplicate of the same name was
+/// silently outvoted by a declaration that can never coexist with it).
+/// Only when no unconditional declaration exists does `prefer_last` decide
+/// between several `cfg`-gated candidates, matching each caller's own prior
+/// tie-break exactly — genuinely ambiguous under a `cfg` this scanner
+/// cannot evaluate, and left to `path_could_reach_target`'s own separate,
+/// fail-closed search to catch what this single pick still might miss.
+fn preferred_alias<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+    first: &str,
+    prefer_last: bool,
+) -> Option<UseAlias> {
+    let candidates: Vec<&'a syn::Item> = items
+        .into_iter()
+        .filter(|item| !has_cfg_test(item_attrs(item)))
+        .filter(|item| declares_name(item, first))
+        .collect();
+    let chosen = candidates
+        .iter()
+        .find(|item| !has_any_cfg(item_attrs(item)))
+        .copied()
+        .or_else(|| {
+            if prefer_last {
+                candidates.last().copied()
+            } else {
+                candidates.first().copied()
+            }
+        })?;
+    own_aliases(core::iter::once(chosen))
+        .into_iter()
+        .find(|candidate| candidate.local == first)
+}
+
+/// The items of `items` — one scope: a module or a single block — that
+/// `matches` selects and that are actually live in some real build.
+///
+/// An unconditional match is the only one a real build can ever have
+/// alongside a `#[cfg]`-gated duplicate *in this same scope*: the
+/// duplicate is either absent, when its own condition is false, or a
+/// duplicate-definition error the moment its condition is true
+/// (`E0428`/`E0255`) — confirmed against real `rustc` — never a second,
+/// alternately-compiling declaration the way two declarations under
+/// mutually exclusive `#[cfg]` flags genuinely are. So once a scope has
+/// an unconditional match, it is the only live one here — found by
+/// scanning the whole scope for one, not by stopping at the first found
+/// walking in one direction, which depends on declaration order for a
+/// question real Rust does not (issue #197, Codex review of the PR: an
+/// unconditional declaration textually *before* a same-scope conditional
+/// duplicate let an order-dependent walk add the duplicate before ever
+/// reaching the unconditional one). The second element is `true` exactly
+/// when an unconditional match was found.
+fn live_named_items_in_scope<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+    matches: impl Fn(&syn::Item) -> bool,
+) -> (Vec<&'a syn::Item>, bool) {
+    let matching: Vec<&'a syn::Item> = items
+        .into_iter()
+        .filter(|item| !has_cfg_test(item_attrs(item)) && matches(item))
+        .collect();
+    match matching.iter().find(|item| !has_any_cfg(item_attrs(item))) {
+        Some(&unconditional) => (vec![unconditional], true),
+        None => (matching, false),
+    }
+}
+
 /// The `use`/`type` alias and `mod` declarations of `first` in `block_items`
 /// that are actually live from the construction site this search started
-/// from — searched innermost block to outermost, and within one block in
-/// declaration order (`own_aliases`' own tie-break) — and stopping at, and
-/// including, the first declaration that is *unconditional*: no
-/// `#[cfg(..)]` of its own at all.
+/// from — searched innermost block to outermost, one scope
+/// ([`live_named_items_in_scope`]) at a time, and stopping at the first
+/// block whose own scope has an unconditional declaration.
 ///
 /// An unconditional declaration shadows everything further out completely
 /// in real Rust, confirmed against real `rustc`: a module-scope alias, or
@@ -5276,36 +5396,28 @@ struct LiveDeclaration<'a> {
 /// scope beside them, was tried as though all of them could be
 /// simultaneously live the way two `cfg`-gated declarations can).
 ///
-/// A declaration that is itself conditional does not stop the walk: it is
-/// included, and the search continues outward, because a `cfg`-gated inner
-/// declaration does not rule out whatever is further out any more than two
-/// `cfg`-gated declarations of one name already fail to rule each other
-/// out. The second element is `true` — module scope stays live — exactly
-/// when the walk exhausts `block_items` without ever finding an
-/// unconditional declaration.
+/// A block whose own scope has no unconditional declaration does not stop
+/// the walk: every conditional match there is included, and the search
+/// continues outward, because a `cfg`-gated declaration does not rule out
+/// whatever is further out any more than two `cfg`-gated declarations of
+/// one name already fail to rule each other out. The second element is
+/// `true` — module scope stays live — exactly when the walk exhausts
+/// `block_items` without ever finding an unconditional declaration.
 fn live_block_declarations<'a>(
     block_items: &[Vec<&'a syn::Item>],
     first: &str,
 ) -> (Vec<LiveDeclaration<'a>>, bool) {
     let mut live = Vec::new();
     for (depth, items) in block_items.iter().enumerate().rev() {
-        for &item in items.iter().rev() {
-            if has_cfg_test(item_attrs(item)) {
-                continue;
-            }
-            let names_first = match item {
-                syn::Item::Mod(module) => ident_name(&module.ident) == first,
-                _ => own_aliases(core::iter::once(item))
-                    .iter()
-                    .any(|alias| alias.local == first),
-            };
-            if !names_first {
-                continue;
-            }
-            live.push(LiveDeclaration { depth, item });
-            if !has_any_cfg(item_attrs(item)) {
-                return (live, false);
-            }
+        let (scope_live, unconditional) =
+            live_named_items_in_scope(items.iter().copied(), |item| declares_name(item, first));
+        live.extend(
+            scope_live
+                .into_iter()
+                .map(|item| LiveDeclaration { depth, item }),
+        );
+        if unconditional {
+            return (live, false);
         }
     }
     (live, true)
@@ -5580,12 +5692,7 @@ fn try_module_scope_candidates<'a>(
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
 ) -> Option<bool> {
-    let module_alias_candidates: Vec<UseAlias> = cache
-        .aliases_of(items)
-        .iter()
-        .filter(|candidate| candidate.local == first)
-        .cloned()
-        .collect();
+    let module_alias_candidates: Vec<UseAlias> = cache.live_aliases_of(items, first).to_vec();
     let mut claimed = !module_alias_candidates.is_empty();
     if try_alias_candidates(
         module_alias_candidates,
@@ -5604,12 +5711,7 @@ fn try_module_scope_candidates<'a>(
     }
     if segments.len() > 1 {
         let remaining: Vec<String> = segments.get(1..).unwrap_or_default().to_vec();
-        let modules: Vec<&'a [syn::Item]> = cache
-            .modules_of(items)
-            .iter()
-            .filter(|(name, _)| *name == first)
-            .map(|(_, module_items)| *module_items)
-            .collect();
+        let modules: Vec<&'a [syn::Item]> = cache.live_modules_of(items, first).to_vec();
         claimed |= !modules.is_empty();
         for module_items in modules {
             // Push onto `entered` rather than replacing it: `items` may
@@ -15871,6 +15973,60 @@ mod cfg_alias_ambiguity_tests {
              #[cfg(feature = \"a\")]\n\
              type Unchecked = a::b::Marker;\n\
              fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_module_scope_alias_excludes_a_same_scope_cfg_duplicate() {
+        // Codex review of PR #204: an unconditional module-scope alias
+        // beside a `#[cfg]`-gated duplicate of the *same* name, in the
+        // *same* scope, is not a live/live ambiguity the way two aliases
+        // under mutually exclusive `cfg` flags are — confirmed against
+        // real `rustc`: the feature-off build compiles with only the
+        // unconditional `Unchecked = Decoy`, and the feature-on build
+        // fails outright with E0428 ("the name `Unchecked` is defined
+        // multiple times"). So the conditional `Unchecked = CheckedDispatch`
+        // never coexists with a successful build at all, and must not be
+        // treated as a second live candidate.
+        let counts = struct_literal_counts(
+            "type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_block_local_alias_excludes_a_same_scope_cfg_duplicate_regardless_of_order()
+    {
+        // Codex review of PR #204: the same rule as the test above, but at
+        // block scope and with the unconditional declaration written
+        // *before* the conditional duplicate — a shape a scan that walks
+        // one block's own items in a single direction and stops at the
+        // first unconditional match it meets can still get wrong, since
+        // reaching the earlier, unconditional item last (in reverse
+        // declaration order) means the later, conditional one was already
+        // added before the walk ever got there. Confirmed against real
+        // `rustc` the same way: only the feature-off build compiles.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
              \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
