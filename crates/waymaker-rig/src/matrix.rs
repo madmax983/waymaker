@@ -8,8 +8,8 @@
 //! # Why it fails closed
 //!
 //! For [`crate::census`]'s reason. A sweep that never reached a row has said nothing about it,
-//! and [`Matrix::verdict`] makes that a refusal rather than a silence. This rig reaches six of
-//! the ten; `tests/matrix.rs` pins the seventh as the gap rather than shrinking the table.
+//! and [`Matrix::verdict`] makes that a refusal rather than a silence. This rig reaches all
+//! ten; `tests/matrix.rs` pins every count so a sweep that quietly thinned fails closed.
 
 /// A row of design document §14's failure-semantics table.
 ///
