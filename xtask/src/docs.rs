@@ -7634,6 +7634,109 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_an_inline_mark_nested_inside_a_hidden_span_stays_hidden() {
+        // Codex, pull request #138, round 65, finding "Track ordinary descendants
+        // in inline hidden markup": `track_non_rendering_html` — the inline twin of
+        // `next_non_rendering_marker`, one self-contained `Event::InlineHtml`
+        // construct at a time — never tracked ordinary descendants at all, only
+        // `top`'s own reopen and its own implicit closes. `text <mark><span
+        // hidden><mark>ignored</mark>decision-id headline</span></mark>` has an
+        // inner `<mark>` open while the hidden `span` is `top`: with no descendant
+        // recorded for it, the inner `</mark>` later matched neither `top` nor any
+        // known descendant and fell through straight to the `ancestors` check,
+        // where the *outer* `<mark>` happened to share its name — force-closing
+        // the hidden `span` two levels early and exposing the id and headline
+        // that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <mark><span hidden><mark>ignored</mark>{} {}</span></mark>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_nested_section_closing_through_a_stale_descendant_still_counts() {
+        // Codex, pull request #138, round 65, finding "Truncate through matching
+        // nested descendants": HTML5 pops everything nested inside a closing
+        // descendant's own end tag too, however many layers deep — the same
+        // "any other end tag" unwind `ancestors` already gets — but
+        // `next_non_rendering_marker` only ever checked `descendants.last()`, the
+        // single most-recently-opened entry. `<section><span hidden><div><section>
+        // </div>ignored</section>decision-id headline` has `</div>` really close
+        // both the inner `section` and the `div` beneath it, leaving neither on
+        // the stack — but checking only the top left the stale inner `section`
+        // behind, so the *next* `</section>` was misread as still closing that
+        // stale inner descendant rather than the real outer ancestor `section`,
+        // latching the hidden `span` open through end of document instead of
+        // properly closing it and exposing the id and headline that follow.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<section><span hidden><div><section></div>ignored</section>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_self_closing_spelled_section_stays_hidden() {
+        // Codex, pull request #138, round 65, finding "Record slash-terminated
+        // HTML descendants": in ordinary HTML a self-closing slash is ignored
+        // unless the active foreign-content namespace actually honors it, but
+        // `next_non_rendering_marker`'s ordinary-descendant tracking skipped a
+        // slash-terminated tag unconditionally. `<section><span hidden>
+        // <section/>ignored</section>decision-id headline</span></section>` has
+        // `<section/>` open for real — no foreign content is open, so the slash
+        // is ignored — but with it never recorded as a descendant, the following
+        // `</section>` matched neither `top` (`span`) nor any known descendant
+        // and fell through to `ancestors`, where the *outer* `section` happened
+        // to share its name — force-closing the hidden `span` early and exposing
+        // the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<section><span hidden><section/>ignored</section>{} {}</span></section>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_hidden_in_a_span_after_a_div_implicitly_closes_a_sibling_paragraph_stays_hidden()
     {
         // Codex, pull request #138, round 62, finding "Remove implicitly closed

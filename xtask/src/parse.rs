@@ -1150,6 +1150,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
                     &mut ancestors,
+                    &mut non_rendering_descendants,
                 );
                 if !consumed && !hidden && is_line_break_tag(&html) {
                     out.push('\n');
@@ -2129,6 +2130,7 @@ fn track_non_rendering_html(
     stack: &mut Vec<String>,
     foreign_content: &mut Vec<ForeignFrame>,
     ancestors: &mut Vec<String>,
+    descendants_stack: &mut Vec<Vec<String>>,
 ) -> bool {
     if html.starts_with("<!--") {
         return true;
@@ -2136,6 +2138,14 @@ fn track_non_rendering_html(
     track_foreign_content_depth(html, foreign_content);
     let self_closing_in_foreign_content =
         honors_self_closing_now(foreign_content) && ends_with_self_closing_slash(html);
+    // Resynced to `stack`'s own depth on every call, the same way
+    // `advance_past_non_rendering` resyncs `NestedHtmlContext::descendants` (Codex,
+    // round 65, "Track ordinary descendants in inline hidden markup") — see that
+    // field's own doc comment.
+    while descendants_stack.len() < stack.len() {
+        descendants_stack.push(Vec::new());
+    }
+    descendants_stack.truncate(stack.len());
     // Cloned rather than borrowed, for the reason `advance_past_non_rendering` now
     // does the same (Codex, pull request #138, round 42, finding 3): `stack` holds
     // owned names since it can carry an arbitrary `hidden`-suppressed one, not only
@@ -2143,6 +2153,9 @@ fn track_non_rendering_html(
     // across the `push`/`pop` calls below.
     match stack.last().cloned() {
         Some(top) if non_rendering_element_nests(&top) => {
+            let Some(descendants) = descendants_stack.last_mut() else {
+                return true;
+            };
             if let Some(tag) = opens_non_rendering_element(html) {
                 if !self_closing_in_foreign_content {
                     stack.push(tag.to_owned());
@@ -2165,22 +2178,42 @@ fn track_non_rendering_html(
                     // the `hidden`-suppressed `top` reopens it, the same way the
                     // block-level scan's `top_reopen` already does.
                     stack.push(top);
+                } else if !self_closing_in_foreign_content && !is_void_element(&next_tag) {
+                    // An ordinary element genuinely nested inside `top`, tracked so
+                    // its own later close (below) is told apart from an untracked
+                    // ancestor's — `next_non_rendering_marker`'s own `descendants`,
+                    // met here for a self-contained inline construct (Codex, round
+                    // 65, "Track ordinary descendants in inline hidden markup"):
+                    // `<span hidden><mark>ignored</mark>decision-id headline</span>`
+                    // had this construct's `<mark>` recorded nowhere at all, so its
+                    // own `</mark>` later matched neither `top` nor any known
+                    // descendant and fell through to the `ancestors` check, where an
+                    // *outer* `<mark>` happened to share its name.
+                    descendants.push(next_tag);
                 }
             } else if let Some(name) = html
                 .starts_with("</")
                 .then(|| markup_tag_name(html).to_ascii_lowercase())
-                && ancestors.contains(&name)
             {
-                // Round 57's "Unwind all elements through a matching ancestor",
-                // met here for a self-contained inline construct rather than a
-                // byte-by-byte walk: a closing tag matching neither `top` nor
-                // anything this construct itself opens, but matching *some*
-                // element genuinely known to be open outside it, force-closes
-                // everything nested inside — the whole tracked stack, not only
-                // `top` — the same "pop everything nested inside a closing
-                // ancestor's end tag" a real HTML5 parser does.
-                stack.clear();
-                while ancestors.pop().as_deref() != Some(name.as_str()) {}
+                if let Some(pos) = descendants.iter().rposition(|open| *open == name) {
+                    // Searched and truncated through, not just checked at the top
+                    // (Codex, round 65, "Truncate through matching nested
+                    // descendants") — see `next_non_rendering_marker`'s own twin
+                    // fix for the reasoning.
+                    descendants.truncate(pos);
+                } else if ancestors.contains(&name) {
+                    // Round 57's "Unwind all elements through a matching ancestor",
+                    // met here for a self-contained inline construct rather than a
+                    // byte-by-byte walk: a closing tag matching neither `top` nor
+                    // anything this construct itself opens, but matching *some*
+                    // element genuinely known to be open outside it, force-closes
+                    // everything nested inside — the whole tracked stack, not only
+                    // `top` — the same "pop everything nested inside a closing
+                    // ancestor's end tag" a real HTML5 parser does.
+                    stack.clear();
+                    descendants.clear();
+                    while ancestors.pop().as_deref() != Some(name.as_str()) {}
+                }
             }
             true
         }
@@ -2797,10 +2830,20 @@ fn next_non_rendering_marker(
                 track_foreign_content_depth(span, foreign_content);
                 return Some(NonRenderingAdvance::Close(end));
             }
-            if descendants.last().is_some_and(|open| *open == name) {
+            if let Some(pos) = descendants.iter().rposition(|open| *open == name) {
                 // A genuine nested child, opened after `top` and closed properly —
-                // not relevant to `top`'s own state.
-                descendants.pop();
+                // not relevant to `top`'s own state. Searched and truncated through
+                // rather than checked only at the top (Codex, round 65, "Truncate
+                // through matching nested descendants"): HTML5 pops everything
+                // nested inside a closing descendant's own end tag too, however many
+                // layers deep, the same "any other end tag" unwind `ancestors`
+                // already gets (round 57) — `<div><section></div>` has `</div>` pop
+                // both `section` and `div`, and checking only `descendants.last()`
+                // (`section`) left the stale `div` behind, where a *later*,
+                // unrelated close matching it by name could be misread as a genuine
+                // nested child closing when it was really the real outer ancestor
+                // sharing that div's name.
+                descendants.truncate(pos);
             } else if !descendants.contains(&name) && ancestors.contains(&name) {
                 // Matches neither `top` nor anything this walk watched open inside
                 // it, but does match *some* element genuinely known to be open
@@ -2863,10 +2906,19 @@ fn next_non_rendering_marker(
             if !(ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content)) {
                 return Some(NonRenderingAdvance::Open(end, name));
             }
-        } else if !ends_with_self_closing_slash(span) && !is_void_element(&name) {
+        } else if !(is_void_element(&name)
+            || ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content))
+        {
             // An ordinary element genuinely nested inside `top`, opened during this
             // same walk — tracked so its own later close (above) is told apart from
-            // an untracked ancestor's.
+            // an untracked ancestor's. A self-closing slash is skipped here only
+            // when the active namespace actually honors it (Codex, round 65,
+            // "Record slash-terminated HTML descendants"): ordinary HTML ignores
+            // the slash, so `<section/>` inside a hidden `top` with no foreign
+            // content open still opens for real and needs its own close tracked —
+            // skipping it unconditionally left that close unmatched by anything,
+            // falling through to the `ancestors` check where an outer element could
+            // share its name and be mistaken for it.
             descendants.push(name);
         }
         // Not relevant to `top` — carry its own namespace effect forward (a no-op for
@@ -6077,6 +6129,7 @@ pub fn visible_source(contents: &str) -> String {
                 &mut non_rendering_start,
                 &mut foreign_content,
                 &mut ancestors,
+                &mut non_rendering_descendants,
                 &mut hidden,
             ),
             _ => {}
@@ -6124,6 +6177,12 @@ pub fn visible_source(contents: &str) -> String {
 /// `non_rendering_start` is armed rather than pushed yet when it only opens one.
 /// Extracted from [`visible_source`] for the same clippy-line-limit reason
 /// [`hide_non_rendering_in_html_line`] was.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one flag per piece of state visible_source already carries across lines \
+              for its own top-level comment search; bundling them loses the ability to \
+              read each mutation at its own call site"
+)]
 fn hide_non_rendering_in_inline_html(
     html: &str,
     range: std::ops::Range<usize>,
@@ -6131,10 +6190,17 @@ fn hide_non_rendering_in_inline_html(
     non_rendering_start: &mut Option<usize>,
     foreign_content: &mut Vec<ForeignFrame>,
     ancestors: &mut Vec<String>,
+    descendants_stack: &mut Vec<Vec<String>>,
     hidden: &mut Vec<(usize, usize)>,
 ) {
     let was_open = !open_non_rendering.is_empty();
-    track_non_rendering_html(html, open_non_rendering, foreign_content, ancestors);
+    track_non_rendering_html(
+        html,
+        open_non_rendering,
+        foreign_content,
+        ancestors,
+        descendants_stack,
+    );
     let now_open = !open_non_rendering.is_empty();
     if !was_open && now_open {
         non_rendering_start.get_or_insert(range.start);
@@ -6553,6 +6619,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
                     &mut ancestors,
+                    &mut non_rendering_descendants,
                     &mut hidden_markup_seen,
                 ) =>
             {
@@ -6576,9 +6643,16 @@ fn advance_list_item_inline_html(
     open_non_rendering_tag: &mut Vec<String>,
     foreign_content: &mut Vec<ForeignFrame>,
     ancestors: &mut Vec<String>,
+    descendants_stack: &mut Vec<Vec<String>>,
     hidden_markup_seen: &mut bool,
 ) -> bool {
-    let opened = track_non_rendering_html(html, open_non_rendering_tag, foreign_content, ancestors);
+    let opened = track_non_rendering_html(
+        html,
+        open_non_rendering_tag,
+        foreign_content,
+        ancestors,
+        descendants_stack,
+    );
     if opened {
         *hidden_markup_seen = true;
     }
@@ -6684,6 +6758,7 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
                     &mut ancestors,
+                    &mut non_rendering_descendants,
                 );
                 if collecting && !consumed && !hidden && is_line_break_tag(&html) {
                     current.push('\n');
@@ -6916,6 +6991,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
                     &mut open_non_rendering_tag,
                     &mut foreign_content,
                     &mut ancestors,
+                    &mut non_rendering_descendants,
                 ) && in_row
                     && !html.starts_with("<!--") =>
             {
