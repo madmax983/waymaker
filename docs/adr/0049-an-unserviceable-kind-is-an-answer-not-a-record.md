@@ -51,13 +51,16 @@ reasons" (`KernelError`'s variants) carries none either.
 `ActivityFuture::poll`'s `Stage::Dispatching` arm answers `Poll::Pending` for both
 `dispatched == Poll::Pending` and `dispatched == Poll::Ready(Ok(Produced::Unserviceable))`.
 Neither calls `Journal::resolve`. Nothing is written, so the effect stays outstanding under
-the identity its schedule record already committed. The two differ in what they do to
-`stage`: `Poll::Pending` leaves it at `Dispatching`, so a retained future keeps asking on
-every poll — the ordinary shape of "the world is slow". `Unserviceable` moves it to `Ended`,
-so a future retained across a spurious repoll within the same boot never asks a dispatcher
-already known to have no answer for this kind. A later boot — the same run, replayed against
-a fresh `ActivityFuture` and a dispatcher that has gained the row — starts over at
-`Stage::Scheduling`, reaches the same `Handoff::Dispatch`, and may complete it.
+the identity its schedule record already committed. The two differ in what they do next.
+`Poll::Pending` leaves `stage` at `Dispatching`, so a retained future keeps asking on every
+poll — the ordinary shape of "the world is slow". `Unserviceable` moves `stage` to `Ended`
+**and** sets a flag on the `Ctx` itself. The first stops a retained future's own spurious
+repoll; the second stops a *different* future for the same still-outstanding effect, because
+`stage` lives in the future and does not survive a drop. `ActivityFuture::poll`'s own first
+check refuses once that flag is set, before `Stage::Scheduling` ever asks the journal again.
+A later boot — the same run, replayed against a fresh `Ctx` and a dispatcher that has gained
+the row — starts over with no flag set, reaches the same `Handoff::Dispatch`, and may
+complete it.
 
 **`wiring::Table::poll_dispatch` answers `Produced::Unserviceable` for a kind no row
 declares**, in place of the `Unhandled::NoSuchActivity` it used to construct. That was
@@ -114,6 +117,18 @@ to leave and nothing to be wrong about.
 **`Unhandled<E>` is a breaking rename for anyone matching on it.** `waymaker-embassy` is
 still rung 0.4 work. Every caller in this workspace — `waymaker-drive`'s tests and the size
 probe — is updated in the same change.
+
+A second Codex round found the first version of the fix incomplete: `stage` alone stops a
+*retained* future's spurious repoll, but a caller that drops the future and asks again this
+boot — a `select!` cancellation, say — gets a fresh `ActivityFuture` starting at
+`Stage::Scheduling`, which does not remember what the dropped one learned. `Ctx` now carries
+the flag instead, shared across every `ActivityFuture` it builds, the same way issue #107
+moved a run's terminal/continued flag out of `TerminalFuture` and `ContinueFuture` and into
+`Ctx` for the identical reason: a value only a future holds is a value a drop can lose.
+`crates/waymaker-embassy/tests/ctx.rs`'s
+`an_unserviceable_kind_is_not_a_retry_after_the_future_is_dropped_and_recreated` drives the
+second future to `Poll::Pending` and asserts both the dispatcher and the journal saw the
+first `schedule` call and nothing after it.
 
 ## Alternatives considered
 

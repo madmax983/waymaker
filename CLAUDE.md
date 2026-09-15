@@ -3675,7 +3675,11 @@ under the identity its schedule record already committed — but it is not a ret
 moves to `Ended` rather than staying at `Dispatching`, so a future retained across a spurious
 repoll within the same boot never asks a dispatcher already known to have no answer for this
 kind. Codex found the gap on review of this change: the first version left `stage` where a
-retry leaves it, and a repoll would have asked again. `wiring::Table`
+retry leaves it, and a repoll would have asked again. A second round found the fix itself
+incomplete: `stage` lives in the future, so a dropped-then-recreated `ActivityFuture` — a
+`select!` cancellation, say — started fresh at `Stage::Scheduling` and asked again this boot.
+The flag now lives in `Ctx`, shared across every future it builds, the way issue #107 moved
+`TerminalFuture` and `ContinueFuture`'s own flag into `Ctx` for the identical reason. `wiring::Table`
 answers it for a kind no row declares, in place of the `Unhandled::NoSuchActivity` it used to
 construct; since that was `Unhandled`'s only reason to exist beside wrapping a row's own
 error, `Unhandled<E>` is gone and `Table<W, E>::Error` is `E` itself. Two tests are the "done

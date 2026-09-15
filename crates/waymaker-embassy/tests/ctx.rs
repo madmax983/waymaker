@@ -399,6 +399,32 @@ fn an_unserviceable_kind_is_not_a_retry_even_when_the_future_is_polled_again() {
 }
 
 #[test]
+fn an_unserviceable_kind_is_not_a_retry_after_the_future_is_dropped_and_recreated() {
+    // Issue #111, Codex round 2. A cancelled `ActivityFuture` -- dropped out of a `select!`,
+    // say -- takes its own `stage` with it. A fresh future for the same outstanding effect
+    // must still meet the stop: this boot already learned no dispatcher here can serve it.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let first = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let second = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Pending);
+    assert_eq!(
+        world.polls, 1,
+        "the second future never reached the dispatcher"
+    );
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the second future never reached the journal either"
+    );
+}
+
+#[test]
 fn a_dispatcher_that_fails_records_a_failure_with_no_payload_and_keeps_the_typed_error() {
     // A failed activity has to reach media, or §08 strands the run: there is no edge from
     // an unresolved effect to a terminal record. The error value itself cannot, because a

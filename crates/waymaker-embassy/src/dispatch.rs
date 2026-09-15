@@ -29,7 +29,9 @@ pub enum Produced {
     /// It writes no record. [`Ctx`](crate::ctx::Ctx) stops the boot here, and asks this
     /// dispatcher nothing more for this boundary: unlike [`Poll::Pending`], this is not a
     /// retry. The effect stays outstanding under its committed identity. A later boot may
-    /// still complete it, if its dispatcher can service this kind. Issue
+    /// still complete it, if its dispatcher can service this kind. The stop outlives one
+    /// `ActivityFuture`, too — a caller that drops the future and asks again this boot, a
+    /// `select!` cancellation say, meets it again without a second call here. Issue
     /// [#111](https://github.com/madmax983/waymaker/issues/111).
     Unserviceable,
 }

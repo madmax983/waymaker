@@ -123,6 +123,11 @@ pub struct Ctx<'a, D: ActivityDispatcher, J: Journal> {
     out: &'a mut [u8],
     payload: usize,
     closed: Option<Closed>,
+    /// Set once a dispatcher answers [`Produced::Unserviceable`]. Shared for issue #107's
+    /// reason: a dropped `ActivityFuture` — cancelled by a `select!`, say — must not let a
+    /// fresh one for the same outstanding effect ask the dispatcher again this boot. `stage`
+    /// alone cannot say that, because a new future starts its own at [`Stage::Scheduling`].
+    unserviceable: bool,
 }
 
 impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
@@ -140,6 +145,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             out,
             payload: 0,
             closed: None,
+            unserviceable: false,
         }
     }
 
@@ -158,6 +164,7 @@ impl<'a, D: ActivityDispatcher, J: Journal> Ctx<'a, D, J> {
             out: self.out,
             payload: &mut self.payload,
             concluded: &self.closed,
+            unserviceable: &mut self.unserviceable,
             kind,
             input,
             stage: Stage::Scheduling,
@@ -277,6 +284,7 @@ pub struct ActivityFuture<'b, T, D: ActivityDispatcher, J: Journal> {
     out: &'b mut [u8],
     payload: &'b mut usize,
     concluded: &'b Option<Closed>,
+    unserviceable: &'b mut bool,
     kind: ActivityKind,
     input: &'b [u8],
     stage: Stage,
@@ -338,7 +346,11 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
         // resolves, so an `async fn` stops there on its own; this is the same statement for
         // a caller that reaches a boundary without going through `.await`, and it is what
         // stops the recorded ending — which points into `out` — being overwritten.
-        if me.concluded.is_some() {
+        // A dropped-then-recreated future must not repeat a stopped boundary either: `stage`
+        // lives in this future alone, but the outstanding effect it would rediscover is the
+        // same one a dispatcher already answered `Unserviceable` for. This flag survives the
+        // drop because it lives in the `Ctx`, the way `closed` does for issue #107.
+        if me.concluded.is_some() || *me.unserviceable {
             return Poll::Pending;
         }
         loop {
@@ -382,12 +394,13 @@ impl<T: Decode, D: ActivityDispatcher, J: Journal> Future for ActivityFuture<'_,
                         // This firmware cannot service `kind` at all. Not a retry: nothing
                         // about `id` changes before a reboot (issue #111). The code records
                         // nothing, and the effect stays outstanding under its committed
-                        // identity. `stage` moves to `Ended` so a spurious repoll within
-                        // this boot never asks a dispatcher already known to have no answer
-                        // for it. A reboot's fresh `ActivityFuture` starts over at
-                        // `Stage::Scheduling` and tries the dispatcher again.
+                        // identity. `stage` moves to `Ended` so a spurious repoll of *this*
+                        // future never asks again, and `unserviceable` is set on the `Ctx`
+                        // so a dropped-then-recreated future cannot either. A reboot's fresh
+                        // `Ctx` starts over and tries the dispatcher again.
                         Poll::Ready(Ok(Produced::Unserviceable)) => {
                             me.stage = Stage::Ended;
+                            *me.unserviceable = true;
                             return Poll::Pending;
                         }
                         // The activity failed with nothing to record. It is recorded as a
