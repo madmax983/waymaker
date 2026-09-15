@@ -14753,6 +14753,33 @@ fn destructured_binding(pat: &syn::Pat, expr: &syn::Expr) -> Vec<(String, syn::E
             };
             destructured_binding(&pat_ref.pat, &expr_ref.expr)
         }
+        // Codex's finding: `struct S(u8); let S(x) = S(0); x` names an irrefutable
+        // tuple-struct destructure — the plain tuple pattern's own reasoning, met one
+        // syntax over: a tuple struct's constructor call binds its fields positionally
+        // the identical way a bare tuple literal does, but the initializer is
+        // `Expr::Call` (the constructor invoked as a function) rather than `Expr::Tuple`.
+        // This fell through to `_ => Vec::new()` for the identical reason every earlier
+        // shape here once did: the whole statement went uncounted by every term that
+        // requires this function to answer at least one name, so a block built entirely
+        // from constants destructured this way refused outright. No check compares the
+        // two sides' own path, the same standing the struct-pattern case above already
+        // has for its own field-name match alone: a `let` pattern is irrefutable by
+        // construction, so an initializer naming a different type would already be a
+        // type error `rustc` refused to compile.
+        syn::Pat::TupleStruct(pat_tuple_struct) => {
+            let syn::Expr::Call(expr_call) = strip_parens(expr) else {
+                return Vec::new();
+            };
+            if pat_tuple_struct.elems.len() != expr_call.args.len() {
+                return Vec::new();
+            }
+            pat_tuple_struct
+                .elems
+                .iter()
+                .zip(expr_call.args.iter())
+                .flat_map(|(inner_pat, inner_expr)| destructured_binding(inner_pat, inner_expr))
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
