@@ -5,7 +5,7 @@
 //! `Future` here and no executor — a synchronous workflow suspends by propagating
 //! [`Suspended`] with `?`, which is what `.await` does in the façade one layer up.
 
-use waymaker_core::timer::TimerSpec;
+use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::version::GateId;
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
@@ -262,14 +262,23 @@ pub trait Boundary {
     ///
     /// # What this driver does
     ///
-    /// It refuses, with
-    /// [`DriveError::ContinueUnsupported`](crate::DriveError::ContinueUnsupported). §10's
-    /// swap is `waymaker-flash`'s `swap` module, and it works on a *bank*: it needs the
-    /// two-bank layout, the authority the device booted, and the generation seal.
-    /// [`Driver`](crate::Driver) is pointed at a
-    /// [`JournalRegion`](waymaker_flash::recovery::JournalRegion) and knows none of them,
-    /// so a swap here would be a swap of a bank this driver cannot name. Issue
-    /// [#110](https://github.com/madmax983/waymaker/issues/110) is where the two are
-    /// joined.
+    /// A [`Driver`](crate::Driver) built with
+    /// [`Driver::new`](crate::Driver::new) is pointed at a
+    /// [`JournalRegion`](waymaker_flash::recovery::JournalRegion), not a bank, and refuses
+    /// with [`DriveError::ContinueUnsupported`](crate::DriveError::ContinueUnsupported):
+    /// §10's swap is `waymaker-flash`'s `swap` module, and it works on a *bank* — the
+    /// two-bank layout, the authority the device booted, and the generation seal — none of
+    /// which this shape knows. One built with
+    /// [`Driver::at_bank`](crate::Driver::at_bank) performs the swap for real, reading
+    /// that authority fresh from the device on this same boot. Issue
+    /// [#110](https://github.com/madmax983/waymaker/issues/110).
     fn continue_as_new(&mut self, input: &[u8]) -> Suspended;
+
+    /// Why [`wait`](Self::wait) answered [`Suspended`], when it was this call and the
+    /// deadline had not passed yet.
+    ///
+    /// [`None`] for every other reason, and after every other method. It exists for one
+    /// caller: an async façade that arms a hardware alarm instead of asking again straight
+    /// away. Issue [#110](https://github.com/madmax983/waymaker/issues/110).
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)>;
 }

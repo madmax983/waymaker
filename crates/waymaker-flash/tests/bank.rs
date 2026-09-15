@@ -610,6 +610,66 @@ fn a_truncated_header_is_truncated_rather_than_corrupt() {
 }
 
 #[test]
+fn header_len_of_answers_from_the_prefix_alone_even_when_the_rest_is_missing() {
+    // Issue #110's round 5: a caller with a page too small for a header's full frame still
+    // needs to know how much room it actually needs, and `decode_header`'s own `Truncated`
+    // says nothing about that — it fires identically whether the buffer is one byte short of
+    // the frame or one byte short of the checksum-protected prefix itself.
+    let mut media = [0_u8; 64];
+    let written = bank::encode_header(&header(b"run input"), &mut media).expect("it fits");
+    let decoded = bank::decode_header(&media[..written]).expect("the whole header is right there");
+    let full = bank::header_len_of(&media[..written]).expect("the whole header is right there");
+    assert_eq!(
+        full,
+        decoded.frame_len(),
+        "a header_len_of answer must agree with the header's own frame length, which is what \
+         encode_header pads rather than what it wrote — `written` is the padded length"
+    );
+
+    // The prefix is present and checksums cleanly, but the input and the trailer are not —
+    // `decode_header` refuses this outright, and `header_len_of` still answers `full`.
+    let prefix_only = &media[..bank::HEADER_PREFIX_BYTES];
+    assert_eq!(
+        bank::decode_header(prefix_only),
+        Err(DecodeError::Truncated),
+        "the fixture needs decode_header itself to refuse this buffer"
+    );
+    assert_eq!(
+        bank::header_len_of(prefix_only),
+        Ok(full),
+        "the prefix alone is enough to answer how long the whole header is"
+    );
+}
+
+#[test]
+fn header_len_of_is_truncated_before_the_prefix_itself_is_whole() {
+    let mut media = [0_u8; 64];
+    bank::encode_header(&header(b"run input"), &mut media).expect("it fits");
+    for short in 0..bank::HEADER_PREFIX_BYTES {
+        let cut = &media[..short];
+        assert_eq!(
+            bank::header_len_of(cut),
+            Err(DecodeError::Truncated),
+            "{short} bytes is short of the prefix itself"
+        );
+    }
+}
+
+#[test]
+fn header_len_of_still_checks_the_prefixs_own_seal() {
+    // A caller could not otherwise be told a corrupted header (no larger a page would ever
+    // fix) apart from one that is merely truncated (a larger page might).
+    let mut media = [0_u8; 64];
+    bank::encode_header(&header(b"run input"), &mut media).expect("it fits");
+    media[0] ^= 0xFF;
+    assert_eq!(
+        bank::header_len_of(&media),
+        Err(DecodeError::IntegrityFailed),
+        "a damaged magic must be refused rather than answered with a length"
+    );
+}
+
+#[test]
 fn every_single_byte_mutation_of_a_header_is_caught() {
     let mut media = [0_u8; 64];
     let written = bank::encode_header(&header(b"input"), &mut media).expect("it fits");

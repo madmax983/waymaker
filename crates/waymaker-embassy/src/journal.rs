@@ -14,7 +14,7 @@
 //!
 //! [`Ctx`]: crate::ctx::Ctx
 
-use waymaker_core::timer::TimerSpec;
+use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
 /// The run cannot go on in this boot.
@@ -112,4 +112,13 @@ pub trait Journal {
     /// journal replaced it, or the journal refused — and a run that is over has no answer
     /// to receive.
     fn continue_as_new(&mut self, input: &[u8]) -> Halted;
+
+    /// Why [`wait`](Self::wait) answered [`Err`], when it was this call and the deadline had
+    /// not passed yet.
+    ///
+    /// [`None`] for every other reason, and after every other method. It exists for one
+    /// caller: [`TimerFuture`](crate::ctx::TimerFuture), which arms a hardware alarm on
+    /// [`Some`] instead of asking again straight away. Issue
+    /// [#110](https://github.com/madmax983/waymaker/issues/110).
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)>;
 }

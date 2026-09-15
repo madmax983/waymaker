@@ -14,7 +14,7 @@ use core::task::{Context as Task, Poll, Waker};
 use std::sync::Arc;
 use std::task::Wake;
 
-use waymaker_core::timer::TimerSpec;
+use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
 use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::wiring::{Activity, Table};
@@ -321,6 +321,10 @@ impl Journal for Ledger {
 
     fn continue_as_new(&mut self, _input: &[u8]) -> Halted {
         Halted
+    }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        None
     }
 }
 

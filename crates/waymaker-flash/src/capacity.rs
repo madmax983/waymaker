@@ -245,7 +245,12 @@ pub enum CapacityError {
     /// not: see
     /// [ADR 0044](https://github.com/madmax983/waymaker/blob/main/docs/adr/0044-a-device-is-a-borrow-in-three-modules-and-a-value-in-a-fourth.md).
     ///
-    /// From [`Reserved::over`] only.
+    /// From [`Reserved::over`], and — since issue #110's `continue_as_new` — from
+    /// `waymaker-drive`'s own pre-swap check too: a `Reserve` a caller built for one layout
+    /// and handed a driver pointed at another passes every check `Reserve::for_layout` alone
+    /// can make (its bounds are compatible with *some* layout; whether they were priced
+    /// against *this* one is a different question), and would otherwise only surface here
+    /// one boot later, after the swap it should have stopped had already run.
     WrongDevice,
 }
 
