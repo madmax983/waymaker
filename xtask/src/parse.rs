@@ -1772,21 +1772,37 @@ fn is_foreign_breakout_tag(span: &str, name: &str) -> bool {
 fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFrame>) {
     let name = markup_tag_name(span);
     if span.starts_with("</") {
-        if let Some(top) = foreign_content.last_mut() {
-            if top.name.eq_ignore_ascii_case(name) {
-                foreign_content.pop();
-            } else {
-                // A close for an ordinary element opened directly under the
-                // innermost frame (Codex, pull request #138, round 61) — tracked
-                // only so the `mglyph`/`malignmark` direct-child check below can
-                // tell whether anything else is currently open between it and an
-                // enclosing MathML text integration point. Truncated through the
-                // match, the same "close only what actually opened" discipline
-                // every other tracked stack here already follows.
-                let lower = name.to_ascii_lowercase();
-                if top.ordinary_descendants.contains(&lower) {
-                    while top.ordinary_descendants.pop().as_deref() != Some(lower.as_str()) {}
-                }
+        // A closing tag that mismatches the innermost frame still closes a real,
+        // currently open *ancestor* frame — not only the innermost one (Codex,
+        // round 63, "Pop through matching foreign-content ancestors"): HTML5's
+        // foreign-content end-tag handling searches the whole stack of open
+        // elements outward from the current node, and popping a match takes
+        // everything nested inside it along, however many frames deep. `<svg>
+        // <foreignObject><math></foreignObject></svg><script />...` has
+        // `</foreignObject>` mismatch the innermost `math` frame, but `foreignObject`
+        // is still a real ancestor frame two levels out — a real browser pops both
+        // `math` and `foreignObject` off, and `</svg>` then pops `svg` the same
+        // way, leaving foreign content empty for the `<script />` that follows.
+        // Checking only `foreign_content.last()` left the stale `math` frame
+        // behind, so `<script />` was misread as still inside foreign content and
+        // wrongly acknowledged as self-closing rather than the real, unclosed
+        // HTML script a browser reads it as.
+        if let Some(pos) = foreign_content
+            .iter()
+            .rposition(|frame| frame.name.eq_ignore_ascii_case(name))
+        {
+            foreign_content.truncate(pos);
+        } else if let Some(top) = foreign_content.last_mut() {
+            // A close for an ordinary element opened directly under the
+            // innermost frame (Codex, pull request #138, round 61) — tracked
+            // only so the `mglyph`/`malignmark` direct-child check below can
+            // tell whether anything else is currently open between it and an
+            // enclosing MathML text integration point. Truncated through the
+            // match, the same "close only what actually opened" discipline
+            // every other tracked stack here already follows.
+            let lower = name.to_ascii_lowercase();
+            if top.ordinary_descendants.contains(&lower) {
+                while top.ordinary_descendants.pop().as_deref() != Some(lower.as_str()) {}
             }
         }
         return;

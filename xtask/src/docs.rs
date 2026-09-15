@@ -7556,6 +7556,48 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_a_script_after_closing_through_a_stale_mathml_ancestor_stays_hidden() {
+        // Codex, pull request #138, round 63, finding "Pop through matching
+        // foreign-content ancestors": a closing tag that mismatches the innermost
+        // open frame still closes a real, currently open *ancestor* frame further
+        // out — HTML5's foreign-content end-tag handling searches the whole stack
+        // of open elements outward from the current node, and popping a match
+        // takes everything nested inside it along however many frames deep.
+        // `<svg><foreignObject><math></foreignObject></svg><script
+        // />decision-id headline</script>` has `<math>` reopen real MathML
+        // parsing inside the SVG integration point `foreignObject` — itself
+        // nested inside `svg` — so `</foreignObject>` mismatches the innermost
+        // `math` frame but is still a real ancestor two frames out: a browser
+        // pops both `math` and `foreignObject`, and the following `</svg>` pops
+        // `svg` the same way, leaving foreign content empty for the `<script />`
+        // that follows — where a self-closing slash is never honored, so it opens
+        // as a real, unclosed HTML script whose raw-text body swallows the id and
+        // headline up to its own literal `</script>`. Checking only the innermost
+        // frame left the stale `math` frame behind after both closing tags, so
+        // `<script />` was misread as still inside foreign content and wrongly
+        // acknowledged as bodyless, exposing the id and headline as ordinary
+        // visible text right after it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><foreignObject><math></foreignObject></svg><script />{} {}</script>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_hidden_in_a_span_after_a_div_implicitly_closes_a_sibling_paragraph_stays_hidden()
     {
         // Codex, pull request #138, round 62, finding "Remove implicitly closed
