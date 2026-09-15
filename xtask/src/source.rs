@@ -8491,6 +8491,19 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
 /// Collected in lockstep with `qualified` and `qualified_unsigned`, at the identical key,
 /// from the identical fixed-point pass: `qualified_constants_with_prefix` now returns all
 /// three maps together.
+///
+/// Codex's next-round finding: this used to iterate `scanned_sources` — one entry per
+/// physical file — and look up *a* prefix for each one with `prefixes.iter().find`, so a
+/// file [`module_path_prefixes`] now visits under more than one module path (two legal
+/// `#[path = "shared.rs"] mod ...;` declarations naming the same file under two different
+/// names) was only ever scanned under whichever prefix `find` happened to return first. The
+/// loop now walks `prefixes` itself instead — which, since that fix, may name one physical
+/// path more than once — so a shared file is parsed and qualified once per distinct module
+/// path that legally reaches it, and a constant reachable only through the discarded alias
+/// is no longer silently absent from `qualified`. The fixed-point bound moves from
+/// `scanned_sources.len()` to `prefixes.len()`, its own now-larger upper bound on how many
+/// passes a cross-file dependency chain could need; the `progressed` check below still ends
+/// the loop the moment a pass adds nothing new.
 #[allow(
     clippy::type_complexity,
     reason = "the value map and its unsignedness and declared-type mirrors, returned \
@@ -8508,17 +8521,19 @@ fn collect_tree_qualified_constants(
     let mut qualified = std::collections::HashMap::new();
     let mut qualified_unsigned = std::collections::HashMap::new();
     let mut qualified_types = std::collections::HashMap::new();
-    for _ in 0..scanned_sources.len().max(1) {
+    for _ in 0..prefixes.len().max(1) {
         let mut progressed = false;
-        for scanned in scanned_sources {
-            let prefix = prefixes
+        for (path, prefix) in prefixes {
+            let Some(scanned) = scanned_sources
                 .iter()
-                .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
-                .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
+                .find(|source| source.path.replace('\\', "/") == *path)
+            else {
+                continue;
+            };
             if let Ok((found, found_unsigned, found_types)) =
                 crate::parse::qualified_constants_with_prefix(
                     &scanned.contents,
-                    &prefix,
+                    prefix,
                     &qualified,
                     &qualified_unsigned,
                     &qualified_types,
@@ -8613,15 +8628,23 @@ fn collect_dependency_qualified_constants(
     // on a name collision, the identical priority `check_integrity_check_module_tree`'s own
     // merge into the checksum module's tree gives its own local declarations over this
     // function's answer.
-    for scanned in &scanned_sources {
-        let prefix = prefixes
+    //
+    // Codex's finding, met here too: this used to look up *a* prefix for each scanned file
+    // with `find`, the identical shape [`collect_tree_qualified_constants`] once had — so a
+    // dependency file `module_path_prefixes` reaches under more than one module path was
+    // only ever scanned for enum variants under one of them. Walking `prefixes` directly,
+    // as that function now does, parses the shared file once per prefix instead.
+    for (path, prefix) in &prefixes {
+        let Some(scanned) = scanned_sources
             .iter()
-            .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
-            .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
+            .find(|source| source.path.replace('\\', "/") == *path)
+        else {
+            continue;
+        };
         let Ok(file) = crate::parse::parse_rust(&scanned.contents) else {
             continue;
         };
-        for (key, value) in crate::parse::item_enum_variant_constants(&file.items, &prefix) {
+        for (key, value) in crate::parse::item_enum_variant_constants(&file.items, prefix) {
             qualified.entry(key).or_insert(value);
         }
     }
@@ -8714,19 +8737,40 @@ fn check_integrity_check_module_tree(
         check_checksum_module_crate_root_patterns(scanned, &mut violations);
         check_checksum_module_const_call_initializers(scanned, &mut violations);
 
-        let prefix = prefixes
+        // Codex's finding: this used to take *a* prefix for `scanned` via `find`, so a file
+        // `module_path_prefixes` now reaches under more than one module path — the shared
+        // half of two legal `#[path = "shared.rs"] mod ...;` declarations — was checked for
+        // a dense match under only one of them. A `super::`-relative pattern inside such a
+        // file resolves differently depending on which alias is in effect, so scanning it
+        // once under an arbitrarily chosen prefix could resolve a pattern to nothing under
+        // the alias that was dropped, the identical way an unresolved arm anywhere else lets
+        // a dense table through. Every prefix the file is legally reachable under gets its
+        // own pass here; a genuinely shared file scanning as dense twice for the one
+        // permitted table would still fail closed rather than passing unseen, and no file in
+        // this tree is reachable under more than one prefix today.
+        let scanned_path = scanned.path.replace('\\', "/");
+        let scanned_prefixes: Vec<&Vec<String>> = prefixes
             .iter()
-            .find(|(path, _)| *path == scanned.path.replace('\\', "/"))
-            .map_or_else(Vec::new, |(_, prefix)| prefix.clone());
-        check_checksum_module_dense_matches(
-            scanned,
-            &qualified,
-            &qualified_unsigned,
-            &qualified_types,
-            &prefix,
-            &mut allowed_table_hits,
-            &mut violations,
-        );
+            .filter(|(path, _)| *path == scanned_path)
+            .map(|(_, prefix)| prefix)
+            .collect();
+        let empty_prefix = Vec::new();
+        let passes: Vec<&Vec<String>> = if scanned_prefixes.is_empty() {
+            vec![&empty_prefix]
+        } else {
+            scanned_prefixes
+        };
+        for prefix in passes {
+            check_checksum_module_dense_matches(
+                scanned,
+                &qualified,
+                &qualified_unsigned,
+                &qualified_types,
+                prefix,
+                &mut allowed_table_hits,
+                &mut violations,
+            );
+        }
     }
     for (table, count) in INTEGRITY_CHECK_TABLES.iter().zip(&allowed_table_hits) {
         if *count != 1 {
@@ -9921,16 +9965,25 @@ fn root_module_name() -> String {
 /// walks: the same seeding rule, parameterised rather than hard-coded, because a
 /// dependency's own crate-root module is named after the crate rather than after a file
 /// stem one directory short of it.
+///
+/// Codex's finding: `visited` used to be keyed on the physical path alone, so two legal
+/// `#[path = "shared.rs"] mod ...;` declarations naming the same file under two different
+/// module names visited it once and recorded one of the two prefixes — never both. A
+/// constant this scan can only see through the *discarded* alias stays unqualified under
+/// that name, and an unqualified name is exactly what lets a dense-table arm's own pattern
+/// resolution come back empty, the shape the whole `integrity-check` scan exists to catch.
+/// Keying on `(path, prefix)` instead visits the shared file once per distinct module path
+/// that reaches it, so every namespace it is legally reachable under gets its own scan.
 fn module_path_prefixes(
     sources: &[crate::size::LayerSource],
     root: &crate::size::LayerSource,
     root_prefix: Vec<String>,
 ) -> Result<Vec<(String, Vec<String>)>, ModuleTreeError> {
     let mut prefixes = Vec::new();
-    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut visited: BTreeSet<(String, Vec<String>)> = BTreeSet::new();
     let mut stack = vec![(root.path.replace('\\', "/"), root_prefix)];
     while let Some((path, prefix)) = stack.pop() {
-        if !visited.insert(path.clone()) {
+        if !visited.insert((path.clone(), prefix.clone())) {
             continue;
         }
         let Some(contents) = sources
@@ -16073,6 +16126,48 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_a_file_shared_by_two_module_paths_is_reported() {
+        // Codex's finding: `#[path = "shared.rs"] mod x;` and `#[path = "shared.rs"] mod
+        // y;` are two legal declarations naming the *same* physical file under two
+        // different module paths — both `x::P0` and `y::P0` are real, valid references to
+        // the identical constant. `module_path_prefixes`'s own `visited` set used to be
+        // keyed on the physical path alone, so the second declaration's own prefix — `y`
+        // here — was discarded the moment the first — `x` — had already visited
+        // `shared.rs`, and every constant this scan could only reach through `y::` stayed
+        // unqualified. This match's own arms alternate between the two aliases (`x::P0`,
+        // `y::P1`, `x::P2`, ...), so whichever alias the old code happened to keep, roughly
+        // half the arms were unresolved and `fully_dense_arm_patterns` refused the whole
+        // match — the shape this test catches regardless of which alias survived.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[path = \"shared.rs\"]\nmod x;\n#[path = \"shared.rs\"]\nmod y;\n\nconst fn \
+             dense_table_over_a_file_shared_by_two_module_paths(nibble: u32) -> u32 {\n    \
+             match nibble {\n        x::P0 => 0,\n        y::P1 => 1,\n        x::P2 => 2,\n        \
+             y::P3 => 3,\n        x::P4 => 4,\n        y::P5 => 5,\n        x::P6 => 6,\n        \
+             y::P7 => 7,\n        x::P8 => 8,\n        y::P9 => 9,\n        x::P10 => 10,\n        \
+             y::P11 => 11,\n        x::P12 => 12,\n        y::P13 => 13,\n        x::P14 => 14,\n        \
+             _ => 15,\n    }\n}\n",
+        );
+        let mut shared = String::from("//! Shared table indices.\n");
+        for n in 0..=14u8 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut shared,
+                format_args!("pub const P{n}: u8 = {n};\n"),
+            );
+        }
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &source),
+            layer("waymaker-flash/src/shared.rs", &shared),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_whose_catchall_covers_the_lowest_value_is_reported() {
         // Codex's sixteenth-round finding: the missing value the wildcard arm covers was
         // fixed at `arms.len() - 1`, on the assumption a dense table's catch-all always
@@ -16364,6 +16459,32 @@ mod deferred_answer_pins {
             "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    match nibble & \
              0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        3 => 3,\n        \
              _ => 4,\n    };\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_raw_address_expression_statement_is_not_reported() {
+        // Codex's finding: `syn::Expr::RawAddr` — `&raw const place` / `&raw mut place` —
+        // has an `attrs` field like every other named variant `expr_attrs` reads, and the
+        // fallback arm dropped it anyway, so a `#[cfg(test)] &raw const array[match ..];`
+        // expression statement — legal, safe Rust, and stripped from shipped code the
+        // identical way the plain `match` statement above is — was still read as
+        // production: `stmt_is_cfg_test` saw no attributes on it at all and the visitor
+        // walked straight into the nested `match`, reporting its dense table as though
+        // `rustc` had shipped it. Verified against real rustc: this statement compiles with
+        // no `unsafe` needed, since taking a raw reference performs no dereference.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    &raw const \
+             array[match nibble & 0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        \
+             3 => 3,\n        _ => 4,\n    } as usize];\n}\n",
         );
         let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
         assert!(

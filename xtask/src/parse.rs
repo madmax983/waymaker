@@ -111,6 +111,12 @@ fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
 /// no one accessor every variant shares, so this covers the named shapes and falls back
 /// to none for anything else (`Verbatim` carries none at all, and a future variant this
 /// scan does not yet know about is the same standing).
+///
+/// Codex's finding: `syn::Expr::RawAddr` — `&raw const place` / `&raw mut place` — has an
+/// `attrs` field like every other named variant here, and the fallback dropped it anyway. A
+/// legal `#[cfg(test)] &raw const array[..];` statement was read as production code, so
+/// `stmt_is_cfg_test` never excluded it and every visitor below walked into its nested
+/// expression as if `rustc` had shipped it.
 fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
     match expr {
         syn::Expr::Array(e) => &e.attrs,
@@ -140,6 +146,7 @@ fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
         syn::Expr::Paren(e) => &e.attrs,
         syn::Expr::Path(e) => &e.attrs,
         syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::RawAddr(e) => &e.attrs,
         syn::Expr::Reference(e) => &e.attrs,
         syn::Expr::Repeat(e) => &e.attrs,
         syn::Expr::Return(e) => &e.attrs,
