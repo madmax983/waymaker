@@ -1377,7 +1377,13 @@ impl<'a> Reader<'a> {
 /// This is recovery's reader. §09: "Recovery stops at the first unsealed, malformed,
 /// out-of-sequence, or integrity-failed frame" — so the scan is *fused*. Once it has
 /// stopped it stays stopped, and [`offset`](Self::offset) is the byte the committed prefix
-/// ends at.
+/// ends at. The one exception is an outcome — `EffectCompleted`, `EffectFailed` or
+/// `TimerFired`, the only three kinds `redeliverable_kind` admits — whose seal does not
+/// hold but whose reserved slot is otherwise erased: issue
+/// [#95](https://github.com/madmax983/waymaker/issues/95), that frame is ignored rather than
+/// stopping the scan, and a later call to [`next`](Self::next) can still return a record
+/// committed after it, or [`None`]. Every other kind still stops the scan at its first
+/// unsealed, malformed, out-of-sequence or integrity-failed frame exactly as stated above.
 ///
 /// # That offset is an append point only when the scan ended in erased media
 ///
