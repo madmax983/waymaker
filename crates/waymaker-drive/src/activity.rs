@@ -7,10 +7,9 @@
 //! [`Clocks`] is the same half of the boundary for design document §11's deadlines: the
 //! world is what a run asks things of, and time is one of them.
 
-use waymaker_core::ActivityKind;
 use waymaker_core::timer::{ClockCapability, ClockKind};
 
-use crate::effect::DurableIntent;
+use crate::effect::CheckedDispatch;
 
 /// What an activity did.
 ///
@@ -72,8 +71,8 @@ pub enum Performed {
 /// times.
 ///
 /// Every attempt carries one identity: the `(RunId, EffectSeq)` the schedule record
-/// committed. [`DurableIntent::id`] returns that pair. It is the only value a downstream
-/// system can deduplicate on.
+/// committed. [`DurableIntent::id`](crate::effect::DurableIntent::id) returns that pair. It
+/// is the only value a downstream system can deduplicate on.
 ///
 /// Waymaker does **not** promise exactly-once physical side effects. No setting changes
 /// this. The engine cannot promise it: the world changes before the record of it is durable.
@@ -81,15 +80,22 @@ pub enum Performed {
 /// idempotent, or deduplicate on the identity downstream. An activity that does neither
 /// repeats its effect on each attempt.
 pub trait Activities {
-    /// Perform `intent`'s effect and write its outcome into `out`.
+    /// Perform `dispatch`'s effect and write its outcome into `out`.
     ///
-    /// `intent` is design document §07 step 4's argument. Some boot committed the schedule
-    /// record for it before this call — this one, or an earlier one that a reset or a retry
-    /// redelivered.
+    /// `dispatch` is a [`CheckedDispatch`]: design document §07 step 4's identity and its
+    /// checked input, bound together. Some boot committed the schedule record for this
+    /// identity before this call — this one, or an earlier one that a reset or a retry
+    /// redelivered. [`CheckedDispatch::durable_intent`] gives
+    /// [`DurableIntent::kind`](crate::effect::DurableIntent::kind), which activity to run,
+    /// and [`CheckedDispatch::bytes`] gives the input
+    /// [`Dispatchable::perform`](crate::Dispatchable::perform) already checked against the
+    /// digest that identity was scheduled under. Both fields of `dispatch` are private, so
+    /// this function has no other way to receive a kind or bytes the schedule record does not
+    /// name, and no way to receive one paired with the other's identity.
     ///
     /// # Postconditions
     ///
-    /// An implementor must tolerate a duplicate attempt. The same `intent` can arrive more
+    /// An implementor must tolerate a duplicate attempt. The same identity can arrive more
     /// than once, with no limit, and it carries the same identity every time.
     /// [`Activities`] states what this engine does not promise.
     ///
@@ -97,13 +103,7 @@ pub trait Activities {
     /// [`Performed::Exhausted`] when the answer is wider. An implementor that writes what
     /// fits and reports `Completed(out.len())` records a short result, and every replay of
     /// the run returns that short result: the driver cannot tell it from a complete one.
-    fn perform(
-        &mut self,
-        intent: DurableIntent,
-        kind: ActivityKind,
-        input: &[u8],
-        out: &mut [u8],
-    ) -> Performed;
+    fn perform(&mut self, dispatch: CheckedDispatch<'_>, out: &mut [u8]) -> Performed;
 }
 
 /// The clocks a driver may read.

@@ -1,4 +1,4 @@
-# ADR 0050: a torn record redelivers when its reserved slot is clean
+# ADR 0051: a torn record redelivers when its reserved slot is clean
 
 - Status: accepted
 - Date: 2026-09-14

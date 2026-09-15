@@ -46,5 +46,5 @@ seal, and recovery still cannot tell an interrupted append from damage there. Th
 no append point and is refused, exactly as before.
 
 The tests sweep both outcomes. See
-[ADR 0050](https://github.com/madmax983/waymaker/blob/main/docs/adr/0050-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
+[ADR 0051](https://github.com/madmax983/waymaker/blob/main/docs/adr/0051-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md)
 for the full decision.

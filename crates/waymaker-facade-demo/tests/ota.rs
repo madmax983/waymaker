@@ -18,7 +18,7 @@ use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::demo::{BOUNDS as DEMO_BOUNDS, Pipeline, World as SyncWorld};
 use waymaker_drive::{
-    Activities, Boundary, Clocks, Conclusion, DriveError, Driver, DurableIntent, Identity,
+    Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
@@ -184,13 +184,7 @@ struct Unused {
 }
 
 impl Activities for Unused {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
         self.performed += 1;
         Performed::Pending
     }
