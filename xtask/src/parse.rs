@@ -4093,7 +4093,7 @@ fn evaluate_while_loop(
         }
         let mut shadow_snapshot = std::collections::HashMap::new();
         resolve_block_sequential(
-            &while_expr.body,
+            &production_stmts(&while_expr.body),
             resolve,
             local_types,
             resolved,
@@ -4143,56 +4143,78 @@ fn restore_shadow_snapshot(
     }
 }
 
+/// Walks `stmts` — every statement a caller has already reduced to what it must interpret,
+/// via [`production_stmts`] and, for [`evaluate_block`]'s own top-level call, a further
+/// split that holds the block's own value-tail out of this walk entirely.
+///
+/// Codex's finding, at its root: an `Expr::If` (or a `match`, a `for`/`loop`, an unsafe or
+/// labelled block, a bare literal, a method call — anything this function does not
+/// specifically interpret) used to fall through every check below and reach a `continue`,
+/// treated as a no-op regardless of what running it would really have done. `evaluate_block`
+/// itself is protected from an *outer* case of this same shape by its own statement-count
+/// invariant, but that invariant is checked once, for the outermost block alone — a nested
+/// scope this function recurses into (a `while` body, a bare block statement) had no
+/// equivalent guard of its own, so an unrecognised statement inside *one of those* was
+/// silently dropped with nothing to notice. Every unrecognised [`syn::Stmt::Expr`] now
+/// refuses the whole call instead, the identical answer this function already gives a
+/// mutation target it cannot resolve (`resolved.get(&name)?` below) — sound because refusing
+/// is always a safe answer here, and never silently substitutes "unresolved" for "wrong."
+///
+/// Two statement kinds are still let through as harmless. A local item —
+/// [`stmt_is_transparent_item`]'s vocabulary, plus a nested `const` — carries no runtime
+/// mutation this scan tracks: a `const` is resolved separately by
+/// [`resolve_block_locals`]/[`resolve_scope_consts`] before this function ever runs, and
+/// every other item kind (a nested `fn`, `type`, `struct`, and so on) has no value to lose.
+/// A `let` with no initializer, or a `let`-`else` whose `else` diverges, binds nothing this
+/// function can compute — but that is *sound* rather than merely convenient: a later read of
+/// the unbound name fails through `resolved.get(&name)?`/`?` on `literal_or_const_value`
+/// exactly as it would for any other unresolvable name, so skipping these two never invents
+/// a value, it only ever leaves one absent.
 fn resolve_block_sequential(
-    block: &syn::Block,
+    stmts: &[&syn::Stmt],
     resolve: &Resolve<'_>,
     local_types: &mut std::collections::HashMap<String, String>,
     resolved: &mut std::collections::HashMap<String, i128>,
     shadow_snapshot: &mut ShadowSnapshot,
 ) -> Option<()> {
-    for stmt in &block.stmts {
-        if stmt_is_cfg_test(stmt) {
-            continue;
-        }
-        if let syn::Stmt::Local(local) = stmt {
-            let Some(init) = local.init.as_ref() else {
-                continue;
-            };
-            if init.diverge.is_some() {
+    for &stmt in stmts {
+        let expr = match stmt {
+            syn::Stmt::Local(local) => {
+                let Some(init) = local.init.as_ref() else {
+                    continue;
+                };
+                if init.diverge.is_some() {
+                    continue;
+                }
+                resolve_sequential_let(
+                    local,
+                    init,
+                    resolve,
+                    local_types,
+                    resolved,
+                    shadow_snapshot,
+                );
                 continue;
             }
-            resolve_sequential_let(local, init, resolve, local_types, resolved, shadow_snapshot);
-            continue;
-        }
-        let syn::Stmt::Expr(expr, semi) = stmt else {
-            continue;
+            syn::Stmt::Item(_) => continue,
+            syn::Stmt::Expr(expr, _) => expr,
+            syn::Stmt::Macro(_) => return None,
         };
-        // Codex's finding: a `while` loop statement needs no trailing semicolon, so it has
-        // to be recognised before the `semi.is_none()` refusal below — which exists for the
-        // mutation shape alone — would otherwise skip it as silently as any other
-        // unrecognised expression statement. Skipping it silently would not merely refuse to
-        // resolve the block: `evaluate_block`'s own statement-count invariant now counts this
-        // statement (`block_while_statement_count`), so the block would pass that check and
-        // then be resolved from a `resolved` map the loop never actually mutated — the wrong
-        // answer, not merely an unresolved one. `evaluate_while_loop` runs the loop for real
-        // and this arm propagates its failure with `?` rather than falling through to
-        // `continue`, for the identical reason `current_value` below does.
+        // A `while` loop and a bare, unlabelled `{ .. }` block statement each need no
+        // trailing semicolon, and each opens a nested lexical scope of its own — a `let`
+        // inside either must not survive past its own closing brace. A labelled block
+        // (`'a: { .. }`) is refused below rather than specially handled, since a
+        // `break 'a value;` inside it can produce a value from a control-flow path this
+        // scan does not trace.
         if let syn::Expr::While(while_expr) = strip_parens(expr) {
             evaluate_while_loop(while_expr, resolve, local_types, resolved)?;
             continue;
         }
-        // Codex's finding: a bare `{ .. }` block statement needs no trailing semicolon
-        // either, and is a nested lexical scope of its own the identical way a `while`
-        // body is — a `let` inside it must not survive past its own closing brace. A
-        // labelled block (`'a: { .. }`) is excluded, since a `break 'a value;` inside it
-        // can produce a value from a control-flow path this scan does not trace; an
-        // unlabelled one only ever falls through, so running its statements in order and
-        // then restoring what it shadowed is the whole of what it does.
         if let syn::Expr::Block(nested) = strip_parens(expr) {
             if nested.label.is_none() {
                 let mut nested_snapshot = ShadowSnapshot::new();
                 resolve_block_sequential(
-                    &nested.block,
+                    &production_stmts(&nested.block),
                     resolve,
                     local_types,
                     resolved,
@@ -4202,12 +4224,7 @@ fn resolve_block_sequential(
                 continue;
             }
         }
-        if semi.is_none() {
-            continue;
-        }
-        let Some((name, op, rhs_expr)) = mutation_target(expr) else {
-            continue;
-        };
+        let (name, op, rhs_expr) = mutation_target(expr)?;
         let &current_value = resolved.get(&name)?;
         let mutation_resolve_value = |path: &syn::Path| {
             path.get_ident()
@@ -4259,6 +4276,21 @@ fn resolve_block_sequential(
     Some(())
 }
 
+/// Every statement `block` declares that a non-test build actually ships: a `#[cfg(test)]`
+/// statement stripped, and a transparent local item ([`stmt_is_transparent_item`]) filtered
+/// the identical way. Factored out of [`evaluate_block`]'s own inline computation so a
+/// nested scope [`resolve_block_sequential`] recurses into — a `while` body, a bare nested
+/// block statement — filters its own statements the same way before walking them, rather
+/// than seeing a `#[cfg(test)]` statement or a local item declaration as something to be
+/// interpreted or refused.
+fn production_stmts(block: &syn::Block) -> Vec<&syn::Stmt> {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| !stmt_is_cfg_test(stmt) && !stmt_is_transparent_item(stmt))
+        .collect()
+}
+
 fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     let const_locals = block_const_exprs(block);
     let const_item_count = const_locals.len();
@@ -4295,12 +4327,8 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // fix: a cfg-gated statement written *last* in source order would otherwise be taken
     // for the block's own tail value, when `rustc` would really return whatever the last
     // *production* statement is.
-    let production_stmts: Vec<&syn::Stmt> = block
-        .stmts
-        .iter()
-        .filter(|stmt| !stmt_is_cfg_test(stmt) && !stmt_is_transparent_item(stmt))
-        .collect();
-    let (tail, rest) = production_stmts.split_last()?;
+    let stmts = production_stmts(block);
+    let (tail, rest) = stmts.split_last()?;
     // Codex's next-round finding: `locals.len()` used to double as both "how many names are
     // bound" and "how many statements bound them", which `destructured_binding` returning
     // more than one name for a single `@`-bound `let` statement broke — a `let
@@ -4344,8 +4372,14 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // scope, so a shadow it introduces is meant to stay in effect for `tail_expr` below,
     // which sits inside the same block. Only a re-executed nested scope — a `while` body,
     // in `evaluate_while_loop` — needs the snapshot back to undo it once that scope ends.
+    //
+    // `rest` rather than `stmts`: `tail` is `evaluate_block`'s own value expression,
+    // resolved separately below through `literal_or_const_value`, and it must never be
+    // handed to `resolve_block_sequential` — that function now refuses anything it does not
+    // specifically recognise, and a bare value-returning tail (typically just a name) is
+    // never one of those shapes.
     resolve_block_sequential(
-        block,
+        rest,
         resolve,
         &mut local_types,
         &mut resolved,

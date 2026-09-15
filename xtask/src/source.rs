@@ -21982,6 +21982,44 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_nested_block_containing_an_unrecognised_statement_is_refused_rather_than_silently_skipped()
+    {
+        // Codex's finding: `{ let mut x: u8 = 30; { if true { x = 3; } } x }` names an `if`
+        // statement with no trailing semicolon, sitting inside a bare nested block —
+        // recognised by `resolve_block_sequential` as neither a `while`, a further nested
+        // block, nor a mutation. Before this fix the fallback was `continue`, so the `if`
+        // was silently treated as a no-op: the inner call "succeeded" having done nothing,
+        // and `evaluate_block` read the block's own tail `x` back at whatever
+        // `let mut x: u8 = 30;` left it — a *resolved* but wrong value (`30`), not merely an
+        // unresolved one, since the `if` never ran. This is exactly the shape
+        // `check_integrity_check`'s own dense-match detector cannot be shown failing on
+        // through *this* particular repair — refusing a wrongly-resolved arm and refusing an
+        // unresolved one look identical to a match-pattern scan, since both mean "no
+        // violation" — so the observable difference is at the resolver itself: `P0` used to
+        // answer `30`, and now must answer nothing at all. Verified against real rustc:
+        // `make(3)` — the identical body, named and with `3` a parameter — is `3`,
+        // warning-free.
+        // `qualified_constants_with_prefix` only populates `qualified` when `prefix` is
+        // non-empty — a module-qualified name is the whole point of that map — so a
+        // one-segment prefix is what makes `P0`'s own resolved (or refused) value visible
+        // here at all, under the key it would be reached by from another file of the tree.
+        let source = "const P0: u8 = { let mut x: u8 = 30; { if true { x = 3; } } x };";
+        let (qualified, _, _) = crate::parse::qualified_constants_with_prefix(
+            source,
+            &["m".to_owned()],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .expect("valid Rust source parses");
+        assert!(
+            !qualified.contains_key("m::P0"),
+            "P0 resolved to {:?} instead of refusing to resolve at all",
+            qualified.get("m::P0")
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_with_an_unsuffixed_bitwise_not_is_reported() {
         // Codex's finding: `const P0: u8 = !255;` names an operand with no suffix, no cast
         // and no path — `evaluate_bitwise_not`'s three fallbacks all correctly decline it,
