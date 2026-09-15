@@ -3246,10 +3246,17 @@ fn declares_braced_struct(code: &str, header: &str) -> bool {
 /// It is here anyway, because the two pins that are *about* construction — the method set and
 /// the `Self` scan — do both go blind on a trait `impl`, and a guarantee that holds only
 /// through a third pin's side effect is one nobody can check by reading this file.
+///
+/// Walked with [`next_impl_line`], not a bare search for `"\nimpl"`: that search misses an
+/// `impl` preceded on its own line by a leading attribute — `#[rustfmt::skip] impl Forge for
+/// ClockKind { .. }` survives `cargo fmt` and names no banned identifier, so a constant ban
+/// built only on this function would stay green over a trait `impl` spelled that way. Codex
+/// found the same blindness here that `next_impl_line`'s own doc comment already records for
+/// `inherent_impl_bodies`'s reader.
 fn implements_trait_for(code: &str, type_name: &str) -> bool {
     let mut cursor = 0_usize;
-    while let Some(at) = code.get(cursor..).and_then(|rest| rest.find("\nimpl")) {
-        let start = cursor.saturating_add(at).saturating_add(1);
+    while let Some(at) = code.get(cursor..).and_then(next_impl_line) {
+        let start = cursor.saturating_add(at);
         let Some(rest) = code.get(start..) else {
             break;
         };
@@ -12595,6 +12602,24 @@ mod deferred_answer_pins {
         // of its own, invisible to a scan that reads only inherent `impl` blocks.
         let module = tests_support::clean_timer_module()
             + "impl Forge for ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
+        let details = timer_details(TIMER_SEMANTICS_PATH, &module);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("implements a trait")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn an_attributed_trait_impl_on_clock_kind_is_reported() {
+        // Codex, on PR #183's own review: `implements_trait_for` searched for a bare
+        // `"\nimpl"`, so an `impl` preceded on its own line by a leading attribute —
+        // `#[rustfmt::skip] impl Forge for ClockKind { .. }`, which survives `cargo fmt` —
+        // was invisible to it, the same blindness `next_impl_line`'s own doc comment already
+        // records for `inherent_impl_bodies`'s reader. Sharing that function closes it here.
+        let module = tests_support::clean_timer_module()
+            + "#[rustfmt::skip] impl Forge for ClockKind {\n    const RTC2: Self = Self(3);\n}\n";
         let details = timer_details(TIMER_SEMANTICS_PATH, &module);
         assert!(
             details
