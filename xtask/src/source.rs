@@ -13546,6 +13546,71 @@ mod tests {
     }
 
     #[test]
+    fn a_locally_imported_macro_wearing_a_whitelisted_name_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 36: `use
+        // crate::make_clone as assert; const _: () = assert!();` is legal Rust whose
+        // `assert!` invocation is not `core::assert!` at all — a local `use` rebinds
+        // the name in the macro namespace the same way it would in the value or type
+        // namespace — but `is_known_safe_expression_macro` matched the spelled name
+        // alone, so a locally-imported macro wearing a whitelisted name walked past
+        // the one check built to catch an unexpandable macro. The macro's own
+        // definition lives outside this file (the shape a real `use` names), so this
+        // case is isolated from `declares_item_macro`'s separate, unconditional
+        // `Item::Macro` ban on a *declaration* in the same file — only the `use` and
+        // the invocation are here, exercising the shadow check alone.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "use crate::round36_make_clone as assert;\n",
+                "const _: () = assert!();\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_test_gated_expression_position_macro_used_as_a_tail_expression_is_accepted() {
+        // Found by Codex review of this change (PR #143), round 36: a macro used as a
+        // *tail* expression still carries its own attributes on the `ExprMacro` node —
+        // `fn helper() { #[cfg(test)] make_clone!() }` is legal Rust whose macro is
+        // removed from every non-test build exactly like a gated statement already is
+        // — but `visit_expr_macro` read only the macro's path, never its own
+        // attributes, so this test-gated invocation failed the whole file closed over
+        // a macro that never ships.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "fn helper() {\n",
+                "    #[cfg(test)]\n",
+                "    make_clone!()\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
     fn a_file_gated_with_a_compound_any_test_cfg_is_not_read_as_production_reachable() {
         // Found by Codex review of this change (PR #143), round 35: `#![cfg(any(test))]`
         // is exactly as test-only as the bare `#![cfg(test)]` round 33 already

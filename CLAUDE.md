@@ -4077,6 +4077,39 @@ introduced and this closes; and the `assert!`-hidden impl was injected unconditi
 confirmed to compile in a plain production build, and confirmed caught by
 `check-layering` before the injection was reverted.
 
+Round 36 found two more, both on the very fixes round 35 had just landed, and neither in
+`has_cfg_test` or the brace-group scan themselves. The first is a whitelist bypass a
+name-only check could never close: `use crate::make_clone as assert; const _: () =
+assert!();` is legal Rust whose `assert!` invocation is not `core::assert!` at all — a
+local `use` rebinds a name in the macro namespace exactly as it would in the value or
+type namespace — but `is_known_safe_expression_macro` matched the spelled name alone, so
+a locally-imported macro wearing a whitelisted name walked past the one check meant to
+catch an unexpandable one. Resolving *which* invocation a given `use` shadows would need
+the same scope-stack machinery `resolve_segments` and `every_resolution` each carry for
+their own callers, which this visitor does not have, so the fix is coarser on purpose: a
+new `shadowed_expression_macro_names` collects every local name a `use` binds to one of
+the thirty whitelisted names anywhere in the file — file scope, a nested module, or a
+function body, since `use` is legal in all three — and poisons that name for the *whole*
+file rather than only the scope the shadowing `use` sits in, which can only reject more
+than a precise version would, never less. The second is the mirror image of round 32's
+own statement-macro fix, one shape further: a macro used as a *tail* expression still
+carries its own attributes on the `ExprMacro` node — `fn helper() { #[cfg(test)]
+make_clone!() }` is legal Rust whose macro is removed from every non-test build exactly
+like a gated statement already is — but `visit_expr_macro` read only the macro's path,
+never `node.attrs`, so a test-gated expression-position invocation failed the whole file
+closed over a macro that never ships. Both were verified against real compilation. The
+shadowing case needed a macro genuinely reachable by path from outside the scanned file
+to avoid also tripping the pre-existing, unconditional ban on a macro *declaration*
+found in the same file: `#[macro_export] macro_rules! round36_make_clone` at the crate
+root, aliased to `assert` and invoked from a `recovery` child file, was shown to produce
+a real, globally-applying impl by declaring a second, ordinary `impl Clone for Recovery`
+beside it and watching rustc refuse the conflict — the sharpest proof available that the
+first one is real — before `check-layering` was confirmed to catch it and the injection
+reverted. The tail-expression case reused the same cross-file macro, this time gated
+`#[cfg(test)]` at the call site, confirmed to compile to nothing in a production build
+and to a real impl under `cargo test`, with `check-layering` confirmed to report nothing
+for either configuration.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

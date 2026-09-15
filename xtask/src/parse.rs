@@ -2174,6 +2174,7 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
 pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
     struct MacroVisitor {
         found: bool,
+        shadowed_expression_macro_names: std::collections::HashSet<String>,
     }
 
     impl<'ast> syn::visit::Visit<'ast> for MacroVisitor {
@@ -2292,8 +2293,25 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
         // block, and only a block can carry an item statement, so a whitelisted
         // macro's own tokens are trusted only when they carry no brace group at all,
         // at any depth.
+        // Round 36: a macro used as a *tail* expression still carries its own
+        // attributes on this node — `fn helper() { #[cfg(test)] make_clone!() }` is
+        // legal Rust whose macro is removed from every non-test build exactly like a
+        // gated statement already is — but this override read only the macro's path,
+        // never `node.attrs`, so a test-gated expression-position invocation failed
+        // the whole file closed over a macro that never ships. `visit_stmt_macro`
+        // already gained this same check for the statement-position shape.
         fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
-            if !is_known_safe_expression_macro(&node.mac.path)
+            if has_cfg_test(&node.attrs) {
+                return;
+            }
+            // Round 36: a name on the whitelist is only trusted when nothing in this
+            // file has rebound it — see `shadowed_expression_macro_names`.
+            let shadowed = node.mac.path.get_ident().is_some_and(|ident| {
+                self.shadowed_expression_macro_names
+                    .contains(&ident_name(ident))
+            });
+            if shadowed
+                || !is_known_safe_expression_macro(&node.mac.path)
                 || token_stream_contains_a_brace_group(node.mac.tokens.clone())
             {
                 self.found = true;
@@ -2315,7 +2333,10 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
     }
 
     let file = parse_rust(contents)?;
-    let mut visitor = MacroVisitor { found: false };
+    let mut visitor = MacroVisitor {
+        found: false,
+        shadowed_expression_macro_names: shadowed_expression_macro_names(&file),
+    };
     visitor.visit_file(&file);
     Ok(visitor.found)
 }
@@ -2435,45 +2456,100 @@ fn is_known_safe_attribute_path(path: &syn::Path) -> bool {
 /// segment (`core::assert!` written out, say) is not how any of them are invoked in
 /// practice — read conservatively, so a genuinely unusual spelling fails closed rather
 /// than being resolved away.
+///
+/// Being one of these names is necessary but not sufficient: [`declares_item_macro`]'s
+/// own caller also asks whether the name is [`shadowed_expression_macro_names`] before
+/// trusting it, because a *local* `use` can rebind any of them — see that function's own
+/// documentation for the round 36 finding this split exists to close.
+const KNOWN_SAFE_EXPRESSION_MACROS: &[&str] = &[
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "cfg",
+    "column",
+    "compile_error",
+    "concat",
+    "dbg",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "env",
+    "eprint",
+    "eprintln",
+    "file",
+    "format",
+    "format_args",
+    "include",
+    "include_bytes",
+    "include_str",
+    "line",
+    "matches",
+    "module_path",
+    "option_env",
+    "panic",
+    "print",
+    "println",
+    "stringify",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "vec",
+    "write",
+    "writeln",
+];
+
 fn is_known_safe_expression_macro(path: &syn::Path) -> bool {
-    const KNOWN_MACROS: &[&str] = &[
-        "assert",
-        "assert_eq",
-        "assert_ne",
-        "cfg",
-        "column",
-        "compile_error",
-        "concat",
-        "dbg",
-        "debug_assert",
-        "debug_assert_eq",
-        "debug_assert_ne",
-        "env",
-        "eprint",
-        "eprintln",
-        "file",
-        "format",
-        "format_args",
-        "include",
-        "include_bytes",
-        "include_str",
-        "line",
-        "matches",
-        "module_path",
-        "option_env",
-        "panic",
-        "print",
-        "println",
-        "stringify",
-        "todo",
-        "unimplemented",
-        "unreachable",
-        "vec",
-        "write",
-        "writeln",
-    ];
     path.get_ident()
-        .is_some_and(|ident| KNOWN_MACROS.contains(&ident_name(ident).as_str()))
+        .is_some_and(|ident| KNOWN_SAFE_EXPRESSION_MACROS.contains(&ident_name(ident).as_str()))
+}
+
+/// Every local name a `use` item anywhere in `file` binds to one of
+/// [`KNOWN_SAFE_EXPRESSION_MACROS`], at any nesting depth — file scope, a nested module,
+/// or a function body, since `use` is legal in all three.
+///
+/// Found by Codex review of this change (PR #143), round 36: `use crate::make_clone as
+/// assert; const _: () = assert!();` is legal Rust whose `assert!` invocation is not
+/// `core::assert!` at all — a local `use` rebinds the name in the macro namespace the
+/// same way it would in the value or type namespace, and [`is_known_safe_expression_
+/// macro`] matched the spelled name alone, so a locally-imported macro wearing a
+/// whitelisted name walked past the one check built to stop an unexpandable macro.
+///
+/// This does not resolve *which* invocation a given `use` shadows — that needs the same
+/// scope-stack machinery [`resolve_segments`] and [`every_resolution`] each carry for
+/// their own callers, which this visitor does not have — so a name found anywhere in the
+/// file is poisoned for the whole file, not only the scope the shadowing `use` sits in.
+/// Coarser than precise shadowing would be, and safe in the direction that matters: a
+/// whitelisted name that is never rebound anywhere keeps trusting the real builtin
+/// exactly as before, and a name rebound *anywhere* stops being trusted *everywhere*,
+/// which can only reject more than a precise version would, never less.
+fn shadowed_expression_macro_names(file: &syn::File) -> std::collections::HashSet<String> {
+    struct ShadowVisitor {
+        shadowed: std::collections::HashSet<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ShadowVisitor {
+        fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+            let mut aliases = Vec::new();
+            collect_tree_aliases(
+                &node.tree,
+                node.leading_colon.is_some(),
+                &mut Vec::new(),
+                &mut aliases,
+            );
+            for alias in aliases {
+                if KNOWN_SAFE_EXPRESSION_MACROS.contains(&alias.local.as_str()) {
+                    self.shadowed.insert(alias.local);
+                }
+            }
+            syn::visit::visit_item_use(self, node);
+        }
+    }
+
+    let mut visitor = ShadowVisitor {
+        shadowed: std::collections::HashSet::new(),
+    };
+    visitor.visit_file(file);
+    visitor.shadowed
 }
 
 /// Whether `tokens` contains a brace-delimited group anywhere, at any depth.
