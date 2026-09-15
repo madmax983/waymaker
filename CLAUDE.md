@@ -3942,6 +3942,35 @@ included, read at any depth for the same reason `collect_derive_names_from_meta`
 recursion is — with anything else read the same way an item-, statement- or
 type-position macro invocation already is.
 
+Round 32 found two more, on the pull request's own merge of a substantial upstream
+drift: `future_trait_implementors` had independently been rewritten on `main` to a
+lexical-scope `resolve_segments` (issues #109 and #169, PRs #160 and #176) while this
+branch built `every_resolution` and its sentinels on the older, shared alias-list
+design — the merge kept both as fully independent implementations rather than
+re-deriving either against the other's architecture, `future_trait_implementors`
+restored to `resolve_segments` verbatim and this branch's `trait_implementors`/
+`trait_implementors_for_pinned_type`/`collect_trait_implementors` left as their own
+functions. The first finding is the same macro-visitor gap as round 27's and round 28's,
+one shape further: `fn helper() { #[cfg(test)] generate_clone!(); }` is legal Rust whose
+macro statement never exists in a shipped build, but `visit_stmt_macro` read only the
+fact that a `StmtMacro` node was reached, never its own `attrs` — `syn::visit::Visit`
+dispatches a statement-level macro through this method rather than back through
+`visit_item`, the same way a field, a variant or a foreign item already needed its own
+override. The second is round 25's own `crate::`-qualification fix one segment deeper,
+and the merge is what made the full fix possible: `impl crate::traits::C for
+super::Recovery { .. }`, naming a crate-root `mod traits { pub use core::clone::Clone
+as C; }` two segments down, resolved to the bare, harmless-looking name `C` exactly the
+way a bare `crate::C` used to, because round 25 closed only that bare, two-segment
+shape — reasoning that a longer `crate::a::b::NAME` was another module's own real
+declaration, and that failing closed on it broadly rejected `waymaker-embassy/src/
+wiring.rs`'s own ordinary `use crate::dispatch::ActivityDispatcher;` when
+`every_resolution` was still `future_trait_implementors`'s scan too. That sharing had
+just ended in this same round's merge, so the reasoning no longer held: `wiring.rs` is
+a file `recovery-surface`'s own scan never reaches, and nothing in `waymaker-flash`
+names a trait or a derive through a multi-segment `crate::` path today.
+`every_resolution` now fails closed on a `crate`-qualified path of any length, not only
+the bare one.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

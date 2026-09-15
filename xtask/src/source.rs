@@ -13259,6 +13259,99 @@ mod tests {
     }
 
     #[test]
+    fn a_cfg_test_gated_macro_statement_inside_a_production_function_is_not_reported() {
+        // Found by Codex review of this change (PR #143), round 32: `fn helper() {
+        // #[cfg(test)] generate_clone!(); }` is legal Rust whose macro statement never
+        // exists in a shipped build, but `visit_stmt_macro` read only the fact that a
+        // `StmtMacro` node was reached, never its own `attrs`, so a test-only macro
+        // statement inside an otherwise-production function failed the whole file
+        // closed over code that ships with nothing generated at all.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "fn helper() {\n",
+                "    #[cfg(test)]\n",
+                "    generate_clone!();\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_macro_statement_reachable_in_production_is_still_rejected() {
+        // The positive twin: a macro statement with no `#[cfg(test)]` at all, or one
+        // gated by a condition other than exactly `test`, still ships and still fails
+        // the file closed — round 32's fix only excuses the exact `#[cfg(test)]` shape,
+        // matching how every other gate in this visitor already reads `has_cfg_test`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!("fn helper() {\n", "    generate_clone!();\n", "}\n",).to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_crate_qualified_alias_reached_through_a_nested_module_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 32: fresh evidence
+        // beyond round 25's bare `crate::C` case is a longer `crate::traits::C`, where
+        // the crate root declares `mod traits { pub use core::clone::Clone as C; }` —
+        // legal Rust that rustc resolves to `Clone` two segments down. Round 25's fix
+        // only closed the bare, two-segment `crate::NAME` shape, reasoning that a
+        // longer path was another module's own real declaration rather than an alias
+        // lookup this scan could fail closed on without rejecting
+        // `waymaker-embassy/src/wiring.rs`'s own ordinary `use crate::...;` imports —
+        // but that reasoning rested on this scan being shared with
+        // `future_trait_implementors`'s own scan of every file the crate has, which
+        // ended when that scan moved to its own `resolve_segments`. `every_resolution`
+        // now fails closed on every `crate`-qualified path, not only the bare one.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "impl crate::traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
     fn a_workspace_with_no_recovery_module_fails_closed() {
         let violations = check_recovery_surface(&kernel_source("pub fn nothing() {}\n"));
         assert_eq!(violations.len(), 1);

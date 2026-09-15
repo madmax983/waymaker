@@ -786,14 +786,11 @@ fn collect_future_implementors<'ast>(
 /// the files `recovery-surface` walks is ever the crate root). Treating the two as
 /// interchangeable let `impl crate::C for Recovery` resolve `C` against this file's own
 /// table as if `crate::` were `self::`, silently missing that the real `C` lives in
-/// `lib.rs`. `every_resolution` fails a bare, two-segment `crate::NAME` closed the same
-/// way it already fails a `super`-qualified path — but only that shape: a longer
-/// `crate::a::b::NAME` names another module's own real declaration rather than asking
-/// for an identifier lookup in a table this scan does not have, and review of the
-/// broader version found it rejecting `waymaker-embassy/src/wiring.rs`'s own `use
-/// crate::dispatch::ActivityDispatcher;` — an ordinary, unaliased import this codebase
-/// uses throughout — so that shape falls through to the plain "no matching alias, take
-/// the last segment" branch below instead, unchanged from before this round.
+/// `lib.rs`. `every_resolution` fails every `crate`-qualified path closed the same way
+/// it already fails a `super`-qualified path — round 25 only closed the bare,
+/// two-segment `crate::NAME` shape, and round 32 closed the rest once `every_resolution`
+/// stopped being shared with `future_trait_implementors`'s scan (see `every_resolution`'s
+/// own doc for why that made the narrower fix's reasoning obsolete).
 fn lookup_candidate(segments: &[String]) -> Option<(&str, &[String])> {
     match strip_self_prefix(segments) {
         [first, tail @ ..] => Some((first, tail)),
@@ -853,8 +850,9 @@ fn qualified_candidates(segments: &[String]) -> Vec<(String, &[String])> {
 /// the *crate root's* own bindings (round 25) — a file this module never reads either
 /// way, since every function here parses one file's `contents` alone — and a candidate
 /// this scan gave up chasing once its bound on how many it will explore was reached. A
-/// longer `crate::a::b::NAME` is not this shape: see `lookup_candidate`'s own doc for
-/// why only the bare, two-segment form fails closed.
+/// `crate`-qualified path of any length is this shape too: see `lookup_candidate`'s own
+/// doc, and `every_resolution`'s own doc below, for why round 25 closed only the bare,
+/// two-segment form and round 32 closed the rest.
 ///
 /// A caller checking for one specific trait name must treat this the same as a match:
 /// "this scan could not run it down" is not evidence that it is not `Clone`, and reading
@@ -915,11 +913,26 @@ const GLOB_IMPORT_MARKER: &str = "*";
 /// hand (`use A as B; use B as A;` — not something real Rust name resolution could
 /// produce, but something a text file can still spell) can make this loop unbounded: at
 /// most `aliases.len()` hops, and at most `MAX_CANDIDATES` names explored in total. Both
-/// bounds, a `super`-qualified path, and a bare `crate::NAME` met at any hop, contribute
-/// [`UNRESOLVED_DERIVE`] rather than the segment sequence a bound or a missing qualifier
-/// happened to stop resolution at — so nothing this scan stopped chasing early, and
-/// nothing it could never chase in the first place, is silently treated as a plain name
-/// that simply is not the one being looked for.
+/// bounds, a `super`-qualified path, and a `crate`-qualified path met at any hop,
+/// contribute [`UNRESOLVED_DERIVE`] rather than the segment sequence a bound or a
+/// missing qualifier happened to stop resolution at — so nothing this scan stopped
+/// chasing early, and nothing it could never chase in the first place, is silently
+/// treated as a plain name that simply is not the one being looked for.
+///
+/// The `crate`-qualified case used to be narrower — round 25 only closed a bare,
+/// two-segment `crate::NAME`, because this function was shared with
+/// `future_trait_implementors`'s own scan of every file the crate has, and failing
+/// closed on a longer `crate::a::b::NAME` there rejected `waymaker-embassy/src/
+/// wiring.rs`'s own `use crate::dispatch::ActivityDispatcher;` — a real, unaliased
+/// import that scan has to read correctly. That sharing ended when
+/// `future_trait_implementors` moved to its own lexical-scope `resolve_segments`: this
+/// function is `recovery-surface`'s alone now, over a reachable tree that never
+/// includes `wiring.rs` or any file outside `waymaker-flash`, so nothing here still
+/// needs the narrower carve-out. Round 32 found the gap it left: `impl
+/// crate::traits::C for Recovery`, naming a crate-root re-export two segments down
+/// (`mod traits { pub use core::clone::Clone as C; }`), resolved to the bare,
+/// harmless-looking name `C` exactly the way a bare `crate::C` used to — every
+/// `crate`-qualified path fails closed now, regardless of length.
 fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
     const MAX_CANDIDATES: usize = 64;
 
@@ -975,23 +988,29 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
                 finished.push(LOCAL_SHADOWED_TYPE.to_owned());
                 continue;
             }
-            // A *bare* `crate::NAME` — exactly two segments — asks to look `NAME` up
-            // in the crate root's own scope, which this scan never reads either; see
-            // `UNRESOLVED_DERIVE` and `lookup_candidate`'s own doc for why round 25
-            // added this narrowly rather than for every `crate`-qualified path. A
-            // longer `crate::a::b::NAME` is a path to another module's own
-            // declaration, not an alias lookup by a bare identifier, and review of
-            // this fix found the broad version rejecting `waymaker-embassy/src/
-            // wiring.rs`'s own `use crate::dispatch::ActivityDispatcher;` — a real,
-            // unaliased import this codebase uses throughout — so it falls through to
-            // the ordinary "no matching alias, take the last segment" branch below,
-            // exactly as any other multi-segment path this scan cannot fully resolve
-            // already does.
-            if let [first, _] = current.as_slice() {
-                if first == "crate" {
-                    finished.push(UNRESOLVED_DERIVE.to_owned());
-                    continue;
-                }
+            // A `crate::`-qualified path — of any length — names something in the
+            // crate root's own scope, which this scan never reads: every function
+            // here parses one file's `contents` alone, and none of the files
+            // `recovery-surface` walks is ever the crate root. Round 25 fixed only
+            // the bare, two-segment `crate::NAME` shape, reasoning that a longer
+            // `crate::a::b::NAME` names another module's own real declaration rather
+            // than asking for an identifier lookup in a table this scan does not
+            // have — but that reasoning rested on `every_resolution` being shared
+            // with `future_trait_implementors`'s scan of every file in the crate,
+            // `waymaker-embassy/src/wiring.rs`'s own `use crate::dispatch::
+            // ActivityDispatcher;` included, where failing closed on the longer shape
+            // really did reject an ordinary, unaliased import. The two scans no
+            // longer share this function — `future_trait_implementors` now resolves
+            // through its own lexical-scope `resolve_segments` — so `every_resolution`
+            // is recovery-surface's alone, and round 32 found the gap the narrower
+            // fix left open: `impl crate::traits::C for Recovery`, where the crate
+            // root's own `mod traits { pub use core::clone::Clone as C; }` re-exports
+            // `Clone` two segments down, resolved to the bare, harmless-looking name
+            // `C` exactly the way a bare `crate::C` used to. Every `crate`-qualified
+            // path now fails closed the same way a `super`-qualified one already does.
+            if current.first().is_some_and(|first| first == "crate") {
+                finished.push(UNRESOLVED_DERIVE.to_owned());
+                continue;
             }
             if current.is_empty() {
                 continue;
@@ -2122,7 +2141,16 @@ pub fn declares_item_macro(contents: &str) -> Result<bool, syn::Error> {
             self.found = true;
         }
 
-        fn visit_stmt_macro(&mut self, _node: &'ast syn::StmtMacro) {
+        // Round 32: a statement-position macro invocation carries its own attributes
+        // the same way an item does, and `#[cfg(test)] generate_clone!();` inside an
+        // otherwise-production function body does not exist in a shipped build — but
+        // this override read only the fact that a `StmtMacro` node was reached, never
+        // its own `attrs`, so a test-only macro statement failed the whole file closed
+        // over code that ships with nothing generated at all.
+        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+            if has_cfg_test(&node.attrs) {
+                return;
+            }
             self.found = true;
         }
 
