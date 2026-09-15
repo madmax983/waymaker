@@ -4247,6 +4247,34 @@ pub const EFFECT_PROOF_FIELDS: &[&str] = &["bytes", "id", "intent", "request"];
 /// caller hand `Activities::perform` a pair the check never vouched for.
 pub const EFFECT_NO_SELF_LITERAL: [&str; 3] = ["CheckedDispatch", "DurableIntent", "Dispatchable"];
 
+/// Attribute names `effect.rs` may carry without further scrutiny, because the compiler
+/// interprets every one of them directly — none has a macro behind it that could expand
+/// into a construction site.
+///
+/// `cfg_attr` is deliberately absent: it can emit an arbitrary attribute, and `effect.rs`
+/// has no legitimate use for one today, so it is refused rather than classified recursively.
+pub const EFFECT_ALLOWED_ATTRIBUTES: &[&str] = &[
+    "allow", "cfg", "deny", "doc", "forbid", "ignore", "must_use", "test", "warn",
+];
+
+/// `#[derive(..)]` names `effect.rs` may carry: the compiler's own derives.
+///
+/// Each expands to a trait `impl` for the deriving type alone and can add no method, no
+/// construction and no field rewrite. A custom derive is an unexamined external expansion,
+/// the shape issue [#92](https://github.com/madmax983/waymaker/issues/92)'s macro-invocation
+/// round closed for a bang macro and this round closes for a derive.
+pub const EFFECT_ALLOWED_DERIVES: &[&str] = &[
+    "Clone",
+    "Copy",
+    "Debug",
+    "Default",
+    "Eq",
+    "Hash",
+    "Ord",
+    "PartialEq",
+    "PartialOrd",
+];
+
 /// The type that owns each body §07's storage steps happen in, and that body's name.
 ///
 /// The owner is load-bearing. `braced_body` takes the *first* match in the file, so a private
@@ -7828,6 +7856,7 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     violations.extend(check_effect_proof_fields_are_not_rebound(&source.contents));
     violations.extend(check_no_projected_type_aliases(&source.contents));
     violations.extend(check_effect_invokes_no_macro(&source.contents));
+    violations.extend(check_effect_attributes_are_audited(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
@@ -8240,6 +8269,54 @@ fn check_effect_invokes_no_macro(contents: &str) -> Vec<Violation> {
                  proof-field rebinding where no scan here can read it"
             ),
         )],
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
+}
+
+/// `effect.rs` carries no attribute outside `EFFECT_ALLOWED_ATTRIBUTES`, and no
+/// `#[derive(..)]` naming anything outside `EFFECT_ALLOWED_DERIVES`, anywhere in the file
+/// outside `#[cfg(test)]`.
+///
+/// A procedural attribute macro or a custom derive is not a `syn::Macro` invocation at all —
+/// it is a `syn::Attribute` — so `check_effect_invokes_no_macro` just above, however
+/// exhaustive over every invocation shape, cannot see one: Codex found this the round after
+/// that check closed, since `#[forge]` on a method or `#[derive(Forge)]` on a struct expands
+/// in its own defining crate with nothing here able to read what comes out. The same hard
+/// refusal this file already gives a macro invocation and a qualified associated-type
+/// projection applies here: every attribute is required to be one the compiler itself
+/// interprets with no macro behind it, rather than an attempt to resolve what an unfamiliar
+/// name expands to.
+fn check_effect_attributes_are_audited(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::unaudited_attributes(
+        contents,
+        EFFECT_ALLOWED_ATTRIBUTES,
+        EFFECT_ALLOWED_DERIVES,
+    ) {
+        Ok(found) if found.is_empty() => Vec::new(),
+        Ok(mut found) => {
+            found.sort_unstable();
+            found.dedup();
+            vec![Violation::new(
+                RULE,
+                DRIVER,
+                format!(
+                    "{found:?} is an attribute or derive {EFFECT_PROTOCOL_PATH} does not \
+                     interpret itself: a procedural macro or a custom derive can expand into \
+                     a `CheckedDispatch` literal or a proof-field rebinding where no scan \
+                     here can read it"
+                ),
+            )]
+        }
         Err(error) => vec![Violation::new(
             RULE,
             DRIVER,
@@ -12902,6 +12979,51 @@ mod deferred_answer_pins {
             details
                 .iter()
                 .any(|detail| detail.contains("invokes a macro")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_procedural_attribute_in_the_effect_protocol_file_is_reported() {
+        // Codex's sixteenth round: `#[forge]` is a `syn::Attribute`, not a `syn::Macro`
+        // invocation, so `invokes_any_macro`'s `visit_macro` override never sees it — an
+        // attribute macro can rewrite the item it decorates from its own defining crate,
+        // invisible to this file's unexpanded tokens.
+        let source =
+            tests_support::clean_effect_module() + "#[forge]\nfn extra() {\n    let _ = 1;\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("forge")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_custom_derive_in_the_effect_protocol_file_is_reported() {
+        // The `derive` half of the same gap: `#[derive(Forge)]` is a procedural macro too,
+        // and a plain allowlist of the identifier `derive` would wave every entry in it
+        // through, custom derives included.
+        let source = tests_support::clean_effect_module() + "#[derive(Forge)]\nstruct Extra;\n";
+        let details = effect_details(&source);
+        assert!(
+            details.iter().any(|detail| detail.contains("Forge")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_effect_protocol_std_derives_are_not_reported() {
+        // The positive half: the file's own real derives — `Clone, Copy, Debug`, and so on
+        // on `EffectId`, `ActivityKind`, etc. — must stay legal, or the allowlist is too
+        // narrow for the file it is pinned against.
+        let source = tests_support::clean_effect_module()
+            + "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Ord, PartialOrd)]\n\
+               struct Extra;\n";
+        let details = effect_details(&source);
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("attribute or derive")),
             "{details:?}"
         );
     }

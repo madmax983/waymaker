@@ -147,6 +147,16 @@ fn attribute_text(attribute: &syn::Attribute) -> String {
         .collect()
 }
 
+/// Render a path the same whitespace-free, raw-marker-stripped way [`attribute_text`]
+/// renders a whole attribute, for naming a `#[derive(..)]` entry in a violation message.
+fn path_text(path: &syn::Path) -> String {
+    unraw_tokens(path.to_token_stream())
+        .to_string()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
 /// The crate-root inner attributes of `contents`, in source order.
 ///
 /// Only `syn::File::attrs` is read: attributes on nested modules, functions, or
@@ -1162,6 +1172,99 @@ pub fn invokes_any_macro(contents: &str) -> Result<bool, syn::Error> {
 
     let file = parse_rust(contents)?;
     let mut visitor = AnyMacro { found: false };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
+/// Every attribute name `contents` carries, outside `#[cfg(test)]`, that is not
+/// `allowed_attributes` or a `#[derive(..)]` naming only `allowed_derives`.
+///
+/// Each is returned as the bare name (`"forge"`) or, for a rejected derive, as
+/// `"derive(Path)"`. A procedural attribute macro or a custom derive is a macro surface neither
+/// [`struct_literal_counts`]'s item walk nor [`invokes_any_macro`]'s `visit_macro` override
+/// ever sees: it is not a `syn::Macro` invocation at all, and its expansion runs in its own
+/// defining crate, invisible to a scan that only reads this file's *unexpanded* tokens
+/// (issue #92 — Codex found this the round after `invokes_any_macro` closed every
+/// invocation shape, because an attribute is represented as `syn::Attribute`, a wrapper
+/// `visit_macro` is never called for). `#[forge]` on a method, or `#[derive(Forge)]` on a
+/// struct, could rewrite a checked body or emit an unchecked construction with nothing here
+/// able to read what it expands to. Rather than try to resolve what a name expands to —
+/// which needs a compiler, not a scanner, exactly like resolving a qualified associated-type
+/// projection does — every attribute is required to be one of a fixed set the compiler
+/// itself interprets with no macro behind it at all; a derive is checked further, since
+/// `#[derive(A, B)]` can mix an inert compiler derive with a custom one in the same
+/// attribute.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn unaudited_attributes(
+    contents: &str,
+    allowed_attributes: &[&str],
+    allowed_derives: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    fn note(attrs: &[syn::Attribute], allowed: &[&str], derives: &[&str], found: &mut Vec<String>) {
+        for attr in attrs {
+            let Some(name) = attr.path().get_ident().map(ident_name) else {
+                found.push(path_text(attr.path()));
+                continue;
+            };
+            if name == "derive" {
+                match attr.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                ) {
+                    Ok(paths) => {
+                        for path in &paths {
+                            let is_allowed = path
+                                .get_ident()
+                                .is_some_and(|ident| derives.contains(&ident_name(ident).as_str()));
+                            if !is_allowed {
+                                found.push(format!("derive({})", path_text(path)));
+                            }
+                        }
+                    }
+                    Err(_) => found.push("derive(..)".to_string()),
+                }
+                continue;
+            }
+            if !allowed.contains(&name.as_str()) {
+                found.push(name);
+            }
+        }
+    }
+
+    struct Attrs<'a> {
+        allowed: &'a [&'a str],
+        derives: &'a [&'a str],
+        found: Vec<String>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Attrs<'_> {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            let attrs = item_attrs(node);
+            if has_cfg_test(attrs) {
+                return;
+            }
+            note(attrs, self.allowed, self.derives, &mut self.found);
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            let attrs = impl_item_attrs(node);
+            if has_cfg_test(attrs) {
+                return;
+            }
+            note(attrs, self.allowed, self.derives, &mut self.found);
+            syn::visit::visit_impl_item(self, node);
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = Attrs {
+        allowed: allowed_attributes,
+        derives: allowed_derives,
+        found: Vec::new(),
+    };
     visitor.visit_file(&file);
     Ok(visitor.found)
 }

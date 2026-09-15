@@ -285,6 +285,26 @@ included, without naming any of them individually; the identifier-only check in
 any macro use at all, outside `#[cfg(test)]`. `a_macro_invocation_in_the_effect_protocol_file_is_reported`
 is the regression, confirmed RED against the identifier-only check.
 
+**A third round in the same family found the shape neither of the first two catches.** An
+attribute macro or a custom derive is a `syn::Attribute`, not a `syn::Macro` invocation, so
+`invokes_any_macro`'s `visit_macro` override — however exhaustive over every invocation shape
+— never sees `#[forge]` on a method or `#[derive(Forge)]` on a struct: each expands in its
+own defining crate with nothing here able to read what comes out. `crate::parse::unaudited_attributes`
+closes it the same way as the two before it — a hard refusal rather than an attempt to
+resolve what an unfamiliar name expands to — requiring every attribute in `effect.rs` to be
+one of a fixed set the compiler itself interprets with no macro behind it
+(`source::EFFECT_ALLOWED_ATTRIBUTES`), and a `#[derive(..)]` to name only the compiler's own
+derives (`source::EFFECT_ALLOWED_DERIVES`), each name in the list checked on its own since
+one attribute can mix an inert compiler derive with a custom one. `cfg_attr` is refused
+outright rather than classified recursively, since it can emit an arbitrary attribute and
+`effect.rs` has no legitimate use for one today. Three rounds deep in this macro-opacity
+family — this project's own review-depth guidance is to stop past two or three rounds and
+open an issue once a fourth still finds real bugs — so a fourth finding of this shape goes to
+a new issue rather than a fourth round here.
+`a_procedural_attribute_in_the_effect_protocol_file_is_reported` and
+`a_custom_derive_in_the_effect_protocol_file_is_reported` are the regressions, confirmed RED
+against the unpatched rule.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch
