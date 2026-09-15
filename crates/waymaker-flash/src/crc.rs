@@ -44,16 +44,25 @@
 //!
 //! ADR 0010 kept both bitwise "until a profile of a real workload says otherwise", naming
 //! the nibble table as the most likely answer if one ever did.
-//! [ADR 0045](https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md)
-//! is that profile, and it splits in two rather than landing where ADR 0010 expected.
-//! [`crc16_nibble`] needs no table at all: for this specific polynomial, four rounds over a
-//! single nibble reduce to one multiply, with no rodata and no lookup — `crc16` stays
-//! table-free in the fullest sense, just no longer bit-serial. [`crc32_nibble`] has no such
-//! reduction — its sixteen values are compiled from [`crc32_nibble_table`]'s sixteen-armed
-//! `match`, which is a 64 B lookup table in every way that costs, even though no `[u32; 16]`
-//! appears in this file's source; the `integrity-check` gate's `INTEGRITY_CHECK_TABLES`
-//! pins that shape specifically, so it is a decision with a name attached rather than a
-//! `match` statement nobody looked at twice.
+//! [ADR 0046](https://github.com/madmax983/waymaker/blob/main/docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md)
+//! answered that first, from a host instruction profile showing both checksums as a large
+//! share of engine instructions in every workload that runs them: [`crc16_nibble`] needs no
+//! table at all — for this specific polynomial, four rounds over a single nibble reduce to
+//! one multiply, with no rodata and no lookup, so `crc16` stays table-free in the fullest
+//! sense, just no longer bit-serial. `crc32`'s reflected polynomial has no such reduction,
+//! so ADR 0046 declined a table for it on the reasoning that a host instruction count is
+//! not the real-flash, real-latency test ADR 0010 asked for, and kept the bitwise loop —
+//! branchless, masked rather than compared, but still eight rounds.
+//!
+//! [ADR 0053](https://github.com/madmax983/waymaker/blob/main/docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md)
+//! revisits that one clause, on the same kind of evidence, measured against ADR 0046's own
+//! branchless loop rather than the bit-loop it replaced: [`crc32_nibble`] and
+//! [`crc32_nibble_table`] still cut engine instructions by double digits on every workload
+//! that runs them, so ADR 0053 supersedes ADR 0046's `crc32` clause and adds the table —
+//! [`crc32_nibble_table`]'s sixteen-armed `match`, which is a 64 B lookup table in every way
+//! that costs even though no `[u32; 16]` appears in this file's source; the
+//! `integrity-check` gate's `INTEGRITY_CHECK_TABLES` pins that shape specifically, so it is
+//! a decision with a name attached rather than a `match` statement nobody looked at twice.
 //!
 //! One property the choice gives up, recorded because it is the only place the two
 //! candidates genuinely differ: ISO-HDLC is primitive, so its Hamming distance falls from 4
@@ -162,7 +171,7 @@ pub(crate) const fn crc32(bytes: &[u8]) -> u32 {
 #[inline(always)]
 #[allow(
     clippy::inline_always,
-    reason = "LLVM only builds crc32_nibble_table's table when this body is visible at each arm first; a soft #[inline] measured as a real call per nibble instead, see ADR 0045"
+    reason = "LLVM only builds crc32_nibble_table's table when this body is visible at each arm first; a soft #[inline] measured as a real call per nibble instead, see ADR 0053"
 )]
 const fn crc32_nibble(nibble: u8) -> u32 {
     // `crc16_nibble`'s reason: named once, in the function that now owns it.
@@ -187,23 +196,23 @@ const fn crc32_nibble(nibble: u8) -> u32 {
 /// `crc32_nibble` and nothing else, over the full masked range of a nibble with no gap and
 /// no repeat. LLVM's own switch-to-lookup-table pass is what turns that shape into a single
 /// indexed load from a table it builds in `.rodata` on every target this crate has been
-/// disassembled for so far — [ADR 0045] is where that disassembly and the reproduction
+/// disassembled for so far — [ADR 0053] is where that disassembly and the reproduction
 /// steps for it live, the same way ADR 0010's cycle counts are a dated, by-hand measurement
 /// rather than a thing CI re-derives on every run, and for the same reason: there is no
 /// gate here that could tell "a compiler stopped applying this optimisation" apart from "a
 /// compiler applied a different one that costs the same", so this stays a documented,
 /// reproducible claim rather than a green check that would read as more than it is.
-/// [ADR 0045] is the decision that this specific, sixteen-entry, `crc32`-only table is worth
+/// [ADR 0053] is the decision that this specific, sixteen-entry, `crc32`-only table is worth
 /// 64 B of `.rodata`; the `integrity-check` gate's `INTEGRITY_CHECK_TABLES` pins its
 /// *shape* — this function's name, `crc32_nibble`'s name, and the count sixteen — so a
 /// seventeenth arm, a seventh helper, or a second table elsewhere in this file is still
 /// exactly the surprise ADR 0010 wanted a decision attached to.
 ///
-/// [ADR 0045]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-a-nibble-table-is-a-superseding-adr-and-crc16-needed-none.md
+/// [ADR 0053]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md
 #[inline(always)]
 #[allow(
     clippy::inline_always,
-    reason = "a soft #[inline] left this match uninlined into crc32's loop, measured as a real call per nibble rather than a table load, see ADR 0045"
+    reason = "a soft #[inline] left this match uninlined into crc32's loop, measured as a real call per nibble rather than a table load, see ADR 0053"
 )]
 const fn crc32_nibble_table(nibble: u8) -> u32 {
     match nibble & 0xF {
@@ -356,6 +365,23 @@ mod tests {
                 assert_ne!(crc32(&flipped), clean32, "byte {index} bit {bit}");
             }
         }
+    }
+
+    #[test]
+    fn crc32_does_not_reduce_to_a_nibble_multiply() {
+        // ADR 0046 declines the same shortcut for CRC-32/ISO-HDLC: its reflected polynomial
+        // sets bits across the whole word, so a nibble's four rounds do not equal a plain
+        // multiply. This pins that fact so nobody applies CRC-16's trick here without
+        // re-deriving it.
+        const POLY: u32 = 0xEDB8_8320;
+
+        let mut folded = 1u32;
+        for _ in 0..4 {
+            let mask = 0u32.wrapping_sub(folded & 1);
+            folded = (folded >> 1) ^ (mask & POLY);
+        }
+
+        assert_ne!(folded, 1u32.wrapping_mul(POLY));
     }
 
     #[test]

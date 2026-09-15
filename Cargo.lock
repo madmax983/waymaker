@@ -411,7 +411,6 @@ name = "waymaker-drive"
 version = "0.0.0"
 dependencies = [
  "waymaker-core",
- "waymaker-embassy",
  "waymaker-fault",
  "waymaker-flash",
  "waymaker-rig",
@@ -431,10 +430,23 @@ dependencies = [
 name = "waymaker-emu"
 version = "0.0.0"
 dependencies = [
+ "cortex-m",
  "cortex-m-rt",
  "cortex-m-semihosting",
  "embedded-storage",
  "waymaker-conformance",
+ "waymaker-flash",
+ "waymaker-rig",
+]
+
+[[package]]
+name = "waymaker-facade-demo"
+version = "0.0.0"
+dependencies = [
+ "waymaker-core",
+ "waymaker-drive",
+ "waymaker-embassy",
+ "waymaker-fault",
  "waymaker-flash",
  "waymaker-rig",
 ]
@@ -504,6 +516,7 @@ dependencies = [
  "waymaker-core",
  "waymaker-drive",
  "waymaker-embassy",
+ "waymaker-facade-demo",
  "waymaker-fault",
  "waymaker-flash",
  "waymaker-rig",

@@ -461,17 +461,20 @@ fn a_reserve_carries_what_continue_as_new_costs_the_bank_it_rolls_into() {
 
 #[test]
 fn what_a_record_still_owes_is_a_function_of_its_kind_alone() {
-    // The exit cost §14 makes load-bearing. A schedule owes an outcome *and* a terminal
-    // record, because §08's transition table has no edge from an unresolved effect to a
-    // terminal one; an outcome owes only the terminal record; a terminal record owes
-    // nothing.
+    // The exit cost §14 makes load-bearing. A schedule owes one wasted outcome attempt, an
+    // outcome, *and* a terminal record — the wasted attempt is issue #95's: recovery can
+    // ignore one torn, otherwise-clean outcome and redeliver in place, and those bytes are
+    // gone for the bank's life, so the schedule has to reserve for it up front. §08's
+    // transition table has no edge from an unresolved effect to a terminal one, which is why
+    // an outcome is owed at all; an outcome owes only the terminal record; a terminal record
+    // owes nothing.
     let reserve = reserve();
     let outcome_width = width(&outcome(0));
     let terminal_width = width(&terminal());
 
     assert_eq!(
         reserve.exit_bytes_after(&schedule(0)),
-        outcome_width + terminal_width
+        outcome_width + outcome_width + terminal_width
     );
     assert_eq!(reserve.exit_bytes_after(&outcome(0)), terminal_width);
     assert_eq!(
@@ -1077,6 +1080,76 @@ fn a_terminal_only_reserve_strands_a_run_with_an_effect_outstanding() {
         seq = seq.saturating_add(1);
     }
     unreachable!("a terminal-only reserve strands this run before the journal is full")
+}
+
+#[test]
+fn a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry() {
+    // A second tempting arithmetic, found by Codex's review of issue #95's fix rather than
+    // by writing it down. That issue lets `Recovery` ignore one torn, otherwise-clean
+    // outcome attempt and redeliver the effect in the same run, rather than losing the bank
+    // to `continue_as_new`. But the bytes the torn attempt consumed cannot be reclaimed on
+    // NOR, and a schedule admitted at the reserve boundary leaves room for exactly one
+    // outcome and the terminal record. Without `redelivery_slack`, a single tear there costs
+    // the bank the only outcome-sized slot it had left: dispatch happens on `Ending::Clean`,
+    // before capacity is ever checked, so the activity would be redelivered on every later
+    // boot while the retry that has to record its outcome refuses with `NearCapacity`
+    // forever — the effect performed again and again with no way to ever terminate it.
+    let mut device = Nor::new(geometry());
+    let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
+
+    // How many ordinary (schedule, outcome) pairs this bank holds, so the *last* one can be
+    // driven by hand below and torn instead of completed.
+    let total = {
+        let mut writer = reserved(&mut device, region);
+        fill_to_the_boundary(&mut writer, &mut device)
+    };
+    assert!(total > 0, "a 4 KiB bank holds at least one effect");
+
+    let mut device = Nor::new(geometry());
+    let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
+    let mut writer = reserved(&mut device, region);
+    for seq in 0..total.saturating_sub(1) {
+        commit(&mut writer, &mut device, &schedule(seq)).expect("an earlier effect, admitted");
+        commit(&mut writer, &mut device, &outcome(seq)).expect("and resolved");
+    }
+    let last = total.saturating_sub(1);
+    commit(&mut writer, &mut device, &schedule(last)).expect("the last effect this bank admits");
+    let room_before_the_tear = writer.journal().room();
+
+    // Tear the outcome: the frame body and its padding land, the commit seal never does.
+    // `Staged`/`Sealable` are `#[must_use]`; dropping the `Sealable` unused, without ever
+    // calling `commit`, is the documented, legal way to leave an unsealed frame on media.
+    let mut page = [0_u8; PAGE];
+    let staged = writer
+        .stage(&mut device, &outcome(last), &mut page)
+        .expect("the last outcome is admitted");
+    let _sealable = staged
+        .payload_barrier()
+        .expect("the payload barrier returns");
+
+    // The boot after the crash. Confirm this is exactly issue #95's recoverable shape before
+    // asking anything of capacity.
+    let mut recovery_page = [0_u8; PAGE];
+    let mut recovery = Recovery::new(region, &mut device);
+    while recovery.next(&mut recovery_page).is_some() {}
+    assert!(
+        matches!(recovery.ending(), Some(Ending::Clean { .. })),
+        "every byte past the torn outcome's own length is erased, so recovery ignores it \
+         and keeps scanning rather than refusing the bank"
+    );
+
+    let mut rebooted = reserved(&mut device, region);
+    assert!(
+        rebooted.journal().room() < room_before_the_tear,
+        "the torn slot cost real bytes recovery cannot give back"
+    );
+
+    // The retry: the *same* outcome, at the *same* sequence, still fits — which is exactly
+    // what `redelivery_slack` buys. Without it this refuses with `NearCapacity`, and the run
+    // can never record this effect's outcome again.
+    commit(&mut rebooted, &mut device, &outcome(last))
+        .expect("the reserve kept room for exactly this retry");
+    commit(&mut rebooted, &mut device, &terminal()).expect("and the exit after it");
 }
 
 // ---------------------------------------------------------------------------------------

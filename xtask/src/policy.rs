@@ -154,6 +154,16 @@ pub const EMULATION_CRATES: &[&str] = &["waymaker-emu"];
 /// "`waymaker-embassy` is a façade and nothing more" falsifiable rather than intended. See
 /// [ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
 ///
+/// `waymaker-facade-demo` is issue
+/// [#106](https://github.com/madmax983/waymaker/issues/106)'s bridge from `waymaker-drive`
+/// to `waymaker-embassy`, and design document §06's two examples run through it. It used to
+/// be three modules of `waymaker-drive` itself, removed by a feature flag to test that the
+/// driver did not need them — which proved only that no *other* module needed them, since
+/// the manifest edge to `waymaker-embassy` stayed. Moving the edge to a crate of its own
+/// makes `waymaker-drive`'s independence a fact about the resolved dependency graph rather
+/// than about a build with a flag set. See
+/// [ADR 0032](https://github.com/madmax983/waymaker/blob/main/docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md).
+///
 /// What this category does *not* license is a layer depending on one of these, in any
 /// dependency kind: [`check_dependency_direction`](crate::graph::check_dependency_direction)
 /// reads [`LAYERS`] and nothing else, so `waymaker-flash` gaining a dev-dependency on
@@ -165,25 +175,34 @@ pub const TEST_SUPPORT_CRATES: &[&str] = &[
     "waymaker-conformance",
     "waymaker-rig",
     "waymaker-drive",
+    "waymaker-facade-demo",
 ];
 
 /// Test-support crates that claim to be `#![no_std]` and allocation-free.
 ///
 /// A subset of [`TEST_SUPPORT_CRATES`], because most of that category is host code:
 /// `waymaker-fault` models media in a `Vec` and `waymaker-spec` enumerates a state space, and
-/// asking either for `#![no_std]` would be asking it to stop doing its job. These three make
+/// asking either for `#![no_std]` would be asking it to stop doing its job. These four make
 /// the claim, each for a reason of its own — `waymaker-conformance` because the adapter
 /// author it exists for may only be able to run it on the target the driver is for,
 /// `waymaker-rig` because a rig that could only run on a host would be a simulation wearing a
-/// rig's name, and `waymaker-drive` because issue #28's "done when" is a workflow driven to
-/// completion with "no `Future`, no Embassy, and **no allocation**".
+/// rig's name, `waymaker-drive` because issue #28's "done when" is a workflow driven to
+/// completion with "no `Future`, no Embassy, and **no allocation**", and
+/// `waymaker-facade-demo` for the same reason one layer up: issue #106's crate split moved
+/// design document §06's two examples off `waymaker-drive`, and a bridge that could only be
+/// built for the host would leave that claim unchecked on the one crate that names the
+/// façade at all.
 ///
 /// The firmware-target build stages are what hold the `std` half; they cannot hold the
 /// allocation half, because `cargo build --lib` produces an rlib and never links, so no
-/// global allocator is required and an `extern crate alloc` under any of these three would
+/// global allocator is required and an `extern crate alloc` under any of these four would
 /// compile clean. [`crate::source::check_crate_attributes`] is what fails a build over it.
-pub const NO_STD_TEST_SUPPORT_CRATES: &[&str] =
-    &["waymaker-conformance", "waymaker-rig", "waymaker-drive"];
+pub const NO_STD_TEST_SUPPORT_CRATES: &[&str] = &[
+    "waymaker-conformance",
+    "waymaker-rig",
+    "waymaker-drive",
+    "waymaker-facade-demo",
+];
 
 /// The crate that is allowed to know about Embassy.
 pub const EMBASSY_FACADE: &str = "waymaker-embassy";

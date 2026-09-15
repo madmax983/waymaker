@@ -1,4 +1,3 @@
-#![cfg(not(feature = "without-facade"))]
 //! Design document §06's provisioning example, over real media.
 //!
 //! Issue [#38](https://github.com/madmax983/waymaker/issues/38)'s second example. Where
@@ -14,15 +13,16 @@ use core::task::{Context as Task, Poll};
 
 use waymaker_core::{ActivityKind, EffectId, RecordRef, RunId};
 use waymaker_drive::demo::World;
-use waymaker_drive::provisioning::{
-    BOUNDS, DEVICE_ID, EXHAUSTED, MAX_ATTEMPTS, Provisioning, ProvisioningContext, REGISTER,
-    Registrar, TOKEN, TOKEN_BYTES, WINDOW, WORKFLOW_FUTURES, poll_provisioning,
-};
 use waymaker_drive::{
     Boundary, Conclusion, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
 use waymaker_embassy::dispatch::Produced;
+use waymaker_facade_demo::ota;
+use waymaker_facade_demo::provisioning::{
+    BOUNDS, DEVICE_ID, EXHAUSTED, MAX_ATTEMPTS, Provisioning, ProvisioningContext, REGISTER,
+    Registrar, TOKEN, TOKEN_BYTES, WINDOW, WORKFLOW_FUTURES, poll_provisioning,
+};
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
@@ -429,7 +429,7 @@ fn the_context_is_the_same_size_for_every_concrete_ctx() {
     // checked here rather than assumed.
     assert_eq!(
         size_of::<ProvisioningContext<'static>>(),
-        waymaker_drive::ota::CONTEXT_BYTES,
+        ota::CONTEXT_BYTES,
     );
 }
 

@@ -38,12 +38,13 @@
 use waymaker_core::{ActivityKind, EffectSeq, RecordRef, RunId};
 use waymaker_flash::append::{AppendError, Journal};
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation, LayoutError};
+use waymaker_flash::capacity::{CapacityError, Refusal, Reserve, Reserved, ReservedError};
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::recovery::{Ending, JournalRegion, Recovery, RecoveryError, RegionError};
 use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
 use crate::audit::{Audit, Breach};
-use crate::cutter::{Cutter, Dispatcher};
+use crate::cutter::{Cutter, Dispatcher, NeverCut};
 use crate::log::{Entry, Outcome};
 use crate::phase::Phase;
 use crate::plan::{Cut, Plan};
@@ -116,6 +117,10 @@ pub enum RigError<E, D = core::convert::Infallible> {
     },
     /// The four units are not a geometry.
     Geometry(GeometryError),
+    /// §10's reserve refused the record, before the device was asked for anything.
+    Capacity(Refusal),
+    /// `reserve` does not describe this journal.
+    Reserve(CapacityError),
 }
 
 /// What a verification found, and the evidence it found it from.
@@ -648,10 +653,27 @@ impl Rig {
         Ok(want)
     }
 
-    /// The journal region of the bank this rig writes into.
+    /// The journal region of the bank this rig writes into, refusing unless that bank's
+    /// header names `workload`'s own run and its own declared workflow identity.
+    ///
+    /// `require_own_authority` names the *bank*; this names the *run*. Review found the gap
+    /// between them: a bank that is this rig's own and currently authoritative can still
+    /// have been installed for a different iteration, and without this check `iterate` and
+    /// its siblings would write one iteration's records and witness marks into another
+    /// iteration's journal rather than refuse — the write-path twin of the check
+    /// [`installed_journal`](Self::installed_journal) already makes `resume` and
+    /// `recover_prefix` pass.
+    ///
+    /// A run id agreeing is not the whole of a workflow's identity: nothing stops the public
+    /// swap surface installing a header that reuses a run id while declaring a different
+    /// `workflow_kind` or input — a real boot compares both against the journal's own
+    /// `RunStarted` (`crates/waymaker-drive/src/drive.rs`), so a bank a boot would refuse as
+    /// `NotThisWorkflow` used to be one this write path accepted on the strength of the run
+    /// id alone.
     fn journal_region<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
+        workload: Workload,
         page: &mut [u8],
     ) -> Result<JournalRegion, RigError<S::Error>> {
         let read = self.read_header(engine, Self::BANK, page)?;
@@ -661,36 +683,91 @@ impl Rig {
         let Ok(header) = bank::decode_header(bytes) else {
             return Err(RigError::Bank);
         };
+        if header.run != workload.run() {
+            return Err(RigError::Bank);
+        }
+        let mut start_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let Some(RecordRef::RunStarted {
+            workflow_kind,
+            workflow_version,
+            input,
+        }) = workload.record(0, &mut start_page)
+        else {
+            return Err(RigError::Workload);
+        };
+        if header.workflow_kind != workflow_kind
+            || header.workflow_version != workflow_version
+            || header.input != input
+        {
+            return Err(RigError::Bank);
+        }
         JournalRegion::of(self.layout, Self::BANK, &header).map_err(RigError::Region)
     }
 
     /// The journal of the bank *this run* was installed in, or `None` if it was never
     /// installed on this part.
     ///
-    /// Three ways to answer `None`, and each of them is a part that has nothing to say about
-    /// `workload`'s run rather than a part that lost something:
+    /// For a caller that means to *continue* the run — [`resume`](Self::resume) and
+    /// [`recover_prefix`](Self::recover_prefix) — so it is gated on [`Rig::BANK`] being the
+    /// bank a boot would choose right now, not merely on its header naming this run. Three
+    /// ways to answer `None`, and each of them is a part this call has nothing to
+    /// continue rather than a part that lost something:
     ///
     /// * no bank is authoritative, or two are — preparation was cut before its generation
     ///   seal landed, which is the state every part is in before its first one;
-    /// * the authoritative bank's header does not decode — there is no journal region to
-    ///   derive, and §14's `frame ignored; previous history prefix wins` is about frames
-    ///   inside a journal rather than about the header that names one;
-    /// * the header decodes and names a **different run** — the part is still the previous
-    ///   iteration's, which is exactly the window a reset during `prepare` opens.
-    ///
-    /// The run id is the comparison rather than the whole header because that is what makes a
-    /// bank *belong* to a run: [`Workload::run`] draws it from the seed and the iteration, so
-    /// two iterations of one plan never share one.
+    /// * a bank *is* authoritative, but it is not [`Rig::BANK`]. A swap moved authority to
+    ///   the other bank. [`Rig::BANK`]'s header still names the retired run (issue
+    ///   [#96](https://github.com/madmax983/waymaker/issues/96): `Rig::judge` and
+    ///   `Rig::resume` used to trust [`Rig::BANK`] by run id alone. A swap leaves the losing
+    ///   bank's header untouched, so that check gave a false positive) — [`own_bank_journal`]
+    ///   is the twin that does not gate on this, for [`judge`](Self::judge)'s different
+    ///   question;
+    /// * [`own_bank_journal`] answered `None`, for either of its own two reasons.
     fn installed_journal<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
         workload: Workload,
-        banks: usize,
+        authority: bank::Authority,
         page: &mut [u8],
     ) -> Result<Option<JournalRegion>, RigError<S::Error>> {
-        if banks != 1 {
+        let bank::Authority::Bank { id: Self::BANK, .. } = authority else {
             return Ok(None);
-        }
+        };
+        self.own_bank_journal(engine, workload, page)
+    }
+
+    /// [`Rig::BANK`]'s own journal, if its header names `workload`'s run — regardless of
+    /// which bank is authoritative right now.
+    ///
+    /// For [`judge`](Self::judge) alone. A bank's own written history does not change when
+    /// a swap moves authority away from it: issue
+    /// [#96](https://github.com/madmax983/waymaker/issues/96)'s rows 7 and 8 leave
+    /// [`Rig::BANK`]'s own history exactly as intact after a swap as before it, so auditing
+    /// what this bank's witness claimed against what its own journal holds is sound whether
+    /// or not this bank is still the one a boot would choose. [`installed_journal`] is the
+    /// authority-gated twin a caller that means to *continue* the run needs instead, because
+    /// continuing does depend on which bank a boot would choose and auditing history does
+    /// not. Reverting to this call alone in [`installed_journal`] reproduces the defect that
+    /// twin exists to refuse — see its own documentation.
+    ///
+    /// Two ways to answer `None`, both a part with nothing to say about `workload`'s run
+    /// rather than a part that lost something:
+    ///
+    /// * the header does not decode — there is no journal region to derive, and §14's
+    ///   `frame ignored; previous history prefix wins` is about frames inside a journal
+    ///   rather than about the header that names one;
+    /// * the header decodes and names a **different run** — the part is still the previous
+    ///   iteration's, which is exactly the window a reset during `prepare` opens.
+    ///
+    /// The run id is compared rather than the bank, because that is what makes a bank
+    /// *belong* to a run: [`Workload::run`] draws it from the seed and the iteration, so two
+    /// iterations of one plan never share one.
+    fn own_bank_journal<S: StableStorage>(
+        &self,
+        engine: &mut Window<'_, S>,
+        workload: Workload,
+        page: &mut [u8],
+    ) -> Result<Option<JournalRegion>, RigError<S::Error>> {
         let read = self.read_header(engine, Self::BANK, page)?;
         let Some(bytes) = page.get(..read) else {
             return Err(RigError::ShortPage);
@@ -738,10 +815,10 @@ impl Rig {
         // boot does, so a rig that skipped it would be running a protocol no firmware runs.
         let region = {
             let mut engine = self.engine(part).map_err(widen)?;
-            if self.authoritative_banks(&mut engine, page).map_err(widen)? != 1 {
-                return Err(RigError::Bank);
-            }
-            self.journal_region(&mut engine, page).map_err(widen)?
+            self.require_own_authority(&mut engine, page)
+                .map_err(widen)?;
+            self.journal_region(&mut engine, workload, page)
+                .map_err(widen)?
         };
         let mut journal = {
             let mut engine = self.engine(part).map_err(widen)?;
@@ -836,6 +913,231 @@ impl Rig {
         Ok(Stop::Completed)
     }
 
+    /// Writes `RunStarted` and `effects_before_swap` schedule/completion pairs. Then it
+    /// stops. It does not write the rest of the run, or `RunCompleted`.
+    ///
+    /// This is issue [#96](https://github.com/madmax983/waymaker/issues/96)'s swap
+    /// workload. A caller that means to roll over mid-run writes this much normally, then
+    /// drives [`waymaker_flash::swap`] itself. This bank's `RunCompleted` is never written.
+    /// The run's continuation is whichever bank the swap leaves authoritative.
+    ///
+    /// No cutter. Rows 7 and 8 of the failure matrix are swept by running the whole
+    /// sequence — this call, the swap, and the run it installs — through the crash
+    /// injector, the way the six other rows are swept through [`iterate`](Self::iterate).
+    ///
+    /// # Errors
+    ///
+    /// As [`iterate`](Self::iterate). [`RigError::Workload`] if `effects_before_swap` is
+    /// not less than [`effects`](Self::effects): a finished run has nothing left to roll
+    /// over.
+    pub fn iterate_until_rollover<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        page: &mut [u8],
+        effects_before_swap: u16,
+    ) -> Result<(), RigError<S::Error, D::Error>> {
+        if page.len() < Self::PAGE_BYTES {
+            return Err(RigError::ShortPage);
+        }
+        if effects_before_swap >= self.effects {
+            return Err(RigError::Workload);
+        }
+        let workload = self.workload(iteration);
+        let Some(stop_before) = effects_before_swap
+            .checked_mul(2)
+            .and_then(|doubled| doubled.checked_add(1))
+        else {
+            return Err(RigError::Workload);
+        };
+
+        let region = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            self.require_own_authority(&mut engine, page)
+                .map_err(widen)?;
+            self.journal_region(&mut engine, workload, page)
+                .map_err(widen)?
+        };
+        let mut journal = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            let mut recovery = Recovery::new(region, &mut engine);
+            while let Some(step) = recovery.next(page) {
+                if let Err(error) = step {
+                    return Err(RigError::Recovery(unwindow_recovery(error)));
+                }
+            }
+            match Journal::after(recovery) {
+                Some(journal) => journal,
+                None => return Err(RigError::Region(RegionError::EmptyRegion)),
+            }
+        };
+
+        let mut witness = Witness::new(self.witness);
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+
+        for index in 0..stop_before {
+            let Some(role) = workload.role(index) else {
+                return Err(RigError::Workload);
+            };
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Attempted),
+                page,
+            )
+            .map_err(widen)?;
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            self.append(part, &mut journal, &record, page)
+                .map_err(widen)?;
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Acknowledged),
+                page,
+            )
+            .map_err(widen)?;
+            if let Role::Schedule(effect) = role {
+                self.after_schedule(
+                    iteration,
+                    index,
+                    effect,
+                    DispatchStep {
+                        part,
+                        witness: &mut witness,
+                        dispatcher,
+                        cutter: &mut NeverCut,
+                    },
+                    page,
+                )?;
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs the workload with `reserve` gating every append, to completion or to the first
+    /// refusal.
+    ///
+    /// As [`iterate`](Self::iterate), through [`Reserved`] instead of the ungated writer.
+    /// No cutter. Issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// history-capacity-reached row is a refusal §10's reserve produces on its own. A crash
+    /// injector does not find this refusal.
+    ///
+    /// # Errors
+    ///
+    /// As [`iterate`](Self::iterate). [`RigError::Capacity`] if the reserve refuses a
+    /// record. The run stops. It reads, programs, and barriers nothing for that record.
+    pub fn iterate_reserved<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        reserve: Reserve,
+        page: &mut [u8],
+    ) -> Result<Stop, RigError<S::Error, D::Error>> {
+        if page.len() < Self::PAGE_BYTES {
+            return Err(RigError::ShortPage);
+        }
+        let workload = self.workload(iteration);
+        let Some(records) = workload.records() else {
+            return Err(RigError::Workload);
+        };
+
+        let region = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            self.require_own_authority(&mut engine, page)
+                .map_err(widen)?;
+            self.journal_region(&mut engine, workload, page)
+                .map_err(widen)?
+        };
+        let mut reserved = {
+            let mut engine = self.engine(part).map_err(widen)?;
+            let mut recovery = Recovery::new(region, &mut engine);
+            while let Some(step) = recovery.next(page) {
+                if let Err(error) = step {
+                    return Err(RigError::Recovery(unwindow_recovery(error)));
+                }
+            }
+            let Some(journal) = Journal::after(recovery) else {
+                return Err(RigError::Region(RegionError::EmptyRegion));
+            };
+            Reserved::over(journal, reserve).map_err(RigError::Reserve)?
+        };
+
+        let mut witness = Witness::new(self.witness);
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut completion_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+
+        for index in 0..records {
+            let Some(role) = workload.role(index) else {
+                return Err(RigError::Workload);
+            };
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            admits(&reserved, &record).map_err(RigError::Capacity)?;
+
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Attempted),
+                page,
+            )
+            .map_err(widen)?;
+
+            self.append_reserved(part, &mut reserved, &record, page)
+                .map_err(widen)?;
+
+            self.mark(
+                part,
+                &mut witness,
+                Mark::new(iteration, index, Stage::Acknowledged),
+                page,
+            )
+            .map_err(widen)?;
+
+            if let Role::Schedule(effect) = role {
+                // The reserve admitting `record` above says nothing about the completion
+                // this effect is about to earn: a schedule's width does not depend on
+                // `Bounds::effect_result_bytes`, so a reserve that will refuse the
+                // completion still let the schedule through. Checked here, before the
+                // effect runs: dispatching first and refusing at the completion's own
+                // index — one iteration later — cannot undo the effect, and every retry
+                // through `resume_reserved` would perform it again.
+                let Some(completion_index) = workload.completion_index(effect) else {
+                    return Err(RigError::Workload);
+                };
+                let Some(completion) = workload.record(completion_index, &mut completion_page)
+                else {
+                    return Err(RigError::Workload);
+                };
+                admits(&reserved, &completion).map_err(RigError::Capacity)?;
+
+                self.after_schedule(
+                    iteration,
+                    index,
+                    effect,
+                    DispatchStep {
+                        part,
+                        witness: &mut witness,
+                        dispatcher,
+                        cutter: &mut NeverCut,
+                    },
+                    page,
+                )?;
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
+            }
+        }
+        Ok(Stop::Completed)
+    }
+
     /// §07 step 4, for the schedule record at `index`: mark the dispatch, take the cut point
     /// if this iteration armed one here, and perform the effect.
     ///
@@ -877,7 +1179,7 @@ impl Rig {
             }));
         }
 
-        self.perform(iteration, effect, dispatcher)?;
+        Self::perform(self.workload(iteration), effect, dispatcher)?;
         Ok(None)
     }
 
@@ -905,15 +1207,56 @@ impl Rig {
         Ok(())
     }
 
-    /// §07 step 4: the physical effect, with the input its schedule record described.
-    fn perform<D: Dispatcher, E>(
+    /// [`append`](Self::append), gated by §10's reserve.
+    ///
+    /// # Errors
+    ///
+    /// [`RigError::Capacity`] when the reserve refuses the record — nothing is read,
+    /// programmed or barriered for it — and [`RigError::Append`] for everything
+    /// [`append`](Self::append) can fail with.
+    fn append_reserved<S: StableStorage>(
         &self,
-        iteration: u32,
+        part: &mut Metered<'_, S>,
+        reserved: &mut Reserved,
+        record: &RecordRef<'_>,
+        page: &mut [u8],
+    ) -> Result<(), RigError<S::Error>> {
+        {
+            let mut engine = self.engine(part)?;
+            let staged =
+                reserved
+                    .stage(&mut engine, record, page)
+                    .map_err(|error| match error {
+                        ReservedError::Capacity(refusal) => RigError::Capacity(refusal),
+                        ReservedError::Append(inner) => RigError::Append(unwindow_append(inner)),
+                    })?;
+            let sealable = staged
+                .payload_barrier()
+                .map_err(|error| RigError::Append(unwindow_append(error)))?;
+            sealable
+                .commit()
+                .map_err(|error| RigError::Append(unwindow_append(error)))?;
+        }
+        part.set_amplification(reserved.journal().amplification());
+        Ok(())
+    }
+
+    /// §07 step 4: the physical effect, with the input its schedule record described.
+    ///
+    /// Takes `workload` rather than an iteration to reconstruct one from: `resume_as` may be
+    /// auditing history against a `declared` workload that disagrees with
+    /// `self.workload(iteration)` — issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// row 10 — and review found this call reconstructing its own instead, so a caller whose
+    /// declaration matched the recovered prefix but claimed more effects than the rig can
+    /// answer for durably appended that schedule and then failed to dispatch it, for a
+    /// reason `declared` could have refused before either happened.
+    fn perform<D: Dispatcher, E>(
+        workload: Workload,
         effect: u16,
         dispatcher: &mut D,
     ) -> Result<(), RigError<E, D::Error>> {
         let mut input = [0_u8; Workload::MAX_PAYLOAD_BYTES];
-        let Some(bytes) = self.workload(iteration).effect_input(effect, &mut input) else {
+        let Some(bytes) = workload.effect_input(effect, &mut input) else {
             return Err(RigError::Workload);
         };
         dispatcher
@@ -936,11 +1279,12 @@ impl Rig {
     ) -> Result<(u16, Option<Journal>), RigError<S::Error>> {
         let region = {
             let mut engine = self.engine(part)?;
-            let banks = self.authoritative_banks(&mut engine, page)?;
+            let authority = self.authority(&mut engine, page)?;
+            let banks = authority_count(authority);
             if banks != 1 {
                 return Err(RigError::Authority { banks });
             }
-            match self.installed_journal(&mut engine, workload, banks, page)? {
+            match self.installed_journal(&mut engine, workload, authority, page)? {
                 Some(region) => region,
                 None => return Err(RigError::Bank),
             }
@@ -998,10 +1342,85 @@ impl Rig {
         dispatcher: &mut D,
         page: &mut [u8],
     ) -> Result<Resumed, RigError<S::Error, D::Error>> {
+        self.resume_as(iteration, self.workload(iteration), part, dispatcher, page)
+    }
+
+    /// Resumes as [`resume`](Self::resume), but treats `declared` as this run's true shape
+    /// instead of the workload `iteration` derives.
+    ///
+    /// Models replay divergence: a firmware whose declared workflow no longer agrees with a
+    /// run already on media. Pass `self.workload(iteration).diverging(effect)` for `declared`
+    /// to change one schedule record's activity kind and leave the rest of the run untouched
+    /// — issue [#96](https://github.com/madmax983/waymaker/issues/96)'s row 10.
+    ///
+    /// # Errors
+    ///
+    /// As [`resume`](Self::resume). A `declared` that disagrees with history answers
+    /// [`RigError::Breach`] with [`Breach::RecordDiffers`], before any effect runs again and
+    /// before any byte is written.
+    pub fn resume_declaring<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        declared: Workload,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        page: &mut [u8],
+    ) -> Result<Resumed, RigError<S::Error, D::Error>> {
+        self.resume_as(iteration, declared, part, dispatcher, page)
+    }
+
+    /// [`resume`](Self::resume) and [`resume_declaring`](Self::resume_declaring), over the
+    /// workload each one means to audit history against.
+    ///
+    /// Refuses a `workload` other than [`effects`](Self::effects) wide, or one whose seed or
+    /// iteration disagrees with this rig's own and `iteration`'s, before touching the device.
+    /// `resume_declaring`'s `declared` only ever means to audit history against a workload
+    /// that agrees with this rig's own run everywhere but the one record
+    /// [`Workload::diverging`] names, and a workload of another length, another seed or
+    /// another iteration is not that shape — nor one this bank or this witness was
+    /// provisioned for, since `Rig::new` sizes both against `effects` alone.
+    ///
+    /// A *wider* declaration was the first review found: it can share this rig's seed and
+    /// iteration and so match its recovered prefix exactly while naming more effects than
+    /// either region was provisioned for, and the unfixed call answered that by writing and
+    /// dispatching until an unrelated capacity error stopped it. A *narrower* one is the
+    /// second: its own early records still agree with this rig's truth record for record —
+    /// a shorter run's opening effects are a byte-for-byte prefix of a longer one's — so
+    /// nothing catches it until the declaration's own early `RunCompleted` collides with an
+    /// index the real run still has open, after everything in between was already written
+    /// and dispatched. Both are refused the same way, before either happens. A third is a
+    /// `declared` for a *different iteration* sharing this rig's seed: its effect count can
+    /// equal `self.effects` by construction, so it passes the first check, and
+    /// `recover_prefix`'s audit checks it against the bank's own header — which agrees,
+    /// because `declared` genuinely is that other iteration's own workload — so a run
+    /// already complete for that iteration was reported as `iteration`'s own `Completed`
+    /// before the per-record comparison against `self.workload(iteration)` was ever reached.
+    /// The fix first compared [`Workload::run`] against `self.workload(iteration).run()`, and
+    /// a fourth review found that comparison itself unsound: [`Workload::run`] mixes the seed
+    /// and the iteration through [`SplitMix64`](crate::plan::SplitMix64), which is not
+    /// injective across both arguments at once, so a `declared` built from a *different* seed
+    /// at a *different* iteration can name the identical run id `self.workload(iteration)`
+    /// does — reproduced directly, since `SplitMix64::at` computes `seed + GAMMA * (index +
+    /// 1)`, and `at(0)` under `seed + GAMMA` equals `at(1)` under `seed`. The check now
+    /// compares `workload.seed()` and `workload.iteration()` against `self.plan.seed()` and
+    /// `iteration` directly, which is exact rather than routed through a hash.
+    fn resume_as<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        workload: Workload,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        page: &mut [u8],
+    ) -> Result<Resumed, RigError<S::Error, D::Error>> {
         if page.len() < Self::PAGE_BYTES {
             return Err(RigError::ShortPage);
         }
-        let workload = self.workload(iteration);
+        if workload.effects() != self.effects
+            || workload.seed() != self.plan.seed()
+            || workload.iteration() != iteration
+        {
+            return Err(RigError::Workload);
+        }
         let Some(records) = workload.records() else {
             return Err(RigError::Workload);
         };
@@ -1019,6 +1438,27 @@ impl Rig {
             });
         }
 
+        // `workload` may be `declared`, auditing history against a run whose own recovered
+        // prefix stops before `records` — nothing on media past it for `recover_prefix`'s
+        // audit to have compared `declared` against. Review found that left every record
+        // still to come free to be written and dispatched, one at a time, up to whichever
+        // one first disagreed — so an agreeing record ahead of the actual divergence still
+        // ran before the resume refused. Every record this resume would still need to
+        // write is checked against this rig's own undiverged truth in one pass, before the
+        // outstanding-effect redelivery below or the write loop after it touch anything:
+        // row 10's "no further execution and history untouched" is a promise about the
+        // whole declaration, not only the one record where it first disagrees.
+        let mut truth_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut preflight_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        for index in recovered..records {
+            let Some(record) = workload.record(index, &mut preflight_page) else {
+                return Err(RigError::Workload);
+            };
+            if self.workload(iteration).record(index, &mut truth_page) != Some(record) {
+                return Err(RigError::Breach(Breach::RecordDiffers { index }));
+            }
+        }
+
         let outstanding = recovered
             .checked_sub(1)
             .and_then(|index| match workload.role(index) {
@@ -1030,7 +1470,7 @@ impl Rig {
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                Self::perform(workload, effect, dispatcher)?;
                 Some(effect)
             }
             None => None,
@@ -1041,12 +1481,12 @@ impl Rig {
             let Some(role) = workload.role(index) else {
                 return Err(RigError::Workload);
             };
-            let mark = Mark::new(iteration, index, Stage::Attempted);
-            self.mark_above(part, &mut witness, &mut known, mark, page)
-                .map_err(widen)?;
             let Some(record) = workload.record(index, &mut record_page) else {
                 return Err(RigError::Workload);
             };
+            let mark = Mark::new(iteration, index, Stage::Attempted);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
             self.append(part, &mut journal, &record, page)
                 .map_err(widen)?;
             let mark = Mark::new(iteration, index, Stage::Acknowledged);
@@ -1056,7 +1496,133 @@ impl Rig {
                 let mark = Mark::new(iteration, index, Stage::Dispatched);
                 self.mark_above(part, &mut witness, &mut known, mark, page)
                     .map_err(widen)?;
-                self.perform(iteration, effect, dispatcher)?;
+                Self::perform(workload, effect, dispatcher)?;
+            }
+            if matches!(role, Role::Completion(_)) {
+                part.credit_effect();
+            }
+        }
+        Ok(Resumed::Completed {
+            recovered,
+            redelivered,
+        })
+    }
+
+    /// Resumes as [`resume`](Self::resume), but gates every record this run still owes with
+    /// `reserve`.
+    ///
+    /// This is issue [#96](https://github.com/madmax983/waymaker/issues/96)'s
+    /// history-capacity-reached row, on replay. A run whose next record the reserve
+    /// already refused meets the same refusal here. It reads, programs, and barriers
+    /// nothing for that record.
+    ///
+    /// This body is near-identical to `resume_as`, gated call by gated call. Left that way
+    /// rather than factored behind a shared generic or trait: the two bodies are
+    /// typestate-heavy control flow over two different writers ([`Journal`] and
+    /// [`Reserved`]), and a shared abstraction over them risks a subtle divergence for a
+    /// cosmetic gain, not a correctness one. This crate already tolerates the same trade
+    /// for `unwindow` and its siblings, for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// As [`resume`](Self::resume). [`RigError::Capacity`] if the reserve refuses the next
+    /// record this run owes. [`RigError::Reserve`] if `reserve` does not describe this
+    /// journal.
+    pub fn resume_reserved<S: StableStorage, D: Dispatcher>(
+        &self,
+        iteration: u32,
+        part: &mut Metered<'_, S>,
+        dispatcher: &mut D,
+        reserve: Reserve,
+        page: &mut [u8],
+    ) -> Result<Resumed, RigError<S::Error, D::Error>> {
+        if page.len() < Self::PAGE_BYTES {
+            return Err(RigError::ShortPage);
+        }
+        let workload = self.workload(iteration);
+        let Some(records) = workload.records() else {
+            return Err(RigError::Workload);
+        };
+        let (mut witness, mut known) = self.continued_witness(part, page).map_err(widen)?;
+        let (recovered, journal) = self
+            .recover_prefix(part, workload, known, page)
+            .map_err(widen)?;
+        let Some(journal) = journal else {
+            return Ok(Resumed::Unextendable { recovered });
+        };
+        if recovered >= records {
+            return Ok(Resumed::Completed {
+                recovered,
+                redelivered: None,
+            });
+        }
+        let mut reserved = Reserved::over(journal, reserve).map_err(RigError::Reserve)?;
+        let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+        let mut completion_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+
+        let outstanding = recovered
+            .checked_sub(1)
+            .and_then(|index| match workload.role(index) {
+                Some(Role::Schedule(effect)) => Some((index, effect)),
+                Some(Role::Start | Role::Completion(_) | Role::Finish) | None => None,
+            });
+        let redelivered = match outstanding {
+            Some((index, effect)) => {
+                // The record this redelivery is *for* is the completion at `recovered`, not
+                // yet written. Checked here, before the effect runs again: a reserve that
+                // will refuse it makes the redelivery pointless — the completion can never
+                // land, so nothing this call owed is repaid by performing the effect once
+                // more. Without this, every resume against such a reserve would redeliver
+                // and then refuse, forever.
+                let Some(record) = workload.record(recovered, &mut record_page) else {
+                    return Err(RigError::Workload);
+                };
+                admits(&reserved, &record).map_err(RigError::Capacity)?;
+
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
+                Self::perform(workload, effect, dispatcher)?;
+                Some(effect)
+            }
+            None => None,
+        };
+        for index in recovered..records {
+            let Some(role) = workload.role(index) else {
+                return Err(RigError::Workload);
+            };
+            let Some(record) = workload.record(index, &mut record_page) else {
+                return Err(RigError::Workload);
+            };
+            admits(&reserved, &record).map_err(RigError::Capacity)?;
+
+            let mark = Mark::new(iteration, index, Stage::Attempted);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
+            self.append_reserved(part, &mut reserved, &record, page)
+                .map_err(widen)?;
+            let mark = Mark::new(iteration, index, Stage::Acknowledged);
+            self.mark_above(part, &mut witness, &mut known, mark, page)
+                .map_err(widen)?;
+            if let Role::Schedule(effect) = role {
+                // As above in the redelivery branch: the reserve admitting this schedule
+                // says nothing about the completion this effect is about to earn, so that
+                // is checked here, before the effect runs for the first time — not one
+                // iteration later, when refusing at the completion's own index can no
+                // longer undo the dispatch this loop just performed.
+                let Some(completion_index) = workload.completion_index(effect) else {
+                    return Err(RigError::Workload);
+                };
+                let Some(completion) = workload.record(completion_index, &mut completion_page)
+                else {
+                    return Err(RigError::Workload);
+                };
+                admits(&reserved, &completion).map_err(RigError::Capacity)?;
+
+                let mark = Mark::new(iteration, index, Stage::Dispatched);
+                self.mark_above(part, &mut witness, &mut known, mark, page)
+                    .map_err(widen)?;
+                Self::perform(workload, effect, dispatcher)?;
             }
             if matches!(role, Role::Completion(_)) {
                 part.credit_effect();
@@ -1151,15 +1717,42 @@ impl Rig {
         outcome.map_err(|error| RigError::Witness(unwindow_witness(error)))
     }
 
-    /// How many banks are authoritative.
+    /// Refuses unless [`Rig::BANK`] is the one bank authoritative right now.
     ///
-    /// §14's `single-authority`, read off media exactly as a boot would read it: each bank's
-    /// header and seal, through [`bank::sealed_generation`], then [`bank::select`].
-    fn authoritative_banks<S: StableStorage>(
+    /// For a caller about to read or append to [`Rig::BANK`]'s own journal —
+    /// [`iterate`](Self::iterate), [`iterate_until_rollover`](Self::iterate_until_rollover)
+    /// and [`iterate_reserved`](Self::iterate_reserved) all do, next. Checking only that some
+    /// *one* bank was authoritative was a defect review found once issue
+    /// [#96](https://github.com/madmax983/waymaker/issues/96) gave a device a way to reach
+    /// two authoritative banks in its lifetime rather than one for ever: a device a swap had
+    /// already moved past would pass that count and this call would go on to read or append
+    /// into the retired bank, growing or duplicating a journal nothing boots from. Naming the
+    /// bank rather than counting closes it the same way [`own_bank_journal`] closed the
+    /// matching gap in `judge`.
+    fn require_own_authority<S: StableStorage>(
         &self,
         engine: &mut Window<'_, S>,
         page: &mut [u8],
-    ) -> Result<usize, RigError<S::Error>> {
+    ) -> Result<(), RigError<S::Error>> {
+        match self.authority(engine, page)? {
+            bank::Authority::Bank { id: Self::BANK, .. } => Ok(()),
+            bank::Authority::Unsealed
+            | bank::Authority::Bank { .. }
+            | bank::Authority::Ambiguous { .. } => Err(RigError::Bank),
+        }
+    }
+
+    /// Which bank is authoritative.
+    ///
+    /// §14's `single-authority`, read off media exactly as a boot would read it: each bank's
+    /// header and seal, through [`bank::sealed_generation`], then [`bank::select`]. Unlike
+    /// [`authoritative_banks`](Self::authoritative_banks), this keeps *which* bank it is —
+    /// the fact a swap workload needs and a single-bank rig never had to ask for.
+    fn authority<S: StableStorage>(
+        &self,
+        engine: &mut Window<'_, S>,
+        page: &mut [u8],
+    ) -> Result<bank::Authority, RigError<S::Error>> {
         let mut generations = [None, None];
         for (slot, id) in generations.iter_mut().zip([BankId::A, BankId::B]) {
             let region = self.layout.bank(id);
@@ -1179,11 +1772,7 @@ impl Rig {
                 .map_err(unwindow)?;
             *slot = bank::sealed_generation(header, seal_slot);
         }
-        Ok(match bank::select(generations) {
-            bank::Authority::Unsealed => 0,
-            bank::Authority::Bank { .. } => 1,
-            bank::Authority::Ambiguous { .. } => 2,
-        })
+        Ok(bank::select(generations))
     }
 
     /// Judges what a reset left behind.
@@ -1234,13 +1823,17 @@ impl Rig {
     ///
     /// # Which bank it walks
     ///
-    /// [`Rig::BANK`], always. The authority count above is computed the way a boot computes
-    /// it — both banks' headers and seals, through [`bank::select`] — and then only bank A's
-    /// journal is read, because bank A is the only one this rig installs. §10's swap has since
-    /// landed as `waymaker_flash::swap` (issue
-    /// [#26](https://github.com/madmax983/waymaker/issues/26)) and this rig still does not
-    /// drive it, so the two agree today; a workload that rolled over would have to make this
-    /// walk the bank [`bank::select`] names, and that is what is owed before it can.
+    /// [`Rig::BANK`], always — this rig only ever writes a run's own history there, whether
+    /// or not a later swap moves authority to the other one. The authority count above is
+    /// still computed the way a boot computes it — both banks' headers and seals, through
+    /// [`bank::select`] — because two sealed banks makes ownership unanswerable regardless
+    /// of what either header names (see the ambiguity check above), and because the count is
+    /// part of the reported [`Verdict`]. What authority does *not* gate any more is whether
+    /// [`Rig::BANK`]'s own history gets audited: issue
+    /// [#96](https://github.com/madmax983/waymaker/issues/96)'s bank-swap rows found that
+    /// gating on it made a legitimately retired, still-intact bank read as one that had lost
+    /// its acknowledged records, because `uninstalled` assumes nothing was written rather
+    /// than that something was written somewhere else now current. See `own_bank_journal`.
     ///
     /// # Errors
     ///
@@ -1261,7 +1854,8 @@ impl Rig {
         }
         let workload = self.workload(iteration);
         let mut engine = self.engine(part)?;
-        let banks = self.authoritative_banks(&mut engine, page)?;
+        let authority = self.authority(&mut engine, page)?;
+        let banks = authority_count(authority);
 
         // Ambiguity is decided first and on its own. Two sealed banks means the rig cannot say
         // which journal is this run's history, so every obligation below — what recovery owed
@@ -1281,16 +1875,31 @@ impl Rig {
             });
         }
 
-        // §10's authority is what a boot reads, and a bank belongs to the run whose header it
-        // carries. Both halves are load-bearing here, and the second one was found by review
-        // rather than by writing it down: a rig's loop is `prepare(n)` → `iterate(n)` → reset
-        // → `verify(n)`, so from the second iteration onwards `verify(n)` meets a part that
-        // *finished* `n - 1`. A reset during `prepare(n)` leaves that part's engine still
-        // sealed at `n - 1`, and a `judge` that walked whatever bank A held read run `n - 1`'s
-        // journal against run `n`'s declarations and reported a §14 violation on a healthy
-        // board. An uninstalled part is not a verdict about recovery — see [`uninstalled`].
-        let Some(region) = self.installed_journal(&mut engine, workload, banks, page)? else {
-            return Ok(uninstalled(workload, progress, banks));
+        // A bank belongs to the run whose header it carries, and that is the only thing
+        // gating an audit: whether it is still the bank a boot would choose is
+        // [`resume`](Self::resume)'s question, not this one's, because a swap moving
+        // authority elsewhere does not rewrite what this bank already holds — issue
+        // [#96](https://github.com/madmax983/waymaker/issues/96)'s rows 7 and 8 found this
+        // by review, having a `judge` gated on authority report `LostAcknowledgedRecord` on
+        // a device whose retired bank was exactly as intact as its witness claimed.
+        // The run-id half stays load-bearing on its own: a rig's loop is
+        // `prepare(n)` → `iterate(n)` → reset → `verify(n)`, so from the second iteration
+        // onwards `verify(n)` meets a part that *finished* `n - 1`. A reset during
+        // `prepare(n)` leaves that part's engine still sealed at `n - 1`, and a `judge` that
+        // walked whatever bank A held with no run-id check would read run `n - 1`'s journal
+        // against run `n`'s declarations and report a §14 violation on a healthy board. An
+        // uninstalled part is not a verdict about recovery — see [`uninstalled`].
+        //
+        // A single authoritative bank that is not `Self::BANK` names a second thing besides
+        // "not the bank to resume from": no crash and no ordinary `prepare` ever seals the
+        // *other* bank, so its presence is a swap having moved on, whether or not `Self::BANK`
+        // is still there to read — review found `own_bank_journal` answering `None` for this
+        // reason too, once §10 step 7 has reclaimed it, and the same false
+        // `LostAcknowledgedRecord` followed. `superseded` is that signal, kept apart from the
+        // run-id check above because it does not need `Self::BANK` to be readable at all.
+        let superseded = matches!(authority, bank::Authority::Bank { id, .. } if id != Self::BANK);
+        let Some(region) = self.own_bank_journal(&mut engine, workload, page)? else {
+            return Ok(uninstalled(workload, progress, banks, superseded));
         };
 
         let mut audit = Audit::new(workload, progress);
@@ -1354,25 +1963,30 @@ struct DispatchStep<'part, 'storage, S, D, C> {
     cutter: &'part mut C,
 }
 
-/// The verdict for a part this run was never installed on.
+/// The verdict for a part this run's own bank has nothing to show for.
 ///
 /// Nothing has been claimed about the run, so there is nothing recovery can have lost — but
 /// "nothing to audit" is not the same as "nothing to check", and the two things this does
 /// check are what keep it from being a hole the rig passes through.
 ///
-/// The witness is normalised rather than read. A [`Progress`] naming a *different* iteration
-/// is the previous run's, still on media because the reset landed before `prepare` erased the
-/// instrument, and on an uninstalled part that is the ordinary state rather than an
-/// instrument fault: it says nothing about this run, so this run is owed nothing. On an
-/// *installed* part the same witness is [`Breach::WitnessUnreadable`] and stays so, because
-/// `prepare` erases the instrument before it installs the bank — an installed part carrying
-/// the previous iteration's marks is an instrument that failed.
+/// The witness is normalised rather than read, and `superseded` and a *different* iteration
+/// are the two reasons it is: a [`Progress`] naming a different iteration is the previous
+/// run's, still on media because the reset landed before `prepare` erased the instrument, and
+/// `superseded` is this run's own having moved to a bank this call never reads — issue
+/// [#96](https://github.com/madmax983/waymaker/issues/96)'s rows 7 and 8, once §10 step 7 has
+/// reclaimed the bank that reached here. Both say the same thing about this run's own bank: it
+/// has nothing to say, which is the ordinary state rather than an instrument fault, so this
+/// run is owed nothing. Neither reason applies, and the witness carries marks anyway, on an
+/// *installed* part is [`Breach::WitnessUnreadable`] and stays so, because `prepare` erases the
+/// instrument before it installs the bank — an installed part carrying the previous
+/// iteration's marks is an instrument that failed.
 ///
 /// And the authority figure is zero rather than `banks`, which is the half that still bites.
 /// §14's `single-authority` asks about *this* run's authority, and a bank carrying another
 /// run's header is not it. So a rig that had begun marking a run — a witness with marks in it,
-/// or one torn mid-mark — on a part with no bank of its own is [`Breach::Authority`], which is
-/// what it is: records were being written into a journal this run does not own.
+/// or one torn mid-mark — on a part with no bank of its own, and not superseded, is
+/// [`Breach::Authority`], which is what it is: records were being written into a journal this
+/// run does not own.
 ///
 /// # Preconditions
 ///
@@ -1381,9 +1995,15 @@ struct DispatchStep<'part, 'storage, S, D, C> {
 /// report the one state [`Audit::finish`] exists to refuse as a pass whenever the witness is
 /// empty — a part prepared and not yet run — and would name the wrong number whenever it is
 /// not.
-const fn uninstalled(workload: Workload, progress: Progress, banks: usize) -> Verdict {
+const fn uninstalled(
+    workload: Workload,
+    progress: Progress,
+    banks: usize,
+    superseded: bool,
+) -> Verdict {
     let progress = match progress.iteration() {
         Some(other) if other != workload.iteration() => Progress::EMPTY,
+        _ if superseded => Progress::EMPTY,
         _ => progress,
     };
     let outcome = match Audit::new(workload, progress).finish(0) {
@@ -1408,6 +2028,24 @@ const fn finish(audit: Audit, banks: usize) -> Verdict {
         outcome,
         recovered,
         banks,
+    }
+}
+
+/// Whether `reserved`'s gate would admit `record`, reading nothing from the device.
+///
+/// Called before any witness mark for `record` is written. Without this, a capacity
+/// refusal that [`Reserved::stage`] would have caught still lets the caller's witness mark
+/// land first — a real mutation, on the one row §10 promises none for.
+fn admits(reserved: &Reserved, record: &RecordRef<'_>) -> Result<(), Refusal> {
+    reserved.reserve().admits(record, reserved.journal().room())
+}
+
+/// How many banks `authority` names.
+const fn authority_count(authority: bank::Authority) -> usize {
+    match authority {
+        bank::Authority::Unsealed => 0,
+        bank::Authority::Bank { .. } => 1,
+        bank::Authority::Ambiguous { .. } => 2,
     }
 }
 
@@ -1481,6 +2119,8 @@ fn widen<E, D>(error: RigError<E>) -> RigError<E, D> {
         RigError::Geometry(inner) => RigError::Geometry(inner),
         RigError::Breach(inner) => RigError::Breach(inner),
         RigError::Authority { banks } => RigError::Authority { banks },
+        RigError::Capacity(refusal) => RigError::Capacity(refusal),
+        RigError::Reserve(inner) => RigError::Reserve(inner),
         RigError::Dispatch(never) => match never {},
     }
 }

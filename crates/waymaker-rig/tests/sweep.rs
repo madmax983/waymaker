@@ -80,7 +80,9 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use waymaker_fault::{Device, FaultError, Harness, Injection, Interruption, Op, Progress, Run};
-use waymaker_flash::bank::BankId;
+use waymaker_flash::append::Journal;
+use waymaker_flash::bank::{self, BankId, BankLayout};
+use waymaker_flash::recovery::{JournalRegion, Recovery};
 use waymaker_flash::storage::{Geometry, StableStorage};
 use waymaker_rig::audit::Breach;
 use waymaker_rig::census::Coverage;
@@ -90,8 +92,9 @@ use waymaker_rig::phase::{Phase, ResetCause};
 use waymaker_rig::plan::Plan;
 use waymaker_rig::run::{Rig, Stop, Verdict};
 use waymaker_rig::wear::{Metered, Wear};
+use waymaker_rig::window::Window;
 use waymaker_rig::witness::{Progress as Marks, Stage, Witness};
-use waymaker_rig::workload::Role;
+use waymaker_rig::workload::{Role, Workload};
 
 const SEED: u64 = 0x00C0_FFEE_0BAD_CAFE;
 const EFFECTS: u16 = 2;
@@ -1306,6 +1309,73 @@ fn a_witness_caused_violation_is_reproduced_from_the_log_line_alone() {
     assert_eq!(usize::from(read.banks()), again.banks());
 }
 
+/// Writes every record of `workload` directly into `bank`'s journal on `engine`, bypassing
+/// `Rig::iterate`'s own run-id check on the bank's header.
+///
+/// `Rig::iterate` now refuses to write into a bank whose header names another run — see
+/// `crates/waymaker-rig/tests/matrix.rs`'s
+/// `iterate_and_its_siblings_refuse_a_bank_installed_for_another_iteration` — so a test that
+/// means to put one workload's literal bytes on a bank *another* run's header names has to
+/// reach the journal through the same low-level primitives `Rig` itself uses, rather than
+/// through `Rig::iterate`.
+fn write_full_run<S: StableStorage>(
+    layout: BankLayout,
+    bank: BankId,
+    workload: Workload,
+    engine: &mut Window<'_, S>,
+    page: &mut [u8],
+) where
+    S::Error: core::fmt::Debug,
+{
+    let region = layout.bank(bank);
+    let Ok(want) = usize::try_from(region.payload_bytes()) else {
+        unreachable!("a header fits a page")
+    };
+    let want = want.min(page.len());
+    let Some(header_slot) = page.get_mut(..want) else {
+        unreachable!("a header fits a page")
+    };
+    let Ok(()) = engine.read(region.base(), header_slot) else {
+        unreachable!("a readable bank")
+    };
+    let Some(header_bytes) = page.get(..want) else {
+        unreachable!("a header fits a page")
+    };
+    let Ok(header) = bank::decode_header(header_bytes) else {
+        unreachable!("a decodable header")
+    };
+    let Ok(journal_region) = JournalRegion::of(layout, bank, &header) else {
+        unreachable!("a valid journal region")
+    };
+    let mut recovery = Recovery::new(journal_region, engine);
+    while let Some(step) = recovery.next(page) {
+        let Ok(_) = step else {
+            unreachable!("a fault-free scan")
+        };
+    }
+    let Some(mut journal) = Journal::after(recovery) else {
+        unreachable!("a freshly prepared bank is an extendable journal")
+    };
+    let Some(records) = workload.records() else {
+        unreachable!("a run this rig can index")
+    };
+    let mut record_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+    for index in 0..records {
+        let Some(record) = workload.record(index, &mut record_page) else {
+            unreachable!("a record this workload declares")
+        };
+        let Ok(staged) = journal.stage(engine, &record, page) else {
+            unreachable!("a fault-free stage")
+        };
+        let Ok(sealable) = staged.payload_barrier() else {
+            unreachable!("a fault-free barrier")
+        };
+        let Ok(_) = sealable.commit() else {
+            unreachable!("a fault-free commit")
+        };
+    }
+}
+
 #[test]
 fn a_media_caused_violation_is_characterised_by_the_log_line_it_cannot_replay() {
     // The other half, and the one worth being exact about. A `RecordDiffers` is caused by the
@@ -1352,6 +1422,10 @@ fn a_media_caused_violation_is_characterised_by_the_log_line_it_cannot_replay() 
     // the bank is installed by `rig` rather than by `other` on purpose. A part another run
     // installed is not this run's part at all; it is judged by `Rig::installed_journal` and
     // reported as no verdict, which is a different finding and belongs to a different test.
+    //
+    // `other.iterate` cannot write this any more — it now refuses a bank whose header names
+    // a different run — so `write_full_run` reaches the journal directly, the same way
+    // `Rig::iterate` itself does, to put `other`'s literal bytes on the bank `rig` installed.
     let other = Rig::new::<waymaker_fault::FaultError>(geometry(), Plan::new(SEED ^ 0xFF), EFFECTS)
         .expect("the same layout under another seed");
     let mut divergent = Device::new(geometry());
@@ -1359,15 +1433,17 @@ fn a_media_caused_violation_is_characterised_by_the_log_line_it_cannot_replay() 
         let mut metered = Metered::new(&mut divergent);
         rig.prepare(&mut metered, 0, &mut page)
             .expect("a part this run installed");
-        other
-            .iterate(
-                0,
-                &mut metered,
-                &mut Counting::default(),
-                &mut NeverCut,
-                &mut page,
-            )
-            .expect("a clean run of another workload");
+        let Ok(mut engine) = Window::new(&mut metered, 0, rig.layout().geometry().capacity())
+        else {
+            unreachable!("the engine window")
+        };
+        write_full_run(
+            rig.layout(),
+            Rig::BANK,
+            other.workload(0),
+            &mut engine,
+            &mut page,
+        );
     }
     let verdict = rig
         .judge(0, &mut divergent, honest, &mut page)

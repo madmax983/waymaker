@@ -1219,6 +1219,8 @@ fn two_bank_lifecycle() -> usize {
     kept = kept.wrapping_add(
         bank::decode_header_with::<Catalogued>(&page).map_or(0, |decoded| decoded.frame_len()),
     );
+    kept = kept.wrapping_add(bank::header_len_of(&page).unwrap_or(0));
+    kept = kept.wrapping_add(bank::header_len_of_with::<Catalogued>(&page).unwrap_or(0));
 
     kept = kept.wrapping_add(bank_seal_and_selection(&page));
 
@@ -1928,11 +1930,13 @@ fn ctx_facade() -> usize {
     use core::pin::pin;
     use core::task::{Context as Task, Poll, Waker};
 
-    use waymaker_core::timer::TimerSpec;
+    use waymaker_core::timer::{ClockKind, TimerSpec};
     use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
     use waymaker_embassy::ctx::{Conclusion, Ctx, Failure, TerminalFuture};
     use waymaker_embassy::dispatch::Produced;
-    use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
+    use waymaker_embassy::{
+        ActivityDispatcher, Alarm, Answer, Decode, Halted, Handoff, Journal, NoAlarm,
+    };
 
     /// A stand-in durable half. It writes nothing; the probe is never run.
     struct Ledger {
@@ -1989,6 +1993,14 @@ fn ctx_facade() -> usize {
         fn continue_as_new(&mut self, input: &[u8]) -> Halted {
             self.held = core::hint::black_box(input.len());
             Halted
+        }
+
+        fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+            if core::hint::black_box(self.held) == 0 {
+                None
+            } else {
+                Some((ClockKind::AFTER_BOOT, self.held as u64))
+            }
         }
     }
 
@@ -2059,9 +2071,18 @@ fn ctx_facade() -> usize {
         });
     }
     {
-        let mut deadline = pin!(ctx.timer(TimerSpec::AfterBoot {
-            ticks: core::hint::black_box(5)
-        }));
+        let mut alarm = NoAlarm;
+        alarm.wake_after(
+            ClockKind::AFTER_BOOT,
+            core::hint::black_box(5),
+            task.waker(),
+        );
+        let mut deadline = pin!(ctx.timer(
+            TimerSpec::AfterBoot {
+                ticks: core::hint::black_box(5)
+            },
+            &mut alarm
+        ));
         kept = kept.wrapping_add(match deadline.as_mut().poll(&mut task) {
             Poll::Ready(()) => 3,
             Poll::Pending => 4,
@@ -2098,13 +2119,14 @@ fn ctx_facade() -> usize {
         Some(Conclusion::Refused) => 10,
         None => 11,
     });
+    kept = kept.wrapping_add(usize::from(ctx.unserviceable()));
 
     core::hint::black_box(kept.wrapping_add(dispatch_wiring()))
 }
 
 /// Issue #36's dispatch table, driven once per public function.
 ///
-/// It exists here because `waymaker-drive`'s OTA example implements
+/// It exists here because `waymaker-facade-demo`'s OTA example implements
 /// [`ActivityDispatcher`](waymaker_embassy::ActivityDispatcher) by hand, so nothing else in
 /// the workspace monomorphises the table — and a `facade` row that charged for a generic
 /// nobody names would be charging for nothing. `size-probe-reach` is what makes that a
@@ -2117,7 +2139,7 @@ fn dispatch_wiring() -> usize {
     use waymaker_core::{ActivityKind, EffectId, EffectSeq, RunId};
     use waymaker_embassy::ActivityDispatcher;
     use waymaker_embassy::dispatch::Produced;
-    use waymaker_embassy::wiring::{Activity, Table, Unhandled};
+    use waymaker_embassy::wiring::{Activity, Table};
 
     /// A stand-in world. The probe is never run.
     struct Fleet(usize);
@@ -2160,9 +2182,8 @@ fn dispatch_wiring() -> usize {
         &mut out,
     ) {
         Poll::Ready(Ok(Produced::Completed(len) | Produced::Failed(len))) => len,
-        Poll::Ready(Err(Unhandled::Activity(reason))) => reason,
-        Poll::Ready(Err(Unhandled::NoSuchActivity(kind))) => usize::from(kind.0),
-        Poll::Pending => 1,
+        Poll::Ready(Err(reason)) => reason,
+        Poll::Ready(Ok(Produced::Unserviceable)) | Poll::Pending => 1,
     };
     kept = kept.wrapping_add(table.name_of(asked).map_or(0, str::len));
     kept = kept.wrapping_add(table.world().0);

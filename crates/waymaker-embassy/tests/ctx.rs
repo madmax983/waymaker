@@ -18,7 +18,9 @@ use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
-use waymaker_embassy::{ActivityDispatcher, Answer, Decode, Halted, Handoff, Journal};
+use waymaker_embassy::{
+    ActivityDispatcher, Alarm, Answer, Decode, Halted, Handoff, Journal, NoAlarm,
+};
 
 const RUN: RunId = RunId(9);
 const DOWNLOAD: ActivityKind = ActivityKind(1);
@@ -51,6 +53,8 @@ struct Ledger {
     resolutions: Vec<Result<Vec<u8>, Halted>>,
     /// What `wait` answers, in order.
     waits: Vec<Result<(), Halted>>,
+    /// What `deadline_remaining` answers after the last `wait`.
+    remaining: Option<(ClockKind, u64)>,
     asked: Vec<Asked>,
     scheduled: usize,
     resolved: usize,
@@ -65,6 +69,7 @@ impl Ledger {
             handoffs: Vec::new(),
             resolutions: Vec::new(),
             waits: Vec::new(),
+            remaining: None,
             asked: Vec::new(),
             scheduled: 0,
             resolved: 0,
@@ -85,6 +90,12 @@ impl Ledger {
 
     fn waiting(mut self, waits: Vec<Result<(), Halted>>) -> Self {
         self.waits = waits;
+        self
+    }
+
+    /// What `deadline_remaining` answers once `wait` has been asked.
+    const fn remaining_after_wait(mut self, remaining: Option<(ClockKind, u64)>) -> Self {
+        self.remaining = remaining;
         self
     }
 }
@@ -139,6 +150,10 @@ impl Journal for Ledger {
         self.asked.push(Asked::ContinueAsNew(input.to_vec()));
         Halted
     }
+
+    fn deadline_remaining(&self) -> Option<(ClockKind, u64)> {
+        self.remaining
+    }
 }
 
 /// A dispatcher that answers from a script and counts how often it was polled.
@@ -157,6 +172,8 @@ struct World {
     as_failure: bool,
     /// The identity each poll was handed.
     ids: Vec<EffectId>,
+    /// Whether every poll answers [`Produced::Unserviceable`].
+    unserviceable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +191,15 @@ impl World {
             reports: None,
             as_failure: false,
             ids: Vec::new(),
+            unserviceable: false,
         }
+    }
+
+    /// Answer every poll with [`Produced::Unserviceable`].
+    const fn unserviceable() -> Self {
+        let mut world = Self::silent();
+        world.unserviceable = true;
+        world
     }
 
     /// Report `len` rather than the answer's own length.
@@ -212,6 +237,9 @@ impl ActivityDispatcher for World {
     ) -> Poll<Result<Produced, Fault>> {
         self.polls += 1;
         self.ids.push(id);
+        if self.unserviceable {
+            return Poll::Ready(Ok(Produced::Unserviceable));
+        }
         if self.stalled < self.stalls {
             self.stalled += 1;
             return Poll::Pending;
@@ -343,6 +371,149 @@ fn a_dispatcher_that_is_not_ready_records_nothing_and_leaves_the_effect_outstand
 }
 
 #[test]
+fn an_unserviceable_kind_records_nothing_and_leaves_the_effect_outstanding() {
+    // Issue #111. An unserviceable kind stops the boot the same way a dispatcher that is
+    // not ready does. It records nothing. The effect stays outstanding under its committed
+    // identity. A later boot may still complete it.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(answered, Poll::Pending);
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the intent is durable, but nothing is ever resolved"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_is_not_a_retry_even_when_the_future_is_polled_again() {
+    // Issue #111. Unlike `Poll::Pending`, an unserviceable kind is not a retry: nothing
+    // about it changes before a reboot. A second poll within the same boot -- a spurious
+    // wake, say -- must not ask the dispatcher again.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let mut future = pin!(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let mut task = Task::from_waker(Waker::noop());
+    let first = future.as_mut().poll(&mut task);
+    let second = future.as_mut().poll(&mut task);
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Pending);
+    assert_eq!(
+        world.polls, 1,
+        "the dispatcher answered once, and was not asked again"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_is_not_a_retry_after_the_future_is_dropped_and_recreated() {
+    // Issue #111, Codex round 2. A cancelled `ActivityFuture` -- dropped out of a `select!`,
+    // say -- takes its own `stage` with it. A fresh future for the same outstanding effect
+    // must still meet the stop: this boot already learned no dispatcher here can serve it.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let first = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let second = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Pending);
+    assert_eq!(
+        world.polls, 1,
+        "the second future never reached the dispatcher"
+    );
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the second future never reached the journal either"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_stops_a_timer_future_built_after_it_from_reaching_the_journal() {
+    // Issue #111, round 3. `waymaker-drive`'s boundary refuses a second boundary while one
+    // effect is outstanding (`DriveError::EffectOutstanding`), so a timer future built after
+    // the dispatcher answered `Unserviceable` must not reach the journal at all -- doing so
+    // would turn this boot's clean stall into a hard boot error instead.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(dispatch(0))])
+        .waiting(vec![Ok(())]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let stalled = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    assert_eq!(stalled, Poll::Pending, "the activity stalls unserviceable");
+
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
+
+    assert_eq!(waited, Poll::Pending);
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the timer future never asked the journal"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_stops_continue_as_new_from_reaching_the_journal() {
+    // Issue #111, round 3. Same shape as the timer case: `continue_as_new` reaching the
+    // journal while an effect is outstanding meets `waymaker-drive`'s hard
+    // `EffectOutstanding` refusal instead of the clean stall this boot already recorded.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let stalled = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    assert_eq!(stalled, Poll::Pending, "the activity stalls unserviceable");
+
+    let continued = poll_once(ctx.continue_as_new(b"next"));
+
+    assert_eq!(continued, Poll::Pending);
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "continue_as_new never asked the journal"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_stops_a_terminal_future_from_recording_a_conclusion() {
+    // Issue #111, round 3. A terminal future built after the dispatcher answered
+    // `Unserviceable` must not record a conclusion: the effect is still outstanding, and
+    // `Ctx::conclusion` reporting an ending here is the same `Ok(Outcome)`-while-pending
+    // shape `waymaker-drive`'s own `Context::conclude` refuses.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let stalled = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    assert_eq!(stalled, Poll::Pending, "the activity stalls unserviceable");
+
+    let ended: Poll<Result<(), ()>> = poll_once(ctx.complete(b"done"));
+
+    assert_eq!(ended, Poll::Pending);
+    assert_eq!(
+        ctx.conclusion(),
+        None,
+        "no conclusion is recorded while the effect is still outstanding"
+    );
+}
+
+#[test]
 fn a_dispatcher_that_fails_records_a_failure_with_no_payload_and_keeps_the_typed_error() {
     // A failed activity has to reach media, or §08 strands the run: there is no edge from
     // an unresolved effect to a terminal record. The error value itself cannot, because a
@@ -450,8 +621,9 @@ fn a_deadline_that_has_not_passed_is_asked_again_on_the_next_poll() {
     let mut world = World::silent();
     let mut out = [0_u8; 16];
     let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = NoAlarm;
 
-    let mut future = pin!(ctx.timer(spec));
+    let mut future = pin!(ctx.timer(spec, &mut alarm));
     let mut task = Task::from_waker(Waker::noop());
     let first = future.as_mut().poll(&mut task);
     let second = future.as_mut().poll(&mut task);
@@ -470,7 +642,7 @@ fn a_timer_reaches_the_journal_and_never_the_dispatcher() {
     let mut out = [0_u8; 16];
     let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
 
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
 
     assert_eq!(waited, Poll::Ready(()));
     assert_eq!(ledger.asked, vec![Asked::Wait(spec)]);
@@ -485,10 +657,100 @@ fn a_deadline_that_has_not_passed_suspends_the_run() {
     let mut out = [0_u8; 16];
     let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
 
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
 
     assert_eq!(waited, Poll::Pending);
     assert_eq!(spec.clock_kind(), ClockKind::AT_PERSISTENT_TIME);
+}
+
+/// An alarm that records every call it was armed with, and the waker it was handed.
+struct Recording {
+    armed: Vec<(ClockKind, u64)>,
+    kept: Option<Waker>,
+}
+
+impl Recording {
+    const fn new() -> Self {
+        Self {
+            armed: Vec::new(),
+            kept: None,
+        }
+    }
+}
+
+impl Alarm for Recording {
+    fn wake_after(&mut self, kind: ClockKind, remaining: u64, waker: &Waker) {
+        self.armed.push((kind, remaining));
+        self.kept = Some(waker.clone());
+    }
+}
+
+#[test]
+fn a_deadline_that_has_not_passed_arms_the_alarm_with_the_remaining_ticks_and_the_task_waker() {
+    // Issue #110's in-boot sleep: the one case a caller can act on by sleeping instead of
+    // polling again straight away.
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let mut ledger = Ledger::new()
+        .waiting(vec![Err(Halted)])
+        .remaining_after_wait(Some((ClockKind::AFTER_BOOT, 25)));
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = Recording::new();
+
+    let counter = Arc::new(Counting {
+        woken: core::sync::atomic::AtomicUsize::new(0),
+    });
+    let waker = Waker::from(Arc::clone(&counter));
+    let mut task = Task::from_waker(&waker);
+
+    let waited = pin!(ctx.timer(spec, &mut alarm)).poll(&mut task);
+
+    assert_eq!(waited, Poll::Pending);
+    assert_eq!(alarm.armed, vec![(ClockKind::AFTER_BOOT, 25)]);
+    let kept = alarm.kept.take().expect("the alarm was armed");
+    assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 0);
+    kept.wake();
+    assert_eq!(counter.woken.load(core::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_deadline_that_has_passed_arms_no_alarm() {
+    // Nothing is left to wake for. Arming here would be a wakeup for an event that already
+    // happened.
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let mut ledger = Ledger::new()
+        .waiting(vec![Ok(())])
+        .remaining_after_wait(Some((ClockKind::AFTER_BOOT, 25)));
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = Recording::new();
+
+    let waited = poll_once(ctx.timer(spec, &mut alarm));
+
+    assert_eq!(waited, Poll::Ready(()));
+    assert!(alarm.armed.is_empty(), "an elapsed deadline arms nothing");
+}
+
+#[test]
+fn a_halt_for_another_reason_arms_no_alarm() {
+    // `Halted` alone does not mean "a deadline that has not passed". A journal that stopped
+    // for an unrelated reason has nothing here worth waking early for, and the empty
+    // `deadline_remaining` is what tells the two apart.
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let mut ledger = Ledger::new()
+        .waiting(vec![Err(Halted)])
+        .remaining_after_wait(None);
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+    let mut alarm = Recording::new();
+
+    let waited = poll_once(ctx.timer(spec, &mut alarm));
+
+    assert_eq!(waited, Poll::Pending);
+    assert!(alarm.armed.is_empty());
 }
 
 #[test]
@@ -765,7 +1027,7 @@ fn a_run_that_ended_reaches_neither_the_journal_nor_the_world_again() {
 
     let _ended: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"bad"));
     let after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
-    let waited = poll_once(ctx.timer(spec));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
     let restarted = poll_once(ctx.continue_as_new(b"next"));
 
     assert_eq!(after, Poll::Pending);
@@ -779,6 +1041,62 @@ fn a_run_that_ended_reaches_neither_the_journal_nor_the_world_again() {
     let _ = ctx;
     assert_eq!(world.polls, 0, "the world was never asked");
     assert!(ledger.asked.is_empty(), "the journal was never asked");
+}
+
+#[test]
+fn a_dropped_terminal_future_cannot_let_a_second_one_overwrite_the_conclusion() {
+    // Issue #107. `TerminalFuture` guarded on its own `ended` field. Poll `complete`, then
+    // drop it. Poll `fail`. The second future is new, so its flag reports nothing recorded
+    // yet. It overwrites the first decision. The flag must live in the `Ctx`.
+    let mut ledger = Ledger::new();
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _first: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"first"));
+    let _second: Poll<Result<(), Fault>> = poll_once(ctx.fail(b"second"));
+
+    assert_eq!(
+        ctx.conclusion(),
+        Some(Conclusion::Ended(Outcome::Completed(b"first"))),
+        "the first terminal decision is the run's"
+    );
+}
+
+#[test]
+fn a_run_that_continued_reaches_neither_the_journal_nor_the_world_again() {
+    // Issue #107. `continue_as_new` marked its own future asked, not the `Ctx`. Poll it,
+    // then drop it. The old workflow could then reach the journal again through another
+    // boundary — even after it asked to replace the run.
+    let spec = TimerSpec::AfterBoot { ticks: 1 };
+    let mut ledger = Ledger::new();
+    let mut world = World::silent();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let _restarted = poll_once(ctx.continue_as_new(b"next"));
+    let after = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let waited = poll_once(ctx.timer(spec, &mut NoAlarm));
+    let restarted_again = poll_once(ctx.continue_as_new(b"again"));
+    let ended: Poll<Result<(), Fault>> = poll_once(ctx.complete(b"late"));
+
+    assert_eq!(after, Poll::Pending);
+    assert_eq!(waited, Poll::Pending);
+    assert!(restarted_again.is_pending());
+    assert_eq!(ended, Poll::Pending, "a continued run cannot also end");
+    assert_eq!(
+        ctx.conclusion(),
+        None,
+        "a continued run is suspended, not ended: it has no terminal record"
+    );
+    // The `Ctx` borrow ends here, so the two counters below can be read.
+    let _ = ctx;
+    assert_eq!(world.polls, 0, "the world was never asked");
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::ContinueAsNew(b"next".to_vec())],
+        "only the first continue reaches the journal"
+    );
 }
 
 #[test]

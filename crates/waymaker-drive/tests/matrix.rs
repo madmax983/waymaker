@@ -33,13 +33,17 @@
 //! are in one of the states above, and the point is classified like any other; the census
 //! requires the two reset causes separately.
 //!
-//! # Where this deviates from §14
+//! # Row 5, and what issue #95 closed
 //!
-//! Row 5 says "redeliver". A torn completion leaves a journal with no append point
-//! (ADR 0018), so the driver refuses the bank rather than redelivering into it; the run's
-//! continuation is §10's `continue_as_new`, which is a new run. The test asserts what holds
-//! — the torn completion is ignored, no partial bytes reach the workflow, nothing is
-//! dispatched — and asserts the refusal rather than pretending a redelivery.
+//! Row 5 says "redeliver". No writer starts a record before the one ahead of it has
+//! sealed, so a torn completion's own reserved slot is the whole of what an interrupted
+//! attempt touched — and if every byte of it is erased, recovery now ignores the record and
+//! reports an append point past it, exactly as design document §14 asks: the effect already
+//! ran, and the same run redelivers it under its own identity rather than being forced into
+//! §10's `continue_as_new`. A tear *inside* the commit seal itself is not this module's to
+//! recover — the bytes there are neither erased nor a real seal, so recovery cannot tell an
+//! interrupted append from damage — and that half of the row still refuses. The test below
+//! sweeps both.
 
 use core::cell::RefCell;
 
@@ -348,10 +352,11 @@ fn classify(run: &Run, performed: &[u32]) -> Option<(Row, u32)> {
                 );
                 Some((Row::AfterActivityBeforeCompletionBarrier, k))
             } else {
-                assert!(
-                    !clean,
-                    "part of the outcome landed and the tail reads clean, at {at}"
-                );
+                // Issue #95: unlike row 4, `clean` no longer implies nothing landed here.
+                // No writer starts a record before the one ahead of it has sealed, so a
+                // torn completion whose own reserved slot came out erased is ignored and
+                // recovery reports `Ending::Clean` past it — redeliverable, not refused. A
+                // tear inside the commit seal itself still is not: this row holds both.
                 Some((Row::DuringCompletionWrite, k))
             }
         }
@@ -632,10 +637,13 @@ fn after_physical_activity_before_completion_barrier_the_same_id_is_redelivered(
 #[test]
 fn during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_bytes_are_exposed()
 {
+    // Issue #95: this row now holds two outcomes rather than one, and both are swept.
+    let mut redelivered = false;
+    let mut refused = false;
     for point in points_of(Row::DuringCompletionWrite) {
         let at = format!("{:?}", point.injection);
         let k = point.effect;
-        let (history, _) = history(&point.image);
+        let (history, ending) = history(&point.image);
         assert_eq!(
             history.last(),
             Some(&Record::Schedule(k)),
@@ -648,20 +656,46 @@ fn during_completion_write_the_torn_completion_is_ignored_and_no_partial_result_
             recovered.iter().all(|p| p == DOWNLOADED || p == HASHED),
             "a partial answer was recovered, at {at}"
         );
-        // See the module documentation: no append point, so the bank is refused rather than
-        // redelivered into, and nothing of the answer reaches the workflow.
         let (ended, world, workflow) = reboot(&point.image);
-        refused_without_dispatch(&ended, &world, &at);
-        let observed = if k == 0 {
-            workflow.downloaded()
+        if matches!(ending, Some(Ending::Clean { .. })) {
+            // No writer starts a record before the one ahead of it has sealed, so a torn
+            // completion whose own reserved slot is otherwise clean leaves a safe append
+            // point behind it. The effect already ran — dispatch happens before the
+            // outcome is written — so the run keeps going and redelivers under its own
+            // identity rather than being forced into `continue_as_new`.
+            redelivered = true;
+            assert!(
+                matches!(ended, Ok(Progress::Finished { .. })),
+                "at {at}: {ended:?}"
+            );
+            assert_eq!(
+                world.dispatched().first().map(|d| d.id),
+                Some(EffectId {
+                    run: RUN,
+                    seq: EffectSeq(k)
+                }),
+                "the redelivery carries the same id, at {at}"
+            );
+            assert_eq!(workflow.hashed(), HASHED, "at {at}");
         } else {
-            workflow.hashed()
-        };
-        assert!(
-            observed.is_empty(),
-            "the workflow observed part of an answer, at {at}"
-        );
+            // A tear inside the commit seal itself is not this module's to recover: no
+            // append point, so the bank is refused rather than redelivered into, and
+            // nothing of the answer reaches the workflow.
+            refused = true;
+            refused_without_dispatch(&ended, &world, &at);
+            let observed = if k == 0 {
+                workflow.downloaded()
+            } else {
+                workflow.hashed()
+            };
+            assert!(
+                observed.is_empty(),
+                "the workflow observed part of an answer, at {at}"
+            );
+        }
     }
+    assert!(redelivered, "no crash point in this row redelivered");
+    assert!(refused, "no crash point in this row was refused");
 }
 
 #[test]
@@ -1090,8 +1124,14 @@ impl StableStorage for Counted<'_> {
 /// Searched for rather than written down, so the number comes from the reserve's own
 /// arithmetic over real records.
 fn near_capacity() -> (Geometry, BankLayout, Reserve, JournalRegion, Device) {
-    for erase in [64_u32, 128, 256, 512] {
-        let Ok(geometry) = Geometry::new(erase * 2, erase, 4, 1) else {
+    // Erase size has to be a power of two (`Geometry::new`), which is too coarse a step to
+    // land on the exact boundary directly — doubling it can jump clean over the one bank
+    // size that fits one effect and refuses the second. Held at its smallest legal value
+    // instead, with the *block count* swept one erase unit at a time, so the search has
+    // byte-level resolution over the bank size regardless of what the reserve's own
+    // arithmetic costs.
+    for blocks in (2_u32..=4096).step_by(2) {
+        let Ok(geometry) = Geometry::new(4_u32.saturating_mul(blocks), 4, 4, 1) else {
             continue;
         };
         let Ok(layout) = BankLayout::new(geometry) else {

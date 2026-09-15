@@ -78,7 +78,10 @@
 //! conservatism: appending anywhere else programs cells a cycle has already cleared, and on
 //! NOR the bank never boots again — [`crate::recovery`]'s module documentation argues it at
 //! length. A constructor taking a region and an offset would let a caller supply two that do
-//! not belong together, so there is not one.
+//! not belong together, so there is not one. [`Recovery`] is not [`Clone`] for the same
+//! reason, since issue [#77](https://github.com/madmax983/waymaker/issues/77): a clone is
+//! one scan's bytes copied, not a second scan, and taking it by value would not have stopped
+//! `Journal::after(recovery.clone())` while a clone existed.
 //!
 //! # Write amplification
 //!
@@ -325,8 +328,9 @@ pub enum AppendError<E> {
 /// # Why it is not `Copy`
 ///
 /// Two writers appending to one journal at one offset would each overwrite the other's
-/// record. `Clone` is not derived either, for the same reason: unlike a reader, a copied
-/// *writer* is not a way to look ahead, it is a second appender.
+/// record. `Clone` is not derived either, for the same reason: a copied *writer* is not a
+/// way to look ahead, it is a second appender — and since issue
+/// [#77](https://github.com/madmax983/waymaker/issues/77), neither is a copied reader.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Journal<C: IntegrityCheck = Catalogued> {
     region: JournalRegion,
@@ -357,10 +361,13 @@ impl<C: IntegrityCheck> Journal<C> {
     /// Because a recovery that could hand out two writers would hand out two writers at one
     /// offset, and the second would program its frame over the first — on NOR, a bank that
     /// fails its own header checksum on every boot for ever. Taking it by value makes the
-    /// accidental case not compile. It cannot make the *deliberate* case impossible: two
-    /// separate scans of one region produce two writers, exactly as two [`Recovery`] values
-    /// over one region already do, and nothing short of ownership of the media could stop
-    /// that. What it buys is that a second writer is a line somebody wrote on purpose.
+    /// accidental case not compile. Since issue
+    /// [#77](https://github.com/madmax983/waymaker/issues/77), [`Recovery`] is not
+    /// [`Clone`] either, so there is no copy to pass in its place. It cannot make the
+    /// *deliberate* case impossible: two separate scans of one region produce two writers,
+    /// each its own [`Recovery`] built and pumped from scratch, and nothing short of
+    /// ownership of the media could stop that. What it buys is that a second writer is a
+    /// line somebody wrote on purpose.
     ///
     /// # Postconditions
     ///
@@ -594,9 +601,16 @@ fn payload_of(record: &RecordRef<'_>) -> u32 {
 /// thing that produces a [`Sealable`] is that call.
 ///
 /// Dropping one is legal and leaves an unsealed frame on media. That is not a leak and not a
-/// silent failure: recovery reports [`Ending::Unsealed`](crate::recovery::Ending::Unsealed)
-/// at that frame, the record is not history, and the bank is recycled rather than appended
-/// to. It is `#[must_use]` all the same, because dropping one is almost never what a caller
+/// silent failure: the record is not history either way. For an outcome —
+/// `EffectCompleted`, `EffectFailed` or `TimerFired`, the only three kinds
+/// `frame::redeliverable_kind` admits — recovery checks only this frame's own reserved
+/// slot — `[frame_len, stride)`, the padding and the seal —
+/// and if every byte of it is erased, ignores the frame and keeps scanning past it, whatever
+/// lies further out (including a later boot's own committed history) — issue
+/// [#95](https://github.com/madmax983/waymaker/issues/95). Every other kind, and any outcome
+/// whose slot is not fully erased, gets no such look: recovery reports
+/// [`Ending::Unsealed`](crate::recovery::Ending::Unsealed) and the bank is recycled instead.
+/// It is `#[must_use]` all the same, because dropping one is almost never what a caller
 /// meant.
 #[must_use = "a staged frame is not committed until its payload barrier and commit barrier \
               have returned"]

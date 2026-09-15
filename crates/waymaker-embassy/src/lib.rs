@@ -29,6 +29,8 @@
 //! * [`clock`] — design document §11's `PersistentClock` capability. It is here rather
 //!   than in the kernel because the kernel's must-not-own cell names a clock, and
 //!   `waymaker-flash`'s names timers.
+//! * [`alarm`] — issue [#110](https://github.com/madmax983/waymaker/issues/110)'s in-boot
+//!   sleep: an [`Alarm`] a [`TimerFuture`] arms instead of asking again straight away.
 //!
 //! # There is no Embassy dependency
 //!
@@ -41,15 +43,18 @@
 //!
 //! Rung 0.4's first three items are here, and so is the exit criterion: `cargo xtask size`
 //! gates this crate's row against a ceiling of its own (issue
-//! [#39](https://github.com/madmax983/waymaker/issues/39)). Still owed: the provisioning
-//! example (issue [#38](https://github.com/madmax983/waymaker/issues/38)), and in-boot sleep
-//! and the `continue_as_new` join (issue
-//! [#110](https://github.com/madmax983/waymaker/issues/110)).
+//! [#39](https://github.com/madmax983/waymaker/issues/39)). The provisioning example is
+//! here too (issue [#38](https://github.com/madmax983/waymaker/issues/38)), and so is
+//! issue [#110](https://github.com/madmax983/waymaker/issues/110): in-boot sleep, above,
+//! and the `continue_as_new` join, which needed nothing new here — [`Journal::continue_as_new`]
+//! already forwarded to `waymaker-drive`'s `Boundary`, and a driver over there that can
+//! swap makes this façade's call really swap, unchanged.
 
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod alarm;
 pub mod clock;
 pub mod ctx;
 pub mod decode;
@@ -57,9 +62,10 @@ pub mod dispatch;
 pub mod journal;
 pub mod wiring;
 
+pub use alarm::{Alarm, NoAlarm};
 pub use clock::{ClockError, PersistentClock, PersistentTimer};
 pub use ctx::{ActivityFuture, ContinueFuture, Ctx, Failure, TerminalFuture, TimerFuture};
 pub use decode::Decode;
 pub use dispatch::{ActivityDispatcher, Produced};
 pub use journal::{Answer, Halted, Handoff, Journal};
-pub use wiring::{Activity, Perform, Table, Unhandled};
+pub use wiring::{Activity, Perform, Table};

@@ -1,11 +1,10 @@
-#![cfg(not(feature = "without-facade"))]
 //! Issue [#36](https://github.com/madmax983/waymaker/issues/36)'s two "done when"s, over
 //! real media.
 //!
 //! The workflow is an `async fn` over `Ctx`, the world is a
-//! [`Table`](waymaker_embassy::wiring::Table) of numeric kinds, the driver is this crate's
-//! and the media is `waymaker-fault`'s model of NOR. So what is measured is the protocol
-//! rather than a fixture that agrees with it.
+//! [`Table`](waymaker_embassy::wiring::Table) of numeric kinds, the driver is
+//! `waymaker-drive`'s and the media is `waymaker-fault`'s model of NOR. So what is measured
+//! is the protocol rather than a fixture that agrees with it.
 //!
 //! * **the bound.** The run declares four bytes of effect result and eight of terminal
 //!   payload, so the context buffer is wider than an answer may be. A dispatcher that
@@ -13,6 +12,10 @@
 //!   of it.
 //! * **durable intent.** At every crash point the injector lists, every effect the world
 //!   performed has a schedule record in the prefix the crash left behind.
+//! * **an unserviceable kind, over real media.** Issue
+//!   [#111](https://github.com/madmax983/waymaker/issues/111). A table with no row commits
+//!   a schedule record and writes nothing else. A second boot, over the same device, with a
+//!   table that has the row, redelivers and completes the same effect.
 //!
 //! The façade's own sequencing is `crates/waymaker-embassy/tests/{ctx,wiring}.rs`.
 
@@ -25,13 +28,14 @@ use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
 use waymaker_drive::{
-    Activities, Boundary, Bridge, Clocks, DriveError, Driver, DurableIntent, Identity, Performed,
-    Scratch, Suspended, Workflow,
+    Activities, Boundary, CheckedDispatch, Clocks, DriveError, Driver, Identity, Performed,
+    Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
-use waymaker_embassy::wiring::{Activity, Table, Unhandled};
+use waymaker_embassy::wiring::{Activity, Table};
 use waymaker_embassy::{ActivityDispatcher, Journal};
+use waymaker_facade_demo::Bridge;
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::{Bounds, Reserve};
@@ -53,9 +57,6 @@ const URL: &[u8] = b"fw://a";
 /// wrote the row's label into the answer buffer put four bytes of an eighteen-byte name on
 /// media and the scan still passed. A name that fits is a scan that can fail.
 const DOWNLOAD_NAME: &str = "dl";
-
-/// The terminal payload of a run that reached a branch this file argues is unreachable.
-const UNREACHED: &[u8] = &[254];
 
 /// A four-byte result bound under an eight-byte terminal bound.
 ///
@@ -171,6 +172,13 @@ impl Wired {
         }
     }
 
+    const fn with_rows(world: World, rows: &'static [Activity<World, Offline>]) -> Self {
+        Self {
+            table: Table::over(world, rows),
+            out: [0; 8],
+        }
+    }
+
     const fn world(&self) -> &World {
         self.table.world()
     }
@@ -186,27 +194,36 @@ impl Workflow for Wired {
     }
 
     fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
-        let ended = {
+        let (ended, suspended) = {
             let mut bridge = Bridge::over(boundary);
             let mut ctx = Ctx::new(&mut bridge, &mut self.table, &mut self.out);
             let polled = {
                 let mut future = pin!(work(&mut ctx));
                 future.as_mut().poll(&mut Task::from_waker(Waker::noop()))
             };
-            match (ctx.conclusion(), polled) {
+            let ended = match (ctx.conclusion(), polled) {
                 (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => Some(bytes.len()),
                 (Some(Conclusion::Ended(Outcome::Failed(_)) | Conclusion::Refused), _)
                 | (None, Poll::Pending) => None,
+                // See `ota.rs`'s own bridge: an outstanding `Unserviceable` effect must not
+                // be reported as ended just because the workflow returned on its own past a
+                // dropped, stalled future.
+                (None, Poll::Ready(_)) if ctx.unserviceable() => None,
                 (None, Poll::Ready(_)) => Some(0),
-            }
+            };
+            // Read after `ctx`'s last use: the same `Suspended` the boundary returned, not
+            // a fresh one -- see `facade`'s module doc.
+            (ended, bridge.take_suspended())
         };
         let Some(len) = ended else {
-            // Unreachable, and observable rather than silent. `work` always ends the run,
-            // its one-byte terminal payload always fits the eight-byte buffer, and this
-            // file's world always answers — so a poll that ends without a conclusion is a
-            // boundary the driver already stopped, and `Context::conclude` reads its own
-            // `stop` before it reads this value. `UNREACHED` is a byte no test expects.
-            return Ok(Outcome::Failed(UNREACHED));
+            // `work` always ends the run, and its payload always fits. This arm was once
+            // unreachable for that reason. Issue #111 opened it: an unserviceable kind can
+            // now leave `ctx.conclusion()` at `None` with the world never stalling at all.
+            // `suspended` is the real value whenever a boundary call produced one; a
+            // dispatcher still working produces none, so this falls back to the one
+            // `Suspended` named for that, the same way `ota.rs`'s own bridge does -- see
+            // `Suspended::awaiting_dispatch`.
+            return Err(suspended.unwrap_or_else(Suspended::awaiting_dispatch));
         };
         Ok(Outcome::Completed(self.out.get(..len).unwrap_or_default()))
     }
@@ -218,13 +235,7 @@ struct Unused {
 }
 
 impl Activities for Unused {
-    fn perform(
-        &mut self,
-        _intent: DurableIntent,
-        _kind: ActivityKind,
-        _input: &[u8],
-        _out: &mut [u8],
-    ) -> Performed {
+    fn perform(&mut self, _dispatch: CheckedDispatch<'_>, _out: &mut [u8]) -> Performed {
         self.performed += 1;
         Performed::Pending
     }
@@ -244,6 +255,86 @@ impl Clocks for Unused {
 fn boot(
     device: &mut Device,
     workflow: &mut Wired,
+) -> Result<waymaker_drive::Progress, DriveError<FaultError>> {
+    let mut page = [0_u8; 256];
+    let mut result = [0_u8; 64];
+    let mut world = Unused { performed: 0 };
+    Driver::new(region(), RUN, reserve()).boot(
+        device,
+        &mut world,
+        workflow,
+        Scratch {
+            page: &mut page,
+            result: &mut result,
+        },
+    )
+}
+
+/// A workflow whose body abandons a stalled activity and returns directly, the way a
+/// `select!` that dropped the losing branch for another would.
+///
+/// It wires no row at all, so the one activity it asks for always answers
+/// `Produced::Unserviceable`.
+struct Racing {
+    table: Table<'static, World, Offline>,
+    out: [u8; 8],
+}
+
+impl Racing {
+    const fn new(world: World) -> Self {
+        Self {
+            table: Table::over(world, NO_ROWS),
+            out: [0; 8],
+        }
+    }
+}
+
+impl Workflow for Racing {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: URL,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let (ended, suspended) = {
+            let mut bridge = Bridge::over(boundary);
+            let mut ctx = Ctx::new(&mut bridge, &mut self.table, &mut self.out);
+            // A `select!` that dropped this branch for another would leave the same shape:
+            // one poll, `Poll::Pending`, and the future gone -- with no boundary reached
+            // again and no conclusion ever recorded through `ctx`. `polled` is `Ready`
+            // because the workflow itself has nothing left to do afterward: it returns
+            // directly, as `Ok(())` never having gone through `ctx.complete`.
+            let polled: Poll<Result<(), ()>> = {
+                let mut activity = pin!(ctx.activity::<()>(DOWNLOAD, URL));
+                let _ = activity.as_mut().poll(&mut Task::from_waker(Waker::noop()));
+                Poll::Ready(Ok(()))
+            };
+            // The same match `ota.rs`'s and `provisioning.rs`'s own bridges carry: an
+            // outstanding `Unserviceable` effect must not be reported as ended just because
+            // the workflow returned on its own past a dropped, stalled future.
+            let ended = match (ctx.conclusion(), polled) {
+                (Some(Conclusion::Ended(Outcome::Completed(bytes))), _) => Some(bytes.len()),
+                (Some(Conclusion::Ended(Outcome::Failed(_)) | Conclusion::Refused), _)
+                | (None, Poll::Pending) => None,
+                (None, Poll::Ready(_)) if ctx.unserviceable() => None,
+                (None, Poll::Ready(_)) => Some(0),
+            };
+            (ended, bridge.take_suspended())
+        };
+        let Some(len) = ended else {
+            return Err(suspended.unwrap_or_else(Suspended::awaiting_dispatch));
+        };
+        Ok(Outcome::Completed(self.out.get(..len).unwrap_or_default()))
+    }
+}
+
+/// One boot of [`Racing`] over `device`.
+fn boot_racing(
+    device: &mut Device,
+    workflow: &mut Racing,
 ) -> Result<waymaker_drive::Progress, DriveError<FaultError>> {
     let mut page = [0_u8; 256];
     let mut result = [0_u8; 64];
@@ -281,6 +372,41 @@ fn history(device: &mut Device) -> Vec<(u8, Vec<u8>)> {
         });
     }
     out
+}
+
+#[test]
+fn a_workflow_that_abandons_a_stalled_effect_and_returns_directly_still_waits() {
+    // Codex round 4 on issue #111. Every future `Ctx` hands out already refuses once a
+    // dispatcher answers `Unserviceable`, but that cannot stop the *enclosing* `async fn`
+    // returning its own `Result` directly -- past a `select!` that dropped the stalled
+    // future for another branch, say. `Racing`'s own body does exactly that. Without the
+    // bridge's `ctx.unserviceable()` check this reports `Ok(Progress::Finished { .. })`
+    // while the effect is still outstanding; with it, the boot answers the same clean
+    // `Ok(Progress::Waiting)` a directly-`.await`ed `Unserviceable` already does.
+    let mut device = Device::new(geometry());
+    let mut workflow = Racing::new(World::default());
+
+    let progress = boot_racing(&mut device, &mut workflow);
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Waiting {
+            id: EffectId {
+                run: RUN,
+                seq: EffectSeq(0),
+            },
+        }),
+        "the abandoned effect still stalls the boot rather than reporting a false ending: \
+         {progress:?}"
+    );
+    assert_eq!(
+        history(&mut device)
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the run and the schedule only -- no terminal record for an effect still outstanding"
+    );
 }
 
 #[test]
@@ -528,10 +654,7 @@ fn a_kind_no_row_declares_stops_the_run_without_a_panic() {
         &mut out,
     );
 
-    assert_eq!(
-        answered,
-        Poll::Ready(Err(Unhandled::NoSuchActivity(ActivityKind(99))))
-    );
+    assert_eq!(answered, Poll::Ready(Ok(Produced::Unserviceable)));
 }
 
 /// One boot over `session`, and the sequences the world was asked to perform.
@@ -624,5 +747,77 @@ fn every_effect_the_facade_dispatched_has_a_recoverable_schedule_at_every_crash_
     assert!(
         shortened > 0,
         "a sweep in which no crash ever shortened history measured nothing"
+    );
+}
+
+/// No row at all. Issue #111's firmware, before it gains `DOWNLOAD`.
+const NO_ROWS: &[Activity<World, Offline>] = &[];
+
+#[test]
+fn a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_left_outstanding() {
+    // Boot 1, over real media. No row answers `DOWNLOAD`. The schedule record commits, and
+    // nothing else does. `Wired::run` reads the real `Suspended` the bridge kept from the
+    // boundary's own last call -- here, none, because the stall never reached a boundary
+    // call at all -- and falls back to `Suspended::awaiting_dispatch`, the same way
+    // `ota.rs`'s own bridge does. The driver's own `pending` check sees the effect
+    // outstanding and a real suspension rather than a workflow outcome, so the boot answers
+    // `Progress::Waiting` cleanly rather than `DriveError::EffectOutstanding`.
+    let mut device = Device::new(geometry());
+    let mut stranded = Wired::with_rows(World::default(), NO_ROWS);
+
+    let progress = boot(&mut device, &mut stranded);
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Waiting {
+            id: EffectId {
+                run: RUN,
+                seq: EffectSeq(0),
+            },
+        }),
+        "boot 1 stalls cleanly rather than erroring: {progress:?}"
+    );
+    assert!(stranded.world().dispatched.is_empty(), "no row ran");
+    assert_eq!(
+        history(&mut device)
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the run and the schedule only -- no outcome and no terminal record for a kind \
+         this firmware cannot service"
+    );
+
+    // Boot 2, over the same device: a firmware update adds the row.
+    let mut rescued = Wired::new(World {
+        answer: b"ok".to_vec(),
+        ..World::default()
+    });
+
+    let progress = boot(&mut device, &mut rescued);
+
+    assert_eq!(
+        progress,
+        Ok(Progress::Finished {
+            conclusion: waymaker_drive::Conclusion::Completed,
+            result_len: 1,
+        }),
+        "the run boot 1 left outstanding now completes"
+    );
+    assert_eq!(
+        rescued.world().dispatched,
+        vec![EffectId {
+            run: RUN,
+            seq: EffectSeq(0),
+        }],
+        "the same identity boot 1's schedule record committed, redelivered and run once"
+    );
+    assert_eq!(
+        history(&mut device)
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 6],
+        "the run, the schedule, the completion, and the end"
     );
 }

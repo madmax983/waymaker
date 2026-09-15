@@ -630,6 +630,71 @@ pub const STORAGE_CONTRACT_CLAUSES: &[StorageClause] = &[
     },
 ];
 
+/// The ADR that decides how issue #130 item 2's shape catalogue is held.
+///
+/// Named here rather than found by prefix, for the reason [`STORAGE_CONFORMANCE_ADR`] is.
+pub const STORAGE_SHAPES_ADR: &str = "0047-a-shape-catalogue-holds-the-suite-to-the-writers.md";
+
+/// Where the conformance crate's own shape table lives, relative to the workspace root.
+///
+/// Read rather than trusted, for the reason [`STORAGE_CLAUSES_PATH`] is: without reading it,
+/// a shape could be deleted from the crate with `CLAUDE.md` still describing it.
+pub const STORAGE_SHAPES_PATH: &str = "crates/waymaker-conformance/src/shape.rs";
+
+/// One `(operation, width)` shape a legal storage call can have, as the gate knows it.
+///
+/// The counterpart of [`waymaker-conformance`'s own table][crate]; `storage-shapes` fails a
+/// build in which the two disagree, in either direction.
+///
+/// [crate]: https://github.com/madmax983/waymaker/blob/main/crates/waymaker-conformance/src/shape.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageShape {
+    /// Stable identifier, cited by `CLAUDE.md`, by the ADR and by the crate.
+    pub id: &'static str,
+    /// The shape, in one sentence.
+    pub sentence: &'static str,
+    /// Which writer or reader in `waymaker-flash` issues it.
+    pub issued_by: &'static str,
+}
+
+/// Every `(operation, width)` shape a legal call above §12's contract can have.
+///
+/// Issue [#130](https://github.com/madmax983/waymaker/issues/130) item 2 asks that "every
+/// legal operation shape the firmware issues must appear in the suite". A program and an
+/// erase each have two rows, one unit and more than one; a read has the same two.
+pub const STORAGE_SHAPES: &[StorageShape] = &[
+    StorageShape {
+        id: "program-single-unit",
+        sentence: "A program of exactly one program unit.",
+        issued_by: "`append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever the padded value — at the journal's own alignment, which may be coarser than the device program unit — comes to exactly one device program unit",
+    },
+    StorageShape {
+        id: "program-multi-unit",
+        sentence: "A program of more than one program unit in one call.",
+        issued_by: "`append::Sealable::commit`'s record commit seal, `append::Journal::stage`'s frame body, `swap::Prepared::stage`'s bank header and `swap::Sealable::commit`'s bank seal, whenever that padded value spans more than one device program unit",
+    },
+    StorageShape {
+        id: "erase-single-block",
+        sentence: "An erase of exactly one erase block.",
+        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device whose bank is one erase block",
+    },
+    StorageShape {
+        id: "erase-multi-block",
+        sentence: "An erase of more than one erase block in one call.",
+        issued_by: "`swap::Swap::prepare` and `Installed::reclaim`, on a device with at least four erase blocks",
+    },
+    StorageShape {
+        id: "read-single-unit",
+        sentence: "A read of exactly one read unit.",
+        issued_by: "`recovery::Recovery::stage`'s header read and its erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — come to exactly one read unit",
+    },
+    StorageShape {
+        id: "read-multi-unit",
+        sentence: "A read of more than one read unit in one call.",
+        issued_by: "`recovery::Recovery::stage`'s whole-record read, always at least two read units by construction; and its header read and erased-tail walk, whenever the bytes actually read — bounded by the geometry and by what remains of the region — span more than one read unit",
+    },
+];
+
 /// The id of the diagram that has to agree with [`LAYERS`].
 pub const CRATE_DEPENDENCY_DIAGRAM: &str = "crate-dependency-flow";
 
@@ -1174,6 +1239,12 @@ pub struct DocsInputs {
     /// is: a conformance suite whose clause table cannot be read is a suite nothing is
     /// holding to the contract it claims to check.
     pub storage_clauses: Option<String>,
+    /// Contents of [`STORAGE_SHAPES_PATH`], when the workspace has it.
+    ///
+    /// `None` is a violation rather than a skip, for the reason
+    /// [`DocsInputs::storage_clauses`] is: a shape catalogue nobody can read is a catalogue
+    /// nothing is holding to the suite.
+    pub storage_shapes: Option<String>,
     /// Contents of [`FAILURE_ROWS_PATH`], when the workspace has it. `None` is a violation.
     pub failure_rows: Option<String>,
     /// Every `.bin` file under [`WIRE_FORMAT_CORPUS_DIR`], by name, with its bytes.
@@ -1363,31 +1434,6 @@ fn without_html_comments(contents: &str) -> String {
     }
     kept.push_str(rest);
     kept
-}
-
-/// `contents` with every fenced code block removed.
-///
-/// A link or a heading inside a fence is displayed as literal text: it is an example of
-/// Markdown, not Markdown. Used where a rule asks whether a reader can follow something.
-#[must_use]
-fn without_fenced_code(contents: &str) -> String {
-    let mut kept = Vec::new();
-    let mut open_fence: Option<(u8, usize)> = None;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        let fence = fence_length(trimmed);
-        match open_fence {
-            Some((marker, width))
-                if fence.is_some_and(|(found, length)| found == marker && length >= width) =>
-            {
-                open_fence = None;
-            }
-            Some(_) => {}
-            None if fence.is_some() => open_fence = fence,
-            None => kept.push(line),
-        }
-    }
-    kept.join("\n")
 }
 
 /// The two phrases CLAUDE.md states the gate's rule count in.
@@ -1833,7 +1879,12 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
     // Fences as well as comments, for the reason the ADR half strips them: a fenced example
     // listing the six ids would otherwise satisfy every check below in a file whose table
     // has been deleted.
-    let contents = without_fenced_code(&without_html_comments(contents));
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — the escaped example a
+    // `\|`-written row renders to is indistinguishable from a real one once the backslash
+    // is gone, and a real GFM table needs a delimiter row an escaped example never has
+    // (issue #82's continuation).
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
     for clause in SPEC_CLAUSES {
         // The clause's own table row, found by its backticked id — not three global
@@ -1841,10 +1892,10 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         // PR #58 and which bites harder here: four of the six clauses name the same proof
         // file, so a whole-file check for `tests/spine.rs` is satisfied by any one of their
         // rows on behalf of all four.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", clause.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -1889,7 +1940,7 @@ fn check_spec_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         }
     }
     let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "recovery-spec",
             "clause count",
@@ -1909,7 +1960,7 @@ fn check_spec_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
              is a choice nobody wrote down",
         )];
     };
-    let contents = without_fenced_code(&without_html_comments(&adr.contents));
+    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
     SPEC_CLAUSES
         .iter()
         .filter(|clause| !contents.contains(&format!("`{}`", clause.id)))
@@ -2097,17 +2148,19 @@ fn check_storage_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violat
         // `claude-md` already reports the missing file.
         return Vec::new();
     };
-    let contents = without_fenced_code(&without_html_comments(contents));
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
     for clause in STORAGE_CONTRACT_CLAUSES {
         // The clause's own table row, found by its backticked id. Not three whole-file
         // `contains` calls, for the reason the recovery half is written this way: four of
         // the six clauses share a discharge, so a file-wide check for "the in-process suite"
         // is satisfied by one row on behalf of all of them.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", clause.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -2156,7 +2209,7 @@ fn check_storage_clauses_are_written_down(claude_md: Option<&str>) -> Vec<Violat
         "All {} storage-contract clauses",
         STORAGE_CONTRACT_CLAUSES.len()
     );
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "storage-conformance",
             "clause count",
@@ -2176,16 +2229,18 @@ fn check_storage_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
              and what it can observe are choices nobody wrote down",
         )];
     };
-    let contents = without_fenced_code(&without_html_comments(&adr.contents));
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(&adr.contents);
     let mut violations = Vec::new();
     for clause in STORAGE_CONTRACT_CLAUSES {
         // The clause's own row, as in the `CLAUDE.md` half. The ADR states what discharges
         // each clause in a table of its own; checking only the id would let that table say
         // the opposite of the one it is a record of.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", clause.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", clause.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -2215,6 +2270,280 @@ fn check_storage_clauses_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
                      discharged by `{}`, so the record and the gate disagree about what \
                      holds it up",
                     clause.discharge.message()
+                ),
+            ));
+        }
+    }
+    violations
+}
+
+/// Rule: issue #130 item 2's shape catalogue and the four places it lives agree.
+///
+/// The same shape as [`check_storage_conformance`]: a shape of [`STORAGE_SHAPES`] has to
+/// appear in `CLAUDE.md` with its sentence and issuer, in [`STORAGE_SHAPES_ADR`], and in the
+/// conformance crate's own table at [`STORAGE_SHAPES_PATH`] — and a shape the crate declares
+/// that the gate does not is a violation too, because a suite growing a shape nobody wrote
+/// down is the other way this rots.
+///
+/// What it cannot check is that a shape is really issued somewhere: that is inside the
+/// crate, and `crates/waymaker-conformance/tests/shapes.rs::a_full_run_issues_every_declared_shape`
+/// is what fails a build over it.
+#[must_use]
+fn check_storage_shapes(
+    claude_md: Option<&str>,
+    adrs: &[AdrFile],
+    shapes: Option<&str>,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+
+    match shapes {
+        None => violations.push(Violation::new(
+            "storage-shapes",
+            STORAGE_SHAPES_PATH,
+            "the conformance suite's shape table is not where the gate looks for it, so \
+             nothing holds the suite to the shapes it claims to issue",
+        )),
+        Some(contents) => {
+            // Comments stripped first, for the reason `check_storage_conformance` strips
+            // them: a table commented out and replaced by an empty slice would otherwise
+            // declare all six shapes and check none of them.
+            let source = strip_rust_comments(contents);
+            let declared = storage_shape_rows(&source);
+            for shape in STORAGE_SHAPES {
+                let Some(row) = declared.get(shape.id) else {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        shape.id,
+                        format!(
+                            "{STORAGE_SHAPES_PATH} declares no shape with this id, so the catalogue has documentation and no suite behind it"
+                        ),
+                    ));
+                    continue;
+                };
+                if row.sentence != Some(shape.sentence) {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        shape.id,
+                        row.sentence.map_or_else(
+                            || {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH}'s row for this shape states no sentence, and docs::STORAGE_SHAPES says `{}`",
+                                    shape.sentence
+                                )
+                            },
+                            |named| {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH} states this shape as `{named}` and docs::STORAGE_SHAPES says `{}`",
+                                    shape.sentence
+                                )
+                            },
+                        ),
+                    ));
+                }
+                if row.issued_by != Some(shape.issued_by) {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        shape.id,
+                        row.issued_by.map_or_else(
+                            || {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH}'s row for this shape names no issuer, and docs::STORAGE_SHAPES says `{}`",
+                                    shape.issued_by
+                                )
+                            },
+                            |named| {
+                                format!(
+                                    "{STORAGE_SHAPES_PATH} names this shape's issuer as `{named}` and docs::STORAGE_SHAPES says `{}`",
+                                    shape.issued_by
+                                )
+                            },
+                        ),
+                    ));
+                }
+            }
+            for id in declared.keys() {
+                if !STORAGE_SHAPES.iter().any(|shape| shape.id == *id) {
+                    violations.push(Violation::new(
+                        "storage-shapes",
+                        (*id).to_owned(),
+                        format!(
+                            "{STORAGE_SHAPES_PATH} declares this shape and docs::STORAGE_SHAPES does not, so the suite issues something nobody wrote down"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    violations.extend(check_storage_shapes_are_written_down(claude_md));
+    violations.extend(check_storage_shapes_are_decided(adrs));
+    violations
+}
+
+/// Every `(shape id, sentence, issuer)` triple [`STORAGE_SHAPES_PATH`] declares.
+///
+/// Matched on the table's own `id: "..."`, `sentence: "..."` and `issued_by: "..."` fields,
+/// the same way [`storage_clause_rows`] matches `Clause`'s.
+fn storage_shape_rows(contents: &str) -> BTreeMap<&str, StorageShapeRow<'_>> {
+    let mut rows = BTreeMap::new();
+    let Some(body) = const_slice_body(contents, "SHAPES") else {
+        return rows;
+    };
+    for row in struct_rows(body, "Shape") {
+        let Some(id) = quoted_field(row, "id: \"") else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        rows.insert(
+            id,
+            StorageShapeRow {
+                sentence: quoted_field(row, "sentence: \""),
+                issued_by: quoted_field(row, "issued_by: \""),
+            },
+        );
+    }
+    rows
+}
+
+/// What one row of the conformance crate's shape table declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageShapeRow<'a> {
+    /// The sentence the crate states the shape as.
+    sentence: Option<&'a str>,
+    /// Who the crate says issues it.
+    issued_by: Option<&'a str>,
+}
+
+/// The half of `storage-shapes` that reads `CLAUDE.md`.
+fn check_storage_shapes_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
+    let Some(contents) = claude_md else {
+        // `claude-md` already reports the missing file.
+        return Vec::new();
+    };
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
+    let mut violations = Vec::new();
+    for shape in STORAGE_SHAPES {
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", shape.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                if rows.is_empty() {
+                    "CLAUDE.md has no table row naming this storage shape in backticks, so a \
+                     contributor cannot tell which shape a change is touching"
+                        .to_owned()
+                } else {
+                    format!(
+                        "CLAUDE.md has {} table rows naming this storage shape, so which one \
+                         a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+
+        if !row.contains(shape.sentence) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "CLAUDE.md's table row for this shape does not state it as `{}`, which is \
+                     what docs::STORAGE_SHAPES reads",
+                    shape.sentence
+                ),
+            ));
+        }
+        if !row.contains(shape.issued_by) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "CLAUDE.md's table row does not say this shape is issued by `{}`, so the \
+                     row states a shape without saying what issues it",
+                    shape.issued_by
+                ),
+            ));
+        }
+    }
+    let count = format!("All {} storage shapes", STORAGE_SHAPES.len());
+    if !prose.contains(&count) {
+        violations.push(Violation::new(
+            "storage-shapes",
+            "shape count",
+            format!("CLAUDE.md does not say `{count}`, which is what the table holds"),
+        ));
+    }
+    violations
+}
+
+/// The half of `storage-shapes` that reads the decision record.
+fn check_storage_shapes_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
+    let Some(adr) = adrs.iter().find(|adr| adr.name == STORAGE_SHAPES_ADR) else {
+        return vec![Violation::new(
+            "storage-shapes",
+            STORAGE_SHAPES_ADR,
+            "the storage-shape catalogue has no decision record, so where it lives and what \
+             it covers are choices nobody wrote down",
+        )];
+    };
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(&adr.contents);
+    let mut violations = Vec::new();
+    for shape in STORAGE_SHAPES {
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", shape.id)))
+            .collect();
+        let [row] = rows.as_slice() else {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                if rows.is_empty() {
+                    format!(
+                        "{STORAGE_SHAPES_ADR} has no table row naming this shape in \
+                         backticks, so the catalogue has a suite and no decision record \
+                         behind it"
+                    )
+                } else {
+                    format!(
+                        "{STORAGE_SHAPES_ADR} has {} table rows naming this shape, so which \
+                         one a reader believes depends on which they reach first",
+                        rows.len()
+                    )
+                },
+            ));
+            continue;
+        };
+        if !row.contains(shape.sentence) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "{STORAGE_SHAPES_ADR}'s table row does not state this shape as `{}`, so \
+                     the record and the gate disagree about what the shape is",
+                    shape.sentence
+                ),
+            ));
+        }
+        if !row.contains(shape.issued_by) {
+            violations.push(Violation::new(
+                "storage-shapes",
+                shape.id,
+                format!(
+                    "{STORAGE_SHAPES_ADR}'s table row does not say this shape is issued by \
+                     `{}`, so the record and the gate disagree about what issues it",
+                    shape.issued_by
                 ),
             ));
         }
@@ -2294,16 +2623,19 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for adr in adrs {
-        // An ADR whose `- Status:` and `- Date:` sit inside an HTML comment renders with no
-        // metadata at all, and every check below would otherwise find them.
-        let prose = crate::parse::markdown_prose(
-            &without_html_comments(&adr.contents),
-            crate::parse::InlineCode::Drop,
-        );
-        // Any rendered line, as before: the rule is "every ADR carries a title", not
-        // "the title is the first thing in the file". A `# ` title inside a fenced
-        // example still satisfies nothing, because fences never reach the prose.
-        if !prose.lines().any(|line| line.starts_with("# ")) {
+        // Real heading events, not rendered lines (Codex, pull request #138, round 34):
+        // `markdown_prose` preserves real, non-comment HTML content unchanged, so a
+        // decoy line that merely *looks* like a title — `# Decoy` inside a raw `<div>`
+        // — rendered identically to a genuine one and satisfied this the same way an
+        // escaped list marker used to satisfy `adr_status` before issue #82's fix. The
+        // rule is still "every ADR carries a title", not "the title is the first thing
+        // in the file": any level-1 heading anywhere satisfies it, and one inside a
+        // fenced example, a blockquote, an HTML comment or a non-rendering element
+        // still does not, for `heading_lines`'s own reasons — which also close the same
+        // gap for the section headings checked below, at every level a decoy could
+        // stand in for one.
+        let headings = crate::parse::heading_lines(&adr.contents);
+        if !headings.iter().any(|line| line.starts_with("# ")) {
             violations.push(Violation::new(
                 "adr-structure",
                 adr.name.clone(),
@@ -2312,7 +2644,11 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         for field in ADR_REQUIRED_FIELDS {
-            if !prose.lines().any(|line| line.starts_with(field)) {
+            // Read as a real list item, not a rendered line (issue #82's continuation): a
+            // field shown escaped as an example, `\- Status: accepted`, must not satisfy
+            // the presence check a real `- Status:` line is meant to pass.
+            let name = field.trim_start_matches("- ");
+            if crate::parse::unordered_list_item_value(&adr.contents, name).is_none() {
                 violations.push(Violation::new(
                     "adr-structure",
                     adr.name.clone(),
@@ -2324,7 +2660,7 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         // The template's placeholder is the one status that is allowed to be
         // unrecognised, because the template records no decision.
         let is_template = adr_number(&adr.name) == Some(0);
-        if let Some(status) = adr_status(&prose) {
+        if let Some(status) = adr_status(&adr.contents) {
             if !is_template && !ADR_STATUSES.contains(&status.as_str()) {
                 violations.push(Violation::new(
                     "adr-structure",
@@ -2338,28 +2674,24 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
         }
 
         // A non-template ADR's date has to be a `YYYY-MM-DD` the index can sort, not just
-        // a non-empty line (issue #51e): `- Date:` with no value used to pass the
-        // `starts_with` presence check above, and `- Date: yesterday` passed it too.
-        if !is_template && prose.lines().any(|line| line.starts_with("- Date:")) {
-            let date = prose
-                .lines()
-                .find_map(|line| line.strip_prefix("- Date:"))
-                .unwrap_or_default()
-                .trim();
-            if !is_adr_date(date) {
-                violations.push(Violation::new(
-                    "adr-structure",
-                    adr.name.clone(),
-                    format!(
-                        "has no usable `- Date:`: `{date}` is not a `YYYY-MM-DD` the index \
-                         can sort"
-                    ),
-                ));
-            }
+        // a non-empty line (issue #51e): `- Date:` with no value used to pass the presence
+        // check above, and `- Date: yesterday` passed it too.
+        if !is_template
+            && let Some(date) = crate::parse::unordered_list_item_value(&adr.contents, "Date:")
+            && !is_adr_date(&date)
+        {
+            violations.push(Violation::new(
+                "adr-structure",
+                adr.name.clone(),
+                format!(
+                    "has no usable `- Date:`: `{date}` is not a `YYYY-MM-DD` the index \
+                     can sort"
+                ),
+            ));
         }
 
         for heading in ADR_REQUIRED_HEADINGS {
-            if !prose.lines().any(|line| line.trim_end() == *heading) {
+            if !headings.iter().any(|line| line.trim_end() == *heading) {
                 violations.push(Violation::new(
                     "adr-structure",
                     adr.name.clone(),
@@ -2373,12 +2705,15 @@ fn check_adr_structure(adrs: &[AdrFile]) -> Vec<Violation> {
 }
 
 /// The lowercased value of an ADR's `- Status:` line, if it has one.
+///
+/// Reads the parser's own list-item events (`parse::unordered_list_item_value`), for
+/// `hardware-attestation`'s and `deferred-questions`' reason: a decoy `- Status: accepted`
+/// shown as an example, hidden in a comment, or written escaped as `\- Status: accepted` to
+/// display the field's syntax, must not out-rank the real line. A rendered-prose line scan
+/// cannot tell the escaped decoy from a real item once the backslash is gone; this can,
+/// because the decoy is never a `Tag::Item` in the first place.
 fn adr_status(contents: &str) -> Option<String> {
-    contents
-        .lines()
-        .map(str::trim_start)
-        .find_map(|line| line.strip_prefix("- Status:"))
-        .map(|status| status.trim().to_lowercase())
+    crate::parse::unordered_list_item_value(contents, "Status:").map(|status| status.to_lowercase())
 }
 
 /// Whether `date` is a `YYYY-MM-DD` the ADR index can sort on.
@@ -2426,12 +2761,13 @@ fn check_adr_index(index: Option<&str>, adrs: &[AdrFile]) -> Vec<Violation> {
         )];
     };
 
-    // Both directions read the same parsed link list, and it is parsed from what renders.
-    // Asking only whether the file *name* appears would accept
-    // `[0001-one.md](../architecture.md)`, where the ADR is mentioned and not linked; and a
-    // link inside an HTML comment or a fenced example is text about a link rather than one
-    // — which is the whole of what an index is for.
-    let linked = linked_markdown_files(&without_fenced_code(&without_html_comments(index)));
+    // Both directions read the same parsed link list. Asking only whether the file
+    // *name* appears would accept `[0001-one.md](../architecture.md)`, where the ADR is
+    // mentioned and not linked; and a link inside an HTML comment, a blockquote or a
+    // fenced example is text about a link rather than one — which is the whole of what
+    // an index is for. Not `markdown_prose`: the raw `](target)` syntax this needs is
+    // exactly what rendered prose strips.
+    let linked = linked_markdown_files(&crate::parse::visible_source(index));
 
     let mut violations: Vec<Violation> = adrs
         .iter()
@@ -2534,7 +2870,9 @@ fn check_settled_decisions(adrs: &[AdrFile]) -> Vec<Violation> {
         )];
     };
 
-    let contents = without_html_comments(&adr.contents);
+    // Fences as well as comments, for the reason its three siblings strip them: a fenced
+    // example listing every decision id would otherwise settle this check on its own.
+    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
     SETTLED_DECISIONS
         .iter()
         .flat_map(|decision| {
@@ -2783,14 +3121,19 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
         )];
     };
 
-    let contents = without_html_comments(contents);
+    // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
+    // every target id would otherwise satisfy this check in a file whose table is gone.
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
 
     for target in HARDWARE_TARGETS {
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", target.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", target.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -2836,7 +3179,7 @@ fn check_hardware_targets_are_written_down(claude_md: Option<&str>) -> Vec<Viola
     }
 
     let count = format!("{} hardware target", HARDWARE_TARGETS.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "hardware-attestation",
             "target count",
@@ -2871,6 +3214,12 @@ pub const FAILURE_RIG_TESTS_PATH: &str = "crates/waymaker-rig/tests/matrix.rs";
 pub enum RigStanding {
     /// `crates/waymaker-rig/tests/matrix.rs` classifies crash points into it and resumes them.
     Swept,
+    /// `crates/waymaker-rig/tests/matrix.rs` reaches it with one hand-driven case rather
+    /// than a crash-point sweep — a capacity refusal or a declared-workflow mismatch is not
+    /// a media crash the injector produces, matching the model half's own treatment of the
+    /// same two rows. Still discharged, and still named by a test of its own; `Swept` would
+    /// overstate what a reader should expect this row's coverage to look like.
+    Driven,
     /// The rig has no workload that reaches it. Owed, and said so: issue #96.
     Owed,
 }
@@ -2881,6 +3230,7 @@ impl RigStanding {
     pub const fn render(self) -> &'static str {
         match self {
             Self::Swept => "Swept",
+            Self::Driven => "Driven",
             Self::Owed => "Owed",
         }
     }
@@ -2909,9 +3259,9 @@ pub struct FailureRow {
 
 /// The ten rows of §14's failure-semantics table.
 ///
-/// Six are swept on the rig. Four are owed there — a swap workload, a capacity refusal and a
-/// divergent replay are things this rig does not do — and a row owed is a row the table says
-/// is owed, rather than one the rig's census quietly omits.
+/// All ten are swept or driven on the rig. Issue #96 closed the last four — a swap
+/// workload, a capacity refusal and a divergent replay. If a row here is ever marked
+/// `Owed` again, that means the rig's census stopped reaching it.
 pub const FAILURE_ROWS: &[FailureRow] = &[
     FailureRow {
         id: "during-schedule-frame-write",
@@ -2978,32 +3328,40 @@ pub const FAILURE_ROWS: &[FailureRow] = &[
         variant: "DuringInactiveBankEraseOrWrite",
         failure_point: "During inactive-bank erase/write",
         model_test: "during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "during_inactive_bank_erase_or_write_the_old_bank_remains_authoritative_and_the_old_run_continues_on_the_rig",
+        ),
     },
     FailureRow {
         id: "after-new-bank-seal-barrier",
         variant: "AfterNewBankSealBarrier",
         failure_point: "After new bank seal barrier",
         model_test: "after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Swept,
+        rig_test: Some(
+            "after_new_bank_seal_barrier_the_new_bank_is_authoritative_and_the_old_run_is_never_current_again_on_the_rig",
+        ),
     },
     FailureRow {
         id: "history-capacity-reached",
         variant: "HistoryCapacityReached",
         failure_point: "History capacity reached",
         model_test: "history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Driven,
+        rig_test: Some(
+            "history_capacity_reached_is_a_capacity_error_with_no_mutation_or_an_explicit_continue_as_new",
+        ),
     },
     FailureRow {
         id: "replay-divergence",
         variant: "ReplayDivergence",
         failure_point: "Replay divergence",
         model_test: "replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched",
-        rig: RigStanding::Owed,
-        rig_test: None,
+        rig: RigStanding::Driven,
+        rig_test: Some(
+            "replay_divergence_is_a_deterministic_fault_with_no_further_execution_and_history_untouched",
+        ),
     },
 ];
 
@@ -3220,13 +3578,16 @@ fn check_failure_rows_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         // `claude-md` already reports the missing file.
         return Vec::new();
     };
-    let contents = without_fenced_code(&without_html_comments(contents));
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
     for row in FAILURE_ROWS {
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", row.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains(&format!("`{}`", row.id)))
             .collect();
         let [line] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -3262,7 +3623,7 @@ fn check_failure_rows_are_written_down(claude_md: Option<&str>) -> Vec<Violation
         }
     }
     let count = format!("All {} failure rows", FAILURE_ROWS.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "failure-matrix",
             "row count",
@@ -3282,7 +3643,7 @@ fn check_failure_rows_are_decided(adrs: &[AdrFile]) -> Vec<Violation> {
              choice nobody wrote down",
         )];
     };
-    let contents = without_fenced_code(&without_html_comments(&adr.contents));
+    let contents = crate::parse::markdown_prose(&adr.contents, crate::parse::InlineCode::Keep);
     FAILURE_ROWS
         .iter()
         .filter(|row| !contents.contains(&format!("`{}`", row.id)))
@@ -3376,7 +3737,12 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
         )];
     };
 
-    let contents = without_html_comments(contents);
+    // Fences as well as comments, for `recovery-spec`'s reason: a fenced example listing
+    // every question id would otherwise satisfy this check in a file whose table is gone.
+    let prose = crate::parse::markdown_prose(contents, crate::parse::InlineCode::Keep);
+    // Real table rows, not rendered lines that start with `|` — see
+    // `check_spec_clauses_are_written_down`.
+    let table_rows = crate::parse::table_rows(contents);
     let mut violations = Vec::new();
 
     for question in DEFERRED_QUESTIONS {
@@ -3389,10 +3755,10 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
         // And a *table* row rather than any line, which Codex caught in the round after
         // that: prose mentioning an id above the table shadowed the row, which fails a
         // correct file and passes one whose row has gone stale.
-        let rows: Vec<&str> = contents
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|') && line.contains(&format!("`{}`", question.id)))
+        let rows: Vec<&str> = table_rows
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.contains(&format!("`{}`", question.id)))
             .collect();
         let [row] = rows.as_slice() else {
             violations.push(Violation::new(
@@ -3439,7 +3805,7 @@ fn check_questions_are_written_down(claude_md: Option<&str>) -> Vec<Violation> {
     }
 
     let count = format!("{} deferred question", DEFERRED_QUESTIONS.len());
-    if !contents.contains(&count) {
+    if !prose.contains(&count) {
         violations.push(Violation::new(
             "deferred-questions",
             "question count",
@@ -3789,6 +4155,11 @@ pub fn check_documentation(inputs: &DocsInputs, rules: &[&str]) -> Vec<Violation
         &inputs.adrs,
         inputs.storage_clauses.as_deref(),
     ));
+    violations.extend(check_storage_shapes(
+        inputs.claude_md.as_deref(),
+        &inputs.adrs,
+        inputs.storage_shapes.as_deref(),
+    ));
     violations.extend(check_hardware_attestation(
         inputs.claude_md.as_deref(),
         &inputs.adrs,
@@ -3865,6 +4236,9 @@ fn check_wire_format_is_documented(
         ));
         return violations;
     };
+    // Not `visible_source`, on purpose: the frozen values live inside fenced
+    // byte-layout blocks in this document, not in prose beside them. Stripping fences
+    // would blind this check to the content it exists to read.
     let spec = without_html_comments(spec);
 
     for frozen in WIRE_FORMAT_CONSTANTS {
@@ -3897,7 +4271,10 @@ fn check_wire_format_is_documented(
     }
 
     if let Some(claude_md) = claude_md {
-        let claude_md = without_fenced_code(&without_html_comments(claude_md));
+        // Not `markdown_prose`: a descriptive link's destination, `[wire-format
+        // specification](docs/format/wire-format-v1.md)`, is exactly what rendered
+        // prose strips, and this only asks whether the path is written down somewhere.
+        let claude_md = crate::parse::visible_source(claude_md);
         if !claude_md.contains(WIRE_FORMAT_SPEC_PATH) {
             violations.push(Violation::new(
                 RULE,
@@ -3930,7 +4307,7 @@ fn check_wire_format_is_documented(
                  decision behind it"
             ),
         )),
-        Some(adr) if !adr.contents.contains("- Status: accepted") => {
+        Some(adr) if adr_status(&adr.contents).as_deref() != Some("accepted") => {
             violations.push(Violation::new(
                 RULE,
                 WIRE_FORMAT_ADR,
@@ -4032,9 +4409,9 @@ pub mod tests_support {
         AdrFile, CRATE_DEPENDENCY_DIAGRAM, CrateRoot, DEFERRED_QUESTION_MARKER, DEFERRED_QUESTIONS,
         DIAGRAMS, DocsInputs, FAILURE_MATRIX_ADR, FAILURE_ROWS, HARDWARE_TARGETS, QuestionStatus,
         RECOVERY_SPEC_ADR, SETTLED_DECISIONS, SETTLED_DECISIONS_ADR, SPEC_CLAUSES,
-        STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES, WIRE_FORMAT_CONSTANTS,
-        WIRE_FORMAT_CORPUS_DIR, WIRE_FORMAT_RECORD_KINDS, WIRE_FORMAT_SPEC_PATH, adr_number,
-        rule_count_phrases,
+        STORAGE_CONFORMANCE_ADR, STORAGE_CONTRACT_CLAUSES, STORAGE_SHAPES, STORAGE_SHAPES_ADR,
+        WIRE_FORMAT_CONSTANTS, WIRE_FORMAT_CORPUS_DIR, WIRE_FORMAT_RECORD_KINDS,
+        WIRE_FORMAT_SPEC_PATH, adr_number, rule_count_phrases,
     };
     use crate::policy::LAYERS;
 
@@ -4139,7 +4516,19 @@ pub mod tests_support {
     }
 
     /// The checked tables of a clean `CLAUDE.md`: questions, targets, clauses and rows.
+    ///
+    /// Every table gets its own header and delimiter row, and a blank line separates it
+    /// from the prose on either side: `table_rows` reads real `pulldown-cmark` table
+    /// events (issue #82's continuation), and a real GFM table needs both — without a
+    /// blank line, a table does not end at the next sentence or the next table's header,
+    /// it keeps swallowing them as more of its own rows.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one clean table per checked list this fixture stands in for; splitting it \
+                  loses the property that every table in one clean CLAUDE.md is built the same way"
+    )]
     fn tables(body: &mut String) {
+        body.push('\n');
         line(body, format_args!("| Id | Question | Where it stands |"));
         line(body, format_args!("| --- | --- | --- |"));
         for question in DEFERRED_QUESTIONS {
@@ -4153,10 +4542,12 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} deferred questions.", DEFERRED_QUESTIONS.len()),
         );
+        body.push('\n');
         line(body, format_args!("| Id | Target | Where it stands |"));
         line(body, format_args!("| --- | --- | --- |"));
         for target in HARDWARE_TARGETS {
@@ -4170,10 +4561,14 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} hardware targets.", HARDWARE_TARGETS.len()),
         );
+        body.push('\n');
+        line(body, format_args!("| Id | Guarantee | Discharged by |"));
+        line(body, format_args!("| --- | --- | --- |"));
         for clause in SPEC_CLAUSES {
             line(
                 body,
@@ -4183,10 +4578,14 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} recovery invariants.", SPEC_CLAUSES.len()),
         );
+        body.push('\n');
+        line(body, format_args!("| Id | Sentence | Discharged by |"));
+        line(body, format_args!("| --- | --- | --- |"));
         for clause in STORAGE_CONTRACT_CLAUSES {
             line(
                 body,
@@ -4198,6 +4597,7 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!(
@@ -4205,6 +4605,28 @@ pub mod tests_support {
                 STORAGE_CONTRACT_CLAUSES.len()
             ),
         );
+        body.push('\n');
+        line(body, format_args!("| Id | Sentence | Issued by |"));
+        line(body, format_args!("| --- | --- | --- |"));
+        for shape in STORAGE_SHAPES {
+            line(
+                body,
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    shape.id, shape.sentence, shape.issued_by
+                ),
+            );
+        }
+        line(
+            body,
+            format_args!("All {} storage shapes.", STORAGE_SHAPES.len()),
+        );
+        body.push('\n');
+        line(
+            body,
+            format_args!("| Id | Failure point | Discharged on the model by | On the rig |"),
+        );
+        line(body, format_args!("| --- | --- | --- | --- |"));
         for row in FAILURE_ROWS {
             line(
                 body,
@@ -4217,6 +4639,7 @@ pub mod tests_support {
                 ),
             );
         }
+        body.push('\n');
         line(
             body,
             format_args!("All {} failure rows.", FAILURE_ROWS.len()),
@@ -4303,6 +4726,23 @@ pub mod tests_support {
         body
     }
 
+    /// A shape table that declares exactly the shapes the gate expects.
+    #[must_use]
+    pub fn clean_storage_shapes() -> String {
+        let mut body = String::from("//! The shape table.\npub const SHAPES: &[Shape] = &[\n");
+        for shape in STORAGE_SHAPES {
+            line(
+                &mut body,
+                format_args!(
+                    "    Shape {{ id: \"{}\", sentence: \"{}\", issued_by: \"{}\" }},",
+                    shape.id, shape.sentence, shape.issued_by
+                ),
+            );
+        }
+        body.push_str("];\n");
+        body
+    }
+
     /// A clause table that declares exactly the clauses the gate expects.
     #[must_use]
     pub fn clean_spec_obligations() -> String {
@@ -4340,6 +4780,24 @@ pub mod tests_support {
             line(
                 &mut body,
                 format_args!("| `{}` | {} |", clause.id, clause.discharge.message()),
+            );
+        }
+        body
+    }
+
+    /// The ADR that records issue #130 item 2's shape catalogue, naming every shape.
+    #[must_use]
+    pub fn clean_storage_shapes_adr() -> String {
+        let mut body = clean_adr("the storage-shape catalogue");
+        line(&mut body, format_args!("| Shape | Sentence | Issued by |"));
+        line(&mut body, format_args!("| --- | --- | --- |"));
+        for shape in STORAGE_SHAPES {
+            line(
+                &mut body,
+                format_args!(
+                    "| `{}` | {} | {} |",
+                    shape.id, shape.sentence, shape.issued_by
+                ),
             );
         }
         body
@@ -4407,6 +4865,13 @@ pub mod tests_support {
                 STORAGE_CONFORMANCE_ADR.to_owned(),
                 clean_storage_conformance_adr(),
             ),
+        );
+
+        let shapes_number =
+            adr_number(STORAGE_SHAPES_ADR).expect("the storage-shapes ADR is numbered");
+        bodies.insert(
+            shapes_number,
+            (STORAGE_SHAPES_ADR.to_owned(), clean_storage_shapes_adr()),
         );
 
         let highest = bodies.keys().copied().max().unwrap_or(0);
@@ -4612,6 +5077,7 @@ pub mod tests_support {
             adrs: clean_adrs(),
             spec_obligations: Some(clean_spec_obligations()),
             storage_clauses: Some(clean_storage_clauses()),
+            storage_shapes: Some(clean_storage_shapes()),
             failure_rows: Some(clean_failure_rows()),
             failure_model_tests: Some(clean_failure_model_tests()),
             failure_rig_tests: Some(clean_failure_rig_tests()),
@@ -4724,6 +5190,26 @@ mod tests {
         let dropped =
             clean_claude_md(RULES).replace(&format!("`{}`", question.id), "(this one, whatever)");
         let violations = check_deferred_questions(Some(&dropped), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule == "deferred-questions" && v.subject == question.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_question_only_inside_a_fenced_block_in_claude_md_does_not_vouch_for_it() {
+        // Issue #82: the counterpart of `recovery-spec`'s fence test. Without stripping
+        // fences, a fenced example listing every question id would satisfy this check in
+        // a file whose real table has been deleted.
+        let claude_md = clean_claude_md(RULES);
+        let question = DEFERRED_QUESTIONS.first().expect("the table is not empty");
+        let fenced = claude_md.replace(
+            &format!("| `{}` |", question.id),
+            &format!("```text\n| `{}` |", question.id),
+        ) + "\n```\n";
+        let violations = check_deferred_questions(Some(&fenced), &clean_inputs(RULES).adrs);
         assert!(
             violations
                 .iter()
@@ -5032,6 +5518,455 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_inside_a_script_element_does_not_settle_anything() {
+        // Codex, pull request #138, round 27: `<script>` and `<style>` are real HTML —
+        // `markdown_prose` previously kept every non-comment HTML block verbatim — but
+        // neither element's body is ever rendered as visible text by a browser. A
+        // marker hidden inside `<script>...</script>` must not settle anything, the
+        // same way one hidden inside an HTML comment does not.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-a-script.md".to_owned(),
+            contents: format!(
+                "{}\n<script>\n{DEFERRED_QUESTION_MARKER} {}\n</script>\n",
+                clean_adr("hidden in a script"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside a <script> element settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_a_template_element_does_not_settle_anything() {
+        // Codex, pull request #138, round 28: `<template>` joins `<script>` and
+        // `<style>` (round 27) as a non-rendering element — its content is inert DOM
+        // meant for cloning by script, never displayed by default, so a marker hidden
+        // inside `<template>...</template>` must not settle anything either.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-a-template.md".to_owned(),
+            contents: format!(
+                "{}\n<template>\n{DEFERRED_QUESTION_MARKER} {}\n</template>\n",
+                clean_adr("hidden in a template"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside a <template> element settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_an_iframe_element_does_not_settle_anything() {
+        // Codex, pull request #138, round 52, "Suppress iframe fallback content":
+        // `<iframe>` is a raw-text element like `<script>`/`<style>`, not a nesting one
+        // like `<template>` — a browser that supports iframes never renders its body as
+        // page prose, that body being legacy fallback content for one that cannot embed
+        // the frame at all — but it was missing from the fixed non-rendering element
+        // list entirely, so a marker hidden inside `<iframe>...</iframe>` read as
+        // ordinary visible documentation evidence.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-an-iframe.md".to_owned(),
+            contents: format!(
+                "{}\n<iframe>\n{DEFERRED_QUESTION_MARKER} {}\n</iframe>\n",
+                clean_adr("hidden in an iframe"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside an <iframe> element settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_a_script_nested_in_a_div_does_not_settle_anything() {
+        // Codex, pull request #138, round 29: `<div>\n<script>\n...\n</script>\n</div>`
+        // is one `HtmlBlock` whose nested `<script>` opens on its own `Event::Html` line
+        // partway through the block, not at the block's own start — classifying only
+        // the block's first line (rounds 27/28) missed it, and the marker inside read
+        // as visible prose.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-a-nested-script.md".to_owned(),
+            contents: format!(
+                "{}\n<div>\n<script>\n{DEFERRED_QUESTION_MARKER} {}\n</script>\n</div>\n",
+                clean_adr("hidden in a nested script"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside a script nested in a div settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_a_mismatched_close_tag_inside_a_script_does_not_settle_anything() {
+        // Codex, pull request #138, round 30: a `<script>` body can contain the
+        // literal text `</style>` — a JavaScript string, say — without ending HTML
+        // parsing of the script. Closing on any of the three non-rendering tags
+        // rather than the one that actually opened would resume visibility too early
+        // and let the marker after it settle the question.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-mismatched-close.md".to_owned(),
+            contents: format!(
+                "{}\n<script>\nvar x = \"</style>\";\n{DEFERRED_QUESTION_MARKER} {}\n</script>\n",
+                clean_adr("mismatched close"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker after a mismatched close tag inside a script settled something: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_a_nested_script_that_outlived_its_block_does_not_settle_anything() {
+        // Codex, pull request #138, round 30: a bare `<script>...</script>` is HTML
+        // block type 1, which `pulldown-cmark` (like CommonMark) ends only at the real
+        // close tag, blank line or not — so a *nested* `<script>` inside a type-6 block
+        // like `<div>` is the case that actually outlives its block at a blank line: the
+        // `<div>` ends there, and the marker on the next, structurally separate
+        // paragraph reaches `Event::Text` while a browser is still in script-data state
+        // until the real `</script>` two lines later. `hidden` has to fold in the open
+        // non-rendering tag for `Event::Text` too, or that marker settles the question
+        // the same way one after an unterminated comment's own blank line used to
+        // (round 20).
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-nested-script-outlived-its-block.md".to_owned(),
+            contents: format!(
+                "{}\n<div>\n<script>\n\n{DEFERRED_QUESTION_MARKER} {}\n\n</script>\n</div>\n",
+                clean_adr("nested script outlived its block"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker after a nested script that outlived its block settled something: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_inside_an_inline_script_does_not_settle_anything() {
+        // Codex, pull request #138, round 31, finding 2: an inline `<script>` — one
+        // that opens mid-paragraph rather than starting its own block — reaches
+        // `Event::InlineHtml` for its own tags and ordinary `Event::Text` for its body,
+        // and nothing updated `open_non_rendering_tag` from an `InlineHtml` event, so
+        // the body between the tags reached `out` unhidden even though the tags
+        // themselves did not.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-in-an-inline-script.md".to_owned(),
+            contents: format!(
+                "{}\n\nbefore <script>{DEFERRED_QUESTION_MARKER} {}</script> after\n",
+                clean_adr("hidden in an inline script"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker inside an inline script settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_between_nested_template_closes_does_not_settle_anything() {
+        // Codex, pull request #138, round 31, finding 3: a bare flag cleared on the
+        // first matching close treated a *nested* `<template>`'s own close as ending
+        // the whole element, even though the outer `<template>` — genuinely still open,
+        // since `<template>` content is parsed as ordinary HTML and really can nest —
+        // was not done yet. A marker between the inner close and the outer one read as
+        // visible prose.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-hidden-between-nested-templates.md".to_owned(),
+            contents: format!(
+                "{}\n<template>\n<template>\ninner\n</template>\n{DEFERRED_QUESTION_MARKER} \
+                 {}\n</template>\n",
+                clean_adr("hidden between nested templates"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker between nested template closes settled something: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_commented_out_script_still_counts() {
+        // Codex, pull request #138, round 31, finding 4: the non-rendering tracker ran
+        // blind to comment spans, so a `<script>` written *inside* a closed HTML
+        // comment — `<div><!-- <script> --></div>` — was read as a real opening tag
+        // with no real close ever coming, hiding every line after it for good, this
+        // decision included.
+        //
+        // `check_deferred_questions` is not the vehicle for this one: it runs its own,
+        // separate `without_html_comments` over an ADR's *raw* contents before ever
+        // reaching `markdown_prose`, so a comment — real or, as here, one merely
+        // containing a decoy tag — is already gone by the time this module's own
+        // comment-and-tag scanning would see it, and a bug in that scanning could never
+        // surface through that path. `check_settled_decisions` calls `markdown_prose`
+        // directly on an ADR's raw contents, with no such pre-stripping, so it is what
+        // this fix actually has to be verified against.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- <script> --></div>\n\n{}\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision after a commented-out script did not count: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_template_close_tag_inside_a_comment_does_not_count() {
+        // Codex, pull request #138, round 32, finding 1: `<template>` content is real,
+        // parsed HTML — unlike `<script>`/`<style>`'s raw text — so a `</template>`
+        // written *inside* a comment there is not a real close; a browser keeps the
+        // outer template open until the genuine final close. The block form matters
+        // here: `<template>` alone on its own line is HTML block type 7, so this is one
+        // `HtmlBlock` of four separate `Event::Html` lines — `<template>`, the comment,
+        // the decision, and the real `</template>` — exercising the block-level tracker
+        // this finding is about, rather than the inline one a single-paragraph-line
+        // example would reach instead. With no second `<template` on the comment's own
+        // line to out-rank it, the close search found the literal `</template>`
+        // substring sitting inside the comment first and cleared the tracked state
+        // early, letting the decision two lines later read as ordinary visible prose
+        // while still really inside the (still open) template.
+        //
+        // `check_settled_decisions` is the vehicle, for `a_decision_after_a_commented_
+        // out_script_still_counts`'s reason: `check_deferred_questions` pre-strips
+        // comments before ever reaching `markdown_prose`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<!-- </template> -->\n{}\n</template>\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision after a template close tag inside a comment still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_a_script_closed_with_trailing_whitespace_does_settle() {
+        // Codex, pull request #138, round 32, finding 2: `</script >` and
+        // `</template\t>` are legally spelled close tags — HTML permits whitespace
+        // between a tag name and its `>` — but an exact `</tag>` string search never
+        // recognized either, so `open_non_rendering_tag` stayed set forever and every
+        // line after was wrongly hidden, producing a false documentation violation for
+        // a marker that really does settle the question.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-script-closed-with-whitespace.md".to_owned(),
+            contents: format!(
+                "{}\n<script>ignore this</script >\n\n{DEFERRED_QUESTION_MARKER} {}\n",
+                clean_adr("script closed with whitespace"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == question.id),
+            "a marker after a script closed with trailing whitespace did not settle: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_whose_id_is_wrapped_in_inline_formatting_still_settles() {
+        // Codex, pull request #138, round 33, finding 1: `markdown_prose` kept every
+        // non-comment `InlineHtml` construct's own raw tag text, so a legitimate marker
+        // whose id happened to be wrapped in harmless formatting — `Settles deferred
+        // question: <span>\`id\`</span>` — was returned by `claims_in` as the literal
+        // string `<span>\`id\`</span>` rather than `id`, matching no real question and
+        // reporting the open question as still unsettled.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-id-wrapped-in-span.md".to_owned(),
+            contents: format!(
+                "{}\n{DEFERRED_QUESTION_MARKER} <span>`{}`</span>\n",
+                clean_adr("id wrapped in span"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == question.id),
+            "a marker whose id is wrapped in inline formatting did not settle: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_marker_after_a_raw_text_element_nested_in_a_template_does_not_settle_anything() {
+        // Codex, pull request #138, round 33, finding 2: a `<script>` or `<style>`
+        // nested inside a `<template>` is real, raw-text content — a browser stays in
+        // script-data state until that nested element's own close, so a literal
+        // `</template>`-looking string inside it (a JavaScript string, say) is not a
+        // real close of the *outer* template. The tracker previously searched only for
+        // the same tag's own reopen/close while a `<template>` was open, so it read the
+        // literal `</template>` inside the nested `<script>`'s body as the real close
+        // and exposed the marker after it — genuinely still inside the outer, still
+        // open template — as ordinary visible prose.
+        let Some(question) = an_open_question() else {
+            return;
+        };
+        let mut adrs = clean_inputs(RULES).adrs;
+        adrs.push(AdrFile {
+            name: "0099-script-nested-in-template.md".to_owned(),
+            contents: format!(
+                "{}\n<template>\n<script>\nlet x='</template>';\n</script>\n\
+                 {DEFERRED_QUESTION_MARKER} {}\n</template>\n",
+                clean_adr("script nested in template"),
+                question.id
+            ),
+        });
+        let violations = check_deferred_questions(clean_claude_md(RULES).as_str().into(), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a marker after a raw-text element nested in a template settled something: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_inline_comment_containing_tag_text_still_counts() {
+        // Codex, pull request #138, round 33, finding 3: `track_non_rendering_html`
+        // (the `Event::InlineHtml` tracker `markdown_prose` and `table_rows` share)
+        // checked whether a construct opened or closed a non-rendering element before
+        // checking whether it was a comment at all, so a self-contained inline comment
+        // whose text merely *contains* an opening tag's spelling — `<!-- <script> -->`
+        // — was read as a real `<script>` opening, hiding everything after it,
+        // including this decision, for good.
+        //
+        // `check_settled_decisions` is the vehicle, for `a_decision_after_a_commented_
+        // out_script_still_counts`'s reason: `check_deferred_questions` pre-strips
+        // comments — this one included, regardless of what is inside it — before ever
+        // reaching `markdown_prose`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\nignore this <!-- <script> --> {}\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision after an inline comment containing tag text did not count: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_before_a_same_line_script_still_counts() {
+        // Codex, pull request #138, round 31, finding 1: when one `Event::Html` line
+        // opens and closes a non-rendering element without the whole line being
+        // non-rendering — `<div>id<script>hidden</script>headline</div>` — the
+        // line-consuming design of round 30 discarded the whole line rather than only
+        // the `<script>` element's own subrange, so the real, visible id before it and
+        // headline after it were both lost along with it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>{}<script>hidden</script>{}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision around a same-line script did not count: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_marker_inside_a_fenced_example_does_not_settle_anything() {
         // Codex, PR #58. An ADR explaining how the marker works must not be read as using
         // it — and the direction that matters more is the other one: an ADR that kept the
@@ -5111,16 +6046,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fence_is_closed_only_by_its_own_character() {
-        // The other half of knowing about two fence characters: a backtick block must not
-        // be closed by a tilde line, or everything after it stops being fenced.
-        assert_eq!(
-            without_fenced_code("keep\n```\nhidden\n~~~\nstill hidden\n```\nkeep too"),
-            "keep\nkeep too"
-        );
-    }
-
-    #[test]
     fn prose_naming_a_question_before_the_table_does_not_stand_in_for_its_row() {
         // Codex, PR #58 round 3. The scan took the first line containing the backticked id,
         // so a mention in prose above the table shadowed the row — failing the gate on a
@@ -5152,15 +6077,18 @@ mod tests {
             question.headline,
             question.render_status()
         );
-        let prose_only = clean_claude_md(RULES).replace(
-            &row,
-            &format!(
-                "`{}` {} {} — stated in prose, in no table at all",
-                question.id,
-                question.headline,
-                question.render_status()
-            ),
+        let prose = format!(
+            "`{}` {} {} — stated in prose, in no table at all.\n",
+            question.id,
+            question.headline,
+            question.render_status()
         );
+        // The row's own line is removed outright, not replaced in place: a line with no
+        // pipes sitting where a table row was expected does not end the table, it becomes
+        // another (mangled) row of it — `table_rows` reads real `Tag::TableRow` events, and
+        // the prose has to sit outside any table to test what it claims to (issue #82's
+        // continuation). The remaining rows stay one real, unbroken table.
+        let prose_only = clean_claude_md(RULES).replace(&format!("{row}\n"), "") + "\n" + &prose;
         let violations = check_deferred_questions(Some(&prose_only), &clean_inputs(RULES).adrs);
         assert!(
             violations.iter().any(|v| v.subject == question.id),
@@ -5456,6 +6384,31 @@ mod tests {
     }
 
     #[test]
+    fn a_heading_split_by_an_inline_break_is_reported_as_missing() {
+        // Codex, pull request #138, round 58, finding "Preserve inline breaks
+        // while collecting heading text": `## Con<br>text` reaches `heading_lines`
+        // as `Event::Text("Con")`, `Event::InlineHtml("<br>")`,
+        // `Event::Text("text")` — a browser renders `<br>` as a real line break, so
+        // this heading reads as two separate lines, "Con" and "text", never as one
+        // heading reading "Context". `heading_lines`' `Event::InlineHtml` arm only
+        // ever called `track_non_rendering_html` for its tracking side effect,
+        // unlike `markdown_prose` (round 37) and `table_rows` (round 38), which
+        // both push a real line break for a genuine `<br>`; the missing separator
+        // let the two fragments concatenate into the literal string `## Context`,
+        // satisfying the required-section check with a heading no reader would
+        // ever see rendered as one line.
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: clean_adr("one").replace("## Context", "## Con<br>text"),
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("## Context")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn an_adr_with_no_status_line_is_reported() {
         let adrs = vec![AdrFile {
             name: "0001-one.md".to_owned(),
@@ -5530,6 +6483,370 @@ mod tests {
     }
 
     #[test]
+    fn a_decoy_title_inside_an_html_block_does_not_satisfy_adr_structure() {
+        // Codex, pull request #138, round 34: `check_adr_structure` used to scan
+        // `markdown_prose`'s rendered output for a line starting with `# ` — but
+        // `markdown_prose` preserves real, non-comment HTML content unchanged (round
+        // 18), so a `# Decoy` line written inside a raw `<div>` rendered identically to
+        // a genuine ATX heading and satisfied the rule the same way an escaped list
+        // marker satisfied `adr_status` before issue #82's fix. A browser shows that
+        // line as a literal hash character, not an `<h1>`. `heading_lines` reads the
+        // parser's own heading events instead of text-matching the rendering
+        // convention, so a decoy inside an HTML block cannot stand in for a title —
+        // and the same function closes the identical gap for the required `## `
+        // section headings checked below.
+        let contents = clean_adr("one").replace("# ADR: one\n", "<div>\n# Decoy\n</div>\n");
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("title")),
+            "a `# ` line inside a raw HTML block satisfied the title check: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_section_heading_inside_an_html_block_does_not_satisfy_adr_structure() {
+        // Codex, pull request #138, round 34: the `## Context` / `## Decision` /
+        // `## Consequences` half of `check_adr_structure` read the same rendered-text
+        // scan as the title check, so a decoy `## Context` inside a raw `<div>` closed
+        // the same gap `heading_lines` closes for the title above.
+        let contents =
+            clean_adr("one").replace("## Context\n\nx\n", "<div>\n## Context\n</div>\n\nx\n");
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("## Context")),
+            "a `## Context` line inside a raw HTML block satisfied the section check: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_non_rendering_tag_inside_a_heading_does_not_satisfy_adr_structure() {
+        // Codex, pull request #138, round 35, finding 1: unlike every other collector
+        // in this module, the first version of `heading_lines` had no
+        // `Event::InlineHtml` arm at all, so an inline `<script>` written inside a
+        // heading never reached `open_non_rendering_tag` and the text between its open
+        // and close tags — ordinary `Event::Text`, invisible to a reader in raw-text
+        // parsing mode — was collected as if the heading had rendered it:
+        // `## <script>Context</script>` satisfied the `## Context` section check even
+        // though a browser shows no text there at all.
+        let contents =
+            clean_adr("one").replace("## Context\n\nx\n", "## <script>Context</script>\n\nx\n");
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("## Context")),
+            "an inline `<script>` heading satisfied the section check: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_status_field_with_a_trailing_comment_naming_a_non_rendering_tag_still_counts() {
+        // Codex, pull request #138, round 35, finding 2: `opens_non_rendering_element`
+        // reads an `Event::InlineHtml`'s raw text for a tag *spelling*, not a real
+        // open tag, so a self-contained inline comment whose own text merely contains
+        // one — `<!-- <script> example -->` — matched it and disqualified a real,
+        // complete field the same way a genuine unclosed `<script>` would, even though
+        // the comment carries no real tag at all. The comment check now runs first and
+        // exclusively, the same fix `track_non_rendering_html` was given for the same
+        // shape of bug (round 33, finding 3).
+        let contents = clean_adr("one").replace(
+            "- Status: accepted\n",
+            "- Status: accepted <!-- <script> example -->\n",
+        );
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents,
+        }];
+        let violations = check_adr_structure(&adrs);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("- Status:")),
+            "a trailing comment naming a non-rendering tag disqualified a real field: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_status_inside_a_fenced_example() {
+        // Issue #82: `hardware-attestation` and `deferred-questions` read `adr_status`
+        // straight off `adr.contents`. A decoy `- Status:` line shown as an example must
+        // not out-rank the real one.
+        let contents = "# ADR\n\n```text\n- Status: accepted\n```\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_status_inside_an_html_comment() {
+        let contents = "# ADR\n\n<!--\n- Status: accepted\n-->\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn a_literal_html_comment_marker_quoted_inside_a_fence_does_not_swallow_the_status() {
+        // Codex, pull request #138: `without_html_comments` used to run before fence
+        // stripping. A literal, unmatched `<!--` shown as example text inside a fence
+        // has no closing `-->` anywhere in the document, so the old order discarded
+        // everything after it — the fence's own close and the real status line alike.
+        let contents =
+            "# ADR\n\n```text\nsome markup looks like <!-- this\n```\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn a_fence_looking_line_inside_a_comment_does_not_confuse_the_status() {
+        // Codex, pull request #138: the converse of the case above. Reordering to
+        // strip fences before comments breaks the other way round — a comment whose
+        // body happens to contain a fence-looking line would make a purely textual
+        // fence scan (run first) consume the comment's own close along with it.
+        // `adr_status` now reads through `markdown_prose`, a real parser: an HTML
+        // comment block runs to its own `-->` regardless of what looks like a fence
+        // inside it, so this is not a hazard for it.
+        let contents =
+            "# ADR\n\n<!--\n```text\n- Status: accepted\n```\n-->\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_status_inside_a_blockquote() {
+        // Codex, pull request #138: `markdown_prose` rendered a blockquoted list item
+        // exactly like a top-level one, backticks and structure markers reconstructed
+        // identically, so `> - Status: accepted` shown as a worked example was
+        // indistinguishable from the real status and `find_map` picked it first.
+        let contents = "# ADR\n\n> - Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_does_not_read_an_ordered_list_item_as_a_bulleted_field() {
+        // Codex, pull request #138: `markdown_prose` reconstructed every list item
+        // with `- `, ordered or not, so `1. Status: accepted` shown as a worked
+        // example rendered exactly like the real `- Status: proposed` bullet.
+        let contents = "# ADR\n\n1. Status: accepted\n2. Something else\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_does_not_normalize_an_asterisk_bullet_into_the_real_marker() {
+        // Codex, pull request #138: `markdown_prose` rendered every unordered item
+        // with `- ` regardless of the source marker, so `* Status: accepted` shown
+        // as an example became indistinguishable from a real `- ` bullet.
+        let contents = "# ADR\n\n* Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_status_written_escaped() {
+        // Codex, pull request #138, round 12: an escaped marker, `\- Status: accepted`,
+        // unescapes to text that reads like a real bullet once rendered — `markdown_prose`
+        // could not tell it from a real `Tag::Item`, because the backslash that would have
+        // said otherwise is already gone. Reading the parser's own item events instead
+        // means the escaped line never became an item to begin with.
+        let contents = "# ADR\n\n\\- Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_status_split_by_a_line_break() {
+        // Codex, pull request #138, round 13: a line break inside an item is a
+        // `SoftBreak` event between two `Text` events, and concatenating the two
+        // bare reconstructs the field the break was meant to split — `- Sta\n  tus:
+        // accepted` becomes `Status: accepted`, dropping the break silently.
+        let contents = "# ADR\n\n- Sta\n  tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_nested_in_a_fenced_block_inside_the_item() {
+        // Codex, pull request #138, round 15: a fenced block indented under the item's
+        // own `- Status:` line is hidden the same as a top-level one, but `collecting`
+        // stayed true across it — leaving `item` at `Status:` once the hidden text was
+        // skipped, which still strips to an empty value that still counts as a match.
+        // The nested fence has to disqualify the item outright, not just go unread.
+        let contents = "# ADR\n\n- Status:\n  ```\n  accepted\n  ```\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_written_as_a_second_loose_paragraph() {
+        // Codex, pull request #138, round 16: a loose item — `- Status:` followed by a
+        // blank line and an indented `accepted` paragraph — is two `Tag::Paragraph`s
+        // with no `SoftBreak` or hidden container between them at all, so neither of
+        // the two earlier fixes catches it. An ADR field is one paragraph, so a second
+        // one opening before the item ends disqualifies it.
+        let contents = "# ADR\n\n- Status:\n\n  accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_hides_everything_after_an_unterminated_comment_that_outlived_its_block() {
+        // Codex, pull request #138, round 20: `pulldown-cmark` ends an `HtmlBlock` at a
+        // blank line even when a comment inside it never closed, so both items after it
+        // — including the one that would otherwise be the real status — read as
+        // ordinary, structurally separate list items. By real HTML rules everything
+        // after the unclosed `<!--` is still inside the comment, so neither counts and
+        // the ADR has no readable status at all.
+        let contents = "# ADR\n\n<div>\n<!--\n</div>\n\n\
+                         - Status: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents), None);
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_item_reached_while_a_nested_script_is_still_open() {
+        // Codex, pull request #138, round 30: a nested `<script>` inside a type-6
+        // block like `<div>` can outlive that `HtmlBlock` across a blank line the same
+        // way a comment does — `pulldown-cmark` ends the block at the blank line
+        // before the decoy item, resuming it as an ordinary, structurally separate
+        // list item, even though a browser is still in script-data state until the
+        // real `</script>` two lines later. `hidden` has to fold in the open
+        // non-rendering tag for `Start(Tag::Item)`, not only for `Event::Html`, or the
+        // decoy item is read as a real one.
+        let contents = "# ADR\n\n<div>\n<script>\n\n- Status: accepted\n\n\
+                         </script>\n</div>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_whose_item_opens_with_an_unterminated_comment() {
+        // Codex, pull request #138, round 21: `- <div>\n  <!--` opens the item with raw
+        // HTML whose comment then outlives that `HtmlBlock` across a blank line, so the
+        // loose paragraph that follows inside the very same item — `Status: accepted`
+        // — is `Event::Text` with `collecting` already true. Checking only
+        // `collecting`, not `hidden`, let the hidden value through despite the round-20
+        // fix correctly marking it hidden.
+        //
+        // The comment is closed by a second, self-contained `<div>...</div>` block
+        // between the two items, not by plain prose (round 28 corrects round 21's own
+        // fix here: ordinary Markdown text is always HTML-escaped when rendered, so a
+        // bare `-->` on its own line can never really close a comment — only content
+        // that reaches this module as genuine, unescaped `Event::Html` can, which this
+        // second block's own `-->` line does).
+        let contents = "# ADR\n\n- <div>\n  <!--\n\n  Status: accepted\n\n\
+                         <div>\n-->\n</div>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_a_multiline_inline_comment() {
+        // Codex, pull request #138, round 23: a multi-line inline comment collapses
+        // to a single `InlineHtml` event with no `SoftBreak` around it at all — `- Sta
+        // <!--\n--> tus: accepted` reaches `Event::Text` as two separate fragments,
+        // `Sta` and `tus: accepted`, with nothing between them to say a comment ever
+        // sat there. Concatenating the two bare reconstructs `Status: accepted` out of
+        // a decoy that was never a real one-line field.
+        let contents = "# ADR\n\n- Sta<!--\n-->tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_reads_a_valid_field_with_a_trailing_same_line_comment() {
+        // Codex, pull request #138, round 24: the round-23 fix disqualified any inline
+        // HTML while collecting, but a same-line trailing comment carries no newline of
+        // its own — `- Status: accepted <!-- rationale -->` is a real, complete,
+        // one-line field with a note after it, and disqualifying it discarded a value
+        // that had already been fully collected before the comment ever appeared.
+        let contents = "# ADR\n\n- Status: accepted <!-- rationale -->\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn adr_status_reads_a_valid_field_with_trailing_hidden_markup() {
+        // Codex, pull request #138, round 49, "Preserve complete fields before
+        // trailing hidden markup": round 30 disqualified the item outright the
+        // moment any non-rendering or `hidden`-suppressed element opened, which
+        // closed a real gap (`- Status: <script>accepted</script>` strips to an
+        // empty value that would otherwise still trivially match) but went too far
+        // in the other direction — `- Status: accepted <span hidden></span>` is a
+        // real, complete, one-line field with an empty, trailing hidden element
+        // after it, and disqualifying it discarded a value that had already been
+        // fully collected before the hidden markup ever appeared, the identical
+        // shape of overreach round 24 corrected for a trailing comment.
+        let contents = "# ADR\n\n- Status: accepted <span hidden></span>\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_a_break_tag() {
+        // Codex, pull request #138, round 25: a real (non-comment) inline tag is not
+        // invisible the way a comment is, so `- Sta<br>tus: accepted` renders as two
+        // lines even though its source is one — `<br>` carries no newline of its own,
+        // so the round-24 newline check alone let this decoy's surrounding `Text`
+        // fragments fuse into a fake one-line `Status: accepted`.
+        let contents = "# ADR\n\n- Sta<br>tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_reads_a_valid_field_with_harmless_inline_formatting() {
+        // Codex, pull request #138, round 26: the round-25 fix disqualified *any*
+        // non-comment inline HTML, which also rejected ordinary inline formatting that
+        // renders with no line break at all — `- Status: <span>accepted</span>` is a
+        // real, complete, one-line field, and `<span>`/`</span>` are not `<br>`.
+        let contents = "# ADR\n\n- Status: <span>accepted</span>\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_an_attributed_break_tag() {
+        // Codex, pull request #138, round 27: the round-26 fix compared an inline
+        // tag's *entire* trimmed body to `"br"`, so an attribute — `<br class="x">` —
+        // no longer matched and the decoy it should disqualify slipped through.
+        let contents = "# ADR\n\n- Sta<br class=\"x\">tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_field_split_by_a_closing_break_tag() {
+        // Codex, pull request #138, round 28: `<br>` has no real closing tag, but a
+        // browser recovers from the `</br>` parse error by treating it as a line break
+        // anyway. The round-27 fix stripped only a trailing self-closing slash, so a
+        // *leading* one — from the closing spelling — left an empty extracted name that
+        // never matched `"br"`, letting this decoy slip through undisqualified.
+        let contents = "# ADR\n\n- Sta</br>tus: accepted\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_hidden_inside_a_script() {
+        // Codex, pull request #138, round 30: `<script>` is a real, non-comment inline
+        // element whose content a reader never sees, and the item disqualifies
+        // outright rather than merely excluding the hidden value — excluding alone
+        // would leave `item` at `"Status: "`, which still strips and trims to an
+        // empty value that still trivially matches, exactly the failure round 15
+        // already closed for a nested fence or blockquote.
+        let contents = "# ADR\n\n- Status: <script>accepted</script>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_item_reached_while_an_inline_script_is_still_open() {
+        // Codex, pull request #138, round 41, finding 2: an inline non-rendering
+        // element opened on one item and left unclosed — `- Status: <script>` — only
+        // disqualified *that* item; `open_non_rendering_tag` was never pushed to at
+        // all here, unlike `markdown_prose`, `heading_lines` and `table_rows`, which
+        // all call `track_non_rendering_html` for every `Event::InlineHtml`. So the
+        // next item, `- Status: accepted`, began collecting fresh with the stack
+        // still empty, even though a browser is still in script-data state until the
+        // real `</script>` two items later — and its value won a match this function
+        // returns on immediately, before the real field further down was ever
+        // reached. The `InlineHtml` arm now calls `track_non_rendering_html`
+        // unconditionally, the same as the other three functions, so the stack opens
+        // and the next item's `Start(Tag::Item)` sees it as hidden.
+        let contents = "# ADR\n\n- Status: <script>\n\n- Status: accepted\n\n\
+                         </script>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
     fn an_empty_adr_date_is_reported() {
         // Issue #51e: `- Date:` with no value passed the `starts_with` presence check.
         let adrs = vec![AdrFile {
@@ -5584,6 +6901,27 @@ mod tests {
         assert!(
             hardware_attestation_claims(&contents).is_empty(),
             "an HTML comment was read as a claim"
+        );
+    }
+
+    #[test]
+    fn a_hardware_target_only_inside_a_fenced_block_in_claude_md_does_not_vouch_for_it() {
+        // Issue #82: the counterpart of `recovery-spec`'s fence test, for the other half
+        // of `hardware-attestation` — the one that reads `CLAUDE.md` rather than an ADR.
+        // Without stripping fences, a fenced example listing every target id would
+        // satisfy this check in a file whose real table has been deleted.
+        let claude_md = clean_claude_md(RULES);
+        let target = HARDWARE_TARGETS.first().expect("the table is not empty");
+        let fenced = claude_md.replace(
+            &format!("| `{}` |", target.id),
+            &format!("```text\n| `{}` |", target.id),
+        ) + "\n```\n";
+        let violations = check_hardware_attestation(Some(&fenced), &clean_inputs(RULES).adrs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule == "hardware-attestation" && v.subject == target.id),
+            "{violations:?}"
         );
     }
 
@@ -5751,6 +7089,250 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_looking_closer_inside_a_top_level_example_fence_does_not_leak_or_hide_links() {
+        // Codex, pull request #138: the converse of the blockquoted-fence case, found
+        // through `check_adr_index` when it was still on the textual scanners. Inside
+        // a top-level (unquoted) example fence, a line like `> ``` ` is quoted
+        // content, not a closer. The textual scanner's bug closed the fence there,
+        // exposing a link inside the example as if it were real, and then read the
+        // real closing fence as a fresh opener — hiding the real link that follows
+        // it. `check_adr_index` now reads through `visible_source`, a real parser,
+        // which does not have this failure mode; this pins the scenario against it.
+        let index =
+            "```text\n> ```\n[0002-two.md](0002-two.md)\n```\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "the real link after the example was not seen: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link quoted only inside the example counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_fence_looking_line_inside_a_comment_does_not_hide_the_real_links() {
+        // Codex, pull request #138: composing the two textual scanners in either
+        // order was reachable through `check_adr_index` too — an HTML comment
+        // containing a fence-looking line let the fence scanner consume the
+        // comment's own terminator (and the real links after it) before the comment
+        // scanner ever ran. `visible_source` finds both constructs in one real
+        // parse, so an HTML comment's own `-->` ends it regardless of what looks
+        // like a fence inside it.
+        let index = "<!--\n```\n-->\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_comment_nested_inside_a_real_html_block_does_not_vouch_for_the_link_inside_it() {
+        // Codex, pull request #138, round 13: a comment inside a block that opens with
+        // a real tag, `<div>\n<!-- ... -->\n</div>`, is still one `Tag::HtmlBlock` event
+        // covering the whole thing, and the old check only hid the block when it started
+        // with `<!--` — so a comment nested inside real HTML was never hidden at all.
+        let index = "<div>\n<!-- [0002-two.md](0002-two.md) -->\n</div>\n\n\
+                      - [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link inside a comment nested in real HTML counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_inside_a_script_tag_does_not_vouch_for_it_but_a_real_one_after_it_still_does() {
+        // Codex, pull request #138, round 45, "Suppress non-rendering blocks in
+        // visible_source": `<script>` content is never rendered, but `visible_source`
+        // only hid an HTML *comment* — a Markdown link written inside one, like
+        // `<script>[0002-two.md](0002-two.md)</script>`, satisfied
+        // `linked_markdown_files` even though a reader never sees it as a link.
+        let index = "<script>\n[0002-two.md](0002-two.md)\n</script>\n\n\
+                      - [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "the real link after the script tag was not seen: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link written only inside a script tag counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_inside_a_title_tag_does_not_vouch_for_it_but_a_real_one_after_it_still_does() {
+        // Codex, pull request #138, round 48, "Suppress title element contents
+        // from visible prose": a document's `<title>` is RCDATA metadata for the
+        // browser chrome, never rendered as page prose, but `<title>` was missing
+        // from the fixed non-rendering list `find_any_opening_tag` and
+        // `visible_html_ranges` share — `visible_html_ranges` stripped only the
+        // tags themselves and emitted the body, so a Markdown link written inside
+        // one, like `<title>[0002-two.md](0002-two.md)</title>`, satisfied
+        // `linked_markdown_files` even though a reader never sees it as a link.
+        let index = "<title>\n[0002-two.md](0002-two.md)\n</title>\n\n\
+                      - [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "the real link after the title tag was not seen: {violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link written only inside a title tag counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_comment_spelling_inside_a_real_tag_does_not_hide_the_real_links_after_it() {
+        // Codex, pull request #138, round 40, finding 2: the per-block comment
+        // search inside an `HtmlBlock` did a raw substring search for `<!--`, blind
+        // to whether that text sat inside an ordinary tag's own quoted attribute
+        // value. `<div title="<!--">note</div>` is one complete, well-formed tag
+        // whose attribute value happens to spell a comment opener — a browser
+        // renders it as attribute text, not a comment — but the raw search matched
+        // it anyway, found no closing `-->` anywhere in the rest of the document,
+        // and hid everything from there to end of file, including the real link
+        // that follows. `find_comment_opener` now tokenizes past the tag's own span
+        // the same way the rest of this module already does, so a spelling trapped
+        // inside one can never stand in for a real comment opener.
+        let index = "<div title=\"<!--\">note</div>\n\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            violations.is_empty(),
+            "a quoted comment spelling inside a real tag hid the real link after it: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_comment_nested_in_html_hides_everything_after_it() {
+        // Codex, pull request #138, round 14: CommonMark never renders an HTML comment
+        // with no closing `-->`, and treats everything after it the same way — the old
+        // `without_html_comments` already discarded the remainder for this case
+        // (`return kept;` on no match), and the per-block scan has to match that rather
+        // than stopping at the enclosing `<div>` block's own boundary, which ends at the
+        // blank line before the real link and has nothing to do with where the comment
+        // itself gives up looking for its close.
+        let index = "<div>\n<!-- unterminated\n</div>\n\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == "0001-one.md"
+                && v.detail.contains("no link in the index points at it")),
+            "an unterminated comment did not hide the real link after it: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_comment_that_outlives_its_blockquote_still_hides_what_follows() {
+        // Codex, pull request #138, round 17: a comment opened inside a one-line
+        // blockquote and never closed reaches past the blockquote's own (shorter)
+        // span. The two hidden ranges then overlap without one containing the other,
+        // and the assembly loop used to just skip the second — discarding its real,
+        // farther-reaching end and letting the blockquote's own end stand in as the
+        // cursor, which exposed the real link between the two ends as visible again.
+        let index = "> <!-- comment\nstill going\n\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![AdrFile {
+            name: "0001-one.md".to_owned(),
+            contents: String::new(),
+        }];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == "0001-one.md"
+                && v.detail.contains("no link in the index points at it")),
+            "an overlapping hidden span did not reach the real link after it: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_comment_does_not_vouch_for_the_link_inside_it() {
+        // Codex, pull request #138: an HTML comment sitting on its own line is
+        // `Event::Html`, but one mid-paragraph — `text <!-- ... --> text` — is
+        // `Event::InlineHtml`, a different event `visible_source` did not hide.
+        let index = "See docs. <!-- [0002-two.md](0002-two.md) --> more text.\n- [0001-one.md](0001-one.md)\n";
+        let adrs = vec![
+            AdrFile {
+                name: "0001-one.md".to_owned(),
+                contents: String::new(),
+            },
+            AdrFile {
+                name: "0002-two.md".to_owned(),
+                contents: String::new(),
+            },
+        ];
+        let violations = check_adr_index(Some(index), &adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == "0001-one.md"),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.subject == "0002-two.md"
+                && v.detail.contains("no link in the index points at it")),
+            "a link inside an inline comment counted as a real one: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_settled_decision_missing_from_the_adr_is_reported() {
         let mut inputs = clean_inputs(RULES);
         let first = SETTLED_DECISIONS[0];
@@ -5785,6 +7367,1987 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_recorded_inside_real_html_still_counts() {
+        // Codex, pull request #138, round 18: `markdown_prose` dropped every
+        // `Event::Html`/`Event::InlineHtml` outright, comment or not — real block-level
+        // HTML is raw passthrough with no separate `Event::Text` for its content, so a
+        // decision recorded inside `<div>...</div>` (visible to a reader and a
+        // renderer, unlike a comment) was invisible to this check, which then reported
+        // it missing even though the ADR states it plainly.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                // The id is removed from its usual heading and placed instead in a
+                // standalone block-level `<div>`, so the check can only find it through
+                // real (non-comment) HTML rather than through the heading text.
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!("{without_heading_id}\n<div>\n{}\n</div>\n", first.id);
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_a_comment_embedded_in_real_html_does_not_count() {
+        // Codex, pull request #138, round 19: a comment does not have to be the whole
+        // line — `<div><!-- id headline --></div>` is real HTML with a comment inside
+        // it, on one `Event::Html` line, and checking only whether the line starts
+        // with `<!--` let the comment's own hidden text ride along with the real tags
+        // around it.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- {} {} --></div>\n",
+                    second.id, second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "a decision hidden in a comment embedded in real HTML still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_placed_after_an_unterminated_comment_that_outlived_its_block_does_not_count() {
+        // Codex, pull request #138, round 20: `pulldown-cmark` ends an `HtmlBlock` at a
+        // blank line even when a comment inside it never closed — `<div>\n<!--\n</div>`
+        // is one complete `HtmlBlock`, its comment still open — so the paragraph right
+        // after reads as ordinary, structurally separate prose. By real HTML rules it is
+        // still inside the comment until an actual `-->` appears, and `hidden` has to
+        // say so for every later event, not only for more `Event::Html` lines.
+        let mut inputs = clean_inputs(RULES);
+        let third = SETTLED_DECISIONS[2];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", third.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<!--\n</div>\n\n{} {}\n",
+                    third.id, third.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == third.id),
+            "content after an unterminated comment that outlived its block still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_comment_never_really_closed_by_plain_prose_does_not_count() {
+        // Codex, pull request #138, round 28, correcting round 21's own fix: once a
+        // comment has outlived its own `HtmlBlock` across a blank line, its apparent
+        // closing `-->` on a later line is ordinary paragraph `Event::Text`, not
+        // `Event::Html` — and ordinary Markdown text is always HTML-escaped when
+        // rendered. Verified with a throwaway `pulldown-cmark` render: this exact
+        // source renders to `...<p>--&gt; two-banks-for-atomic-replacement ...`, so the
+        // literal three-byte sequence `-->` never survives into the HTML a browser
+        // parses, and the real, unescaped `<!--` a few lines up is still open through
+        // it — and everything after — exactly as if the paragraph had never been
+        // there. A decision after this decoy must stay hidden, the same as one after a
+        // comment with no apparent close of any kind (see
+        // `adr_status_hides_everything_after_an_unterminated_comment_that_outlived_its_block`).
+        let mut inputs = clean_inputs(RULES);
+        let fourth = SETTLED_DECISIONS[3];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fourth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<!--\n</div>\n\n-->\n\n{} {}\n",
+                    fourth.id, fourth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fourth.id),
+            "a decision after a comment only apparently closed by plain prose still \
+             counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_visible_suffix_after_a_same_line_comment_close_still_counts() {
+        // Codex, pull request #138, round 21: a later `Event::Html` line can both close
+        // an open comment and carry real, visible text after the close on the very same
+        // line — `-->decision-id headline</div>`. Passing the blanket `hidden` (still
+        // true from before the close) into the text-scanning helper for that one event
+        // would suppress the suffix along with the comment; only fence/blockquote
+        // containment is passed instead, so the helper's own close-then-resume logic
+        // decides the rest.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- open\n-->{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a visible suffix after a same-line comment close was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_visible_suffix_after_an_end_bang_comment_close_still_counts() {
+        // Codex, pull request #138, round 54, "Recognize the HTML comment end-bang
+        // close": HTML5's tokenizer accepts `--!>` as a genuine, if parse-error,
+        // comment close alongside the standard `-->` — `<!-- open\n--!>decision-id
+        // headline</div>` closes the comment right there, but a search for only
+        // the standard spelling left `in_html_comment` set through end of
+        // document, hiding the visible suffix and everything after it.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- open\n--!>{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a visible suffix after an end-bang comment close was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_visible_suffix_after_an_abrupt_empty_comment_close_still_counts() {
+        // Codex, pull request #138, round 55, "Recognize abrupt empty-comment
+        // closes": HTML5's tokenizer treats `<!-->` and `<!--->` as parse-error
+        // "abrupt closing of empty comment" — the comment closes at that very `>`,
+        // right after the opener's own dashes, rather than waiting for a standard
+        // `-->` or `--!>` later in the document.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-->{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a visible suffix after an abrupt empty-comment close was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_ancestor_closes_a_still_open_hidden_element_still_counts() {
+        // Codex, pull request #138, round 55, "Unwind hidden descendants when an
+        // ancestor closes": `<div><span hidden>ignored</div>decision-id headline`
+        // never gives `span` its own end tag, but a browser still force-closes it
+        // — and anything nested inside it — the moment its ancestor `<div>`
+        // closes, via the standard "pop the stack of open elements" end-tag
+        // algorithm. Tracking only the fixed non-rendering/hidden stack, blind to
+        // any ordinary ancestor that was never pushed onto it, left `span`
+        // latched open through end of document, hiding the decision that follows.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden>ignored</div>{} {}\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after an ancestor closed a still-open hidden element was \
+             wrongly hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_bogus_comment_with_a_quote_still_counts() {
+        // Codex, pull request #138, round 55, "End bogus comments at the first
+        // greater-than sign": HTML5's bogus-comment state (`<!ignored ...>`)
+        // tracks no quotes at all — the very first `>` ends it, so `<!ignored
+        // title=">decision-id headline">` closes right after `title="`, and
+        // everything after that — the id, the headline, the stray quote and the
+        // final `>` alike — is ordinary visible text. Routing this construct
+        // through the quote-aware scan built for real tags instead waited for the
+        // matching close-quote's own trailing `>`, swallowing the decision as
+        // though it were still markup.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<!ignored title=\">{} {}\">\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after a bogus comment with a quote was wrongly hidden: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_svg_cdata_still_counts() {
+        // Codex, pull request #138, round 56, "Preserve CDATA text while parsing
+        // foreign content": inside SVG or MathML, `<![CDATA[...]]>` is not a bogus
+        // comment — the browser emits its payload as real, visible character data.
+        // Round 55's fix for markup declarations treated every `<!...>` construct
+        // uniformly, closing at the first `>` and discarding everything up to it,
+        // payload included, as invisible markup — correct outside foreign content,
+        // where `<![CDATA[` really does degrade to a bogus comment, but not inside
+        // it.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                // Wrapped in a block-level `<div>` on its own line so the whole
+                // construct is a genuine CommonMark HTML block — verified via a
+                // throwaway `pulldown-cmark` probe — reaching this module's
+                // block-level `Event::Html` scan rather than `Event::InlineHtml`,
+                // which is where round 56's finding traced the bug.
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg><![CDATA[{} {}]]></svg>\n</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision inside SVG CDATA was wrongly hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_stray_unmatched_closing_tag_stays_hidden() {
+        // Codex, pull request #138, round 56, "Ignore closes that do not match a
+        // real ancestor": round 55's fix treated any closing tag matching neither
+        // `top` nor a same-walk nested child as proof of an ancestor's close, by
+        // elimination — but a wholly unmatched stray closing tag, with no
+        // `<bogus>` ever opened anywhere, is exactly as unmatched by that test,
+        // and wrongly closed the hidden `span` early, exposing text that is still
+        // really inside it. A real HTML5 parser ignores an end tag with no
+        // matching open element anywhere on the stack rather than guessing it
+        // must belong to something.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden>ignored</bogus>{} {}</span></div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after a stray unmatched closing tag was wrongly read as \
+             visible prose while still inside a hidden element: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_a_multiline_cdata_payload_still_counts() {
+        // Codex, pull request #138, round 57, finding "Carry foreign CDATA across
+        // lines": a multi-line `<![CDATA[...]]>` section inside foreign content
+        // that does not close on its own opening line used to be silently dropped
+        // as a hiding candidate rather than carried across the line break, falling
+        // through instead to the generic incomplete-tag machinery built for an
+        // ordinary tag whose own `>` is on a later line. That machinery swallows
+        // every line up to the next unquoted `>` as though it were all one tag's
+        // own markup — here, the real closing `]]>`'s own `>`, the first one the
+        // payload contains — so the whole CDATA payload, id and headline included,
+        // was hidden as inert tag syntax instead of kept as the real, visible
+        // character data a browser renders it as.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg><![CDATA[\n{} {}\n]]></svg>\n</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_breakout_script_still_counts_as_hidden() {
+        // Codex, pull request #138, round 57, finding "Exit foreign mode on HTML
+        // breakout tags": `<p>` is one of HTML5's fixed foreign-content breakout
+        // elements, so opening it while genuinely inside an `<svg>` (not at an
+        // HTML integration point) pops back out to ordinary HTML parsing before
+        // the `<p>` itself is processed. `<script />` that follows is then read
+        // under ordinary rules, where a self-closing slash on a non-void,
+        // non-foreign element is ignored rather than honored — a real, raw-text
+        // `<script>` whose body a browser never renders, not a bodyless one the
+        // way `<script />` reads directly inside `<svg>`. `track_foreign_content_depth`
+        // used to recognize only foreign-content roots and HTML integration points
+        // as namespace changes, so the still-open `<svg>` frame kept exempting the
+        // self-closing slash, and the id and headline that follow read as
+        // ordinary, visible text a self-closing `<script>` never opened at all.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><p><script />{} {}</script></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_valueless_font_breakout_stays_hidden() {
+        // Codex, pull request #138, round 60, finding "Recognize valueless font
+        // breakout attributes": HTML5's `font` breakout condition is "carries a
+        // `color`, `face` or `size` attribute" — present at all, not "carries one
+        // with a value" — so `<font color>`, a boolean attribute with no `=value`,
+        // still breaks out of foreign content exactly as `<font color="red">`
+        // does. `is_foreign_breakout_tag` checked `attribute_value(span,
+        // attribute).is_some()`, which requires a real `=`, so `<svg><font
+        // color><script />decision-id headline</script></font></svg>` never broke
+        // out at all: `<svg>` stayed the innermost frame, the self-closing
+        // `<script />` read as bodyless under it, and the id and headline that
+        // follow read as ordinary, visible text a self-closing `<script>` never
+        // opened.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><font color><script />{} {}</script></font></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_inside_mglyph_still_counts() {
+        // Codex, pull request #138, round 60, finding "Preserve MathML parsing for
+        // mglyph children": WHATWG's one named exception to "an HTML integration
+        // point's descendants parse under ordinary HTML rules" is `<mglyph>` and
+        // `<malignmark>` — opened directly inside a MathML text integration point
+        // (`mi`/`mo`/`mn`/`ms`/`mtext`), either one is itself still processed
+        // under the foreign-content rules, reopening real MathML parsing (and the
+        // self-closing acknowledgment that comes with it) for its own descendants,
+        // rather than leaving the integration point's own `honors_self_closing:
+        // false` frame as the innermost one. `track_foreign_content_depth`
+        // recognized only foreign-content roots and HTML integration points as
+        // namespace changes, so `<math><mtext><mglyph><script
+        // /></mglyph>decision-id headline</mtext></math>` still had `mtext` as the
+        // innermost frame when `<script />` was reached, read its slash as
+        // ignored, and opened a real, unclosed `<script>` that swallowed the id
+        // and headline after it to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><mglyph><script /></mglyph>{} {}</mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_inside_mglyph_nested_in_a_span_stays_hidden() {
+        // Codex, pull request #138, round 61, finding "Require `mglyph` to be a
+        // direct integration-point child": round 60's `mglyph`/`malignmark`
+        // exception read only the innermost open frame's own name, blind to any
+        // ordinary HTML element opened beneath it — but WHATWG's exception applies
+        // only while `mglyph`/`malignmark` is a genuine *direct* child of the
+        // MathML text integration point, the adjusted current node. Once an
+        // ordinary `<span>` opens inside `<mtext>`, the current node is `span`, an
+        // HTML element, so a further `<mglyph>` nested inside *it* no longer
+        // qualifies: `<math><mtext><span><mglyph><script
+        // />decision-id headline</script></mglyph></span></mtext></math>` has the
+        // `<script />`'s slash ignored under ordinary HTML rules there, opening a
+        // real, raw-text `<script>` whose body a browser never renders — but the
+        // round-60 check still re-entered MathML anyway, wrongly reading it as
+        // bodyless and exposing the id and headline as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><span><mglyph><script />{} {}</script></mglyph></span></mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_div_implicitly_closing_a_hidden_ancestors_paragraph_still_counts() {
+        // Codex, pull request #138, round 61, finding "Apply implicit closes
+        // through hidden descendants": `<p><span hidden>ignored<div>decision-id
+        // headline</div>` has `<div>` implicitly close the ancestor `<p>` — HTML5's
+        // own "close a p element" rule — which pops everything nested inside `p`
+        // off the stack right along with it, the hidden `span` included, so the
+        // `div` and its text are genuinely outside any hidden element and visible.
+        // `next_non_rendering_marker`'s implicit-close check only ever asked
+        // whether the incoming tag implicitly closes `top` (`span`) itself — which
+        // it does not, `span` having no optional-tag rules of its own — so `div`
+        // was recorded as an ordinary child nested *inside* the still-open hidden
+        // `span` instead, latching it (and the id and headline inside `div`)
+        // hidden through end of document, since no `</span>` ever follows.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<p><span hidden>ignored<div>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_inside_mglyph_after_a_self_closing_span_stays_hidden() {
+        // Codex, pull request #138, round 62, finding "Honor HTML slashes while
+        // tracking direct children": a self-closing slash is only ever honored by
+        // the *innermost* open frame's own rule, and under an HTML integration
+        // point like `mtext` it is ignored, so the tag opens for real rather than
+        // closing itself. `track_foreign_content_depth` returned unconditionally
+        // whenever a tag's own markup ended in a self-closing slash, whether or not
+        // that slash was actually honored, so `<span/>` under `mtext` was read as
+        // bodyless and never recorded as an ordinary descendant. `<math><mtext>
+        // <span/><mglyph><script />decision-id headline</script></mglyph></mtext>
+        // </math>` therefore has `mglyph`'s `ordinary_descendants.is_empty()`
+        // direct-child check see nothing open between it and `mtext`, and wrongly
+        // apply the exception that reopens MathML for it — when a real browser
+        // reads the ignored slash as opening `span` for real first, so `mglyph` is
+        // nested inside an ordinary HTML element rather than a direct child of the
+        // integration point, and the `<script />` beneath it is bodyless HTML raw
+        // text that swallows the id and headline after it to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><span/><mglyph><script />{} {}</script></mglyph></mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_inside_a_hidden_svg_still_counts() {
+        // Codex, pull request #138, round 62, finding "Track namespace changes on
+        // hidden openers": the `Hidden` marker arm pushed a hidden opener's own
+        // name onto the non-rendering suppression stack and never told
+        // `track_foreign_content_depth` about it, so `<svg hidden>` left the
+        // foreign-content stack exactly as it found it — empty. Wrapped in a
+        // `<div>` so the whole construct is real block-level HTML (`div` is one of
+        // `CommonMark`'s own fixed block tag names, where `svg` on its own is not,
+        // and reaches this scanner rather than the separate one
+        // `Event::InlineHtml` uses, which already called
+        // `track_foreign_content_depth` unconditionally and never had this bug).
+        // `<div><svg hidden><script /></svg>decision-id headline</div>` then reads
+        // its self-closing `<script />` against that empty stack, where a
+        // self-closing slash is never honored, so it opens as a real, unclosed
+        // HTML script that swallows everything after it — the closing `</svg>`
+        // and the id and headline included — to end of document, rather than the
+        // bodyless script and properly closed `svg` a browser reads it as.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><svg hidden><script /></svg>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_after_closing_through_a_stale_mathml_ancestor_stays_hidden() {
+        // Codex, pull request #138, round 63, finding "Pop through matching
+        // foreign-content ancestors": a closing tag that mismatches the innermost
+        // open frame still closes a real, currently open *ancestor* frame further
+        // out — HTML5's foreign-content end-tag handling searches the whole stack
+        // of open elements outward from the current node, and popping a match
+        // takes everything nested inside it along however many frames deep.
+        // `<svg><foreignObject><math></foreignObject></svg><script
+        // />decision-id headline</script>` has `<math>` reopen real MathML
+        // parsing inside the SVG integration point `foreignObject` — itself
+        // nested inside `svg` — so `</foreignObject>` mismatches the innermost
+        // `math` frame but is still a real ancestor two frames out: a browser
+        // pops both `math` and `foreignObject`, and the following `</svg>` pops
+        // `svg` the same way, leaving foreign content empty for the `<script />`
+        // that follows — where a self-closing slash is never honored, so it opens
+        // as a real, unclosed HTML script whose raw-text body swallows the id and
+        // headline up to its own literal `</script>`. Checking only the innermost
+        // frame left the stale `math` frame behind after both closing tags, so
+        // `<script />` was misread as still inside foreign content and wrongly
+        // acknowledged as bodyless, exposing the id and headline as ordinary
+        // visible text right after it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><foreignObject><math></foreignObject></svg><script />{} {}</script>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_nested_div_split_across_a_line_break_stays_hidden() {
+        // Codex, pull request #138, round 64, finding "Persist hidden descendants
+        // across raw-HTML lines": `next_non_rendering_marker`'s own `descendants` —
+        // the ordinary elements opened directly under the currently tracked hidden
+        // element — was a fresh, empty list on every call, and `pulldown-cmark`
+        // fires one `Event::Html` per raw HTML source line, so an element opened on
+        // one line and closed on the next had its own open forgotten the moment
+        // the first line's call returned. `<div><span hidden><div>\n
+        // </div>decision-id headline</span></div>` has the inner `<div>` opened on
+        // line one and closed on line two: with no memory that it was ever open,
+        // the closing `</div>` on line two matched neither `top` (`span`) nor any
+        // known descendant, so it fell through to the `ancestors` check — where the
+        // *outer* `<div>` happened to share its name — and was misread as that real
+        // outer ancestor closing, ending the hidden `span` two levels early and
+        // exposing the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden><div>\n</div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_an_inline_mark_nested_inside_a_hidden_span_stays_hidden() {
+        // Codex, pull request #138, round 65, finding "Track ordinary descendants
+        // in inline hidden markup": `track_non_rendering_html` — the inline twin of
+        // `next_non_rendering_marker`, one self-contained `Event::InlineHtml`
+        // construct at a time — never tracked ordinary descendants at all, only
+        // `top`'s own reopen and its own implicit closes. `text <mark><span
+        // hidden><mark>ignored</mark>decision-id headline</span></mark>` has an
+        // inner `<mark>` open while the hidden `span` is `top`: with no descendant
+        // recorded for it, the inner `</mark>` later matched neither `top` nor any
+        // known descendant and fell through straight to the `ancestors` check,
+        // where the *outer* `<mark>` happened to share its name — force-closing
+        // the hidden `span` two levels early and exposing the id and headline
+        // that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <mark><span hidden><mark>ignored</mark>{} {}</span></mark>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_nested_section_closing_through_a_stale_descendant_still_counts() {
+        // Codex, pull request #138, round 65, finding "Truncate through matching
+        // nested descendants": HTML5 pops everything nested inside a closing
+        // descendant's own end tag too, however many layers deep — the same
+        // "any other end tag" unwind `ancestors` already gets — but
+        // `next_non_rendering_marker` only ever checked `descendants.last()`, the
+        // single most-recently-opened entry. `<section><span hidden><div><section>
+        // </div>ignored</section>decision-id headline` has `</div>` really close
+        // both the inner `section` and the `div` beneath it, leaving neither on
+        // the stack — but checking only the top left the stale inner `section`
+        // behind, so the *next* `</section>` was misread as still closing that
+        // stale inner descendant rather than the real outer ancestor `section`,
+        // latching the hidden `span` open through end of document instead of
+        // properly closing it and exposing the id and headline that follow.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<section><span hidden><div><section></div>ignored</section>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_self_closing_spelled_section_stays_hidden() {
+        // Codex, pull request #138, round 65, finding "Record slash-terminated
+        // HTML descendants": in ordinary HTML a self-closing slash is ignored
+        // unless the active foreign-content namespace actually honors it, but
+        // `next_non_rendering_marker`'s ordinary-descendant tracking skipped a
+        // slash-terminated tag unconditionally. `<section><span hidden>
+        // <section/>ignored</section>decision-id headline</span></section>` has
+        // `<section/>` open for real — no foreign content is open, so the slash
+        // is ignored — but with it never recorded as a descendant, the following
+        // `</section>` matched neither `top` (`span`) nor any known descendant
+        // and fell through to `ancestors`, where the *outer* `section` happened
+        // to share its name — force-closing the hidden `span` early and exposing
+        // the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<section><span hidden><section/>ignored</section>{} {}</span></section>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_after_a_div_implicitly_closes_a_tracked_descendant_paragraph_stays_hidden()
+    {
+        // Codex, pull request #138, round 66, finding "Apply implicit closes to
+        // tracked hidden descendants": pushing a new opening tag onto the
+        // descendant stack never first checked whether it implicitly closes the
+        // descendant already on top of it — the same discipline round 62 gave
+        // `track_ordinary_ancestor` for `ancestors`, never extended to this stack.
+        // `<div><span hidden><p><div></p></div>decision-id headline</span></div>`
+        // has the inner `<div>` implicitly close the open `<p>` — HTML5's own
+        // "close a p element" rule — so a browser recovers from the stray `</p>`
+        // that follows without it affecting anything, and only the later `</div>`
+        // closes the real, surviving `div`. Appending `div` without first popping
+        // the stale `p` left both on the stack, so the stray `</p>` matched `p`
+        // and — searching and truncating through the match, round 65's own fix —
+        // took the real `div` down with it, leaving the following `</div>` to
+        // match nothing here and fall through to `ancestors`, where the *outer*
+        // `div` happened to share its name, force-closing the hidden `span` early
+        // and exposing the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden><p><div></p></div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_after_an_inline_div_implicitly_closes_a_tracked_descendant_paragraph_stays_hidden()
+     {
+        // Codex, pull request #138, round 66, finding "Apply implicit closes to
+        // tracked hidden descendants", met here for `track_non_rendering_html`'s
+        // own self-contained-`Event::InlineHtml` twin of the fix above — "including
+        // in the inline tracker" was the finding's own second half. `text
+        // <div><span hidden><p><div></p></div>decision-id headline</span></div>`
+        // has the same construct as the block-level test, reached through a
+        // paragraph's inline HTML events instead of one raw HTML line: the inner
+        // `<div>` implicitly closes the open `<p>`, a browser recovers from the
+        // stray `</p>` that follows, and only the later `</div>` closes the real,
+        // surviving `div`. Without popping the stale `p` first, the stray `</p>`
+        // took the real `div` down with it here too, leaving the following
+        // `</div>` to fall through to `ancestors`, where the *outer* `div`
+        // happened to share its name — force-closing the hidden `span` (via
+        // `stack.clear()`) before the id and headline text was even reached, so it
+        // read as ordinary visible text rather than hidden `span` content.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <div><span hidden><p><div></p></div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_after_a_div_implicitly_closes_a_paragraph_two_levels_out_stays_hidden() {
+        // Codex, pull request #138, round 67, finding "Truncate through implicitly
+        // closed ancestors": `track_ordinary_ancestor`'s own implicit-close check
+        // only ever asked whether the incoming tag implicitly closes
+        // `ancestors.last()` — the single most-recently-opened entry — not
+        // anything deeper in the stack. `<p><span><div></div><section
+        // hidden>ignored<div>decision-id headline</div></section>` has the first
+        // `<div>` implicitly close the `<p>` two levels out — HTML5's "close a p
+        // element" rule pops everything nested inside it too, the intervening
+        // `<span>` included — but checking only `ancestors.last()` (`span`) never
+        // found the `<p>` at all, leaving both stale in `ancestors`. The *second*
+        // `<div>`, opened later inside the hidden `section`, then had
+        // `next_non_rendering_marker`'s own implicit-ancestor-close search (round
+        // 61) find that stale `p`, wrongly read its own opening tag as closing the
+        // hidden `section` (an ancestor's implicit close taking a hidden element
+        // down with it), and expose the id and headline that follow as ordinary
+        // visible text before the hidden region should have ended at all.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<p><span><div></div><section hidden>ignored<div>{} {}</div></section>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_after_a_self_closing_svg_root_stays_hidden() {
+        // Codex, pull request #138, round 67, finding "Skip self-closing foreign
+        // roots when tracking namespaces": any element being inserted into the SVG
+        // or MathML namespace acknowledges its own self-closing flag immediately,
+        // whatever the ambient context was a moment before — unlike an *ordinary*
+        // HTML element's self-closing slash, which is only ever honored while
+        // already parsing inside foreign content. `text
+        // <svg/><script />decision-id headline</script>` has `<svg/>` acknowledged
+        // and immediately popped back off before `<script />` is ever reached,
+        // returning to plain HTML — where a self-closing slash is *not* honored,
+        // so `<script />` opens for real and its raw-text body hides the id and
+        // headline up to its own literal `</script>`. Pushing a frame for `<svg/>`
+        // unconditionally left a stale, still-open `honors_self_closing: true`
+        // frame behind, wrongly reading the following `<script />` as bodyless and
+        // exposing the id and headline as ordinary visible text right after it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <svg/><script />{} {}</script>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_inside_a_bare_mtext_with_no_math_ancestor_stays_hidden() {
+        // Codex, pull request #138, round 68, finding "Require a foreign namespace
+        // before opening integration frames": `is_html_integration_point` matches
+        // on a tag's own name and attributes alone, blind to whether any foreign
+        // root is open at all — but an HTML integration point is only ever real
+        // while it is genuinely being inserted into the SVG or MathML namespace.
+        // `text <mtext><mglyph><script />decision-id headline</script></mglyph>
+        // </mtext>` has no enclosing `<math>` at all, so `mtext` is nothing more
+        // than an unrecognized ordinary HTML element to a real browser — but
+        // opening an integration-point frame for it regardless let the following
+        // `mglyph` exception wrongly re-enter "MathML" that was never really open,
+        // treating `<script />` as bodyless and exposing the id and headline that
+        // follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <mtext><mglyph><script />{} {}</script></mglyph></mtext>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_after_a_div_implicitly_closes_a_paragraph_inside_mtext_still_counts()
+     {
+        // Codex, pull request #138, round 68, finding "Drop implicitly closed
+        // integration-point descendants": pushing an ordinary tag onto a frame's
+        // own `ordinary_descendants` never first checked whether it implicitly
+        // closes the descendant already on top — the round-66 fix for the plain
+        // `ancestors`/`descendants` stacks, never extended to this one.
+        // `<math><mtext><p><div></div><mglyph><script /></mglyph>decision-id
+        // headline</mtext></math>` has the `<div>` implicitly close the open `<p>`
+        // — HTML5's "close a p element" rule — so a browser recovers and `mglyph`
+        // is once again a genuine *direct* child of `mtext`, reopening real MathML
+        // parsing for its bodyless `<script />`. Appending `div` without first
+        // popping the stale `p` left `ordinary_descendants` nonempty, wrongly
+        // failing `mglyph`'s direct-child check and reading the script as a real,
+        // unclosed HTML one that hides the id and headline that follow instead of
+        // leaving them visible.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><p><div></div><mglyph><script /></mglyph>{} {}</mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_math_nested_inside_svg_never_leaves_the_svg_namespace_still_counts() {
+        // Codex, pull request #138, round 70, finding "Keep nested foreign roots in
+        // the current namespace": a foreign root genuinely starts new foreign content
+        // only while HTML's own "in body" insertion mode is the one in effect —
+        // nothing open, or an open HTML integration point — not while *already*
+        // inside raw foreign content. `<svg><math><mtext><script
+        // /></mtext></math><text>decision-id headline</text></svg>` never leaves the
+        // SVG namespace a real browser reads it in: `math` and `mtext` are just
+        // unrecognized SVG-namespaced elements there, self-closing stays honored
+        // throughout, and `<script />` is bodyless. Pushing a frame for `math`
+        // unconditionally opened a genuinely new (and wrong) MathML root, whose
+        // `mtext` was then read as a real integration point switching to HTML rules —
+        // leaving `<script />` a real, unclosed script that swallowed the closing
+        // `</mtext></math>`, the following `<text>` and the id and headline inside it,
+        // to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><math><mtext><script /></mtext></math><text>{} {}</text></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_following_a_nested_same_named_svg_root_still_counts()
+    {
+        // Codex, pull request #138, round 72, finding "Distinguish nested foreign
+        // elements from namespace frames": a same-named foreign element nested
+        // inside a foreign root is a real, separately open element — HTML5's own
+        // open-element stack has a distinct entry for it — and its own close has
+        // to unwind that entry rather than being read as the enclosing root's own
+        // close just because the two share a name. `<svg><svg></svg><script
+        // /><text>decision-id headline</text></svg>` has the inner, ordinary
+        // `<svg>` close only itself; the outer root stays open, self-closing
+        // stays honored, and `<script />` is bodyless. Matching the closing tag
+        // against frame names before any tracked descendant found the outer
+        // root's own frame by that same name and popped it — ending foreign
+        // content two elements early, so the now-unclosed `<script>` (no longer
+        // self-closing, since self-closing is honored only inside foreign
+        // content) swallowed the `<text>` and the id and headline inside it to
+        // end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><svg></svg><script /><text>{} {}</text></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_beneath_a_nested_integration_point_stays_hidden() {
+        // Codex, pull request #138, round 72, finding "Require foreign parsing
+        // before opening integration frames": an integration point switches
+        // parsing of its own descendants from foreign-content rules to HTML
+        // ones — a transition that can only happen once. An integration-point-
+        // shaped tag reached while already inside HTML content (the innermost
+        // open frame's own self-closing already not honored) is itself just an
+        // ordinary, unrecognized HTML element, not a second switch into HTML
+        // rules. `<math><mtext><mtext><mglyph><script />decision-id
+        // headline</script></mglyph></mtext></mtext></math>` has the inner
+        // `mtext`, `mglyph` and `script` all parsed as ordinary HTML — the slash
+        // on `script` ignored, its body real and hidden. Matching on namespace
+        // alone let the inner `mtext` reopen a second integration-point frame,
+        // whose empty `ordinary_descendants` then let the `mglyph` exception
+        // wrongly re-enter MathML, treating `<script />` as bodyless and
+        // exposing the id and headline after it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><mtext><mglyph><script />{} {}</script></mglyph></mtext></mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_a_template_past_an_unmatched_ancestor_close_stays_hidden() {
+        // Codex, pull request #138, round 72, finding "Respect HTML scope
+        // boundaries when unwinding hidden content": an ancestor name being
+        // present is not sufficient for an end tag to reach it across an HTML
+        // scope boundary. `<div><template>ignored</div>decision-id
+        // headline</template></div>` has the inner `</div>` match nothing on
+        // template content's own, separate stack of open elements — a real
+        // outer `div` genuinely open around the `<template>` itself is not
+        // reachable from inside it — so it is a stray, unmatched end tag, left
+        // inert, and the id and headline after it stay inside the still-open
+        // `<template>`, hidden until its own literal close. Matching the stray
+        // `</div>` against `ancestors` (positive evidence the real, outer `div`
+        // is genuinely open) wrongly read that as `top` itself closing too,
+        // ending the hidden template region early and exposing the marker.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><template>ignored</div>{} {}</template></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_misnested_formatting_element_stays_hidden() {
+        // Codex, pull request #138, round 73, finding "Preserve hidden formatting
+        // after adoption-agency closes": a *formatting* element's own end tag
+        // does not simply close it when something opened after it is still
+        // open — HTML5's adoption agency algorithm runs instead. `<b
+        // hidden><div>ignored</b>decision-id headline</div>` has the misnested
+        // `</b>` produce `<b hidden></b><div>ignored<b hidden>decision-id
+        // headline</b></div>` in a real browser: the id and headline are
+        // reparented into a *cloned* `<b hidden>`, still inside the still-open
+        // `div`, and stay exactly as hidden as before the stray `</b>`.
+        // Treating any closing tag matching `top` as an unconditional close
+        // ended suppression at the misnested `</b>` instead, exposing them.
+        // `b` is never one of CommonMark's own fixed HTML-block tag names, so
+        // no formatting element can ever reach `next_non_rendering_marker`'s
+        // block-level walk as `top` at all — this construct, and the fix, are
+        // `track_non_rendering_html`'s own self-contained `Event::InlineHtml`
+        // twin, the same as the sibling test just below.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><div>ignored</b>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_misnested_element_still_closes_on_its_own_end_tag() {
+        // The other half of round 73's fix: adoption agency is special to HTML5's
+        // fixed set of formatting elements, not a general rule for any misnested
+        // close. `<span hidden><section>ignored</span>decision-id
+        // headline</section>` has an ordinary `<span>` — not a formatting
+        // element — closed while a `<section>` opened after it is still open,
+        // and a real browser runs the plain "any other end tag" algorithm
+        // there: the stack search finds `span`, and popping it takes the
+        // intervening `section` down with it, ending the hidden region at the
+        // explicit `</span>` exactly as an unconditional close already modeled.
+        // `span`, like `b`, is not one of CommonMark's own fixed HTML-block tag
+        // names, so this reaches `track_non_rendering_html`'s self-contained
+        // `Event::InlineHtml` construct the same way the misnested-formatting
+        // case above does — confirmed by mutating `is_formatting_element` to
+        // always answer `true`, which turns this test red too, proving the gate
+        // is doing real work here rather than "some descendant is still open"
+        // alone deciding it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span hidden><section>ignored</span>{} {}</section>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_the_furthest_block_of_an_adopted_formatting_element_closes_still_counts() {
+        // Codex, pull request #138, round 74, finding "Pop adopted formatting content
+        // when its block closes": round 73's fix correctly left a misnested formatting
+        // element's suppression open past its own stray end tag, but never closed it
+        // again — the real adoption-agency clone HTML5 builds is reparented as a new
+        // child of the "furthest block" (the outermost element opened between the
+        // formatting element and the point of misnesting), so it closes when *that*
+        // element does. `<b hidden><div>ignored</b></div>decision-id headline` has the
+        // clone's own hidden lifetime end at `</div>`, not run to end of document —
+        // leaving `top` on the tracked stack forever, as round 73's fix alone did,
+        // wrongly kept everything after `</div>` hidden too.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><div>ignored</b></div>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_non_breaking_space_in_a_nested_tag_name_stays_hidden() {
+        // Codex, pull request #138, round 74, finding "Use HTML whitespace when
+        // delimiting tag names": `markup_tag_name` used `char::is_whitespace`, which
+        // treats a non-breaking space (U+00A0) as whitespace, where HTML5's own
+        // tokenizer does not — a non-breaking space right after a tag name stays part
+        // of it. `<div><span\u{A0} hidden>ignored</span>decision-id
+        // headline</div>` has the real, hidden element's tag name as `span\u{A0}`, so
+        // the later, literal `</span>` never matches it — a browser leaves it open
+        // until the enclosing `</div>` closes both together. Reading the name with
+        // `char::is_whitespace` truncated it to plain `span`, which the literal
+        // `</span>` *does* match, wrongly ending suppression there and exposing the id
+        // and headline that follow. `span\u{A0}` itself is never recognized by
+        // `pulldown-cmark` as an HTML tag opener on its own — CommonMark's own
+        // tag-open grammar requires real ASCII whitespace in that position too — so
+        // this is nested inside a real, ASCII-only `<div>` block, reached the way this
+        // scanner's own internal tag search finds it within an already-open block
+        // rather than through a fresh per-tag `pulldown-cmark` event.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span\u{A0} hidden>ignored</span>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_misnested_formatting_element_with_no_special_descendant_is_visible() {
+        // Codex, pull request #138, round 75, finding "Require a real furthest
+        // block before preserving formatting": round 74's fix promoted *any*
+        // nonempty descendant list to a furthest block, but HTML5's adoption
+        // agency algorithm only ever promotes a descendant from the "special"
+        // category — an ordinary phrasing element like `<span>` never qualifies,
+        // however deeply the misnesting reaches. `<b hidden><span>ignored</b>
+        // decision-id headline</span>` has `span` as `b`'s only descendant; since
+        // `span` is not special, there is no furthest block at all, and HTML5's
+        // own "no furthest block" case pops both `span` and `b` together when
+        // `</b>` is reached — the suffix is visible immediately, not latched
+        // open until a `</span>` that never legitimately reopens anything.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><span>ignored</b>{} {}</span>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_inside_an_inline_template_stays_hidden_past_a_stray_ancestor_close() {
+        // Codex, pull request #138, round 75, finding "Keep inline template
+        // content isolated from outer ancestors": `next_non_rendering_marker`
+        // (round 72) gates its "unwind through a matching real ancestor" branch
+        // with `ancestors_are_in_scope`, refusing to let a real outer ancestor's
+        // close reach into an open `<template>` — but `track_non_rendering_html`,
+        // the same unwind's self-contained-inline-construct twin, carried no such
+        // gate. A leading text prefix forces every tag on the line through
+        // `Event::InlineHtml`: `text <div><template>ignored</div>decision-id
+        // headline</template></div>` has a stray `</div>` inside the template
+        // match the real, outer `div` still in `ancestors` and wrongly
+        // force-close `template` — and the suppression along with it — early,
+        // exposing the id and headline that follow even though they are still
+        // genuinely inside `<template>` content, isolated on its own separate
+        // stack a real ancestor's end tag cannot reach into.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <div><template>ignored</div>{} {}</template></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_the_clones_own_end_tag_is_visible_before_the_furthest_block_closes() {
+        // Codex, pull request #138, round 76, finding "Keep the adopted
+        // formatting clone addressable by its end tag": round 74's fix
+        // promoted the furthest block into `top`'s own place, discarding the
+        // clone's own tag identity along the way — so a second, legitimate end
+        // tag matching the clone (nested inside the furthest block, exactly as
+        // HTML5's adoption agency algorithm leaves it) matched neither `top`
+        // (now the furthest block's own name) nor any tracked descendant, and
+        // was left inert, wrongly keeping suppression alive until the furthest
+        // block's own close. `<b hidden><div>ignored</b>still
+        // hidden</b>decision-id headline</div>` has the clone opened by the
+        // first `</b>` still genuinely hidden ("still hidden" is its own
+        // text) — but the *second* `</b>` is the clone's own real close, and
+        // everything after it, up to `</div>`, is ordinary content: `div`
+        // was never itself marked `hidden`, only the clone nested inside it
+        // was.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<b hidden><div>ignored</b>still hidden</b>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_by_a_script_inside_an_html_integration_point_using_a_character_reference_stays_hidden()
+     {
+        // Codex, pull request #138, round 76, finding "Decode the annotation
+        // encoding before namespace switching": `is_html_integration_point`
+        // compared `annotation-xml`'s raw, undecoded `encoding` attribute
+        // value against `text/html`/`application/xhtml+xml`, but a browser
+        // resolves an attribute's character references before comparing it
+        // against anything. `encoding="text&#47;html"` names `text/html`
+        // exactly as much as the literal spelling does, so `<script />`
+        // inside it is a real HTML integration point's descendant —
+        // self-closing is never honored there, so the slash is ignored and a
+        // genuine, unclosed `<script>` element opens, hiding everything up
+        // to its own literal `</script>`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><annotation-xml encoding=\"text&#47;html\"><script />{} {}</script></annotation-xml></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_inside_a_foreign_object_nested_in_math_still_counts()
+    {
+        // Codex, pull request #138, round 69, finding "Match integration points to
+        // their foreign namespace": round 68's fix required *some* foreign root be
+        // open before an integration-point frame could open, but never checked
+        // that the specific integration point belongs to the *right* one —
+        // `foreignObject` is an integration point only in SVG, not `MathML`.
+        // `<math><foreignObject><script /></foreignObject></math>decision-id
+        // headline` has no `<svg>` anywhere, so a real browser keeps real `MathML`
+        // parsing throughout — `foreignObject` is just an unrecognized
+        // `MathML`-namespaced element there, never switching to HTML rules — and
+        // the still-honored self-closing slash on `<script />` leaves it bodyless.
+        // Accepting any nonempty foreign stack wrongly opened an integration-point
+        // frame for it anyway, switching to HTML rules that read the same
+        // `<script />` as a real, unclosed script hiding the id and headline that
+        // follow instead of leaving them visible.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><foreignObject><script /></foreignObject></math>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_script_following_a_div_implicitly_closing_a_paragraph_two_descendants_deep_inside_mtext_still_counts()
+     {
+        // Codex, pull request #138, round 69, finding "Search through implicitly
+        // closed integration descendants": round 68's implicit-close-before-push
+        // fix for `ordinary_descendants` only ever checked its own top, the same
+        // gap round 68's *other* fix closed for the plain `descendants` stack.
+        // `<math><mtext><p><span><div></div><mglyph><script
+        // /></mglyph>decision-id headline</mtext></math>` has `<div>` implicitly
+        // close the ancestor `<p>` two levels down, taking the intervening
+        // `<span>` with it, so after `</div>` a browser has `mglyph` once again a
+        // direct child of `mtext` and its `<script />` is bodyless `MathML`
+        // content. Checking only `ordinary_descendants.last()` (`span`) never
+        // found the `p` at all, leaving both stale and wrongly failing `mglyph`'s
+        // direct-child check — reading the script as a real, unclosed HTML one
+        // that hides the id and headline that follow instead of leaving them
+        // visible.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><p><span><div></div><mglyph><script /></mglyph>{} {}</mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_a_section_after_a_div_implicitly_closes_a_paragraph_two_descendants_deep_stays_hidden()
+     {
+        // Codex, pull request #138, round 68, finding "Truncate through implicitly
+        // closed hidden descendants": the round-66 implicit-close-before-push fix
+        // for the descendant stack only ever checked `descendants.last()`, not the
+        // whole stack — the same "any other end tag"-shaped gap round 67 found and
+        // fixed for `track_ordinary_ancestor`, still open here.
+        // `<div><section hidden><p><span><div></p></div>decision-id
+        // headline</section></div>` has the inner `<div>` implicitly close the
+        // `<p>` two levels down, taking the intervening `<span>` with it — but
+        // checking only the top never found the `<p>`, leaving both stale. The
+        // stray `</p>` that follows then matched that stale `p` and cleared the
+        // entire descendant stack, so the real closing `</div>` matched nothing
+        // and fell through to `ancestors`, where the *outer* `div` happened to
+        // share its name, prematurely ending the hidden `section` and exposing
+        // the id and headline that follow as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><section hidden><p><span><div></p></div>{} {}</section></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_an_inline_section_after_a_div_implicitly_closes_a_paragraph_two_descendants_deep_stays_hidden()
+     {
+        // Codex, pull request #138, round 68, finding "Truncate through implicitly
+        // closed hidden descendants", met here for `track_non_rendering_html`'s
+        // own self-contained-`Event::InlineHtml` twin of the fix above. `text
+        // <div><span hidden><p><em><div></p></div>decision-id
+        // headline</span></div>` has the same construct as the block-level test,
+        // reached through a paragraph's inline HTML events instead of one raw
+        // HTML line: the inner `<div>` implicitly closes the `<p>` two levels
+        // down, taking the intervening `<em>` with it — but checking only the top
+        // left both stale here too, so the stray `</p>` that follows cleared the
+        // entire descendant stack and the real closing `</div>` fell through to
+        // `ancestors`, where the *outer* `div` happened to share its name,
+        // force-closing the hidden `span` early.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\ntext <div><span hidden><p><em><div></p></div>{} {}</span></div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_a_span_after_a_div_implicitly_closes_a_sibling_paragraph_stays_hidden()
+    {
+        // Codex, pull request #138, round 62, finding "Remove implicitly closed
+        // ancestors before reusing them": `track_ordinary_ancestor` recorded an
+        // opening tag as a new ancestor without ever applying that same tag's own
+        // implicit closes to the ancestor stack first, so a `<p>` a sibling `<div>`
+        // had already closed stayed behind as a stale entry. `<p><div></div><span
+        // hidden>ignored<div>decision-id headline</div></span>` then has the
+        // round-61 implicit-close ancestor search — run for the `<div>` nested
+        // inside the hidden `span` — find that stale `p` still on the stack,
+        // misread it as a real outer `<p>` genuinely being closed, and end the
+        // hidden `span` early on the strength of it, exposing the id and headline
+        // inside the nested `div` as ordinary visible text a browser never shows,
+        // since the hidden `span` has no closing tag of its own anywhere in the
+        // document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<p><div></div><span hidden>ignored<div>{} {}</div></span>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_div_closing_through_a_hidden_span_still_counts() {
+        // Codex, pull request #138, round 57, finding "Unwind all elements
+        // through a matching ancestor": a real HTML5 parser searches its whole
+        // stack of open elements for a matching end tag, not only its topmost
+        // entry, so `<div><section><span hidden>ignored</div>` closes `span`,
+        // `section` and `div` all at once when `</div>` is reached — even though
+        // `section` sits between `div` and the hidden `span` on the stack.
+        // Checking only `ancestors.last()` (`section`) never matched `</div>` at
+        // all, leaving the hidden `span` latched open through end of document
+        // and hiding the id and headline that follow it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><section><span hidden>ignored</div>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_cdata_at_an_html_integration_point_stays_hidden() {
+        // Codex, pull request #138, round 57, finding "Restrict CDATA to active
+        // foreign namespaces": `<foreignObject>` switches parsing of its own
+        // descendants back to ordinary HTML rules even while the enclosing
+        // `<svg>` is still open, so `<![CDATA[...]]>` reached inside one is once
+        // again a bogus comment ending at its own first `>` — the `]]>`'s own —
+        // rather than real character data, even though `foreign_content` is
+        // still non-empty there. Gating CDATA recognition on a bare "some
+        // foreign frame is open" check read this construct as real CDATA
+        // anyway, and its payload — genuinely inert bogus-comment text no
+        // reader ever sees — satisfied the check. Wrapped in a block-level
+        // `<div>` on its own line, the same as round 56's own CDATA test, so the
+        // whole construct is a genuine CommonMark HTML block reaching this
+        // module's block-level `Event::Html` scan — where `next_hiding_marker`'s
+        // CDATA eligibility check actually runs — rather than `Event::InlineHtml`,
+        // which has no CDATA-specific handling of its own to exercise at all.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg><foreignObject><![CDATA[{} {}]]></foreignObject></svg>\n</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_headline_encoded_inside_foreign_cdata_still_stays_hidden() {
+        // Codex, pull request #138, round 59, finding "Preserve character references
+        // inside foreign CDATA": HTML5's CDATA section tokenizer state emits every
+        // byte between `<![CDATA[` and `]]>` literally, with no character-reference
+        // processing at all — `<svg><text><![CDATA[All &#54; recovery
+        // invariants]]></text></svg>` renders the literal six-character sequence
+        // `&#54;`, never the digit `6`, unlike ordinary HTML text content, which a
+        // browser does resolve entities in. `append_visible_html` decoded every
+        // `VisibleHtmlSpan::Text` span unconditionally, CDATA payloads included
+        // (both push it the same way), so an encoded headline inside one decoded
+        // back to its real, exact text and satisfied a check for a phrase no reader
+        // ever actually sees rendered.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        assert!(second.headline.starts_with('R'));
+        let encoded_headline = format!("&#82;{}", &second.headline[1..]);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                // Removes the *whole* original heading, headline text and id
+                // alike (Codex, pull request #138, round 59) — not only the id's
+                // own parenthetical, the way every earlier round's test in this
+                // module does: `check_settled_decisions` checks a decision's id
+                // and headline as two independent substrings, so a test that left
+                // the real, unencoded headline text sitting untouched in its own
+                // original heading would find it there regardless of whatever
+                // this test's own encoded copy decodes to, exercising nothing.
+                let without_heading = adr.contents.replace(
+                    &format!("### {} ({})", second.headline, second.id),
+                    "### (elsewhere)",
+                );
+                adr.contents = format!(
+                    "{without_heading}\n<div>\n<svg><text><![CDATA[{} {}]]></text></svg>\n</div>\n",
+                    second.id, encoded_headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_multiline_self_closing_script_in_svg_still_counts() {
+        // Codex, pull request #138, round 57, finding "Honor multiline
+        // self-closing scripts in SVG": SVG honors a self-closing slash on a
+        // *fixed* non-rendering name like `<script>` the same way it would any
+        // other descendant, so a `<script\n />` whose own `/` lands on a later
+        // line still has no body and needs no matching close.
+        // `resolve_pending_tag`'s cross-line path pushed a fixed name onto the
+        // hidden-element stack unconditionally, regardless of where it landed
+        // relative to open foreign content, waiting forever for a `</script>`
+        // this document never writes and hiding everything after it —
+        // including the id and headline that follow inside a plain `<text>` —
+        // clear through to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg>\n<script\n />\n<text>{} {}</text>\n</svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_inline_span_closing_a_hidden_element_still_counts() {
+        // Codex, pull request #138, round 58, finding "Track ordinary ancestors
+        // across inline HTML events": `<span><em hidden>ignored</span>decision-id
+        // headline` reaches `markdown_prose` as three self-contained
+        // `Event::InlineHtml` constructs — `<span>`, `<em hidden>`, `</span>` — a
+        // browser force-closes the hidden `em` the moment its ancestor `span`
+        // closes, even though `em` never gets its own end tag, but
+        // `track_non_rendering_html` recorded only foreign-content state, never an
+        // ordinary ancestor the way the block-level scan's `ancestors` stack
+        // (round 56) already does. `</span>` therefore matched neither the
+        // tracked `em` nor anything this single-tag construct itself opens, and
+        // was left inert — the same "positive evidence only" discipline that
+        // correctly leaves a *stray*, wholly unmatched close alone here wrongly
+        // left a real ancestor's close alone too, latching `em` hidden through end
+        // of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span><em hidden>ignored</span>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_stray_close_left_by_a_truncated_ancestor_stays_hidden() {
+        // Codex, pull request #138, round 59, finding "Truncate ordinary ancestors
+        // on matching outer closes": `<div><span></div><em hidden>ignored</span>
+        // decision-id headline</em>` has `</div>` close both `span` and `div` at
+        // once, per HTML5's "any other end tag" stack-popping algorithm — `span`
+        // never gets its own close. `track_ordinary_ancestor` only ever popped its
+        // stack's own top on a match, so after `</div>` (not `ancestors.last()`,
+        // which was `span`) nothing popped and both `div` and `span` stayed
+        // recorded as genuinely open forever. The later, truly stray `</span>` —
+        // its real ancestor already closed out from under it — then matched
+        // `ancestors` as if it were positive evidence of a real, still-open
+        // element, wrongly force-closing the hidden `em` and exposing the id and
+        // headline that follow it, still really inside `em` until its own actual
+        // close.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span></div><em hidden>ignored</span>{} {}</em>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_ordinary_span_still_counts() {
+        // Codex, pull request #138, round 59, finding "Ignore self-closing slashes
+        // on ordinary HTML ancestors": HTML5 only honors a trailing `/` as bodyless
+        // syntax inside foreign content (SVG/MathML) — `<span/><em
+        // hidden>ignored</span>decision-id headline</em>` has an ordinary,
+        // non-foreign `<span/>` whose slash a browser ignores entirely, leaving a
+        // real, open `span` that its later `</span>` genuinely closes, force-closing
+        // the hidden `em` along with it (the same "any other end tag" unwind the
+        // other round-59 finding above tests) and exposing the id and headline
+        // that follow. `track_ordinary_ancestor` treated any self-closing-looking
+        // markup as bodyless regardless of namespace, so `span` was never recorded
+        // at all, leaving the later `</span>` with nothing to match and `em`
+        // latched hidden through its own real, later close.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span/><em hidden>ignored</span>{} {}</em>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_doctype_with_a_quoted_greater_than_sign_still_counts() {
+        // Codex, pull request #138, round 59, finding "Keep quoted greater-than
+        // signs inside DOCTYPE declarations" — investigated and does not
+        // reproduce. The claim was that a real HTML5 tokenizer keeps scanning past
+        // a `>` inside a quoted DOCTYPE public/system identifier, so
+        // `<!DOCTYPE html SYSTEM "x>decision-id headline">` would suppress the
+        // whole declaration through its real closing `>`. The opposite is true:
+        // per the WHATWG HTML parsing spec's own "DOCTYPE public/system identifier
+        // (quoted) state" definitions, a `>` reached there is the
+        // "abrupt-doctype-public-identifier"/"abrupt-doctype-system-identifier"
+        // parse error, which — "abrupt" is the operative word — ends the DOCTYPE
+        // token immediately, right there, exactly the way this module's existing
+        // bogus-comment-style handling (round 55, "no quote tracking whenever the
+        // byte after `<` is `!` or `?`") already treats every `<!...>` construct.
+        // So the id and headline after the first `>` are correctly ordinary,
+        // visible text — kept as a permanent guard with no code change.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<!DOCTYPE html SYSTEM \"x>{} {}\">\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_escaped_or_encoded_comment_marker_still_counts() {
+        // Codex, pull request #138, round 22: `\<!--` and `&lt;!--` both decode to text
+        // containing `<!--`, but a real, unescaped one is always recognized by
+        // `pulldown-cmark`'s own inline scanner first and reaches this module as
+        // `Event::InlineHtml` or inside an `Event::Html` block — never as
+        // `Event::Text`. So one that does reach `Event::Text` can only be an escape or
+        // a decoded entity, and a renderer shows both as plain visible characters, not
+        // as a comment. Treating the decoded text as a real opener hid every decision
+        // after a decoy meant to display literally.
+        let mut inputs = clean_inputs(RULES);
+        let sixth = SETTLED_DECISIONS[5];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", sixth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\\<!-- looks like a comment but renders literally\n\n{} {}\n",
+                    sixth.id, sixth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == sixth.id),
+            "a decision after an escaped comment-marker decoy was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_escaped_fake_closer_still_does_not_count() {
+        // Codex, pull request #138, round 26, subsumed by round 28's broader fix: an
+        // escaped `\-->` decodes to a `Text("-->")` event, but round 28 established
+        // that *no* `Event::Text` can ever close a real comment — ordinary Markdown
+        // text is always HTML-escaped when rendered, so `-->` never survives as three
+        // unescaped bytes in the rendered HTML regardless of how it reached this
+        // module. The decision after this decoy must not count, for that simpler,
+        // more general reason.
+        let mut inputs = clean_inputs(RULES);
+        let seventh = SETTLED_DECISIONS[6];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", seventh.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<!--\n</div>\n\n\\-->\n\n{} {}\n",
+                    seventh.id, seventh.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == seventh.id),
+            "a decision after an escaped fake closer still counted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn ids_hidden_in_an_html_comment_do_not_record_a_decision() {
         // Otherwise an ADR reduced to a title and a block of ids in a comment passes.
         let mut ids = String::new();
@@ -5805,10 +9368,1117 @@ mod tests {
     }
 
     #[test]
+    fn ids_hidden_in_a_fenced_example_do_not_record_a_decision() {
+        // Issue #82: the fenced-block counterpart of the HTML-comment test above.
+        let mut ids = String::new();
+        for decision in SETTLED_DECISIONS {
+            use std::fmt::Write as _;
+            let _ = writeln!(ids, "{} {}", decision.id, decision.headline);
+        }
+        let adrs = vec![AdrFile {
+            name: SETTLED_DECISIONS_ADR.to_owned(),
+            contents: format!("# ADR 0003: nothing here\n\n```text\n{ids}```\n"),
+        }];
+        let violations = check_settled_decisions(&adrs);
+        assert_eq!(
+            violations.len(),
+            SETTLED_DECISIONS.len() * 2,
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn ids_hidden_in_a_blockquoted_fenced_example_do_not_record_a_decision() {
+        // Codex, pull request #138: a fence opened with a leading `>` was invisible to
+        // a first, textual fix for this, whose fence scan looked only at the very
+        // first byte of the line, so a decision listed only inside a quoted example
+        // still satisfied this check. `check_settled_decisions` now reads this through
+        // `markdown_prose`, a real parser, which tracks the blockquote container
+        // structurally rather than by a leading-byte guess.
+        let mut body = String::from("> ```text\n");
+        for decision in SETTLED_DECISIONS {
+            use std::fmt::Write as _;
+            let _ = writeln!(body, "> {} {}", decision.id, decision.headline);
+        }
+        body.push_str("> ```\n");
+        let adrs = vec![AdrFile {
+            name: SETTLED_DECISIONS_ADR.to_owned(),
+            contents: format!("# ADR 0003: nothing here\n\n{body}"),
+        }];
+        let violations = check_settled_decisions(&adrs);
+        assert_eq!(
+            violations.len(),
+            SETTLED_DECISIONS.len() * 2,
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_looking_line_inside_a_top_level_fence_does_not_close_it() {
+        // Codex, pull request #138: the converse of the case above. A textual fix that
+        // strips one leading `>` to find a fence underneath a quote would also strip
+        // it from a line like `> id headline` that is really just content quoted
+        // *inside* a top-level (unquoted) fence, closing that fence early and exposing
+        // what should still be hidden. A real parser does not have this failure mode,
+        // because it tracks which container a line is actually inside.
+        let mut body = String::from("```text\n");
+        for decision in SETTLED_DECISIONS {
+            use std::fmt::Write as _;
+            let _ = writeln!(body, "> {} {}", decision.id, decision.headline);
+        }
+        body.push_str("```\n");
+        let adrs = vec![AdrFile {
+            name: SETTLED_DECISIONS_ADR.to_owned(),
+            contents: format!("# ADR 0003: nothing here\n\n{body}"),
+        }];
+        let violations = check_settled_decisions(&adrs);
+        assert_eq!(
+            violations.len(),
+            SETTLED_DECISIONS.len() * 2,
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_record_with_no_settled_decisions_adr_is_reported() {
         let violations = check_settled_decisions(&[]);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].subject, SETTLED_DECISIONS_ADR);
+    }
+
+    #[test]
+    fn a_decision_id_hidden_in_an_html_attribute_does_not_count() {
+        // Codex, pull request #138, round 34: `visible_html_ranges` kept a block-level
+        // `Event::Html` line's raw bytes whenever they fell outside a non-rendering
+        // element's own delimiters — attribute text and tag markup included — so an id
+        // sitting inside an ordinary attribute, `<div data-note="id">`, read as visible
+        // just as if it were the element's real inner text, even though no browser ever
+        // renders an attribute's value as page content. `visible_html_ranges` now
+        // strips tag markup itself (`find_any_tag`/`HidingMarker::Markup`), so only
+        // genuine inner text survives into `markdown_prose`'s output.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div data-note=\"{}\">visible</div>\n",
+                    first.id
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision id hidden in an HTML attribute still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_hidden_in_a_quoted_attribute_containing_a_greater_than_sign_does_not_count() {
+        // Codex, pull request #138, round 36, finding 1: `find_any_tag` closed a tag's
+        // markup on the first `>` it found, blind to whether that `>` sat inside a
+        // quoted attribute value. `<div title="ends here>id headline">other</div>` is
+        // one tag whose `title` attribute happens to contain a literal `>` — legal
+        // HTML — and closing early on it exposed the rest of the still-quoted
+        // attribute text as visible prose, even though no browser renders any part of
+        // an attribute value as page content.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div title=\"ends here>{} {}\">other</div>\n",
+                    second.id, second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "a decision id hidden in a quoted attribute containing `>` still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_split_by_a_line_break_tag_does_not_count() {
+        // Codex, pull request #138, round 37, finding 1: `markdown_prose`'s
+        // `Event::InlineHtml` arm dropped a `<br>` with no separator at all, so text
+        // split across it — a real, rendered line break — fused back into one
+        // contiguous run a `.contains` scan could match, even though no reader ever
+        // sees those characters run together: they render as two separate lines. A
+        // real line break is pushed for `<br>` now, the same as `Event::SoftBreak` and
+        // `Event::HardBreak` already get.
+        let mut inputs = clean_inputs(RULES);
+        let third = SETTLED_DECISIONS[2];
+        let (first_half, second_half) = third.id.split_at(third.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", third.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\n{first_half}<br>{second_half} {}\n",
+                    third.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == third.id),
+            "a decision id split by a `<br>` still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_behind_a_quoted_close_tag_inside_a_scripts_own_attribute_does_not_count() {
+        // Codex, pull request #138, round 37, finding 3: only `find_any_tag` became
+        // quote-aware in round 36 — this sibling, used to find a non-rendering
+        // element's own *opening* tag, still ended it at the first `>` regardless of
+        // whether that `>` sat inside a quoted attribute value. `<script
+        // title="></script>">` has a `title` attribute whose value happens to be the
+        // literal text `></script>` — legal HTML — and ending the opening tag there
+        // (right after the spurious `>` inside the quote) left the *real* text
+        // `</script>` immediately following it on the same line, which the tracker
+        // then read as a genuine close — clearing `open_non_rendering_tag` before the
+        // next line's actually-hidden script body was ever reached. Verified via a
+        // throwaway `pulldown-cmark` probe: `pulldown-cmark`'s own CommonMark block
+        // parser already ends the `HtmlBlock` after this one line (its raw-text
+        // termination rule matches any line *containing* the literal text
+        // `</script>`, quoting or not), so the following line — the genuinely hidden
+        // body — always arrives as ordinary paragraph text, and whether it renders
+        // depends entirely on `open_non_rendering_tag` still being open when this
+        // module reaches it.
+        let mut inputs = clean_inputs(RULES);
+        let fourth = SETTLED_DECISIONS[3];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fourth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script title=\"></script>\">\n{} {}\n</script>\n",
+                    fourth.id, fourth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fourth.id),
+            "a decision hidden behind a quoted close tag inside a script's own attribute \
+             still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_hidden_behind_a_quoted_close_tag_inside_an_intervening_tag_does_not_count() {
+        // Codex, pull request #138, round 39, finding 1: `find_closing_tag`'s
+        // block-level search for a non-rendering element's own close did a raw
+        // substring search for `</tag`, blind to whether that text sat inside a
+        // *different*, intervening tag's own quoted attribute value.
+        // `<span title="</template>">...</span>` written inside an open `<template>`
+        // has a `title` attribute whose value happens to be the literal text
+        // `</template>` — legal HTML, and no more a real close than any other quoted
+        // string — but the raw search matched it anyway, popping the tracked state
+        // early and exposing everything the `<span>` itself hides as though the
+        // template had already ended. Verified via a throwaway `pulldown-cmark` probe
+        // that this source is one `HtmlBlock` of three `Event::Html` lines.
+        // `find_closing_tag` now tokenizes the line tag by tag (the same fix
+        // `find_any_tag` already got in round 36), so a spelling trapped inside an
+        // unrelated tag's own quotes can never stand in for the real close.
+        let mut inputs = clean_inputs(RULES);
+        let sixth = SETTLED_DECISIONS[5];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", sixth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<span title=\"</template>\">{} {}</span>\n</template>\n",
+                    sixth.id, sixth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == sixth.id),
+            "a decision id hidden behind a quoted close tag inside an intervening tag \
+             still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_quoted_comment_spelling_inside_a_template_child_still_counts() {
+        // Codex, pull request #138, round 40, finding 1: while scanning inside an open
+        // `<template>` for the next comment opener, non-rendering open, or close,
+        // the comment half did a raw substring search for `<!--`, blind to whether
+        // that text sat inside an ordinary child tag's own quoted attribute value.
+        // `<span title="<!--">hidden filler</span>` is one complete, well-formed tag
+        // whose attribute value happens to spell a comment opener — a browser
+        // renders it as attribute text, not a comment — but the raw search matched
+        // it anyway, found no closing `-->` anywhere after it (there is none: the
+        // quote closes with a plain `"` and `>`), and latched `in_html_comment` for
+        // the rest of the document. The template's own real close two lines later
+        // never gets a chance to pop the tracked stack, because the block-level loop
+        // checks `in_html_comment` before it ever looks at the open element — so the
+        // decision, recorded as an ordinary paragraph well *after* the template
+        // genuinely ends, reads as still hidden along with everything else. Verified
+        // via a throwaway `pulldown-cmark` probe that this source is one `HtmlBlock`
+        // of three `Event::Html` lines. The comment search now tokenizes past every
+        // ordinary tag's own span (`find_comment_opener`), so a spelling trapped
+        // inside one can never stand in for a real comment opener, and the template's
+        // own close is found and pops the stack as it should.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<span title=\"<!--\">hidden filler</span>\n</template>\n\n{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "a decision after a quoted comment spelling inside a template child was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_a_raw_text_close_tags_own_split_markup_stays_hidden() {
+        // Codex, pull request #138, round 45, "Finish multiline raw-text close tags
+        // before popping": `find_raw_text_closing_tag` treated the tag's name having
+        // matched as the whole answer, so `</script` with no `>` before the line ran
+        // out was read as a complete close right there — even though a browser keeps
+        // consuming the end tag's own markup through to its own `>`, wherever that
+        // falls. `<script>\nhidden filler\n</script\n data-note="decision-id
+        // headline">\n` is one legal close tag split across two lines by
+        // `pulldown-cmark`; popping early exposed the second line's
+        // `data-note="..."` text — no `<` in it at all once the tag is
+        // (wrongly) considered closed — as ordinary visible prose. The decision
+        // written inside that still-open close tag's own attribute text must stay
+        // hidden until the real `>` is found.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script>\nhidden filler\n</script\n data-note=\"{} {}\">\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision inside a raw-text close tag's own markup, split across two \
+             lines, was wrongly exposed once the close was read as complete a line \
+             early: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_named_child_opened_across_lines_inside_a_hidden_element_stays_hidden() {
+        // Codex, pull request #138, round 45, "Carry nested multiline tags through
+        // hidden blocks": the nesting search for a reopen of the currently open
+        // element only recognized a *complete* one on the same line, so
+        // `<div hidden>\n<div\n class="x">\n</div>decision-id headline</div>` — an
+        // ordinary child `<div>` reopening the `hidden`-suppressed outer one, whose
+        // own `>` lands on a later line — was invisible to it. The inner element's
+        // close then popped what the scan believed was the *outer* one, exposing the
+        // decision that is really still inside it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden>\n<div\n class=\"x\">\n</div>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision still inside a hidden element, past an inner same-named \
+             child opened across lines, was wrongly exposed once the child's own \
+             close was read as the outer element's: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_named_child_reaching_inline_markdown_inside_a_hidden_element_stays_hidden() {
+        // Codex, pull request #138, round 45, "Preserve inline nesting for hidden
+        // elements": `track_non_rendering_html`'s nesting branch only recognized a
+        // reopen among the three fixed non-rendering names, so an ordinary
+        // same-named child of a `hidden`-suppressed element reaching *inline*
+        // Markdown — `<span hidden><span>x</span>decision-id headline</span>` — was
+        // never pushed, and its own close popped the outer element early, exposing
+        // the decision that is really still inside it.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n\nNote: <span hidden><span>x</span>{} {}</span> done.\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision still inside an inline hidden element, past an inner \
+             same-named child, was wrongly exposed once the child's own close was \
+             read as the outer element's: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_a_raw_text_end_tags_own_quoted_delimiter_stays_hidden() {
+        // Codex, pull request #138, round 46, "Scan raw-text end tags through an
+        // unquoted delimiter": `find_raw_text_closing_tag`'s search for the tag's
+        // own terminating `>` was a blind, unquoted search, so `<script>x</script
+        // data-note=">decision-id headline">` — a legal close tag whose own bogus
+        // "attribute" quotes an entire `>decision-id headline` past a first `>`
+        // that sits *inside* that quoted value — popped the stack at the first `>`
+        // it found, exposing everything from there (the real quoted value,
+        // decision text included) as ordinary visible prose. A browser keeps
+        // tracking quotes while consuming an end tag's own trailing markup exactly
+        // like an opening tag's, and the real close is the second, unquoted `>`.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script>x</script data-note=\">{} {}\">\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision inside a raw-text end tag's own quoted delimiter was \
+             wrongly exposed once the first, quoted `>` was read as the real \
+             close: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_an_html_elements_ignored_self_closing_slash_stays_hidden() {
+        // Codex, pull request #138, round 46, "Honor self-closing syntax only in
+        // foreign content": `is_self_closing_tag` treated a trailing `/` as
+        // bodyless for *any* tag, but a browser only honors that XML-style syntax
+        // for SVG and MathML elements — `<div hidden />decision-id
+        // headline</div>` still has a real, open `div` whose body includes the
+        // decision, `/` and all, because ordinary HTML ignores the slash outright.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden />{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision after an HTML element's ignored self-closing slash was \
+             wrongly exposed as outside the hidden element: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_multiline_self_closing_foreign_element_still_counts() {
+        // Codex, pull request #138, round 46, "Skip multiline self-closing
+        // foreign hidden tags": a self-closing `<svg hidden />` split across
+        // lines — `<svg\n hidden />` — reaches `resolve_pending_tag`'s cross-line
+        // path rather than `find_any_hidden_opening_tag`'s own same-line search
+        // (confirmed via a throwaway `pulldown-cmark` probe: a `<div>` block's
+        // nested `<svg\n hidden />decision-id headline</svg>` splits into four
+        // `Event::Html` lines, with the incomplete `<svg\n` becoming a
+        // `PendingTag`), and `resolve_pending_tag` pushed it onto the tracked
+        // stack solely because it carries `hidden`, without checking whether it
+        // is self-closing — so the scanner treated the text after it as still
+        // inside the (already self-closed) element.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg\n hidden />{} {}</svg>\n</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_inside_svg_still_counts() {
+        // Codex, pull request #138, round 49, "Avoid pushing self-closing scripts
+        // in foreign content": HTML5 acknowledges the self-closing flag on *any*
+        // start tag — not only `<svg>`/`<math>` themselves — once the parser is
+        // inside foreign content, so `<svg><script /></svg>` never opens a
+        // genuinely unclosed `<script>` the way a bare `<script />` does outside
+        // one, where the slash is ignored and a real `</script>` is still needed.
+        // The fixed non-rendering list pushed `script` unconditionally regardless
+        // of foreign content, waiting forever for a `</script>` this document
+        // never writes and hiding everything after it — including the decision
+        // that immediately follows `</svg>` — to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><script /></svg>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_hidden_element_inside_svg_still_counts() {
+        // Codex, pull request #138, round 50, "Skip self-closing hidden elements
+        // inside foreign content": `<g>` is not in `VOID_ELEMENTS` and is not one
+        // of the fixed non-rendering names, so `<svg><g hidden /></svg>` — a
+        // self-closing arbitrary `hidden`-suppressed element inside foreign
+        // content — was pushed onto the hidden stack regardless of the trailing
+        // `/`, waiting forever for a `</g>` this document never writes and hiding
+        // the decision that immediately follows `</svg>` to end of document. The
+        // round-49 foreign-content guard was only ever applied to the fixed list.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><g hidden /></svg>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_dd_implicitly_closing_a_hidden_dt_still_counts() {
+        // Codex, pull request #138, round 50, "Honor implicit closes triggered by
+        // different tag names": `<dt>` and `<dd>` close each other, not only
+        // themselves — `<dt hidden>ignored<dd>All 6 recovery invariants` has its
+        // `<dd>` ending the hidden `<dt>` just as surely as another `<dt>` would,
+        // but the round-48 reopen check only recognized a *same-name* reopen, so
+        // the hidden stack stayed open past the `<dd>` and the decision after it
+        // stayed hidden. A leading `x` keeps this construct from starting a
+        // block-level `HtmlBlock` at all — `<dt>` is one of `HTML_BLOCK_TAG_NAMES`
+        // — so it reaches `track_non_rendering_html`'s inline path, the one this
+        // finding is about.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\nx<dt hidden>ignored<dd>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_dialog_implicitly_closing_a_hidden_p_still_counts() {
+        // Codex, pull request #138, round 53, "Include every element that implicitly
+        // closes a hidden p": round 50's `p` arm only carried the first, largest group
+        // of HTML5's own list of tags whose start closes a still-open `<p>` — the
+        // specification scatters nine more across separate clauses, `<dialog>` among
+        // them. `<p hidden>ignored<dialog>All 6 recovery invariants` has its `<dialog>`
+        // closing the hidden `<p>` just as surely as a `<div>` (already covered) would,
+        // but the incomplete list left the hidden stack open past it, hiding the
+        // decision after it. A leading `x` keeps this construct from starting a
+        // block-level `HtmlBlock` at all — `<p>` and `<dialog>` are both
+        // `HTML_BLOCK_TAG_NAMES` — so it reaches `track_non_rendering_html`'s inline
+        // path, the one this finding is about.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\nx<p hidden>ignored<dialog>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_a_markup_declaration_does_not_count() {
+        // Codex, pull request #138, round 54, "Exclude markup declarations from
+        // visible prose": `next_tag_start`'s "plausible tag start" check only
+        // admitted an ASCII letter or `/` after `<`, so `<!ignored ...>` — a
+        // parse-error "bogus comment" an HTML5 tokenizer still runs to the next
+        // `>` and never renders, the same family as a browser-visible
+        // `<!DOCTYPE html>` — was never recognized as a tag-like construct at
+        // all, and `visible_html_ranges` emitted the whole declaration, id and
+        // headline included, as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<!ignored {} {}>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision inside a markup declaration was wrongly read as visible \
+             prose: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_multiline_svg_still_counts() {
+        // Codex, pull request #138, round 50, "Carry foreign-content depth across
+        // raw HTML lines": the round-49 fix re-scanned only the *current*
+        // `Event::Html` line for an unclosed `<svg>`/`<math>`, so
+        // `<svg>\n<script />\n</svg>` — with `<svg>` alone on its own line,
+        // satisfying `CommonMark` §4.6 type 7 and starting a real `HtmlBlock` that
+        // continues line by line with no blank line to end it — had the
+        // `<script />` line's own scan find no opener at all, since the real one
+        // sits on the *previous* line. The self-closing script was misread as a
+        // genuinely open one, hiding the decision that follows `</svg>` on the
+        // third line. Fixed by carrying a running `foreign_content` depth across
+        // `Event::Html` lines the same way `open_non_rendering` already is.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg>\n<script />\n</svg>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_inside_a_script_reached_through_an_svg_integration_point_does_not_count() {
+        // Codex, pull request #138, round 51, finding 1, "Exit foreign mode at HTML
+        // integration points": `<foreignObject>` is one of the three SVG elements
+        // that switches parsing of its own descendants back to ordinary HTML rules
+        // — a self-closing `/` ignored, like anywhere else in an HTML document —
+        // even while the enclosing `<svg>` is still open, so `<script />` inside
+        // one is not bodyless the way it is directly inside `<svg>`; it is a real,
+        // open `<script>` whose raw-text body a browser never renders, the same as
+        // one reached with no foreign content around it at all. The round-49/50
+        // fix tracked only a bare depth of open foreign-content roots, blind to an
+        // intervening integration point, so this self-closing read was still
+        // exempted and the decision's id and headline — genuinely inert script
+        // text no reader ever sees — satisfied the check.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><foreignObject><script />{} {}</script></foreignObject></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_in_an_svg_nested_in_a_template_still_counts() {
+        // Codex, pull request #138, round 51, finding 2, "Update foreign context
+        // while scanning hidden content": `next_non_rendering_marker`'s search for
+        // what is relevant to an open `<template>` jumped straight from the
+        // template's own opener to the fixed `<script>` it found elsewhere in the
+        // block, never consuming the intervening `<svg>` along the way — so
+        // `foreign_content` stayed at whatever it already was (nothing, this being
+        // the first foreign content anywhere in the block), and the self-closing
+        // `<script />` read as though no foreign content were open at all, pushed
+        // as a genuinely unclosed raw-text element that `</svg>` could never pop
+        // and `</template>` could never reach. Everything after it, including the
+        // decision that immediately follows `</template>`, was hidden clear
+        // through to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<svg><script /></svg>\n</template>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_raw_text_end_tag_trapped_in_a_quoted_attribute_still_counts() {
+        // Codex, pull request #138, round 40, finding 3: `find_closing_tag`'s
+        // quote-aware tokenization, built for `<template>`'s genuinely parsed
+        // content, was also used to search for a `<script>`/`<style>` element's own
+        // close — but a browser is not parsing tags or quotes at all once one of
+        // those raw-text elements opens, so `<span title="x</script>y">`, appearing
+        // inside an open `<script>`, is not a `<span>` tag whose attribute happens to
+        // quote a closer; it is plain script text containing the real close. The old
+        // tokenized search read the whole `<span ...>` as one well-formed tag and
+        // skipped straight over the closer "trapped" inside it, leaving the tracked
+        // state open and hiding the decision's own id and headline, which sit right
+        // after the decoy on the same line. `find_raw_text_closing_tag` now matches
+        // the literal, case-insensitive `</script` sequence the way an HTML5 parser's
+        // raw-text mode does, regardless of anything around it that merely looks
+        // tag-shaped.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script>\n<span title=\"x</script>y\">{} {}</span>\n</script>\n",
+                    second.id, second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == second.id),
+            "a decision after a raw-text end tag trapped in a quoted attribute was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_tag_spelling_inside_another_tags_quoted_attribute_still_counts() {
+        // Codex, pull request #138, round 38, finding 1: `opens_non_rendering_element`
+        // searched a whole self-contained `Event::InlineHtml` construct for a tag
+        // spelling anywhere in it, not only at its own start, so a real, ordinary inline
+        // tag whose quoted attribute value merely spells one — `<span
+        // title="<script>">decision-id headline</span>` — was read as a genuine
+        // `<script>` opener. A browser renders `<span title="<script>">` as an inline
+        // span with a tooltip, showing the label plainly; treating the tooltip text as
+        // a real script open suppressed the label and everything after it, since
+        // `</span>` never matches `<script>`'s own close and the tracked state never
+        // clears. Verified via a throwaway `pulldown-cmark` probe that this source is
+        // exactly one self-contained `InlineHtml("<span title=\"<script>\">")`
+        // construct. The match is now required to start at the construct's own
+        // beginning, so quoted attribute text can no longer stand in for a real tag.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<span title=\"<script>\">{} {}</span>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after a tag spelling inside another tag's quoted attribute was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_split_by_adjacent_block_level_tags_does_not_count() {
+        // Codex, pull request #138, round 39, finding 3: a block tag's own markup was
+        // excluded from `visible_html_ranges`'s output with nothing between it and
+        // neighboring text, so the reader-visible line break two adjacent block
+        // elements force — `<div>head</div><div>line</div>` renders as two separate
+        // lines, `head` and `line`, never one running word — was not preserved at all,
+        // fusing back into the literal contiguous run `headline` a `.contains` scan
+        // could match. A block tag (any of `HTML_BLOCK_TAG_NAMES`) now leaves a real
+        // line break behind when its markup is stripped; an inline tag still leaves
+        // none.
+        let mut inputs = clean_inputs(RULES);
+        let seventh = SETTLED_DECISIONS[6];
+        let (first_half, second_half) = seventh.id.split_at(seventh.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", seventh.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>{first_half}</div><div>{second_half} {}</div>\n",
+                    seventh.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == seventh.id),
+            "a decision id split by adjacent block-level tags still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_split_by_adjacent_pre_blocks_does_not_count() {
+        // Codex, pull request #138, round 40, finding 4: `<pre>` is `CommonMark` §4.6
+        // type 1, not type 6, so `HTML_BLOCK_TAG_NAMES`'s type-6-only list did not
+        // classify it as block-level. A browser still always starts `<pre>` on a
+        // line of its own, so `<pre>head</pre><pre>line</pre>` renders as two
+        // separate blocks, `head` and `line`, exactly like the type-6 tags this
+        // module already handles — but stripping its markup with no separator fused
+        // the two into the literal contiguous run `headline`, matching a `.contains`
+        // scan no reader would. Verified via a throwaway `pulldown-cmark` probe that
+        // this source is one `Event::Html` line, the same shape as the round-39
+        // `<div>` scenario. `is_html_block_tag` now recognizes `<pre>` alongside the
+        // type-6 list without adding it to that list itself.
+        let mut inputs = clean_inputs(RULES);
+        let eighth = SETTLED_DECISIONS[7];
+        let (first_half, second_half) = eighth.id.split_at(eighth.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", eighth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<pre>{first_half}</pre><pre>{second_half} {}</pre>\n",
+                    eighth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == eighth.id),
+            "a decision id split by adjacent <pre> blocks still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_hidden_inside_a_script_opened_across_two_lines_does_not_count() {
+        // Codex, pull request #138, round 41, finding 1: `pulldown-cmark` splits a tag
+        // whose own closing `>` falls on a later source line into one `Event::Html`
+        // per line — `<script\n type="text/javascript">` arrives as `"<script\n"`
+        // and then `" type=\"text/javascript\">\n"` — and every scan in this module
+        // worked one line at a time, so the first line's search for the tag's close
+        // found nothing and, with nothing carried to the next line, the whole
+        // construct read as ordinary visible text: the non-rendering stack never
+        // opened at all, leaving the script's own body — including the decision id
+        // and headline placed inside it — fully visible. Verified via a throwaway
+        // `pulldown-cmark` probe that this source is one `HtmlBlock` split exactly
+        // that way. A `PendingTag` now carries the unclosed tag's name and quote
+        // state into the next line, so the stack opens once the real `>` is found
+        // there.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<script\n type=\"text/javascript\">\n{} {}\n</script>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision id hidden inside a script opened across two lines still \
+             counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_split_by_a_block_event_br_tag_does_not_count() {
+        // Codex, pull request #138, round 42, finding 1: `<br>` reaches
+        // `visible_html_ranges` through the independent `Markup` branch when it sits
+        // inside a raw HTML *block* — `<div>head<br>line</div>`, all one
+        // `Event::Html` line — rather than through `Event::InlineHtml`'s own,
+        // already-fixed handling (round 37). `is_html_block_tag` correctly does not
+        // classify `<br>` as block-level (it is `CommonMark` §4.6 type 6's own
+        // omission, not a bug), so stripping its markup left nothing between the
+        // text on either side, fusing `head` and `line` into the literal contiguous
+        // run `headline` a browser never renders that way: `<br>` forces a line
+        // break wherever it appears, block context or not. The `Markup` branch now
+        // also checks `is_line_break_tag`, inserting the same
+        // `VisibleHtmlSpan::Break` a block tag's own markup already does.
+        let mut inputs = clean_inputs(RULES);
+        let second = SETTLED_DECISIONS[1];
+        let (first_half, second_half) = second.id.split_at(second.id.len() / 2);
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", second.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>{first_half}<br>{second_half} {}</div>\n",
+                    second.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == second.id),
+            "a decision id split by a block-event <br> tag still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_tag_whose_quoted_attribute_itself_crosses_a_line_still_counts() {
+        // Codex, pull request #138, round 42, finding 2: the pending-tag scan
+        // introduced in round 41 always started a fresh line's resumed search from
+        // `quote: None`, discarding whatever quote state the *first* line's own scan
+        // had actually reached. `<div title="first\nsecond">decision-id
+        // headline</div>` is a legal tag whose quoted attribute value itself spans
+        // the line break `pulldown-cmark` splits the block on, so the real close
+        // quote on the second line — `second">` — was read as a fresh *opening*
+        // quote instead, and the tag's own real `>` right after it was then read as
+        // still inside a (nonexistent) quoted value. The tag never resolved, and
+        // the visible decision text after it was discarded along with it, all the
+        // way to end of document. The quote state reached at the end of the first
+        // line's own scan is now captured and carried into `PendingTag`, the same
+        // way its name and closing/opening kind already are.
+        let mut inputs = clean_inputs(RULES);
+        let third = SETTLED_DECISIONS[2];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", third.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div title=\"first\nsecond\">{} {}</div>\n",
+                    third.id, third.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == third.id),
+            "a decision after a tag whose quoted attribute itself crosses a line was \
+             still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_hidden_by_a_div_carrying_the_hidden_attribute_does_not_count() {
+        // Codex, pull request #138, round 42, finding 3: `visible_html_ranges` only
+        // suppressed the body of the three fixed non-rendering elements
+        // (`<script>`, `<style>`, `<template>`); an *arbitrary* element carrying the
+        // standard HTML `hidden` boolean attribute — `<div hidden>decision-id
+        // headline</div>` — is just as invisible to a browser, and everything
+        // inside it, but only the `<div>` tag's own markup was excluded, leaving its
+        // real, hidden text content exposed as ordinary visible prose. A new
+        // `find_any_hidden_opening_tag` recognizes any non-void opening tag carrying
+        // `hidden` and tracks it on the same non-rendering stack the three fixed
+        // elements already use — widened from `Vec<&'static str>` to `Vec<String>`
+        // to hold an arbitrary name — closed by its own first matching close tag.
+        let mut inputs = clean_inputs(RULES);
+        let fourth = SETTLED_DECISIONS[3];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fourth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden>{} {}</div>\n",
+                    fourth.id, fourth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fourth.id),
+            "a decision id hidden by a div carrying the hidden attribute still \
+             counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_id_hidden_by_a_div_nesting_a_same_named_tag_does_not_count() {
+        // Codex, pull request #138, round 43, finding 1: the "further open" half of
+        // `next_non_rendering_marker`'s nesting branch only recognized a reopen among
+        // the three fixed non-rendering names, so `<div hidden><div>x</div>decision-id
+        // headline</div>` — an ordinary, unsuppressed `<div>` nested inside the
+        // `hidden`-tracked outer one — was invisible to it: the search for the outer
+        // element's own close found the *inner* `</div>` first and popped the tracked
+        // state early, exposing everything after it (still really inside the hidden
+        // container) as visible prose. `find_opening_tag(line, cursor, top)` is now
+        // also checked, so a reopen of an arbitrary `hidden`-suppressed name is found
+        // the same way `<template>`'s own reopen already was.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div hidden><div>x</div>{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fifth.id),
+            "a decision id hidden by a div nesting a same-named tag still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_hidden_inside_an_inline_span() {
+        // Codex, pull request #138, round 43, finding 2: `track_non_rendering_html`'s
+        // empty-stack branch only checked `opens_non_rendering_element` (the three
+        // fixed names) to decide whether an `Event::InlineHtml` construct opens
+        // something, so `<span hidden>` — real, invisible content just like
+        // `<script>`'s, but on an arbitrary tag — was never recognized, and
+        // `- Status: <span hidden>accepted</span>` read its hidden value as an
+        // ordinary, visible one. `opens_hidden_element` is now also checked.
+        let contents = "# ADR\n\n- Status: <span hidden>accepted</span>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_hidden_behind_a_form_feed_boundary() {
+        // Codex, pull request #138, round 54, "Accept form feed as HTML attribute
+        // whitespace": HTML treats U+000C FORM FEED as attribute whitespace too,
+        // but `has_hidden_attribute`'s boundary checks were a hand-picked list of
+        // four bytes — space, tab, line feed, carriage return — that left form
+        // feed out, so `<span hidden\u{c}>` read as an ordinary, unsuppressed tag
+        // whose own name merely continued past `hidden`, and its browser-invisible
+        // body was read as the field's real value.
+        let contents =
+            "# ADR\n\n- Status: <span hidden\u{c}>accepted</span>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn a_decision_id_hidden_by_a_div_whose_hidden_attribute_is_on_a_later_line_does_not_count() {
+        // Codex, pull request #138, round 43, finding 3: `PendingTag` carried only a
+        // tag's name, closing/opening kind and quote state across a line break, not
+        // enough to tell whether it carries `hidden` when the attribute itself sits
+        // on a line after the one the tag started on — `<div\n hidden>decision-id
+        // headline</div>` resolved the pending `div` on its second line with no way
+        // to know that line had just supplied `hidden`, so the element was never
+        // tracked and its content stayed visible. `PendingTag` now accumulates the
+        // tag's own raw text across every line it spans, and `has_hidden_attribute`
+        // is checked against the complete text once the tag finally resolves.
+        let mut inputs = clean_inputs(RULES);
+        let sixth = SETTLED_DECISIONS[5];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", sixth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div\n hidden>{} {}</div>\n",
+                    sixth.id, sixth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == sixth.id),
+            "a decision id hidden by a div whose hidden attribute is on a later line \
+             still counted: {violations:?}"
+        );
     }
 
     #[test]
@@ -6255,6 +10925,530 @@ mod tests {
     }
 
     #[test]
+    fn a_clause_shown_as_an_escaped_pipe_example_does_not_vouch_for_it() {
+        // Codex, pull request #138, round 12: `\|`-escaped prose meant to *show* a row's
+        // syntax unescapes to text indistinguishable from a real row once rendered, and a
+        // rendered-line scan for a line starting with `|` cannot tell the two apart —
+        // `markdown_prose` reconstructs the escaped example as a paragraph reading
+        // `| \`id\` | headline | proof |`, backslash gone. A real GFM table needs a header
+        // row and a delimiter row of dashes, which a lone escaped line in prose never has,
+        // so reading real `Tag::TableRow` events instead leaves the example invisible
+        // rather than merely outranked by a real row that also happens to exist.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "\\| `{}` \\| {} \\| {} \\|\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_descriptive_link_still_counts() {
+        // Codex, pull request #138, round 14: a descriptive link renders only its label
+        // through `Event::Text` — the destination lives on `Tag::Link`, which the cell
+        // collector did not read. A row that names its discharge as
+        // `[recovery proof](tests/spine.rs)` shows a reader "recovery proof" and links it
+        // to the real path, and `table_rows` must still find the path itself.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| [recovery proof]({}) |", clause.discharged_by),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_raw_html_link_still_counts() {
+        // Codex, pull request #138, round 15: raw HTML is not a `Tag::Link` at all — it
+        // is two `InlineHtml` events around the label's own text — so the fix for a
+        // Markdown link left a raw-HTML one, `<a href="tests/spine.rs">recovery
+        // proof</a>`, still losing its destination.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!(
+                "| <a href=\"{}\">recovery proof</a> |",
+                clause.discharged_by
+            ),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_an_unquoted_raw_html_link_still_counts() {
+        // Codex, pull request #138, round 38, finding 2: `anchor_href` only recognized
+        // a quoted attribute value, so a legal, unquoted one — `<a
+        // href=tests/spine.rs>recovery proof</a>`, which a browser follows exactly as
+        // it would a quoted `href` — was read as carrying no destination at all. An
+        // unquoted value is not special-cased away any more; it runs to the next HTML
+        // whitespace or the tag's own closing `>`, neither of which is legal inside
+        // one.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href={}>recovery proof</a> |", clause.discharged_by),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_spaced_raw_html_link_still_counts() {
+        // Codex, pull request #138, round 39, finding 2: a bare, contiguous `href=`
+        // search rejected anything else, so a legal raw anchor written with the
+        // whitespace HTML permits on either side of `=` — `<a href = "tests/spine.rs">
+        // recovery proof</a>` — was read as carrying no destination at all, even
+        // though a browser follows it exactly as it would `href="..."`. The scan now
+        // skips whitespace after the attribute name and after the `=` before looking
+        // for the value.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!(
+                "| <a href = \"{}\">recovery proof</a> |",
+                clause.discharged_by
+            ),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_raw_html_link_with_a_named_slash_reference_still_counts() {
+        // Codex, pull request #138, round 52, "Decode the full HTML named-reference
+        // set": `decode_character_references` recognized only the five XML entities and
+        // a numeric reference, so a destination that spelled a slash as the standard
+        // named reference `&sol;` — which a browser resolves to `/` exactly the way it
+        // resolves the numeric `&#47;` round 44 already covers — was left undecoded and
+        // never matched the real repository path.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let encoded = clause.discharged_by.replace('/', "&sol;");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href=\"{encoded}\">recovery proof</a> |"),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_raw_html_link_with_a_semicolon_free_numeric_reference_still_counts()
+    {
+        // Codex, pull request #138, round 53, "Decode numeric references without
+        // semicolons": HTML5's tokenizer never requires the terminating `;` on a
+        // *numeric* character reference the way it does on a named one — the reference
+        // resolves as soon as a non-digit byte ends it, semicolon or not — so a
+        // destination spelled `tests&#47spine.rs`, with no `;` after the digits, still
+        // resolves to `tests/spine.rs` in a browser, but the old semicolon-requiring
+        // scan left it undecoded.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let encoded = clause.discharged_by.replace('/', "&#47");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href=\"{encoded}\">recovery proof</a> |"),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_raw_html_link_with_encoded_slashes_still_counts() {
+        // Codex, pull request #138, round 44, finding 3: `anchor_href` hands back the
+        // raw source text of an `href`, and a destination can spell part of its own
+        // path as an HTML character reference — `tests&#47;spine.rs` resolves to
+        // `tests/spine.rs` exactly the way a browser resolves it before following the
+        // link, but as raw bytes the two never matched a real repository path. The
+        // extracted destination is now decoded before it is compared.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let encoded = clause.discharged_by.replace('/', "&#47;");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href=\"{encoded}\">recovery proof</a> |"),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_left_hidden_past_its_own_end_is_discarded_rather_than_merged_into_the_next() {
+        // Codex, pull request #138, round 44, finding 1: ending a table row used to be
+        // guarded by `!hidden`, so a row that was still inside an inline non-rendering
+        // element when it ended — one opened in this row and not yet closed — skipped
+        // both the push and the `in_row = false` reset. Its own content then survived,
+        // concatenated onto the front of the *next* row's, and because the
+        // concatenation still contained every substring a naive check looks for, the
+        // corruption was invisible unless the check requires the first row to be
+        // properly discarded on its own rather than smuggled through merged with its
+        // neighbour. Here a `<script>` opens at the end of the first clause's row and
+        // closes at the very start of the second clause's, so under the old code the
+        // two rows became one and both clauses' text survived; under the fix the first
+        // row is discarded for having ended hidden and the second is captured cleanly.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let next = SPEC_CLAUSES.get(1).expect("the table has a second row");
+        let opened = claude_md.replacen(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| {}<script> |", clause.discharged_by),
+            1,
+        );
+        let hidden = opened.replacen(
+            &format!("| `{}`", next.id),
+            &format!("| </script>`{}`", next.id),
+            1,
+        );
+        let violations = check_recovery_spec(Some(&hidden), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation
+                        .detail
+                        .contains("no table row naming this recovery invariant")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_closing_hidden_element_before_a_clause_does_not_swallow_it_forever() {
+        // Codex, pull request #138, round 44, finding 2: `find_any_hidden_opening_tag`
+        // used to track every tag carrying a bare `hidden` attribute as needing a
+        // matching close, self-closing foreign elements included — and a self-closing
+        // tag like `<svg hidden />` never has one. Nothing after it, for the rest of
+        // the document, would ever be visible again. It is now recognised as
+        // self-closing from its own trailing `/>` and opens no hidden state at all.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let edited: Vec<AdrFile> = adrs
+            .into_iter()
+            .map(|adr| {
+                if adr.name == RECOVERY_SPEC_ADR {
+                    AdrFile {
+                        contents: adr.contents.replace(
+                            &format!("- `{}`", clause.id),
+                            &format!("- <svg hidden />\n- `{}`", clause.id),
+                        ),
+                        ..adr
+                    }
+                } else {
+                    adr
+                }
+            })
+            .collect();
+        let violations = check_recovery_spec(Some(&claude_md), &edited, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_character_reference_in_visible_html_text_still_counts() {
+        // Codex, pull request #138, round 45, "Decode entities in visible raw-HTML
+        // text": a browser resolves `<div>All &#54; recovery invariants</div>` to
+        // `All 6 recovery invariants` before a reader ever sees it, but
+        // `append_visible_html` kept the unresolved source bytes, so the same count
+        // written inside real (non-comment) block HTML was reported as missing even
+        // though a reader sees the right number.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let digit = SPEC_CLAUSES.len().to_string();
+        assert_eq!(digit.len(), 1, "the encoding below assumes a single digit");
+        let code_point = u32::from(digit.as_bytes()[0]);
+        let encoded = format!(
+            "<div>{}</div>",
+            count.replacen(&digit, &format!("&#{code_point};"), 1)
+        );
+        let linked = claude_md.replacen(&count, &encoded, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_literal_less_than_sign_does_not_swallow_the_count_as_markup() {
+        // Codex, pull request #138, round 47, "Distinguish literal less-than signs
+        // from tag starts": `next_tag_start` returned any `<` as an unresolved tag
+        // start, not only one a browser would actually tokenize as markup —
+        // `<div>\n2 < 3\nAll 6 recovery invariants\n</div>` has a literal `2 < 3`
+        // on its own line, and its `<` (followed by a space, not a letter or `/`)
+        // was captured as a `PendingTag` that then consumed everything through the
+        // later `</div>`'s own `>` as markup, the count included.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<div>\n2 < 3\n{count}\n</div>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_comment_spelling_inside_a_still_open_quoted_attribute_does_not_hide_the_count() {
+        // Codex, pull request #138, round 47, "Ignore comment markers inside
+        // pending tag attributes": `next_hiding_marker`'s own comment-opener
+        // search was a raw substring search, so `<div title="<!--\ncontinued">All
+        // 6 recovery invariants</div>` — a legal, multiline tag with no complete
+        // candidate at all on its first line — had the `<!--` trapped inside its
+        // still-open quoted attribute value read as a genuine comment opener,
+        // latching `in_html_comment` for the rest of the document once no real
+        // `-->` is ever found for it.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<div title=\"<!--\ncontinued\">{count}</div>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_element_literally_named_hidden_does_not_hide_its_own_body() {
+        // Codex, pull request #138, round 47, "Skip the element name when scanning
+        // for hidden attributes": `has_hidden_attribute` accepted `<` as a valid
+        // boundary immediately before "hidden", meant to admit a genuine attribute
+        // sitting right at the very start of the attribute list — but the same
+        // allowance let the *tag's own name* be mistaken for the attribute:
+        // `<hidden>All 6 recovery invariants</hidden>` is an ordinary element
+        // literally named `hidden`, not an element carrying a `hidden` attribute,
+        // and a reader sees its body plainly.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<hidden>{count}</hidden>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_li_implicitly_closes_a_hidden_first_li_and_stays_visible() {
+        // Codex, pull request #138, round 48, "Honor implicit closes for
+        // optional-end-tag elements": an `li` element's own end tag may be omitted
+        // immediately before another `li`, so `<ul><li hidden>hidden<li>All 6
+        // recovery invariants</li></ul>` is one hidden `li` followed by one
+        // ordinary, visible `li` sharing the document's single `</li>` — not two
+        // nested `li`s, neither of which that one close tag could ever fully close.
+        // Treating the second `<li>` as a further open (as every non-raw-text
+        // same-name opener used to be) left the second, visible item suppressed
+        // and the hidden stack open past its own close, hiding the count and
+        // everything the document says after it.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let count = format!("All {} recovery invariants", SPEC_CLAUSES.len());
+        let wrapped = format!("<ul><li hidden>hidden<li>{count}</li></ul>");
+        let linked = claude_md.replacen(&count, &wrapped, 1);
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not say")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_split_by_a_line_break_tag_is_reported_as_missing() {
+        // Codex, pull request #138, round 38, finding 3: the round-37 fix for `<br>`
+        // landed in `markdown_prose`; this independent collector, `table_rows`, still
+        // dropped the tag with no separator at all, so a discharge path split across a
+        // real, rendered line break — `tests/<br>spine.rs` renders as two lines,
+        // `tests/` and `spine.rs` — fused back into the literal contiguous path a
+        // `.contains` scan matched, even though a reader never sees it run together.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let (first_half, second_half) = clause
+            .discharged_by
+            .split_at(clause.discharged_by.len() / 2);
+        let split = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| {first_half}<br>{second_half} |"),
+        );
+        let violations = check_recovery_spec(Some(&split), &adrs, Some(&obligations));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "a discharge path split by a `<br>` still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_of_html_comments_does_not_vouch_for_the_clause() {
+        // Codex, pull request #138, round 16: an inline HTML comment is one
+        // self-contained `InlineHtml` event, and the round-15 fix for a raw HTML link's
+        // `href` kept that event's text verbatim with no exception for a comment — so a
+        // row built entirely of comments, `| <!-- \`id\` --> | <!-- headline --> | <!--
+        // proof --> |`, rendered empty to a reader still carried every required
+        // substring into the reconstructed row.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "| Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | <!-- `{}` --> | <!-- {} --> | <!-- {} --> |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_after_an_unterminated_comment_that_outlived_its_block_does_not_count() {
+        // Codex, pull request #138, round 20: `pulldown-cmark` ends an `HtmlBlock` at a
+        // blank line even when a comment inside it never closed, so a table right after
+        // reads as an ordinary, structurally separate one. By real HTML rules it is
+        // still inside the comment until an actual `-->` appears, so `table_rows` must
+        // not read it as real either.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "<div>\n<!--\n</div>\n\n\
+             | Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | `{}` | {} | {} |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
+            "a table after an unterminated comment that outlived its block still counted: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_after_a_comment_never_really_closed_by_plain_prose_does_not_count() {
+        // Codex, pull request #138, round 28, correcting round 22's own fix: a comment
+        // that outlives its own `HtmlBlock` across a blank line appears to close via a
+        // standalone `-->` a few lines later, but that line is ordinary paragraph
+        // `Event::Text`, not `Event::Html` — and ordinary Markdown text is always
+        // HTML-escaped when rendered, so the literal three-byte sequence `-->` never
+        // survives into the HTML a browser parses (verified with a throwaway
+        // `pulldown-cmark` render). The real, unescaped `<!--` stays open through it —
+        // and everything after, including the table below — exactly as it would with
+        // no apparent close at all.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "<div>\n<!--\n</div>\n\n-->\n\n\
+             | Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | `{}` | {} | {} |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("no table row")),
+            "a table after a comment only apparently closed by plain prose still \
+             counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_headline_hidden_inside_a_script_does_not_count() {
+        // Codex, pull request #138, round 30: `table_rows` is an independent parser
+        // from `markdown_prose` and had no non-rendering-element handling at all, so a
+        // required cell value placed inside `<script>` (or `<style>`/`<template>`) was
+        // still copied into the row verbatim, even though a reader never sees it.
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let claude_md = format!(
+            "| Id | Guarantee | Discharged by |\n| --- | --- | --- |\n\
+             | `{}` | <script>{}</script> | {} |\n",
+            clause.id, clause.headline, clause.discharged_by
+        );
+        let violations = check_spec_clauses_are_written_down(Some(&claude_md));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains(&format!("`{}`", clause.headline))),
+            "a table headline hidden inside a <script> still counted: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_clause_named_by_two_rows_is_reported_rather_than_resolved() {
         let (claude_md, adrs, obligations) = spec_inputs();
         let clause = SPEC_CLAUSES.first().expect("the table is not empty");
@@ -6615,6 +11809,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_storage_clause_message_hidden_in_a_span_attribute_is_reported() {
+        // Codex, pull request #138, round 35, finding 3: `table_rows`'s
+        // `Event::InlineHtml` arm used to keep an inline tag's entire raw text
+        // verbatim in the cell, so a decoy attribute unrelated to any link
+        // destination — `<span title="...">` — carried the required discharge text
+        // into the row just as readily as a real `<a href="...">`'s did, letting an
+        // otherwise-wrong row satisfy this check from text no reader ever sees.
+        // `anchor_href` now extracts only a genuine `<a>` tag's `href`, so a `<span>`
+        // attribute contributes nothing to the cell.
+        let (claude_md, mut adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES[0];
+        for adr in &mut adrs {
+            if adr.name == STORAGE_CONFORMANCE_ADR {
+                let real_row = format!("| `{}` | {} |", clause.id, clause.discharge.message());
+                let decoy_row = format!(
+                    "| `{}` | <span title=\"{}\">elsewhere</span> |",
+                    clause.id,
+                    clause.discharge.message()
+                );
+                assert!(
+                    adr.contents.contains(&real_row),
+                    "fixture row not found: {real_row}"
+                );
+                adr.contents = adr.contents.replace(&real_row, &decoy_row);
+            }
+        }
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&clauses));
+        assert!(
+            violations.iter().any(|v| v.subject == clause.id),
+            "a discharge message hidden in a span attribute still counted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_href_lookalike_attribute_does_not_supply_a_table_cells_evidence() {
+        // Codex, pull request #138, round 36, finding 2: `anchor_href`'s bare
+        // substring search for `href=` also matched inside `data-href=`, so `<a
+        // data-href="...">elsewhere</a>` — an anchor with no link destination at all
+        // — returned that unrelated attribute's value as if it were the real `href`.
+        // The match now requires a fresh attribute name (nothing, or HTML
+        // whitespace, immediately before it), so a look-alike attribute name is
+        // skipped rather than mistaken for the real one.
+        let (claude_md, mut adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES[0];
+        for adr in &mut adrs {
+            if adr.name == STORAGE_CONFORMANCE_ADR {
+                let real_row = format!("| `{}` | {} |", clause.id, clause.discharge.message());
+                let decoy_row = format!(
+                    "| `{}` | <a data-href=\"{}\">elsewhere</a> |",
+                    clause.id,
+                    clause.discharge.message()
+                );
+                assert!(
+                    adr.contents.contains(&real_row),
+                    "fixture row not found: {real_row}"
+                );
+                adr.contents = adr.contents.replace(&real_row, &decoy_row);
+            }
+        }
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&clauses));
+        assert!(
+            violations.iter().any(|v| v.subject == clause.id),
+            "a data-href lookalike attribute still supplied the table cell's evidence: \
+             {violations:?}"
+        );
+    }
+
+    #[test]
+    fn href_text_inside_another_quoted_attribute_does_not_supply_a_table_cells_evidence() {
+        // Codex, pull request #138, round 37, finding 2: a leading-whitespace check
+        // alone is not a real attribute boundary — `<a title=" href='...'">proof</a>`
+        // has no link destination either, but the `href=` inside `title`'s own quoted
+        // value is *preceded* by whitespace too (the space right after `title`'s
+        // opening quote), so the whitespace check alone still accepted it. The scan
+        // now tracks whichever quote character is currently open and only tests for
+        // `href=` while no attribute value is open, so text inside one — whatever
+        // precedes it — is never read as a fresh attribute name.
+        let (claude_md, mut adrs, clauses) = storage_inputs();
+        let clause = STORAGE_CONTRACT_CLAUSES[0];
+        for adr in &mut adrs {
+            if adr.name == STORAGE_CONFORMANCE_ADR {
+                let real_row = format!("| `{}` | {} |", clause.id, clause.discharge.message());
+                let decoy_row = format!(
+                    "| `{}` | <a title=\" href='{}'\">elsewhere</a> |",
+                    clause.id,
+                    clause.discharge.message()
+                );
+                assert!(
+                    adr.contents.contains(&real_row),
+                    "fixture row not found: {real_row}"
+                );
+                adr.contents = adr.contents.replace(&real_row, &decoy_row);
+            }
+        }
+        let violations = check_storage_conformance(Some(&claude_md), &adrs, Some(&clauses));
+        assert!(
+            violations.iter().any(|v| v.subject == clause.id),
+            "href text inside another quoted attribute still supplied the table cell's \
+             evidence: {violations:?}"
+        );
+    }
+
     fn storage_inputs() -> (String, Vec<AdrFile>, String) {
         (
             clean_claude_md(RULES),
@@ -6961,6 +12258,7 @@ mod tests {
                 "recovery-spec",
                 "settled-decisions",
                 "storage-conformance",
+                "storage-shapes",
                 "wire-format"
             ]
         );
@@ -6983,6 +12281,60 @@ mod tests {
                 &inputs.wire_format_corpus,
             ),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_descriptively_labelled_link_to_the_spec_still_counts() {
+        // Codex, pull request #138: a check that only asks whether a path is written
+        // down somewhere must read raw Markdown syntax, not rendered prose — a link's
+        // destination, `[wire-format specification](docs/format/wire-format-v1.md)`,
+        // is exactly what a real parser drops in favour of the visible label.
+        let mut inputs = wire_format_inputs();
+        inputs.claude_md = inputs.claude_md.map(|claude_md| {
+            claude_md.replace(
+                WIRE_FORMAT_SPEC_PATH,
+                &format!("[wire-format specification]({WIRE_FORMAT_SPEC_PATH})"),
+            )
+        });
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &inputs.adrs,
+            inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not link")),
+            "a descriptively labelled link was read as missing: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_written_as_raw_html_still_counts() {
+        // Codex, pull request #138: `visible_source` hid every raw HTML span, not
+        // only comments, so a link written as `<a href="...">label</a>` — real,
+        // visible HTML a reader and a renderer both see — lost its destination the
+        // same way a commented-out one should.
+        let mut inputs = wire_format_inputs();
+        inputs.claude_md = inputs.claude_md.map(|claude_md| {
+            claude_md.replace(
+                WIRE_FORMAT_SPEC_PATH,
+                &format!("<a href=\"{WIRE_FORMAT_SPEC_PATH}\">wire-format specification</a>"),
+            )
+        });
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &inputs.adrs,
+            inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("does not link")),
+            "a link written as raw HTML was read as missing: {violations:?}"
         );
     }
 
@@ -7117,6 +12469,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_accepted_status_written_with_different_case_still_counts() {
+        // Issue #82: the raw check this rule used to run was case-sensitive, and two real
+        // ADRs in this repository write `- Status: Accepted` with a capital letter.
+        let inputs = wire_format_inputs();
+        let adrs: Vec<AdrFile> = inputs
+            .adrs
+            .iter()
+            .map(|adr| AdrFile {
+                name: adr.name.clone(),
+                contents: if adr.name == WIRE_FORMAT_ADR {
+                    adr.contents
+                        .replace("- Status: accepted", "- Status: Accepted")
+                } else {
+                    adr.contents.clone()
+                },
+            })
+            .collect();
+        let violations = check_wire_format_is_documented(
+            inputs.claude_md.as_deref(),
+            &adrs,
+            inputs.wire_format_spec.as_deref(),
+            &inputs.wire_format_corpus,
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == WIRE_FORMAT_ADR
+                    && violation.detail.contains("not accepted")),
+            "a capitalized accepted status was read as unaccepted: {violations:?}"
+        );
+    }
+
     // Issue #31: the failure matrix.
 
     fn matrix_inputs() -> DocsInputs {
@@ -7141,8 +12526,8 @@ mod tests {
         tests.sort_unstable();
         tests.dedup();
         assert_eq!(tests.len(), 10, "two rows share a test");
-        assert!(FAILURE_ROWS.iter().any(|row| row.rig == RigStanding::Swept));
-        assert!(FAILURE_ROWS.iter().any(|row| row.rig == RigStanding::Owed));
+        // Issue #96 closed the rig's last four owed rows: every row is swept or driven now.
+        assert!(FAILURE_ROWS.iter().all(|row| row.rig != RigStanding::Owed));
     }
 
     #[test]
@@ -7254,7 +12639,7 @@ mod tests {
             .iter()
             .find_map(|row| row.rig_test.map(|test| (row, test)))
         else {
-            unreachable!("the rig sweeps six rows")
+            unreachable!("the rig reaches every row")
         };
         let mut inputs = matrix_inputs();
         inputs.failure_rig_tests = inputs
@@ -7270,10 +12655,10 @@ mod tests {
     }
 
     #[test]
-    fn every_swept_row_names_a_rig_test_and_no_owed_row_does() {
+    fn every_swept_or_driven_row_names_a_rig_test_and_no_owed_row_does() {
         for row in FAILURE_ROWS {
             assert_eq!(
-                row.rig == RigStanding::Swept,
+                row.rig != RigStanding::Owed,
                 row.rig_test.is_some(),
                 "{}",
                 row.id
@@ -7286,7 +12671,12 @@ mod tests {
         let Some(row) = FAILURE_ROWS.first() else {
             unreachable!("the table has ten rows")
         };
-        for attribute in ["#[ignore]", "#[cfg(any())]"] {
+        for attribute in [
+            "#[ignore]",
+            "#[cfg(any())]",
+            // Issue #97: a skippable test must not vouch for its row.
+            "#[cfg_attr(all(), ignore)]",
+        ] {
             let mut inputs = matrix_inputs();
             inputs.failure_model_tests = inputs
                 .failure_model_tests
@@ -7337,7 +12727,7 @@ mod tests {
             .iter()
             .find_map(|row| row.rig_test.map(|test| (row, test)))
         else {
-            unreachable!("the rig sweeps six rows")
+            unreachable!("the rig reaches every row")
         };
         let mut inputs = matrix_inputs();
         inputs.failure_rig_tests = inputs.failure_rig_tests.map(|tests| {
@@ -7420,7 +12810,11 @@ mod tests {
                 .find(|line| line.contains(&format!("`{}`", row.id)))
                 .unwrap_or_default()
                 .to_owned();
-            format!("{md}\n{line}\n")
+            // Doubled as a second row of the same real table, not appended after the
+            // document's last blank line: a `table_rows` reads real `Tag::TableRow`
+            // events, and a line dangling with no header and delimiter above it is not
+            // one (issue #82's continuation).
+            md.replacen(&format!("{line}\n"), &format!("{line}\n{line}\n"), 1)
         });
         assert!(
             matrix_violations(&doubled)
@@ -7479,7 +12873,7 @@ mod tests {
         let mut wrong_standing = matrix_inputs();
         wrong_standing.claude_md = wrong_standing
             .claude_md
-            .map(|md| md.replace("| Owed |", "| Swept |"));
+            .map(|md| md.replacen("| Swept |", "| Owed |", 1));
         assert!(
             matrix_violations(&wrong_standing)
                 .iter()
