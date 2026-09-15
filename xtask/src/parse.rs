@@ -1888,14 +1888,25 @@ fn collect_trait_implementors<'a>(
 /// declare their *own* [`syn::Generics`] too (`struct Holder<T = Wrapper<{ impl Clone
 /// for super::Recovery { .. }; 0 }>>(T);` is the reported case), and none of those six
 /// arms read it at all.
-fn collect_trait_implementors_in_item_body<'a>(
-    item: &'a syn::Item,
+fn collect_trait_implementors_in_item_body(
+    item: &syn::Item,
     aliases: &[UseAlias],
     trait_name: &str,
     shadow_locals: bool,
     implementors: &mut Vec<String>,
 ) {
-    let mut roots: Vec<&'a syn::Block> = Vec::new();
+    for root in scope_root_blocks_of_item(item) {
+        collect_trait_implementors_in_block(root, aliases, trait_name, shadow_locals, implementors);
+    }
+}
+
+/// The `roots` computation [`collect_trait_implementors_in_item_body`] used to inline
+/// before round 42 of Codex review on this change (PR #143) split it out: derive
+/// checking (see [`any_unresolved_derive_in_item_body`]) needs exactly the same set of
+/// scope-root blocks a handwritten `impl` can hide behind, since a block-local struct,
+/// enum or union carrying a derive is buried the identical way a block-local `impl` is.
+fn scope_root_blocks_of_item(item: &syn::Item) -> Vec<&syn::Block> {
+    let mut roots: Vec<&syn::Block> = Vec::new();
     match item {
         syn::Item::Fn(function) => {
             roots.extend(direct_blocks_in_signature(&function.sig));
@@ -1990,9 +2001,7 @@ fn collect_trait_implementors_in_item_body<'a>(
         }
         _ => {}
     }
-    for root in roots {
-        collect_trait_implementors_in_block(root, aliases, trait_name, shadow_locals, implementors);
-    }
+    roots
 }
 
 /// [`collect_trait_implementors_in_item_body`]'s `Item::Impl` arm, over one `impl`
@@ -2296,8 +2305,11 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
 /// Whether any struct, enum or union `contents` declares derives something this
 /// module cannot rule out as one of Rust's own nine derivable traits.
 ///
-/// Checked at module scope and at any depth of inline-module nesting. Found by
-/// Codex review of this change (PR #143), round 40: a procedural derive
+/// Checked at module scope, at any depth of inline-module nesting, and — since round 42
+/// of Codex review on this change (PR #143) — at any depth of block nesting a function
+/// body, a method, a trait's default method, or any of the other scopes
+/// `scope_root_blocks_of_item` already finds for Clone-impl detection can carry. Found
+/// by Codex review of this change (PR #143), round 40: a procedural derive
 /// macro is not obliged to emit an implementation only for the trait its own name
 /// suggests, or only for the type it is attached to — `#[derive(Evil)] struct
 /// Helper;` anywhere in a production-reachable file can expand to `impl Clone for
@@ -2309,14 +2321,19 @@ pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>,
 /// question of each, with the same `push_resolved_names` logic and the same
 /// fail-closed answer for a name this scan cannot vouch for.
 ///
-/// Scoped to module-level and inline-module-nested declarations, matching
-/// `collect_trait_implementors`'s own module-boundary alias threading — an
-/// out-of-line child module is a separate file this function's own caller calls it
-/// on again, exactly as `trait_implementors_for_pinned_type` already is. A
-/// block-local struct, enum or union (declared inside a function body) is not
-/// walked; closing that narrower residual needs the same block-scoped descent
-/// `collect_trait_implementors_in_block` carries for a handwritten `impl`, which
-/// this module-scoped check does not yet share.
+/// Round 40 scoped this to module-level and inline-module-nested declarations alone,
+/// matching `collect_trait_implementors`'s own module-boundary alias threading, and its
+/// own doc comment named the gap round 42 closes: "a production function containing
+/// `#[derive(Evil)] struct Helper;`" reached neither `declares_item_macro`'s trust of the
+/// outer `derive` nor this scan's own module-scoped walk, so a procedural derive on that
+/// local item could emit a non-local `impl Clone for crate::recovery::Recovery` with
+/// `recovery-surface` still passing. `any_unresolved_derive_in_item_body` closes it by
+/// reusing exactly the scope-root blocks a handwritten `impl` can hide behind, and
+/// `any_unresolved_derive_in_block` walks one block at a time the way
+/// `collect_trait_implementors_in_block` does, so a block-local `use` or `type` alias
+/// resolves a nested derive's name under its own lexical scope rather than a sibling
+/// block's. An out-of-line child module is still a separate file this function's own
+/// caller calls it on again, exactly as `trait_implementors_for_pinned_type` already is.
 ///
 /// # Errors
 ///
@@ -2328,7 +2345,10 @@ pub fn unresolved_derive_elsewhere(contents: &str) -> Result<bool, syn::Error> {
     Ok(any_unresolved_derive_in_scope(&file.items, &aliases))
 }
 
-fn any_unresolved_derive_in_scope(items: &[syn::Item], aliases: &[UseAlias]) -> bool {
+fn any_unresolved_derive_in_scope<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+    aliases: &[UseAlias],
+) -> bool {
     for item in items {
         if has_cfg_test(item_attrs(item)) {
             continue;
@@ -2363,8 +2383,53 @@ fn any_unresolved_derive_in_scope(items: &[syn::Item], aliases: &[UseAlias]) -> 
             }
             _ => {}
         }
+        // Round 42: every scope-root block a handwritten `impl` can hide behind —
+        // a function or method body, a trait's default method, a const/static
+        // initializer, or a field, variant or generic bound's own type — can just
+        // as well hide a block-local struct, enum or union carrying a derive this
+        // scan has not yet resolved. `scope_root_blocks_of_item` returns an empty
+        // list for an item with no such scope (an ordinary `use`, for instance),
+        // so this costs nothing beyond the walk every other item already gets.
+        if any_unresolved_derive_in_item_body(item, aliases) {
+            return true;
+        }
     }
     false
+}
+
+/// [`any_unresolved_derive_in_scope`]'s descent into `item`'s own scope-root blocks —
+/// the derive-checking twin of [`collect_trait_implementors_in_item_body`], sharing its
+/// [`scope_root_blocks_of_item`] rather than duplicating the per-item-kind block search.
+fn any_unresolved_derive_in_item_body(item: &syn::Item, aliases: &[UseAlias]) -> bool {
+    scope_root_blocks_of_item(item)
+        .into_iter()
+        .any(|root| any_unresolved_derive_in_block(root, aliases))
+}
+
+/// Walks one [`syn::Block`] at a time, the derive-checking twin of
+/// [`collect_trait_implementors_in_block`]: an item declared directly in this block's own
+/// statements extends the ambient alias table for this block and every block nested
+/// inside it, but never a sibling block, so a local `use` or `type` alias two blocks over
+/// cannot resolve a derive found here. `shadow_locals` is `false` throughout — this
+/// function asks only whether a derive name resolves, never whether a local declaration
+/// shadows the pinned type, so [`shadow_aliases_for_local_types`]'s `LOCAL_SHADOWED_TYPE`
+/// marker has no part to play here.
+fn any_unresolved_derive_in_block(block: &syn::Block, aliases: &[UseAlias]) -> bool {
+    let direct_items: Vec<&syn::Item> = block
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        })
+        .collect();
+    let scoped_aliases = extend_with_local_scope(aliases, &direct_items, false);
+    if any_unresolved_derive_in_scope(direct_items.iter().copied(), &scoped_aliases) {
+        return true;
+    }
+    direct_child_blocks_of_block(block)
+        .into_iter()
+        .any(|nested| any_unresolved_derive_in_block(nested, &scoped_aliases))
 }
 
 fn any_unresolved_derive(attrs: &[syn::Attribute], aliases: &[UseAlias]) -> bool {

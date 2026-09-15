@@ -4286,6 +4286,34 @@ local-trait-and-impl pair was injected into `waymaker-flash`'s own `recovery` mo
 confirmed to compile, confirmed to be a false positive under `check-layering` before
 this fix and cleared by it after.
 
+Round 42 found the residual `unresolved_derive_elsewhere`'s own doc comment had named
+when round 40 landed it: "a block-local struct, enum or union (declared inside a
+function body) is not walked". `#[derive(Evil)] struct Helper;` inside a production
+function reaches neither `declares_item_macro`'s trust of the outer `derive` attribute
+nor that module-scoped walk, so a procedural derive on a block-local item can emit a
+non-local `impl Clone for crate::recovery::Recovery` exactly as freely as one on a
+struct declared at module scope. The fix shares rather than duplicates the block-descent
+machinery `collect_trait_implementors_in_block` already carries for a handwritten
+`impl`: the roots computation `collect_trait_implementors_in_item_body` used to inline —
+every scope-root block a function's signature and body, a method, a trait's default
+method, a const or static initializer, or a field, variant or generic bound's own type
+can hide — is now `scope_root_blocks_of_item`, called by both the Clone-impl scan and a
+new derive-checking twin, `any_unresolved_derive_in_item_body`. A new
+`any_unresolved_derive_in_block` walks one block at a time exactly the way
+`collect_trait_implementors_in_block` does, so a block-local `use` or `type` alias
+resolves a nested derive's name under its own lexical scope rather than a sibling
+block's, and `any_unresolved_derive_in_scope` calls it for every item its own loop
+reaches — Struct, Enum and Union's own field types included, since those can bury a
+further block the identical way a function body can. Verified against real
+compilation: a standalone two-crate example, an `evil_macro` proc-macro crate whose
+`#[derive(Evil)]` ignores the item it decorates and emits a hardcoded
+`impl Clone for Recovery` instead, compiled cleanly with the derive placed on a
+block-local struct inside an ordinary function — and, placed beside a second, explicit
+`impl Clone for Recovery`, produced rustc's own `E0119` conflicting-implementation
+error, the sharpest proof available that the injected impl is real. A real derive macro
+cannot be added to `waymaker-flash` itself without an external dependency the layering
+forbids, matching round 33's own two findings of this shape.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

@@ -14265,6 +14265,88 @@ mod tests {
     }
 
     #[test]
+    fn a_procedural_derive_on_a_block_local_struct_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 42: a production
+        // function containing `#[derive(Evil)] struct Helper;` reached neither
+        // `declares_item_macro`'s trust of the outer `derive` attribute nor
+        // `unresolved_derive_elsewhere`'s own module-scoped walk, which that
+        // function's own doc comment already named as a residual — a procedural
+        // derive on a block-local item can emit a non-local `impl Clone for
+        // crate::recovery::Recovery` exactly as freely as one on a struct declared
+        // at module scope (round 40).
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub fn install() {\n",
+                "    #[derive(Evil)]\n",
+                "    struct Helper;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_procedural_derive_on_a_struct_nested_two_blocks_deep_is_rejected() {
+        // The same finding at the depth `collect_trait_implementors_in_block`
+        // already walks a handwritten `impl` through: a block nested inside a
+        // function's own `if` statement is still reachable, one level of
+        // `direct_child_blocks_of_block` recursion further than the function's own
+        // top-level block.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub fn install(flag: bool) {\n",
+                "    if flag {\n",
+                "        #[derive(Evil)]\n",
+                "        struct Helper;\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_block_local_structs_ordinary_derive_does_not_trip_the_recovery_pin() {
+        // The negative case beside the last two: a block-local struct deriving one
+        // of the ordinary safe builtins, unaliased, must not be flagged.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "pub fn install() {\n",
+                "    #[derive(Debug, PartialEq, Eq)]\n",
+                "    struct Helper;\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
     fn an_absolute_path_aliased_to_a_trait_in_the_same_file_is_rejected() {
         // Found by Codex review of this change (PR #143), round 34: `impl ::dep::C for
         // Recovery { .. }` is legal Rust — an absolute path reaches the extern prelude,
