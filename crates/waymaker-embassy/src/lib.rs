@@ -68,4 +68,4 @@ pub use ctx::{ActivityFuture, ContinueFuture, Ctx, Failure, TerminalFuture, Time
 pub use decode::Decode;
 pub use dispatch::{ActivityDispatcher, Produced};
 pub use journal::{Answer, Halted, Handoff, Journal};
-pub use wiring::{Activity, Perform, Table, Unhandled};
+pub use wiring::{Activity, Perform, Table};
