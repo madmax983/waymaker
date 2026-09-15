@@ -1910,6 +1910,11 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
             )];
         }
     };
+    // Round 29: the one file whose *top-level* scope is where `Recovery` is actually
+    // declared — everywhere else in the reachable tree, a same-named struct, enum or
+    // union is a different declaration, and `recovery_reachable_file_is_clone_free`
+    // needs to know which case it is in to tell the two apart.
+    let root_path = source.path.replace('\\', "/");
     for path in &production_reachable {
         // `find_source` matches by suffix; `module_tree` already resolved this path to
         // exactly one of `sources`, so an exact match is what is wanted here.
@@ -1919,7 +1924,10 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
         else {
             continue;
         };
-        if let Some(violation) = recovery_reachable_file_is_clone_free(path, &reached.contents) {
+        let is_pinned_type_file = *path == root_path;
+        if let Some(violation) =
+            recovery_reachable_file_is_clone_free(path, &reached.contents, is_pinned_type_file)
+        {
             return vec![violation];
         }
     }
@@ -1982,7 +1990,18 @@ fn check_recovery_is_not_clone(sources: &[crate::size::LayerSource]) -> Vec<Viol
 ///
 /// Split out of [`check_recovery_is_not_clone`] to keep the per-file checks readable on
 /// their own; every reachable file, root included, is checked the same way.
-fn recovery_reachable_file_is_clone_free(path: &str, contents: &str) -> Option<Violation> {
+///
+/// `is_pinned_type_file` is `true` only when `path` is the one file whose top-level
+/// scope is where [`RECOVERY_TYPE`] is actually declared — passed through to
+/// [`crate::parse::trait_implementors_for_pinned_type`] so a same-named struct, enum or
+/// union declared anywhere else the tree reaches is read as the unrelated local
+/// declaration it is, rather than folded into the same match the pinned type's own
+/// `Clone` impl would be (round 29 of Codex review on this change, PR #143).
+fn recovery_reachable_file_is_clone_free(
+    path: &str,
+    contents: &str,
+    is_pinned_type_file: bool,
+) -> Option<Violation> {
     const RULE: &str = "recovery-surface";
     const ADAPTER: &str = "waymaker-flash";
 
@@ -2010,14 +2029,20 @@ fn recovery_reachable_file_is_clone_free(path: &str, contents: &str) -> Option<V
         }
     }
     // Every file the tree reaches is read for a handwritten `impl`, the root included:
-    // `trait_implementors` resolves both the trait name and the self-type through every
-    // alias it can chase — including a local `type` alias on the self-type side, since
-    // round 13 found both a trait alias (`use Clone as C; use self::C as Klon; impl Klon
-    // for ..`) and a type alias (`type R = super::Recovery; impl Clone for R`) that a
-    // single-hop, unaliased read of either side would miss — so `impl Clone for
-    // super::Recovery` in a child module, however it spells either name, is caught here
-    // the same way `impl Clone for Recovery` in the root file is.
-    let handwritten = match crate::parse::trait_implementors(contents, "Clone") {
+    // `trait_implementors_for_pinned_type` resolves both the trait name and the
+    // self-type through every alias it can chase — including a local `type` alias on
+    // the self-type side, since round 13 found both a trait alias (`use Clone as C; use
+    // self::C as Klon; impl Klon for ..`) and a type alias (`type R = super::Recovery;
+    // impl Clone for R`) that a single-hop, unaliased read of either side would miss —
+    // so `impl Clone for super::Recovery` in a child module, however it spells either
+    // name, is caught here the same way `impl Clone for Recovery` in the root file is.
+    // `is_pinned_type_file` is what keeps a same-named local declaration elsewhere in
+    // the tree from being read as that same match (round 29).
+    let handwritten = match crate::parse::trait_implementors_for_pinned_type(
+        contents,
+        "Clone",
+        is_pinned_type_file,
+    ) {
         Ok(implementors) => implementors,
         Err(error) => {
             return Some(Violation::new(
@@ -12543,6 +12568,166 @@ mod tests {
                 "}\n",
             )
             .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_derive_reached_through_a_sibling_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 29: `struct_derives`
+        // collected its aliases with a hand-rolled loop over `Item::Use` alone, so
+        // `mod traits { pub use core::clone::Clone as C; } #[derive(traits::C)]` had
+        // no alias for the qualified name `traits::C` to resolve against at all — the
+        // derive-side counterpart of round 28's finding for a handwritten `impl`,
+        // which read `module_scope_aliases` (and so `direct_scope_module_aliases`)
+        // from the start.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "mod traits {\n",
+            "    pub use core::clone::Clone as C;\n",
+            "}\n",
+            "#[derive(traits::C, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_derive_reached_through_a_local_type_alias_argument_is_rejected() {
+        // The other half of the same finding: `struct_derives`'s hand-rolled loop
+        // read no `type` alias at all, so a plain-path `type Klon = core::clone::
+        // Clone; #[derive(Klon)]` — which `direct_scope_aliases` has resolved for
+        // every other caller since round 13 — bypassed the derive scan entirely too.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "type Klon = core::clone::Clone;\n",
+            "#[derive(Klon, Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("Clone"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn an_unrelated_recovery_struct_in_an_inline_module_is_not_the_pinned_type() {
+        // Found by Codex review of this change (PR #143), round 29: a nested inline
+        // module is free to declare its own, wholly unrelated `struct Recovery` and
+        // hand it a `Clone` impl — real Rust name resolution has the unqualified
+        // `Recovery` written there mean the module's own local declaration, not the
+        // pinned type declared at its enclosing file's own top level. The scan used
+        // to read both as the same bare name and reject a file that never gave two
+        // writers to anything.
+        //
+        // The inline module is nested inside a *child* file rather than inside
+        // `recovery.rs` itself so this test exercises only the finding at hand:
+        // writing a second, unrelated `Clone::clone` directly into `recovery.rs`'s
+        // own text — however deeply nested — trips `recovery-surface`'s *other*
+        // half, the method-surface pin over that one file's own public functions,
+        // which is unrelated to issue #77 and is not this test's concern.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod unrelated;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/unrelated.rs".to_owned(),
+            contents: concat!(
+                "mod nested {\n",
+                "    pub struct Recovery;\n",
+                "\n",
+                "    impl Clone for Recovery {\n",
+                "        fn clone(&self) -> Self {\n",
+                "            Recovery\n",
+                "        }\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn an_unrelated_recovery_struct_in_a_child_file_is_not_the_pinned_type() {
+        // The same finding, one file over: a production-reachable child file — from
+        // the whole tree's point of view, exactly as nested as an inline module would
+        // be — can declare its own local `struct Recovery` too, with nothing to do
+        // with the one `recovery.rs` itself declares.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod unrelated;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/unrelated.rs".to_owned(),
+            contents: concat!(
+                "pub struct Recovery;\n",
+                "\n",
+                "impl Clone for Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_clone_impl_reached_through_an_out_of_line_modules_qualified_alias_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 29: `mod traits;`,
+        // with its content in a sibling file this per-file scan never opens, had no
+        // alias for a qualified `traits::C` to resolve against at all — round 28
+        // closed this same gap for an *inline* `mod traits { .. }`, whose content is
+        // right here in the same file to read, but an out-of-line module's content
+        // lives somewhere this scan cannot see, so the honest answer is the same
+        // fail-closed one a `super`-qualified path already gets rather than a guess.
+        // Without it, `traits::C` fell through to "no matching alias, take the last
+        // segment" and reported the bare, still-aliased `C` — which matches neither
+        // `Clone` nor the unresolved sentinel, so the whole self-type check (and with
+        // it, the impl's own `super::Recovery` self-type, which the pre-existing
+        // `super`-qualified guard would otherwise catch on its own) was skipped
+        // entirely, and a real `Clone` impl for the pinned type went unnoticed.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits;\n",
+                "impl traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl/traits.rs".to_owned(),
+            contents: "pub use core::clone::Clone as C;\n".to_owned(),
         });
         let violations = check_recovery_surface(&sources);
         assert_eq!(violations.len(), 1, "{violations:?}");

@@ -470,6 +470,17 @@ fn qualified_candidate(segments: &[String]) -> Option<(String, &[String])> {
 /// reported as such, not folded into "resolved, and not a match".
 pub const UNRESOLVED_DERIVE: &str = "<unresolved derive>";
 
+/// Sentinel [`every_resolution`] emits for a name that resolves, unambiguously, to a
+/// struct, enum or union declared locally in the very scope a reference to it appears
+/// in — a *different* declaration than the one an enclosing scope's identically-named
+/// item would mean, so it must never be folded into whatever that enclosing name would
+/// compare equal to. Unlike [`UNRESOLVED_DERIVE`], this is not "this scan gave up": it
+/// is confident the name means something, and confident that something is not whatever
+/// is being searched for in another scope entirely. See
+/// [`shadow_aliases_for_local_types`] for where this is registered and
+/// [`trait_implementors_for_pinned_type`] for why.
+const LOCAL_SHADOWED_TYPE: &str = "<locally shadowed type>";
+
 /// Every name `path` could ultimately mean, considering every alias that could bind any
 /// step along the way — not just the one [`resolve_segments`] would pick by taking the
 /// first match at the first step alone.
@@ -518,6 +529,34 @@ fn every_resolution(path: &syn::Path, aliases: &[UseAlias]) -> Vec<String> {
             // `UNRESOLVED_DERIVE`.
             if current.first().is_some_and(|first| first == "super") {
                 finished.push(UNRESOLVED_DERIVE.to_owned());
+                continue;
+            }
+            // Round 29: a candidate that has already resolved to `UNRESOLVED_DERIVE` at
+            // an earlier hop — through `direct_scope_opaque_module_aliases`, an
+            // out-of-line `mod name;` registered as a synthetic alias to this same
+            // sentinel — can still carry a trailing tail (`traits::C` resolving one hop
+            // to `["<unresolved derive>", "C"]`). Without this guard the tail survives:
+            // it matches neither `qualified_candidate` nor `lookup_candidate`, so the
+            // "no matching alias, take the last segment" branch below silently reports
+            // the harmless-looking `"C"` rather than propagating that the hop it went
+            // through could not be resolved at all.
+            if current
+                .first()
+                .is_some_and(|first| first == UNRESOLVED_DERIVE)
+            {
+                finished.push(UNRESOLVED_DERIVE.to_owned());
+                continue;
+            }
+            // Round 29: the companion sentinel for a name shadowed by a local
+            // struct/enum/union declaration (see `LOCAL_SHADOWED_TYPE`) propagates the
+            // same way, for the same reason — a qualified reference through it
+            // (`local_shadow_alias::C`, if anything ever chased a further hop through
+            // one) must not silently resolve to its own trailing segment either.
+            if current
+                .first()
+                .is_some_and(|first| first == LOCAL_SHADOWED_TYPE)
+            {
+                finished.push(LOCAL_SHADOWED_TYPE.to_owned());
                 continue;
             }
             // A *bare* `crate::NAME` — exactly two segments — asks to look `NAME` up
@@ -625,7 +664,54 @@ pub fn trait_implementors(contents: &str, trait_name: &str) -> Result<Vec<String
     // is also what a nested `mod` gets its own table from during the walk below.
     let aliases = module_scope_aliases(&file.items);
     let mut implementors = Vec::new();
-    collect_trait_implementors(&file.items, &aliases, trait_name, &mut implementors);
+    collect_trait_implementors(&file.items, &aliases, trait_name, false, &mut implementors);
+    Ok(implementors)
+}
+
+/// [`trait_implementors`], refined to tell a genuine implementor of one pinned,
+/// singular type from an unrelated, identically-named type declared somewhere else the
+/// module tree reaches.
+///
+/// Issue #77's rule is not "no file in the module tree implements `Clone` for a type
+/// *named* `Recovery`" — it is "no file implements `Clone` for *the* `Recovery`", and
+/// those are different questions once two declarations share a name. A
+/// production-reachable child file, or an inline module nested anywhere the tree
+/// reaches, is free to declare its own, wholly unrelated `struct Recovery` and hand it
+/// a `Clone` impl with nothing to do with the pinned type — real Rust name resolution
+/// has an unqualified `Recovery` written there mean the *local* declaration, exactly as
+/// [`struct_derives`] already reads only a *top-level* declaration in the pinned
+/// type's own file as the one that counts for a derive. This extends that same
+/// restriction to a handwritten `impl`: every directly nested inline module's own
+/// struct, enum or union shadows its name for an unqualified reference inside that
+/// module (via `shadow_aliases_for_local_types`, folded in wherever
+/// `collect_trait_implementors` builds a nested module's own scope) — and, when
+/// `is_pinned_type_file` is `false`, so does one declared at the scanned file's own top
+/// level, because from the whole reachable tree's point of view a child file reached
+/// through `mod name;` is exactly as nested as `mod name { .. }` would have been had
+/// its contents been written inline instead.
+///
+/// `is_pinned_type_file` must be `true` only for the one file whose *top-level* scope
+/// is where the pinned type is actually declared — every other reachable file, however
+/// it is reached, is nested with respect to that declaration and gets its own top
+/// level shadowed the same way an inline module's would be.
+///
+/// Found by Codex review of this change (PR #143), round 29.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn trait_implementors_for_pinned_type(
+    contents: &str,
+    trait_name: &str,
+    is_pinned_type_file: bool,
+) -> Result<Vec<String>, syn::Error> {
+    let file = parse_rust(contents)?;
+    let mut aliases = module_scope_aliases(&file.items);
+    if !is_pinned_type_file {
+        aliases.extend(shadow_aliases_for_local_types(file.items.iter()));
+    }
+    let mut implementors = Vec::new();
+    collect_trait_implementors(&file.items, &aliases, trait_name, true, &mut implementors);
     Ok(implementors)
 }
 
@@ -748,7 +834,90 @@ fn module_scope_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> V
     direct_scope_aliases(items.iter().copied())
         .into_iter()
         .chain(direct_scope_module_aliases(items.iter().copied()))
+        .chain(direct_scope_opaque_module_aliases(items.iter().copied()))
         .collect()
+}
+
+/// A synthetic, fail-closed alias to [`UNRESOLVED_DERIVE`] for every directly nested
+/// *out-of-line* module — `mod name;`, with its content in a sibling file this function
+/// never reads — so a qualified path through its name has something to resolve against
+/// rather than falling through to "no matching alias, take the last segment".
+///
+/// [`direct_scope_module_aliases`] is this same idea for an *inline* `mod name { .. }`,
+/// which can be resolved precisely because its content is right here in `items`. An
+/// out-of-line module's content lives in another file this per-file scan does not open,
+/// so nothing here can say what a name qualified by it actually means — the honest
+/// answer is the same one a `super`-qualified path already gets, not a guess and not a
+/// silent skip.
+///
+/// Found by Codex review of this change (PR #143), round 29: `mod traits; impl
+/// traits::C for super::Recovery { .. }`, where `traits`'s content lives in
+/// `recovery/traits.rs` and binds `C` to `Clone`, had no alias for `traits::C` to
+/// resolve against at all — the same gap round 28 closed for an inline module, one
+/// level out.
+fn direct_scope_opaque_module_aliases<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+) -> Vec<UseAlias> {
+    let mut aliases = Vec::new();
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        if module.content.is_some() {
+            // `direct_scope_module_aliases`'s to resolve, precisely.
+            continue;
+        }
+        aliases.push(UseAlias {
+            local: ident_name(&module.ident),
+            target: vec![UNRESOLVED_DERIVE.to_owned()],
+        });
+    }
+    aliases
+}
+
+/// A synthetic, self-referential alias for every struct, enum or union directly
+/// declared in `items`, each resolving to [`LOCAL_SHADOWED_TYPE`] rather than to its
+/// own name.
+///
+/// [`trait_implementors_for_pinned_type`] registers this for every scope that is not
+/// the pinned type's own file-level declaration site, because a locally declared
+/// item's name always resolves to that local declaration before it resolves to
+/// anything an enclosing scope or an import could mean by the same identifier — the
+/// same rule [`direct_scope_aliases`]'s own alias shadowing already applies to a `use`
+/// or `type` alias redeclared in a nested scope (round 24), extended here to a struct,
+/// enum or union item, which registers no alias of its own and so was invisible to
+/// that mechanism entirely.
+///
+/// Found by Codex review of this change (PR #143), round 29: a production-reachable
+/// child file, or an inline module nested anywhere the module tree reaches, declaring
+/// its own unrelated `struct Recovery` and a handwritten, unqualified `impl Clone for
+/// Recovery` resolved to the bare name `Recovery` exactly as a genuine implementor of
+/// the pinned type would — nothing distinguished "the name `Recovery`, resolved with no
+/// alias in play" from "the name `Recovery`, resolved to a *different* declaration of
+/// that name local to this very scope".
+fn shadow_aliases_for_local_types<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+) -> Vec<UseAlias> {
+    let mut aliases = Vec::new();
+    for item in items {
+        if has_cfg_test(item_attrs(item)) {
+            continue;
+        }
+        let name = match item {
+            syn::Item::Struct(declared) => ident_name(&declared.ident),
+            syn::Item::Enum(declared) => ident_name(&declared.ident),
+            syn::Item::Union(declared) => ident_name(&declared.ident),
+            _ => continue,
+        };
+        aliases.push(UseAlias {
+            local: name,
+            target: vec![LOCAL_SHADOWED_TYPE.to_owned()],
+        });
+    }
+    aliases
 }
 
 /// Every alias reachable through one level of qualification by a directly nested
@@ -808,6 +977,7 @@ fn collect_trait_implementors<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     aliases: &[UseAlias],
     trait_name: &str,
+    shadow_locals: bool,
     implementors: &mut Vec<String>,
 ) {
     for item in items {
@@ -877,7 +1047,13 @@ fn collect_trait_implementors<'a>(
                 // initializer or a type starts. `implementation.attrs` is not
                 // re-checked: the loop's own top-of-body `has_cfg_test` already
                 // excluded this arm entirely when the `impl` itself is `#[cfg(test)]`.
-                collect_trait_implementors_in_item_body(item, aliases, trait_name, implementors);
+                collect_trait_implementors_in_item_body(
+                    item,
+                    aliases,
+                    trait_name,
+                    shadow_locals,
+                    implementors,
+                );
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
@@ -886,8 +1062,23 @@ fn collect_trait_implementors<'a>(
                     // module's own aliases must not leak back out to the caller either
                     // — each nested module gets a table built fresh from its own scope
                     // alone, the same way `trait_implementors` builds the file-root one.
-                    let module_aliases = module_scope_aliases(nested);
-                    collect_trait_implementors(nested, &module_aliases, trait_name, implementors);
+                    let mut module_aliases = module_scope_aliases(nested);
+                    if shadow_locals {
+                        // Round 29: a nested inline module's own struct, enum or union
+                        // shadows its name for any unqualified reference inside this
+                        // same module, exactly as a `use` or `type` alias redeclared
+                        // here already shadows an ambient one (round 24) — see
+                        // `shadow_aliases_for_local_types` and
+                        // `trait_implementors_for_pinned_type`.
+                        module_aliases.extend(shadow_aliases_for_local_types(nested.iter()));
+                    }
+                    collect_trait_implementors(
+                        nested,
+                        &module_aliases,
+                        trait_name,
+                        shadow_locals,
+                        implementors,
+                    );
                 }
             }
             // Round 15 of Codex review on this change (PR #143) found an `impl`
@@ -913,7 +1104,13 @@ fn collect_trait_implementors<'a>(
             | syn::Item::Struct(_)
             | syn::Item::Union(_)
             | syn::Item::ForeignMod(_) => {
-                collect_trait_implementors_in_item_body(item, aliases, trait_name, implementors);
+                collect_trait_implementors_in_item_body(
+                    item,
+                    aliases,
+                    trait_name,
+                    shadow_locals,
+                    implementors,
+                );
             }
             _ => {}
         }
@@ -949,6 +1146,7 @@ fn collect_trait_implementors_in_item_body<'a>(
     item: &'a syn::Item,
     aliases: &[UseAlias],
     trait_name: &str,
+    shadow_locals: bool,
     implementors: &mut Vec<String>,
 ) {
     let mut roots: Vec<&'a syn::Block> = Vec::new();
@@ -1047,7 +1245,7 @@ fn collect_trait_implementors_in_item_body<'a>(
         _ => {}
     }
     for root in roots {
-        collect_trait_implementors_in_block(root, aliases, trait_name, implementors);
+        collect_trait_implementors_in_block(root, aliases, trait_name, shadow_locals, implementors);
     }
 }
 
@@ -1153,6 +1351,7 @@ fn collect_trait_implementors_in_block(
     block: &syn::Block,
     aliases: &[UseAlias],
     trait_name: &str,
+    shadow_locals: bool,
     implementors: &mut Vec<String>,
 ) {
     let direct_items: Vec<&syn::Item> = block
@@ -1168,10 +1367,17 @@ fn collect_trait_implementors_in_block(
         direct_items.iter().copied(),
         &scoped_aliases,
         trait_name,
+        shadow_locals,
         implementors,
     );
     for nested in direct_child_blocks_of_block(block) {
-        collect_trait_implementors_in_block(nested, &scoped_aliases, trait_name, implementors);
+        collect_trait_implementors_in_block(
+            nested,
+            &scoped_aliases,
+            trait_name,
+            shadow_locals,
+            implementors,
+        );
     }
 }
 
@@ -1264,13 +1470,13 @@ fn extend_with_local_scope(ambient: &[UseAlias], local_items: &[&syn::Item]) -> 
 /// at all may answer for `name`: this module does not evaluate a `cfg`'s condition, so a
 /// `#[cfg(any())] struct Recovery;` that never compiles would otherwise sit beside a real,
 /// `Clone`-deriving type exported under that name and answer "declared, not `Clone`" for
-/// it. And the aliases a derive resolves through are collected at the top level only, not
-/// through the crate-wide `use`-alias walk every other function in this module shares: an
-/// inner module's `use X as Klon;`, read before a top-level `use core::clone::Clone as
-/// Klon;` because it happens to sit earlier in the file, would otherwise resolve
-/// `#[derive(Klon)]` to `X` instead — and a nested module cannot shadow a name in the
-/// scope the pinned struct is declared in, so reading only the top level is the correct
-/// resolution here, not merely a narrower one.
+/// it. And the aliases a derive resolves through are collected at the top level only — via
+/// `module_scope_aliases`, the same function [`trait_implementors`] builds its own file
+/// scope from — rather than by recursing into a nested module: an inner module's `use X as
+/// Klon;`, read before a top-level `use core::clone::Clone as Klon;` because it happens to
+/// sit earlier in the file, would otherwise resolve `#[derive(Klon)]` to `X` instead — and
+/// a nested module cannot shadow a name in the scope the pinned struct is declared in, so
+/// reading only the top level is the correct resolution here, not merely a narrower one.
 ///
 /// A returned name can also be [`UNRESOLVED_DERIVE`], found on the same review round as
 /// the two paragraphs above: a `super`-qualified derive path, or one buried past the pile
@@ -1279,26 +1485,19 @@ fn extend_with_local_scope(ambient: &[UseAlias], local_items: &[&syn::Item]) -> 
 /// match, the same way it already treats [`None`] here as "cannot say" rather than as
 /// "not `Clone`".
 ///
+/// Found by Codex review of this change (PR #143), round 29: this used to collect its
+/// aliases with a hand-rolled loop over `Item::Use` alone, which — unlike
+/// `module_scope_aliases` — read neither a plain-path `type` alias
+/// (`type Klon = core::clone::Clone; #[derive(Klon)]`) nor an alias exported one level
+/// through an inline module's own name (`mod traits { pub use core::clone::Clone as C; }
+/// #[derive(traits::C)]`), so a derive resolved through either bypassed the scan entirely.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn struct_derives(contents: &str, name: &str) -> Result<Option<Vec<String>>, syn::Error> {
     let file = parse_rust(contents)?;
-    let mut aliases = Vec::new();
-    for item in &file.items {
-        if let syn::Item::Use(use_item) = item {
-            // `has_cfg_test`, not `has_any_cfg`: an alias needs the opposite
-            // conservatism a declaration does. A `#[cfg(feature = "x")] use Y as Klon;`
-            // still means `#[derive(Klon)]` is `Y` under that feature, so excluding a
-            // cfg-gated alias here would be the false negative — the derive scan has to
-            // read every alias that could possibly apply, and only a `#[cfg(test)]` one
-            // is excluded, because code reachable only from a shipped struct could never
-            // reach a name defined solely under `cfg(test)` in the first place.
-            if !has_cfg_test(item_attrs(item)) {
-                collect_tree_aliases(&use_item.tree, &mut Vec::new(), &mut aliases);
-            }
-        }
-    }
+    let aliases = module_scope_aliases(&file.items);
     let mut derives = Vec::new();
     let mut declared = false;
     for item in &file.items {

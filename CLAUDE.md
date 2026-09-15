@@ -3496,6 +3496,44 @@ twin, both built over an extracted `strip_self_prefix` — is tried before the p
 single-segment lookup at every hop, branching over both rather than stopping at the
 first the way this scan's other duplicate-candidate cases already do.
 
+Round 29 found three more, two of them the derive-side and file-boundary twins of
+round 28's own findings. The first: `struct_derives` collected its aliases with a
+hand-rolled loop over `Item::Use` alone, predating `module_scope_aliases` itself, so it
+read neither a plain-path `type` alias (`type Klon = core::clone::Clone;
+#[derive(Klon)]`, resolved for every other caller since round 13) nor an alias exported
+one level through an inline module's own name (`mod traits { pub use
+core::clone::Clone as C; } #[derive(traits::C)]`, round 28's own fix for a handwritten
+`impl`). It now reads `module_scope_aliases` like every other caller, gaining both for
+free. The second: a production-reachable child file, or an inline module nested
+anywhere the module tree reaches, is free to declare its own, wholly unrelated `struct
+Recovery` and hand it a `Clone` impl with nothing to do with the pinned type — real
+Rust name resolution has the unqualified `Recovery` written there mean the *local*
+declaration, exactly as `struct_derives` already reads only a *top-level* declaration
+in the pinned type's own file as the one that counts for a derive, but the
+handwritten-impl scan read both as the same bare name and rejected a file that never
+gave two writers to anything. A new `shadow_aliases_for_local_types` registers a
+synthetic, self-referential alias for every struct, enum or union directly declared in
+a scope, resolving to a new sentinel, `LOCAL_SHADOWED_TYPE`, rather than to its own
+name; `trait_implementors_for_pinned_type` — `trait_implementors`'s refinement for this
+one caller, so `future_trait_implementors`'s unrelated scan is untouched — folds it into
+every nested inline module's own scope unconditionally, and into the scanned file's own
+top level whenever that file is not the one the pinned type is actually declared in,
+because a child file reached through `mod name;` is exactly as nested, from the whole
+tree's point of view, as `mod name { .. }` would have been had its contents been
+written inline. The third: `mod traits;`, with its content in a sibling file this
+per-file scan never opens, had no alias for a qualified `traits::C` to resolve against
+at all — round 28 closed this same gap for an *inline* `mod traits { .. }`, whose
+content is right here in the same file to read, but an out-of-line module's content
+lives somewhere this scan cannot see, so the honest answer is the same fail-closed one
+a `super`-qualified path already gets rather than a guess. A new
+`direct_scope_opaque_module_aliases` registers every out-of-line `mod name;` as a
+synthetic alias to `UNRESOLVED_DERIVE`, folded into `module_scope_aliases` alongside the
+other two; and `every_resolution` gained a matching guard so that sentinel propagates
+through a further hop (`traits::C` resolving one hop to `["<unresolved derive>", "C"]`)
+rather than letting the tail segment silently survive as the harmless-looking `"C"` —
+the same shape of gap the `LOCAL_SHADOWED_TYPE` sentinel needed its own propagation
+guard for, added beside it on the same review round.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of
