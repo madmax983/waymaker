@@ -248,6 +248,10 @@ impl<D: ActivityDispatcher> Workflow for Provisioning<D> {
                 // `OUT_BYTES` is the wider bound, so `Refused` cannot happen here. `Pending`
                 // with no ending means the run is still waiting on the timer or an attempt.
                 (Some(Conclusion::Refused), _) | (None, Poll::Pending) => None,
+                // See `ota.rs`'s own `Ota::run`: an outstanding `Unserviceable` effect must
+                // not be reported as ended just because the workflow returned on its own
+                // past a dropped, stalled future.
+                (None, Poll::Ready(_)) if ctx.unserviceable() => None,
                 (None, Poll::Ready(Ok(()))) => Some(Ended::Completed(0)),
                 (None, Poll::Ready(Err(_))) => Some(Ended::Failed(0)),
             };
