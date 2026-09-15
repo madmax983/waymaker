@@ -1864,18 +1864,35 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
         && foreign_content.last().is_some_and(|frame| {
             is_mathml_text_integration_point(&frame.name) && frame.ordinary_descendants.is_empty()
         });
+    // Any element being inserted into the SVG or MathML namespace acknowledges its
+    // own self-closing flag immediately, whatever the ambient context was a moment
+    // before (Codex, round 67, "Skip self-closing foreign roots when tracking
+    // namespaces") — unlike an *ordinary* HTML element's self-closing slash, which
+    // is only ever honored while parsing already inside foreign content
+    // (`honors_self_closing_now`, checked above and everywhere else in this
+    // function). `<svg/><script />decision-id headline</script>` has `<svg/>`
+    // acknowledged and immediately popped back off before `<script />` is ever
+    // reached, returning to plain HTML — where a self-closing slash is *not*
+    // honored, so `<script />` opens for real. Pushing a frame for `<svg/>`
+    // unconditionally left a stale, still-open `honors_self_closing: true` frame
+    // behind, wrongly reading the following `<script />` as bodyless.
+    let self_closes_immediately = ends_with_self_closing_slash(span);
     if is_mglyph_exception || is_foreign_content_root(name) {
-        foreign_content.push(ForeignFrame {
-            name: name.to_ascii_lowercase(),
-            honors_self_closing: true,
-            ordinary_descendants: Vec::new(),
-        });
+        if !self_closes_immediately {
+            foreign_content.push(ForeignFrame {
+                name: name.to_ascii_lowercase(),
+                honors_self_closing: true,
+                ordinary_descendants: Vec::new(),
+            });
+        }
     } else if is_html_integration_point(span, name) {
-        foreign_content.push(ForeignFrame {
-            name: name.to_ascii_lowercase(),
-            honors_self_closing: false,
-            ordinary_descendants: Vec::new(),
-        });
+        if !self_closes_immediately {
+            foreign_content.push(ForeignFrame {
+                name: name.to_ascii_lowercase(),
+                honors_self_closing: false,
+                ordinary_descendants: Vec::new(),
+            });
+        }
     } else if !honors_self_closing_now(foreign_content)
         && !is_void_element(&name.to_ascii_lowercase())
     {
@@ -1928,17 +1945,25 @@ fn track_ordinary_ancestor(
         let self_closing_in_foreign_content =
             ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content);
         if !is_void_element(&name) && !self_closing_in_foreign_content {
-            // An opening tag applies its own implicit closes to the top of the real
-            // ancestor stack *before* it is recorded as open (Codex, round 62,
-            // "Remove implicitly closed ancestors before reusing them"): otherwise a
-            // `<p>` a sibling `<div>` had already closed stayed in `ancestors` as a
-            // stale entry, and a later, unrelated opening tag found it there and was
+            // An opening tag applies its own implicit closes to the real ancestor
+            // stack *before* it is recorded as open (Codex, round 62, "Remove
+            // implicitly closed ancestors before reusing them"): otherwise a `<p>` a
+            // sibling `<div>` had already closed stayed in `ancestors` as a stale
+            // entry, and a later, unrelated opening tag found it there and was
             // misread as closing a real outer `<p>` that no longer existed.
-            while ancestors
-                .last()
-                .is_some_and(|top| implicitly_closed_by(top, &name))
+            //
+            // Searched and truncated through the whole stack, not only its top
+            // (Codex, round 67, "Truncate through implicitly closed ancestors"):
+            // HTML5's "close a p element" rule pops everything nested inside the
+            // closed `<p>` too, however many ordinary elements deep — `<p><span>
+            // <div>` has the `<div>` close the `<p>` and take the intervening
+            // `<span>` down with it, but checking only `ancestors.last()` (`span`)
+            // never found the `<p>` two levels down at all, leaving both stale.
+            if let Some(pos) = ancestors
+                .iter()
+                .rposition(|open| implicitly_closed_by(open, &name))
             {
-                ancestors.pop();
+                ancestors.truncate(pos);
             }
             ancestors.push(name);
         }
