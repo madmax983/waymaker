@@ -14,7 +14,7 @@ use waymaker_drive::{
 };
 use waymaker_fault::Device;
 use waymaker_flash::bank::{self, BankHeader, BankId, BankLayout, Generation};
-use waymaker_flash::capacity::{Bounds, CapacityError, Reserve};
+use waymaker_flash::capacity::{Bounds, CapacityError, Refusal, Reserve};
 use waymaker_flash::frame::{self, ProgramAlign};
 use waymaker_flash::integrity::{Catalogued, IntegrityCheck};
 use waymaker_flash::recovery::{JournalRegion, RecoveryError};
@@ -227,8 +227,18 @@ fn booted() -> Device {
 
 /// The header a bank on media carries, decoded the way a cold boot has to.
 fn header_on(device: &mut Device, id: BankId) -> Option<(RunId, u16, u16, Vec<u8>)> {
-    let region = layout().bank(id);
-    let mut page = [0_u8; 512];
+    header_on_with(device, layout(), id)
+}
+
+/// [`header_on`], against a caller-chosen layout rather than [`layout`]'s own.
+fn header_on_with(
+    device: &mut Device,
+    layout: BankLayout,
+    id: BankId,
+) -> Option<(RunId, u16, u16, Vec<u8>)> {
+    let region = layout.bank(id);
+    let read_len = region.bytes().min(512) as usize;
+    let mut page = vec![0_u8; read_len];
     let Ok(()) = device.read(region.base(), &mut page) else {
         unreachable!("a bank's header is inside the device")
     };
@@ -2132,4 +2142,180 @@ fn an_oversized_bank_and_an_unreadable_bank_prefer_the_higher_generations_own_an
         "the higher-generation bank's own device fault must be the answer, not the lower \
          bank's page-size complaint: {progress:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Codex round 12: a near-capacity refusal is a rollover exit, not a dead end.
+// ---------------------------------------------------------------------------------------
+
+/// Small enough that one effect's own commit leaves the second with nowhere to go.
+const SMALL_INPUT: &[u8] = b"seed";
+
+/// What `continue_as_new` asks for, once the rollover exit is taken.
+const SMALL_NEXT_INPUT: &[u8] = b"next";
+
+const SMALL_BOUNDS: Bounds = Bounds {
+    run_input_bytes: 4,
+    effect_result_bytes: 4,
+    terminal_bytes: 4,
+};
+
+/// A fixed, small erase block: what varies across the search below is how many of them
+/// make up one bank, so the bank size grows in steps of one erase block rather than
+/// doubling — a `BankLayout` needs its capacity to be a whole number of erase blocks, so
+/// varying the erase size itself only ever offers a bank size search a factor of two wide.
+const SMALL_ERASE: u32 = 64;
+
+fn small_geometry(blocks_per_bank: u32) -> Geometry {
+    let Ok(geometry) = Geometry::new(SMALL_ERASE * blocks_per_bank * 2, SMALL_ERASE, 4, 1) else {
+        unreachable!("a whole number of erase blocks, split evenly into two banks")
+    };
+    geometry
+}
+
+fn small_layout(blocks_per_bank: u32) -> BankLayout {
+    let Ok(layout) = BankLayout::new(small_geometry(blocks_per_bank)) else {
+        unreachable!("an even number of erase blocks is two banks")
+    };
+    layout
+}
+
+const fn small_header(run: RunId, layout: BankLayout) -> BankHeader<'static> {
+    BankHeader {
+        run,
+        align: layout.align(),
+        workflow_kind: WORKFLOW_KIND,
+        workflow_version: WORKFLOW_VERSION,
+        input_schema: INPUT_SCHEMA,
+        input: SMALL_INPUT,
+    }
+}
+
+/// Two effects, each propagating a suspension outright — used only to search for a bank
+/// small enough that the second effect's own schedule is the one that meets §10's reserve,
+/// with the first already committed.
+///
+/// Neither activity kind is one [`waymaker_drive::demo::World`] treats specially, so both
+/// answer its four-byte default and never [`waymaker_core::activity::Performed::Exhausted`].
+struct TwoEffectsNoRollover;
+
+impl Workflow for TwoEffectsNoRollover {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: SMALL_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let _ = boundary.call(ActivityKind(6), b"one")?;
+        let _ = boundary.call(ActivityKind(7), b"two")?;
+        Ok(Outcome::Completed(b"done"))
+    }
+}
+
+/// A layout, reserve and freshly booted bank A small enough that
+/// [`TwoEffectsNoRollover`]'s second effect is the one Codex's round 12 finding is about —
+/// searched for rather than written down, so the number comes from the reserve's own
+/// arithmetic over real records, the way `crates/waymaker-drive/tests/matrix.rs`'s own
+/// `near_capacity` is.
+fn near_capacity() -> (BankLayout, Reserve) {
+    for blocks_per_bank in 1_u32..=8 {
+        let layout = small_layout(blocks_per_bank);
+        let Ok(reserve) = Reserve::for_layout(SMALL_BOUNDS, layout) else {
+            continue;
+        };
+        let mut device = Device::new(small_geometry(blocks_per_bank));
+        install_on(
+            &mut device,
+            layout,
+            BankId::A,
+            Generation::FIRST,
+            &small_header(RUN, layout),
+        );
+        let mut page = [0_u8; 512];
+        let mut result = [0_u8; 16];
+        let mut world = waymaker_drive::demo::World::new();
+        let progress = Driver::at_bank(layout, reserve).boot(
+            &mut device,
+            &mut world,
+            &mut TwoEffectsNoRollover,
+            scratch(&mut page, &mut result),
+        );
+        if progress == Err(DriveError::Capacity(Refusal::NearCapacity))
+            && world.dispatched().len() == 1
+        {
+            return (layout, reserve);
+        }
+    }
+    unreachable!("no bank in the search fills after exactly one effect")
+}
+
+/// Performs one effect, then asks for a second. Codex's round 12 finding is that a
+/// suspension is the *only* way a workflow can react to §10's reserved rollover exit — it
+/// cannot inspect [`Suspended`] to learn why it stopped — so this workflow does not
+/// propagate the second suspension with `?` the way [`TwoEffectsNoRollover`] does: it
+/// reacts to it by asking to roll the run over instead, which is `Refusal::NearCapacity`'s
+/// own documented remedy ("stop scheduling, and either end the run or `continue_as_new`").
+struct RolloverOnSuspension;
+
+impl Workflow for RolloverOnSuspension {
+    fn identity(&self) -> Identity<'_> {
+        Identity {
+            kind: WORKFLOW_KIND,
+            versions: VersionRange::exact(WORKFLOW_VERSION),
+            input: SMALL_INPUT,
+        }
+    }
+
+    fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+        let _ = boundary.call(ActivityKind(6), b"one")?;
+        match boundary.call(ActivityKind(7), b"two") {
+            Ok(_) => Ok(Outcome::Completed(b"unexpected room for a second effect")),
+            Err(_) => Err(boundary.continue_as_new(SMALL_NEXT_INPUT)),
+        }
+    }
+}
+
+#[test]
+fn a_near_capacity_refusal_is_still_a_live_rollover_exit_in_the_same_boot() {
+    let (layout, reserve) = near_capacity();
+    let mut device = Device::new(layout.geometry());
+    install_on(
+        &mut device,
+        layout,
+        BankId::A,
+        Generation::FIRST,
+        &small_header(RUN, layout),
+    );
+    let mut page = [0_u8; 512];
+    let mut result = [0_u8; 16];
+    let mut world = waymaker_drive::demo::World::new();
+
+    let progress = Driver::at_bank(layout, reserve).boot(
+        &mut device,
+        &mut world,
+        &mut RolloverOnSuspension,
+        scratch(&mut page, &mut result),
+    );
+
+    // Only the first effect ever ran: the second was refused before the world was asked
+    // anything, exactly as an ordinary near-capacity refusal already promised.
+    assert_eq!(world.dispatched().len(), 1);
+
+    let Ok(Progress::Migrated { run: next_run }) = progress else {
+        unreachable!(
+            "a live `continue_as_new` reacting to the reserved rollover exit must migrate \
+             rather than repeat the capacity error it was handed: {progress:?}"
+        )
+    };
+    assert_eq!(next_run, RUN.successor().expect("RUN has a successor"));
+
+    // The swap really happened: bank B is now authoritative, over the input the workflow
+    // asked `continue_as_new` for rather than the one the retired run started with.
+    let (b_run, _, _, b_input) =
+        header_on_with(&mut device, layout, BankId::B).expect("bank B is now sealed");
+    assert_eq!(b_run, next_run);
+    assert_eq!(b_input, SMALL_NEXT_INPUT);
 }

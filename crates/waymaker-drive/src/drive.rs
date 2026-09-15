@@ -2427,7 +2427,18 @@ impl<S: StableStorage, A: Activities + Clocks, C: IntegrityCheck> Boundary
     }
 
     fn continue_as_new(&mut self, input: &[u8]) -> Suspended {
-        if self.stop.is_none() {
+        // §10's reserve names its own remedy: "stop scheduling, and either end the run or
+        // `continue_as_new`". A pre-mutation near-capacity refusal is that remedy offered
+        // and not yet taken, so a workflow that reacts to it by asking to migrate is not
+        // asking to override a stop this boot already committed to — it is exercising the
+        // one exit §10 reserved capacity for. Every other stop — a wait, a finished run, an
+        // unrelated failure, or a `continue_as_new` this same call already decided — still
+        // wins, because those are not offers open for the taking.
+        let reserved_rollover = matches!(
+            self.stop,
+            Some(Stop::Failed(DriveError::Capacity(Refusal::NearCapacity)))
+        );
+        if self.stop.is_none() || reserved_rollover {
             self.stop = Some(match self.swap_in(input) {
                 Ok(run) => Stop::Migrated(run),
                 Err(error) => Stop::Failed(error),
