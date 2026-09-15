@@ -4117,6 +4117,12 @@ fn pattern_binds_a_name(pat: &syn::Pat) -> bool {
 /// rather than a silent gap, the same standing `wire-format`'s literal comparison and
 /// `effect-scheduled-fields`'s name comparison already have.
 ///
+/// A rebind spelled inside a macro's own token body is invisible to every route above
+/// (issue #189): `syn` never expands a macro, the same opacity [`invokes_any_macro`]'s
+/// own doc comment states for a construction site. This function has one caller, and
+/// that caller's file refuses any macro at all through `invokes_any_macro` first — so a
+/// macro that hides a rebind is still refused as a macro before this gap can be reached.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
@@ -14053,6 +14059,27 @@ mod raw_identifier_tests {
         let mut sorted = found;
         sorted.sort_unstable();
         assert_eq!(sorted, ["intent", "request"], "{sorted:?}");
+    }
+
+    #[test]
+    fn a_rebind_hidden_inside_a_macro_invocation_is_invisible_to_this_scan_alone() {
+        // Issue #189: a macro's token body is opaque to `syn`, the same limit
+        // `invokes_any_macro`'s own doc comment states. This scan sees real
+        // `syn::Expr`/`syn::Pat` nodes only, so a rebind spelled inside one is
+        // outside its reach. `effect.rs`, this function's one caller, closes the
+        // gap one level up: it refuses any macro at all, so a macro that hides a
+        // rebind is still refused as a macro. See
+        // `source::tests::a_proof_field_rebind_hidden_behind_a_macro_is_reported`.
+        let found = mutated_field_names(
+            "macro_rules! rebind {\n\
+             \x20   ($p:expr, $v:expr) => { $p = $v };\n\
+             }\n\
+             fn tamper(dispatch: &mut Foo, other: u8) {\n\
+             \x20   rebind!(dispatch.bytes, other);\n}",
+            &["bytes"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
