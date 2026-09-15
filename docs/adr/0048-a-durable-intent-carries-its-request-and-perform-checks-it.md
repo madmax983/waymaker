@@ -273,6 +273,18 @@ a scanner cannot expand a macro, so it refuses the construct rather than trying 
 through it. `a_macro_rules_in_the_effect_protocol_file_is_reported` is the regression,
 confirmed RED against the unpatched rule.
 
+**Codex found the gap that ban left open in the same round.** Reading the `macro_rules`
+identifier catches a *definition*, not an *invocation* of a macro defined anywhere else in
+the crate — `emit!(CheckedDispatch { intent, bytes })` spells no such identifier at all, and
+its token body is exactly as opaque to `syn::Visit` as a local definition's. `syn::Macro` is
+the one type every invocation site shares — `ItemMacro`, `StmtMacro`, `ExprMacro`,
+`TypeMacro` and `PatMacro` each carry one — so `crate::parse::invokes_any_macro` overrides
+`visit_macro` once instead, which catches all five invocation shapes, `macro_rules!`
+included, without naming any of them individually; the identifier-only check in
+`check_effect_types` is retired in its favour. `effect.rs` now refuses the file outright over
+any macro use at all, outside `#[cfg(test)]`. `a_macro_invocation_in_the_effect_protocol_file_is_reported`
+is the regression, confirmed RED against the identifier-only check.
+
 ## Consequences
 
 A caller cannot dispatch one effect's identity under another effect's kind, cannot dispatch

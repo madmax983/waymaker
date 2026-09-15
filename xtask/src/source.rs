@@ -7797,10 +7797,9 @@ fn check_no_hidden_state(
 /// under `cfg(test)` discharges nothing about the code that ships.
 ///
 /// What it cannot see is a protocol step added from another file — it pins one file, exactly
-/// as `capacity-reserve`, `recovery-surface` and `storage-contract` each do — a method a
-/// macro expands to, and whether the barriers are real, which is §12's contract and
-/// `waymaker-conformance`'s across-reset witness. The crash windows are
-/// `crates/waymaker-drive/tests/crash.rs`.
+/// as `capacity-reserve`, `recovery-surface` and `storage-contract` each do — and whether the
+/// barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset
+/// witness. The crash windows are `crates/waymaker-drive/tests/crash.rs`.
 #[must_use]
 pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violation> {
     const RULE: &str = "effect-protocol";
@@ -7828,6 +7827,7 @@ pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violati
     violations.extend(check_checked_dispatch_construction(&source.contents));
     violations.extend(check_effect_proof_fields_are_not_rebound(&source.contents));
     violations.extend(check_no_projected_type_aliases(&source.contents));
+    violations.extend(check_effect_invokes_no_macro(&source.contents));
     violations.extend(check_effect_steps(&code));
     violations
 }
@@ -7852,23 +7852,6 @@ fn check_effect_types(code: &str, contents: &str) -> Vec<Violation> {
                 "{EFFECT_PROTOCOL_PATH} declares a module: \u{a7}07's protocol is one flat \
                  module, because the method pin below reads `impl` at column zero and an \
                  `impl` inside a submodule escapes it"
-            ),
-        ));
-    }
-
-    // `syn::Visit` does not descend into a `macro_rules!` body — it is an opaque token
-    // stream — so a local macro expanding to `CheckedDispatch { intent, bytes }` builds the
-    // pinned type under a construction site none of the scans below can see (Codex review).
-    // The same shape `ctx-facade` already refuses outright for the same reason: a scanner
-    // cannot expand a macro, so it refuses the construct.
-    if names_identifier(code, "macro_rules") {
-        violations.push(Violation::new(
-            RULE,
-            DRIVER,
-            format!(
-                "{EFFECT_PROTOCOL_PATH} declares a `macro_rules!`, which can expand a \
-                 `CheckedDispatch` literal or a proof-field rebinding where no scan below \
-                 can read it"
             ),
         ));
     }
@@ -8219,6 +8202,44 @@ fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
                 ),
             )]
         }
+        Err(error) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} could not be parsed ({error}); an unreadable module \
+                 fails closed"
+            ),
+        )],
+    }
+}
+
+/// `effect.rs` invokes no macro at all, outside `#[cfg(test)]`.
+///
+/// `syn::Visit` treats a macro's token body as opaque, whether it is a `macro_rules!`
+/// definition or a plain invocation of one defined anywhere else in the crate — a local
+/// `escape_hatch!()` and an inherited `emit!(CheckedDispatch { intent, bytes })` are the
+/// same blind spot under two spellings, and a ban that reads only the identifier
+/// `macro_rules` catches the first and not the second (Codex's fifteenth round on issue
+/// #92: "fresh evidence after the local-macro fix" was exactly this — an invocation of a
+/// macro defined in `lib.rs` or another ancestor scope). [`crate::parse::invokes_any_macro`]
+/// is the one check that closes both at once, the same shape as the qualified
+/// associated-type-projection ban just above: a hard refusal of an unauditable construct
+/// rather than an attempt to see through it.
+fn check_effect_invokes_no_macro(contents: &str) -> Vec<Violation> {
+    const RULE: &str = "effect-protocol";
+    const DRIVER: &str = "waymaker-drive";
+
+    match crate::parse::invokes_any_macro(contents) {
+        Ok(false) => Vec::new(),
+        Ok(true) => vec![Violation::new(
+            RULE,
+            DRIVER,
+            format!(
+                "{EFFECT_PROTOCOL_PATH} invokes a macro: whether it is defined locally or \
+                 elsewhere, its token body can expand a `CheckedDispatch` literal or a \
+                 proof-field rebinding where no scan here can read it"
+            ),
+        )],
         Err(error) => vec![Violation::new(
             RULE,
             DRIVER,
@@ -12861,7 +12882,26 @@ mod deferred_answer_pins {
             + "macro_rules! escape_hatch {\n    () => {};\n}\n";
         let details = effect_details(&source);
         assert!(
-            details.iter().any(|detail| detail.contains("macro_rules")),
+            details
+                .iter()
+                .any(|detail| detail.contains("invokes a macro")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_invocation_in_the_effect_protocol_file_is_reported() {
+        // Codex's fifteenth round: banning the `macro_rules` identifier catches only a
+        // *definition*, not an invocation of a macro defined anywhere else in the crate —
+        // `emit!(CheckedDispatch { intent, bytes })` spells no such identifier at all, and
+        // its token body is exactly as opaque to `syn::Visit` as a local definition's.
+        let source =
+            tests_support::clean_effect_module() + "fn extra() {\n    let _ = format!(\"x\");\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("invokes a macro")),
             "{details:?}"
         );
     }

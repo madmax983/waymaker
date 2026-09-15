@@ -1115,6 +1115,57 @@ pub fn mutated_field_names(contents: &str, names: &[&str]) -> Result<Vec<String>
     Ok(visitor.found)
 }
 
+/// Whether `contents` invokes any macro at all, outside `#[cfg(test)]`.
+///
+/// `syn::Visit` treats a macro's token body as opaque — it is exactly the shape a
+/// `macro_rules!` definition already has to be refused for, and it is also the shape of
+/// a plain *invocation*: `emit!(CheckedDispatch { intent, bytes })`, calling a macro
+/// defined anywhere else in the crate, builds the same construction site under tokens no
+/// scan built on [`struct_literal_counts`] or [`mutated_field_names`] can read (issue #92,
+/// Codex's fifteenth round — a passthrough invocation is the gap a ban on `macro_rules!`
+/// alone leaves open, since that ban reads a definition's own identifier and an invocation
+/// spells no such thing). `syn::Macro` is the one type every invocation site shares —
+/// `ItemMacro`, `StmtMacro`, `ExprMacro`, `TypeMacro` and `PatMacro` each carry one — so a
+/// single override of `visit_macro` catches all five, `macro_rules!` included, without
+/// naming any of them individually.
+///
+/// # Errors
+///
+/// Returns [`syn::Error`] when `contents` does not parse as Rust.
+pub fn invokes_any_macro(contents: &str) -> Result<bool, syn::Error> {
+    struct AnyMacro {
+        found: bool,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for AnyMacro {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            if has_cfg_test(item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_item(self, node);
+        }
+
+        fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+            if has_cfg_test(impl_item_attrs(node)) {
+                return;
+            }
+            syn::visit::visit_impl_item(self, node);
+        }
+
+        fn visit_macro(&mut self, _node: &'ast syn::Macro) {
+            self.found = true;
+            // The body is an opaque token stream, so there is nothing further to descend
+            // into; `syn::visit::visit_macro` would only walk `node.path`, which is not a
+            // construction site.
+        }
+    }
+
+    let file = parse_rust(contents)?;
+    let mut visitor = AnyMacro { found: false };
+    visitor.visit_file(&file);
+    Ok(visitor.found)
+}
+
 /// How many `fn name` items `contents` declares, at any nesting depth.
 ///
 /// Free functions, trait declarations, trait method defaults, and inherent methods
