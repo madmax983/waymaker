@@ -2959,9 +2959,114 @@ fn stmt_let_type(
     Some((ident_name(&ident.ident), ty))
 }
 
+/// Whether `pat` binds a single, bare name with no tuple and no `@` sub-pattern, unwrapping
+/// a type ascription (`Pat::Type`) the identical way [`stmt_let_type`] does for a `let` that
+/// carries an initializer. Shared by [`block_uninitialized_let_statement_count`] (which only
+/// counts a no-initializer `let` of this shape) and [`resolve_uninitialized_let`] (which only
+/// knows how to track one), so the two stay in lock-step by construction the way every other
+/// counted-and-resolved pair in this module already does.
+fn local_pattern_is_single_ident(pat: &syn::Pat) -> bool {
+    let pat = match pat {
+        syn::Pat::Type(pat_type) => pat_type.pat.as_ref(),
+        other => other,
+    };
+    matches!(pat, syn::Pat::Ident(ident) if ident.subpat.is_none())
+}
+
+/// The count of every `let NAME;` or `let NAME: TYPE;` declared *directly* in `block` with no
+/// initializer at all — legal Rust exactly as long as every read of `NAME` is preceded, in
+/// source order, by an assignment to it, and counted rather than resolved for the identical
+/// reason [`block_ignored_let_count`] counts a wildcard `let` instead of folding it: nothing
+/// here has a *value* yet, only a declaration.
+///
+/// Codex's finding: `{ let x: u8; x = n; x }` names exactly this shape — [`production_stmts`]
+/// never excluded it, since it is an ordinary `Stmt::Local` and not a transparent item, but
+/// neither [`block_let_statement_count`] (which requires an initializer to destructure) nor
+/// [`block_ignored_let_count`] (which requires a wildcard pattern) ever counted it, so
+/// [`evaluate_block`]'s own statement-count invariant always came up one short and the whole
+/// block refused before its own later assignment to `x` ever had a chance to run. This is the
+/// missing counting term; [`resolve_uninitialized_let`] is the missing resolution half.
+fn block_uninitialized_let_statement_count(block: &syn::Block) -> usize {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| {
+            let syn::Stmt::Local(local) = stmt else {
+                return false;
+            };
+            if has_cfg_test(&local.attrs) {
+                return false;
+            }
+            if local.init.is_some() {
+                return false;
+            }
+            local_pattern_is_single_ident(&local.pat)
+        })
+        .count()
+}
+
+/// A `let NAME;` or `let NAME: TYPE;` declaration with no initializer, tracked rather than
+/// folded: there is no value to resolve, only a name — and, when the pattern ascribes one, a
+/// type — for a *later* assignment to supply. Declaring one shadows any outer `NAME` this
+/// scope already resolved a value for: real Rust would refuse a read of the new `NAME` before
+/// this scope's own first assignment to it, so a stale outer value left visible here would be
+/// a value nothing in legal Rust could actually observe. [`ShadowSnapshot`] still captures
+/// the outer value and type once, the identical way [`resolve_sequential_let`]'s own shadow
+/// does, so both are restored once this declaration's own enclosing scope exits.
+///
+/// Only [`local_pattern_is_single_ident`]'s own shape is tracked; anything else is left
+/// alone; a block relying on a pattern this narrow cannot fold is a block
+/// [`block_uninitialized_let_statement_count`] does not count either, so it refuses the same
+/// way an unhandled `let` with an initializer already does elsewhere in this module.
+fn resolve_uninitialized_let(
+    local: &syn::Local,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+    shadow_snapshot: &mut ShadowSnapshot,
+) {
+    if !local_pattern_is_single_ident(&local.pat) {
+        return;
+    }
+    let (pat, ascribed) = match &local.pat {
+        syn::Pat::Type(pat_type) => (
+            pat_type.pat.as_ref(),
+            single_segment_type_name(&pat_type.ty),
+        ),
+        other => (other, None),
+    };
+    let syn::Pat::Ident(ident) = pat else {
+        return;
+    };
+    let name = ident_name(&ident.ident);
+    shadow_snapshot.entry(name.clone()).or_insert_with(|| {
+        (
+            resolved.get(&name).copied(),
+            local_types.get(&name).cloned(),
+        )
+    });
+    resolved.remove(&name);
+    local_types.remove(&name);
+    if let Some(ty) = ascribed {
+        local_types.insert(name, ty);
+    }
+}
+
+/// Whether `pat` is a wildcard `_` — unwrapping a type ascription (`Pat::Type`) the same way
+/// [`destructured_binding`]'s own `Pat::Type` case does, since `let _: u8 = EXPR;` discards
+/// exactly as much as an unascribed `let _ = EXPR;` does. Shared by [`block_ignored_let_count`]
+/// (which only *counts* such a statement) and [`resolve_sequential_let`] (which now still has
+/// to *run* its initializer for any side effect a real `let _ = EXPR;` would perform).
+fn pattern_is_wildcard(pat: &syn::Pat) -> bool {
+    match pat {
+        syn::Pat::Type(pat_type) => pattern_is_wildcard(&pat_type.pat),
+        syn::Pat::Wild(_) => true,
+        _ => false,
+    }
+}
+
 /// The count of every plain `let _ = EXPR;` declared *directly* as a statement in `block` —
-/// a value-discarding binding, counted rather than resolved, since nothing later in the
-/// block can reference a name a wildcard pattern never bound.
+/// a value-discarding binding, counted rather than resolved for its own *value*, since
+/// nothing later in the block can reference a name a wildcard pattern never bound.
 ///
 /// Codex's next-round finding: `const P0: u8 = { let _ = core::marker::PhantomData::<()>; 0
 /// };` holds a statement [`block_let_exprs`] correctly leaves out of its own map — its
@@ -2969,19 +3074,16 @@ fn stmt_let_type(
 /// [`evaluate_block`]'s own statement-count check has no way to tell "a statement this scan
 /// cannot fold" from "a statement that folds to nothing on purpose", so the whole block was
 /// refused rather than only a block genuinely holding the former. Counted here instead of
-/// resolved: a real `let _ = EXPR;` never reads `EXPR`'s own value again, so this scan does
-/// not need to fold it either — only to know the statement was legitimately accounted for.
+/// resolved: a real `let _ = EXPR;` never reads `EXPR`'s own *value* again, so this scan does
+/// not need to fold one either — only to know the statement was legitimately accounted for.
 /// Scoped the same way [`block_let_exprs`] is: no `#[cfg(test)]` statement, and no
 /// `let-else` diverge arm, whose reachability this scan does not decide.
+///
+/// Codex's next-round finding: a *value* is not the only thing a real `let _ = EXPR;` can
+/// leave behind — [`resolve_sequential_let`] now runs `EXPR` for any mutation it performs,
+/// which is a resolution concern rather than a counting one, so this function's own count
+/// is unaffected by it.
 fn block_ignored_let_count(block: &syn::Block) -> usize {
-    fn is_wildcard(pat: &syn::Pat) -> bool {
-        match pat {
-            syn::Pat::Type(pat_type) => is_wildcard(&pat_type.pat),
-            syn::Pat::Wild(_) => true,
-            _ => false,
-        }
-    }
-
     block
         .stmts
         .iter()
@@ -2998,7 +3100,7 @@ fn block_ignored_let_count(block: &syn::Block) -> usize {
             if init.diverge.is_some() {
                 return false;
             }
-            is_wildcard(&local.pat)
+            pattern_is_wildcard(&local.pat)
         })
         .count()
 }
@@ -4010,6 +4112,15 @@ fn resolve_block_locals(
 /// shadowing a typed `x` has to lose that type exactly as much as a typed shadow has to
 /// replace it, since a shadow this scan cannot ascribe a type to is a shadow whose type is
 /// unknown, not one that inherits its predecessor's.
+///
+/// Codex's next-round finding: a wildcard pattern binds nothing for [`destructured_binding`]
+/// to loop over, so `bound_names` stays empty and every line above is a no-op for a plain
+/// `let _ = EXPR;` — which is correct for `EXPR`'s own *value*, since nothing later in the
+/// block can read a name a wildcard never bound, but wrong for a *mutation* `EXPR` performs:
+/// real Rust still evaluates it. [`resolve_wildcard_let_side_effects`] is what runs it, called
+/// only once `bound_names` is confirmed empty and the pattern is confirmed a wildcard, so an
+/// unrecognised pattern that also happens to bind nothing (already refused elsewhere, by
+/// `block_let_statement_count`'s own count leaving it out) is not mistaken for one.
 fn resolve_sequential_let(
     local: &syn::Local,
     init: &syn::LocalInit,
@@ -4017,7 +4128,7 @@ fn resolve_sequential_let(
     local_types: &mut std::collections::HashMap<String, String>,
     resolved: &mut std::collections::HashMap<String, i128>,
     shadow_snapshot: &mut ShadowSnapshot,
-) {
+) -> Option<()> {
     let ascribed_type = stmt_let_type(local, init, resolve);
     let mut bound_names = Vec::new();
     for (name, expr) in destructured_binding(&local.pat, &init.expr) {
@@ -4075,6 +4186,68 @@ fn resolve_sequential_let(
     }
     if let Some((name, ty)) = ascribed_type {
         local_types.insert(name, ty);
+    }
+    if bound_names.is_empty() && pattern_is_wildcard(&local.pat) {
+        resolve_wildcard_let_side_effects(&init.expr, resolve, local_types, resolved)?;
+    }
+    Some(())
+}
+
+/// A wildcard-pattern `let _ = EXPR;`'s own initializer, run for whatever side effect it
+/// performs — never for its value, which nothing can read once `_` has discarded it.
+///
+/// Codex's finding: `{ let mut x: u8 = n * 10; let old = x; let _ = { x = n; old }; x }`
+/// mutates `x` back to `n` inside the wildcard's own initializer block before discarding the
+/// block's own value (`old`); real Rust performs that assignment and the outer `x` reads `n`
+/// afterward, while a scan that evaluates no side effect at all for a wildcard leaves `x` at
+/// `n * 10`. Only a bare, unlabelled block initializer is interpreted — the identical shape,
+/// and for the identical reason, [`resolve_block_sequential`]'s own nested-block-statement
+/// arm exists: it opens its own lexical scope for anything it declares, undone by its own
+/// [`ShadowSnapshot`] once it exits, while a mutation of an outer name inside it — this
+/// scan's `resolved` map has no scoping of its own to speak of — persists exactly the way a
+/// real mutation would. [`block_stmts_for_discarded_value`] is what excludes the block's own
+/// tail from that walk: the whole point of a wildcard binding is discarding the block's
+/// result, so nothing here needs to interpret what the tail is, only that everything *before*
+/// it ran. Any other initializer shape — a bare name, a literal, a call such as
+/// `core::marker::PhantomData::<()>` — is left exactly as untouched as it always was, since
+/// none of those can carry a mutation this scan would otherwise miss.
+fn resolve_wildcard_let_side_effects(
+    expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    let syn::Expr::Block(nested) = strip_parens(expr) else {
+        return Some(());
+    };
+    if nested.label.is_some() {
+        return Some(());
+    }
+    let mut nested_snapshot = ShadowSnapshot::new();
+    resolve_block_sequential(
+        &block_stmts_for_discarded_value(&nested.block),
+        resolve,
+        local_types,
+        resolved,
+        &mut nested_snapshot,
+    )?;
+    restore_shadow_snapshot(local_types, resolved, nested_snapshot);
+    Some(())
+}
+
+/// `block`'s own production statements, minus its trailing value-tail *only when it has one*
+/// — unlike [`block_non_tail_stmts`], which always drops the last production statement
+/// because [`evaluate_block`]'s own caller has already confirmed that statement is a real
+/// `Stmt::Expr(_, None)` tail before ever asking. A block discarded whole by a wildcard `let`
+/// carries no such guarantee: `{ x = n; }` (its last statement sealed by a semicolon, so the
+/// block's own value is `()`) is exactly as legal an initializer as `{ x = n; old }` is, and
+/// unconditionally dropping its one and only statement would silently skip the very mutation
+/// [`resolve_wildcard_let_side_effects`] exists to run.
+fn block_stmts_for_discarded_value(block: &syn::Block) -> Vec<&syn::Stmt> {
+    let stmts = production_stmts(block);
+    match stmts.split_last() {
+        Some((syn::Stmt::Expr(_, None), rest)) => rest.to_vec(),
+        _ => stmts,
     }
 }
 
@@ -4547,6 +4720,7 @@ fn resolve_block_sequential(
         let expr = match stmt {
             syn::Stmt::Local(local) => {
                 let Some(init) = local.init.as_ref() else {
+                    resolve_uninitialized_let(local, local_types, resolved, shadow_snapshot);
                     continue;
                 };
                 if init.diverge.is_some() {
@@ -4567,7 +4741,7 @@ fn resolve_block_sequential(
                     local_types,
                     resolved,
                     shadow_snapshot,
-                );
+                )?;
                 continue;
             }
             syn::Stmt::Item(_) => continue,
@@ -4605,62 +4779,96 @@ fn resolve_block_sequential(
             evaluate_if_statement(if_expr, resolve, local_types, resolved)?;
             continue;
         }
-        let (name, op, rhs_expr) = mutation_target(expr)?;
-        let &current_value = resolved.get(&name)?;
-        let mutation_resolve_value = |path: &syn::Path| {
-            path.get_ident()
-                .map(ident_name)
-                .and_then(|candidate| resolved.get(&candidate).copied())
-                .or_else(|| (resolve.value)(path))
-        };
-        let mutation_resolve_unsigned = |path: &syn::Path| {
-            resolved_local_name(path, resolved).map_or_else(
-                || (resolve.unsigned)(path),
-                |candidate| {
-                    local_types
-                        .get(&candidate)
-                        .is_some_and(|name| is_unsigned_type_name(name))
-                },
-            )
-        };
-        let mutation_resolve_width = |path: &syn::Path| {
-            resolved_local_name(path, resolved).map_or_else(
-                || (resolve.width)(path),
-                |candidate| local_types.get(&candidate).map(String::as_str),
-            )
-        };
-        let mutation_resolve = Resolve {
-            value: &mutation_resolve_value,
-            unsigned: &mutation_resolve_unsigned,
-            width: &mutation_resolve_width,
-        };
-        let declared_type = local_types.get(&name).map(String::as_str);
-        // Codex's finding: `x = x - 100;` is `syn::Expr::Assign` rather than one of the ten
-        // compound-assignment `syn::Expr::Binary` shapes, so `op` is `None` here exactly
-        // when `mutation_target` recognised a plain `=` — its new value is `rhs_expr`'s own,
-        // evaluated against the scope as it stands *before* this statement's write, with no
-        // synthetic binary needed at all; `current_value` above still gates it on the target
-        // already being a local this scan resolved, the identical refusal a compound
-        // assignment to an untracked name already gets, for the identical reason.
-        //
-        // Codex's next-round finding: the plain-assignment arm called `literal_or_const_value`
-        // directly, discarding the same `declared_type` the compound-assignment arm beside it
-        // already threads through — but Rust uses the *target's* own declared type as the
-        // RHS's expected type for a plain assignment exactly as it does for a typed `let`, so
-        // `x = !255 + n;` against a `let mut x: u8 = ..;` needs it the identical way
-        // `resolve_declared_initializer` already serves a `let`'s own initializer.
-        let updated = match &op {
-            Some(assign_op) => apply_compound_assignment(
+        resolve_mutation_statement(expr, resolve, &*local_types, resolved)?;
+    }
+    Some(())
+}
+
+/// A plain `x = EXPR;` or compound `x OP= EXPR;` statement — [`resolve_block_sequential`]'s
+/// own fallback for a `Stmt::Expr` that named none of `While`/`Block`/`If`. Factored out to
+/// its own function, the way [`evaluate_if_statement`]'s own body already is, so the caller
+/// stays under clippy's line count rather than because the two halves are otherwise
+/// unrelated.
+///
+/// Codex's finding: `{ let x: u8; x = n; x }` is exactly the shape [`resolve_uninitialized_let`]
+/// now tracks — declared, with a type, but with no value in `resolved` at all until this very
+/// statement supplies its first one — and this used to require `resolved.get(&name)` to
+/// already succeed *before* even asking whether the assignment was plain or compound,
+/// refusing the identical block a compound assignment to the same untracked name would have
+/// refused for a real reason. A compound assignment still needs a current value to combine
+/// with (there is no other reading of `x += 1;` against a name nothing has assigned yet, so
+/// it stays gated exactly as before); a plain assignment does not, and is gated instead on
+/// the target being a name this scan is tracking *at all* — already resolved, or declared via
+/// `local_types` with or without a value — so an assignment to some name the scan never saw
+/// declared still refuses, the identical refusal an untracked compound assignment already
+/// gets.
+fn resolve_mutation_statement(
+    expr: &syn::Expr,
+    resolve: &Resolve<'_>,
+    local_types: &std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    let (name, op, rhs_expr) = mutation_target(expr)?;
+    if op.is_none() && !resolved.contains_key(&name) && !local_types.contains_key(&name) {
+        return None;
+    }
+    let mutation_resolve_value = |path: &syn::Path| {
+        path.get_ident()
+            .map(ident_name)
+            .and_then(|candidate| resolved.get(&candidate).copied())
+            .or_else(|| (resolve.value)(path))
+    };
+    let mutation_resolve_unsigned = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.unsigned)(path),
+            |candidate| {
+                local_types
+                    .get(&candidate)
+                    .is_some_and(|name| is_unsigned_type_name(name))
+            },
+        )
+    };
+    let mutation_resolve_width = |path: &syn::Path| {
+        resolved_local_name(path, resolved).map_or_else(
+            || (resolve.width)(path),
+            |candidate| local_types.get(&candidate).map(String::as_str),
+        )
+    };
+    let mutation_resolve = Resolve {
+        value: &mutation_resolve_value,
+        unsigned: &mutation_resolve_unsigned,
+        width: &mutation_resolve_width,
+    };
+    let declared_type = local_types.get(&name).map(String::as_str);
+    // Codex's finding: `x = x - 100;` is `syn::Expr::Assign` rather than one of the ten
+    // compound-assignment `syn::Expr::Binary` shapes, so `op` is `None` here exactly
+    // when `mutation_target` recognised a plain `=` — its new value is `rhs_expr`'s own,
+    // evaluated against the scope as it stands *before* this statement's write, with no
+    // synthetic binary needed at all; the `op.is_none()` check above still gates it on
+    // the target already being a name this scan is tracking, the identical refusal a
+    // compound assignment to an untracked name already gets below, for the identical
+    // reason.
+    //
+    // Codex's next-round finding: the plain-assignment arm called `literal_or_const_value`
+    // directly, discarding the same `declared_type` the compound-assignment arm beside it
+    // already threads through — but Rust uses the *target's* own declared type as the
+    // RHS's expected type for a plain assignment exactly as it does for a typed `let`, so
+    // `x = !255 + n;` against a `let mut x: u8 = ..;` needs it the identical way
+    // `resolve_declared_initializer` already serves a `let`'s own initializer.
+    let updated = match &op {
+        Some(assign_op) => {
+            let &current_value = resolved.get(&name)?;
+            apply_compound_assignment(
                 current_value,
                 declared_type,
                 assign_op,
                 &rhs_expr,
                 &mutation_resolve,
-            )?,
-            None => resolve_declared_initializer(&rhs_expr, declared_type, &mutation_resolve)?,
-        };
-        resolved.insert(name, updated);
-    }
+            )?
+        }
+        None => resolve_declared_initializer(&rhs_expr, declared_type, &mutation_resolve)?,
+    };
+    resolved.insert(name, updated);
     Some(())
 }
 
@@ -4741,6 +4949,11 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // statement, but one this sum counts structurally rather than through
     // `block_let_statement_count`, since a let-else needs its pattern actually checked
     // against its scrutinee before anyone can say whether it bound a name at all.
+    // `block_uninitialized_let_statement_count` is `block_ignored_let_count`'s own twin one
+    // more time over: a `let NAME;`/`let NAME: TYPE;` with no initializer binds a name too,
+    // but not yet a *value* — `production_stmts` never excluded it, and nothing before this
+    // counted it either, so `rest` always came up one statement short of every other term
+    // here and the whole block refused before a later assignment to `NAME` ever ran.
     if rest.len()
         != const_item_count
             + block_let_statement_count(block)
@@ -4749,6 +4962,7 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
             + block_nested_block_statement_count(block)
             + block_if_statement_count(block)
             + block_let_else_statement_count(block)
+            + block_uninitialized_let_statement_count(block)
             + ignored_lets
     {
         return None;
@@ -5569,25 +5783,37 @@ fn resolve_declared_initializer(
         return Some(value);
     }
     let width = declared_type?;
+    let rewritten = propagate_declared_width(expr, width)?;
+    literal_or_const_value(&rewritten, resolve)
+}
+
+/// Rewrites every bare, unsuffixed bitwise-NOT [`cast_bare_negation_to_width`] can reach from
+/// `expr` into `!(LITERAL as width)` — not only `expr` itself, and not only its own immediate
+/// two operands when it is a binary, but recursively through every operand of every binary
+/// nested inside it, since real Rust propagates one declaration's expected type through the
+/// *whole* arithmetic expression it types rather than stopping one level in.
+///
+/// Codex's finding: `const Pn: u8 = (!255 + n) + 0;` names a bare negation two binary levels
+/// down from the declaration — [`resolve_declared_initializer`]'s own rewrite used to reach
+/// `expr` itself and its immediate two operands (`!255 + n` and `0`) and stop there; neither
+/// of those two is itself a bare negation, so both tries declined and the whole expression
+/// stayed unresolved even though the declaration's own width was exactly what `!255` needed.
+/// This recurses into a binary operand that is itself a binary, trying the identical rewrite
+/// one level further in each time, so a bare negation is found no matter how many arithmetic
+/// operators separate it from the declaration. An operand that already resolves on its own
+/// (`n`, a literal, a path) is left untouched at every level, and the fully reconstructed
+/// expression is handed back to [`literal_or_const_value`]'s own dispatch rather than
+/// evaluated here, so every operator still goes through the identical width- and sign-aware
+/// evaluator every other binary expression does.
+fn propagate_declared_width(expr: &syn::Expr, width: &str) -> Option<syn::Expr> {
     if let Some(rewritten) = cast_bare_negation_to_width(expr, width) {
-        return literal_or_const_value(&rewritten, resolve);
+        return Some(rewritten);
     }
-    // Codex's finding: `const Pn: u8 = !255 + n;` names a bare negation that is not the
-    // *whole* initializer but one operand of a binary expression wrapping it — the shape
-    // above alone still declines it, because `expr` itself is `Expr::Binary`, not
-    // `Expr::Unary`. Real Rust propagates the declaration's own expected type into *both*
-    // operands of an arithmetic binary the identical way it does for the initializer as a
-    // whole, so each operand gets the same rewrite tried on it independently; an operand
-    // that already resolves on its own (`n`, a literal or a path) is left untouched, and the
-    // reconstructed binary is handed back to `literal_or_const_value`'s own `Expr::Binary`
-    // dispatch rather than evaluated here, so `Add`/`Sub`/`Mul` and every other operator
-    // still go through the identical width- and sign-aware evaluator every other binary
-    // expression does.
     let syn::Expr::Binary(binary) = strip_parens(expr) else {
         return None;
     };
-    let left = cast_bare_negation_to_width(&binary.left, width);
-    let right = cast_bare_negation_to_width(&binary.right, width);
+    let left = propagate_declared_width(&binary.left, width);
+    let right = propagate_declared_width(&binary.right, width);
     if left.is_none() && right.is_none() {
         return None;
     }
@@ -5598,7 +5824,7 @@ fn resolve_declared_initializer(
     if let Some(right) = right {
         rewritten.right = Box::new(right);
     }
-    literal_or_const_value(&syn::Expr::Binary(rewritten), resolve)
+    Some(syn::Expr::Binary(rewritten))
 }
 
 /// Rewrites a bare, unsuffixed bitwise-NOT — `!255`, with no cast and no path of its own to

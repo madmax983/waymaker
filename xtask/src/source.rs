@@ -22086,6 +22086,42 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_with_a_bitwise_not_two_binary_levels_deep_is_reported() {
+        // Codex's finding: `const Pn: u8 = (!255 + n) + 0;` names a bare, unsuffixed negation
+        // two binary levels down from the declaration — the previous fix's own rewrite
+        // reached `expr` itself and its immediate two operands (`!255 + n` and `0`), neither
+        // of which is itself a bare negation, so both tries declined and the whole
+        // expression stayed unresolved. `propagate_declared_width` now recurses into a binary
+        // operand that is itself a binary, trying the identical rewrite one level further in,
+        // so `!255` is found and rewritten to `!(255 as u8)` regardless of how many
+        // arithmetic operators separate it from `Pn`'s own declaration. Verified against real
+        // rustc, warning-free: `(!255 + n) + 0` for `n` in `0..=14` is the dense `0..14`
+        // sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(constants, "    const P{n}: u8 = (!255 + {n}) + 0;");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_bitwise_not_two_binary_levels_deep(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_with_a_while_let_bound_body_is_reported() {
         // Codex's finding: `while let x @ 1 = y { out = x - 1 + n; y = 0; }` binds `x`
         // through the loop's own condition — but `evaluate_while_loop` reduced that
@@ -22232,6 +22268,89 @@ mod deferred_answer_pins {
         let _ = write!(
             source,
             "\nconst fn dense_table_over_a_successful_let_else_binding(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_wildcard_let_initializer_mutation_is_reported() {
+        // Codex's finding: `destructured_binding` correctly returns no names for a wildcard
+        // pattern, but nothing evaluated `EXPR` at all in `let _ = EXPR;`, so a mutation
+        // written inside it never reached `resolved`. `{ let mut x: u8 = n * 10; let old = x;
+        // let _ = { x = n; old }; x }` mutates `x` back to `n` inside the wildcard's own
+        // initializer block before discarding the block's own value (`old`) — real Rust
+        // performs that assignment and the outer `x` reads `n` afterward, while a scanner
+        // that runs no side effect for a wildcard keeps `x` at `n * 10`, a sparse,
+        // non-monotonic set of sixteen values that would let a dense match past
+        // `integrity-check` undetected. `resolve_wildcard_let_side_effects` now walks the
+        // wildcard's own block initializer (minus its own discarded tail) through the same
+        // sequential interpreter every other nested scope uses. Verified against real rustc,
+        // warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = {n}u8 * 10; let old = x; let _ = {{ x \
+                 = {n}u8; old }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_wildcard_let_mutation(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_an_uninitialized_let_is_reported() {
+        // Codex's finding: `{ let x: u8; x = n; x }` names a declaration with no initializer
+        // at all — legal Rust as long as every read of `x` is preceded by an assignment to
+        // it — but `production_stmts` never excluded it while neither
+        // `block_let_statement_count` (which requires an initializer to destructure) nor
+        // `block_ignored_let_count` (which requires a wildcard pattern) ever counted it, so
+        // `evaluate_block`'s own statement-count invariant always came up one short and the
+        // whole block refused before the later assignment to `x` ever ran.
+        // `block_uninitialized_let_statement_count` now counts the declaration and
+        // `resolve_uninitialized_let` tracks its declared type until `x = n;` — now permitted
+        // to be `x`'s very first value, since a plain assignment no longer requires an
+        // existing `resolved` entry the way a compound assignment still does — supplies it.
+        // Verified against real rustc, warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let x: u8; x = {n}u8; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_uninitialized_let(nibble: u32) -> u32 \
              {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
              P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
              P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
