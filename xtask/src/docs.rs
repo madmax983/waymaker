@@ -7480,6 +7480,118 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_hidden_by_a_script_inside_mglyph_after_a_self_closing_span_stays_hidden() {
+        // Codex, pull request #138, round 62, finding "Honor HTML slashes while
+        // tracking direct children": a self-closing slash is only ever honored by
+        // the *innermost* open frame's own rule, and under an HTML integration
+        // point like `mtext` it is ignored, so the tag opens for real rather than
+        // closing itself. `track_foreign_content_depth` returned unconditionally
+        // whenever a tag's own markup ended in a self-closing slash, whether or not
+        // that slash was actually honored, so `<span/>` under `mtext` was read as
+        // bodyless and never recorded as an ordinary descendant. `<math><mtext>
+        // <span/><mglyph><script />decision-id headline</script></mglyph></mtext>
+        // </math>` therefore has `mglyph`'s `ordinary_descendants.is_empty()`
+        // direct-child check see nothing open between it and `mtext`, and wrongly
+        // apply the exception that reopens MathML for it — when a real browser
+        // reads the ignored slash as opening `span` for real first, so `mglyph` is
+        // nested inside an ordinary HTML element rather than a direct child of the
+        // integration point, and the `<script />` beneath it is bodyless HTML raw
+        // text that swallows the id and headline after it to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<math><mtext><span/><mglyph><script />{} {}</script></mglyph></mtext></math>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_inside_a_hidden_svg_still_counts() {
+        // Codex, pull request #138, round 62, finding "Track namespace changes on
+        // hidden openers": the `Hidden` marker arm pushed a hidden opener's own
+        // name onto the non-rendering suppression stack and never told
+        // `track_foreign_content_depth` about it, so `<svg hidden>` left the
+        // foreign-content stack exactly as it found it — empty. Wrapped in a
+        // `<div>` so the whole construct is real block-level HTML (`div` is one of
+        // `CommonMark`'s own fixed block tag names, where `svg` on its own is not,
+        // and reaches this scanner rather than the separate one
+        // `Event::InlineHtml` uses, which already called
+        // `track_foreign_content_depth` unconditionally and never had this bug).
+        // `<div><svg hidden><script /></svg>decision-id headline</div>` then reads
+        // its self-closing `<script />` against that empty stack, where a
+        // self-closing slash is never honored, so it opens as a real, unclosed
+        // HTML script that swallows everything after it — the closing `</svg>`
+        // and the id and headline included — to end of document, rather than the
+        // bodyless script and properly closed `svg` a browser reads it as.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><svg hidden><script /></svg>{} {}</div>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_hidden_in_a_span_after_a_div_implicitly_closes_a_sibling_paragraph_stays_hidden()
+    {
+        // Codex, pull request #138, round 62, finding "Remove implicitly closed
+        // ancestors before reusing them": `track_ordinary_ancestor` recorded an
+        // opening tag as a new ancestor without ever applying that same tag's own
+        // implicit closes to the ancestor stack first, so a `<p>` a sibling `<div>`
+        // had already closed stayed behind as a stale entry. `<p><div></div><span
+        // hidden>ignored<div>decision-id headline</div></span>` then has the
+        // round-61 implicit-close ancestor search — run for the `<div>` nested
+        // inside the hidden `span` — find that stale `p` still on the stack,
+        // misread it as a real outer `<p>` genuinely being closed, and end the
+        // hidden `span` early on the strength of it, exposing the id and headline
+        // inside the nested `div` as ordinary visible text a browser never shows,
+        // since the hidden `span` has no closing tag of its own anywhere in the
+        // document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<p><div></div><span hidden>ignored<div>{} {}</div></span>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_div_closing_through_a_hidden_span_still_counts() {
         // Codex, pull request #138, round 57, finding "Unwind all elements
         // through a matching ancestor": a real HTML5 parser searches its whole

@@ -1800,7 +1800,14 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
         }
         return;
     }
-    if ends_with_self_closing_slash(span) {
+    // A self-closing slash is only ever honored by the *innermost* frame's own rule
+    // (Codex, round 62, "Honor HTML slashes while tracking direct children"): under
+    // an HTML integration point the slash is ignored and the tag opens for real, so
+    // returning here unconditionally skipped tracking it as an ordinary descendant.
+    // `<math><mtext><span/><mglyph>...` left `span` unrecorded, so `mglyph`'s
+    // `ordinary_descendants.is_empty()` direct-child check saw nothing between it and
+    // `mtext` and wrongly re-entered MathML.
+    if ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content) {
         return;
     }
     // WHATWG's one named exception to "an HTML integration point's descendants parse
@@ -1893,6 +1900,18 @@ fn track_ordinary_ancestor(
         let self_closing_in_foreign_content =
             ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content);
         if !is_void_element(&name) && !self_closing_in_foreign_content {
+            // An opening tag applies its own implicit closes to the top of the real
+            // ancestor stack *before* it is recorded as open (Codex, round 62,
+            // "Remove implicitly closed ancestors before reusing them"): otherwise a
+            // `<p>` a sibling `<div>` had already closed stayed in `ancestors` as a
+            // stale entry, and a later, unrelated opening tag found it there and was
+            // misread as closing a real outer `<p>` that no longer existed.
+            while ancestors
+                .last()
+                .is_some_and(|top| implicitly_closed_by(top, &name))
+            {
+                ancestors.pop();
+            }
             ancestors.push(name);
         }
     }
@@ -2737,6 +2756,13 @@ fn next_non_rendering_marker(
         let name = markup_tag_name(span).to_ascii_lowercase();
         if closing {
             if name == top {
+                // `top` itself may own a namespace change the Hidden/Tag opener
+                // pushed (Codex, round 62, "Track namespace changes on hidden
+                // openers"), and every other path back out of a tracked frame
+                // already calls this on its own closing tag — the safe no-op this
+                // is when `top` never pushed one, so the frame it did push does
+                // not otherwise outlive the element that opened it.
+                track_foreign_content_depth(span, foreign_content);
                 return Some(NonRenderingAdvance::Close(end));
             }
             if descendants.last().is_some_and(|open| *open == name) {
@@ -3335,6 +3361,13 @@ fn advance_via_hiding_marker(
         }
         Some(HidingMarker::Hidden(start, end, name)) => {
             spans.push(VisibleHtmlSpan::Text(cursor..start));
+            // The hidden opener's own namespace matters to what is scanned beneath
+            // it (Codex, round 62, "Track namespace changes on hidden openers"):
+            // `<svg hidden>` never reached `track_foreign_content_depth` before, so
+            // a self-closing `<script />` inside it found an empty foreign-content
+            // stack, read its own slash as unhonored HTML, and opened as a real,
+            // unclosed script that swallowed the rest of the document.
+            track_foreign_content_depth(&line[start..end], nested.foreign_content);
             open_non_rendering.push(name);
             Some(end)
         }
@@ -6153,6 +6186,7 @@ fn hide_non_rendering_in_html_line(
             }
             Some(HidingMarker::Hidden(start, end, name)) => {
                 non_rendering_start.get_or_insert(line_start + start);
+                track_foreign_content_depth(&html[start..end], foreign_content);
                 open_non_rendering.push(name);
                 cursor = end;
             }
