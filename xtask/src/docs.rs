@@ -7179,6 +7179,73 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_inside_svg_cdata_still_counts() {
+        // Codex, pull request #138, round 56, "Preserve CDATA text while parsing
+        // foreign content": inside SVG or MathML, `<![CDATA[...]]>` is not a bogus
+        // comment — the browser emits its payload as real, visible character data.
+        // Round 55's fix for markup declarations treated every `<!...>` construct
+        // uniformly, closing at the first `>` and discarding everything up to it,
+        // payload included, as invisible markup — correct outside foreign content,
+        // where `<![CDATA[` really does degrade to a bogus comment, but not inside
+        // it.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                // Wrapped in a block-level `<div>` on its own line so the whole
+                // construct is a genuine CommonMark HTML block — verified via a
+                // throwaway `pulldown-cmark` probe — reaching this module's
+                // block-level `Event::Html` scan rather than `Event::InlineHtml`,
+                // which is where round 56's finding traced the bug.
+                adr.contents = format!(
+                    "{without_heading_id}\n<div>\n<svg><![CDATA[{} {}]]></svg>\n</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a decision inside SVG CDATA was wrongly hidden: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_stray_unmatched_closing_tag_stays_hidden() {
+        // Codex, pull request #138, round 56, "Ignore closes that do not match a
+        // real ancestor": round 55's fix treated any closing tag matching neither
+        // `top` nor a same-walk nested child as proof of an ancestor's close, by
+        // elimination — but a wholly unmatched stray closing tag, with no
+        // `<bogus>` ever opened anywhere, is exactly as unmatched by that test,
+        // and wrongly closed the hidden `span` early, exposing text that is still
+        // really inside it. A real HTML5 parser ignores an end tag with no
+        // matching open element anywhere on the stack rather than guessing it
+        // must belong to something.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><span hidden>ignored</bogus>{} {}</span></div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == fifth.id),
+            "a decision after a stray unmatched closing tag was wrongly read as \
+             visible prose while still inside a hidden element: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_an_escaped_or_encoded_comment_marker_still_counts() {
         // Codex, pull request #138, round 22: `\<!--` and `&lt;!--` both decode to text
         // containing `<!--`, but a real, unescaped one is always recognized by
