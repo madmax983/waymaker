@@ -157,6 +157,8 @@ struct World {
     as_failure: bool,
     /// The identity each poll was handed.
     ids: Vec<EffectId>,
+    /// Whether every poll answers [`Produced::Unserviceable`].
+    unserviceable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +176,15 @@ impl World {
             reports: None,
             as_failure: false,
             ids: Vec::new(),
+            unserviceable: false,
         }
+    }
+
+    /// Answer every poll with [`Produced::Unserviceable`].
+    const fn unserviceable() -> Self {
+        let mut world = Self::silent();
+        world.unserviceable = true;
+        world
     }
 
     /// Report `len` rather than the answer's own length.
@@ -212,6 +222,9 @@ impl ActivityDispatcher for World {
     ) -> Poll<Result<Produced, Fault>> {
         self.polls += 1;
         self.ids.push(id);
+        if self.unserviceable {
+            return Poll::Ready(Ok(Produced::Unserviceable));
+        }
         if self.stalled < self.stalls {
             self.stalled += 1;
             return Poll::Pending;
@@ -339,6 +352,149 @@ fn a_dispatcher_that_is_not_ready_records_nothing_and_leaves_the_effect_outstand
     assert_eq!(
         ledger.asked,
         vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())]
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_records_nothing_and_leaves_the_effect_outstanding() {
+    // Issue #111. An unserviceable kind stops the boot the same way a dispatcher that is
+    // not ready does. It records nothing. The effect stays outstanding under its committed
+    // identity. A later boot may still complete it.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let answered = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(answered, Poll::Pending);
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the intent is durable, but nothing is ever resolved"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_is_not_a_retry_even_when_the_future_is_polled_again() {
+    // Issue #111. Unlike `Poll::Pending`, an unserviceable kind is not a retry: nothing
+    // about it changes before a reboot. A second poll within the same boot -- a spurious
+    // wake, say -- must not ask the dispatcher again.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let mut future = pin!(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let mut task = Task::from_waker(Waker::noop());
+    let first = future.as_mut().poll(&mut task);
+    let second = future.as_mut().poll(&mut task);
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Pending);
+    assert_eq!(
+        world.polls, 1,
+        "the dispatcher answered once, and was not asked again"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_is_not_a_retry_after_the_future_is_dropped_and_recreated() {
+    // Issue #111, Codex round 2. A cancelled `ActivityFuture` -- dropped out of a `select!`,
+    // say -- takes its own `stage` with it. A fresh future for the same outstanding effect
+    // must still meet the stop: this boot already learned no dispatcher here can serve it.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let first = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    let second = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+
+    assert_eq!(first, Poll::Pending);
+    assert_eq!(second, Poll::Pending);
+    assert_eq!(
+        world.polls, 1,
+        "the second future never reached the dispatcher"
+    );
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the second future never reached the journal either"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_stops_a_timer_future_built_after_it_from_reaching_the_journal() {
+    // Issue #111, round 3. `waymaker-drive`'s boundary refuses a second boundary while one
+    // effect is outstanding (`DriveError::EffectOutstanding`), so a timer future built after
+    // the dispatcher answered `Unserviceable` must not reach the journal at all -- doing so
+    // would turn this boot's clean stall into a hard boot error instead.
+    let mut ledger = Ledger::new()
+        .scheduling(vec![Ok(dispatch(0))])
+        .waiting(vec![Ok(())]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let stalled = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    assert_eq!(stalled, Poll::Pending, "the activity stalls unserviceable");
+
+    let spec = TimerSpec::AfterBoot { ticks: 25 };
+    let waited = poll_once(ctx.timer(spec));
+
+    assert_eq!(waited, Poll::Pending);
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "the timer future never asked the journal"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_stops_continue_as_new_from_reaching_the_journal() {
+    // Issue #111, round 3. Same shape as the timer case: `continue_as_new` reaching the
+    // journal while an effect is outstanding meets `waymaker-drive`'s hard
+    // `EffectOutstanding` refusal instead of the clean stall this boot already recorded.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let stalled = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    assert_eq!(stalled, Poll::Pending, "the activity stalls unserviceable");
+
+    let continued = poll_once(ctx.continue_as_new(b"next"));
+
+    assert_eq!(continued, Poll::Pending);
+    assert_eq!(
+        ledger.asked,
+        vec![Asked::Schedule(DOWNLOAD, b"url".to_vec())],
+        "continue_as_new never asked the journal"
+    );
+}
+
+#[test]
+fn an_unserviceable_kind_stops_a_terminal_future_from_recording_a_conclusion() {
+    // Issue #111, round 3. A terminal future built after the dispatcher answered
+    // `Unserviceable` must not record a conclusion: the effect is still outstanding, and
+    // `Ctx::conclusion` reporting an ending here is the same `Ok(Outcome)`-while-pending
+    // shape `waymaker-drive`'s own `Context::conclude` refuses.
+    let mut ledger = Ledger::new().scheduling(vec![Ok(dispatch(0))]);
+    let mut world = World::unserviceable();
+    let mut out = [0_u8; 16];
+    let mut ctx = Ctx::new(&mut ledger, &mut world, &mut out);
+
+    let stalled = poll_once(ctx.activity::<Slot>(DOWNLOAD, b"url"));
+    assert_eq!(stalled, Poll::Pending, "the activity stalls unserviceable");
+
+    let ended: Poll<Result<(), ()>> = poll_once(ctx.complete(b"done"));
+
+    assert_eq!(ended, Poll::Pending);
+    assert_eq!(
+        ctx.conclusion(),
+        None,
+        "no conclusion is recorded while the effect is still outstanding"
     );
 }
 

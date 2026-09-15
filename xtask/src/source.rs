@@ -6752,7 +6752,7 @@ pub const CTX_JOURNAL_PATH: &str = "waymaker-embassy/src/journal.rs";
 
 /// Every public function issue #35's `Ctx` declares.
 ///
-/// Four futures, a constructor, and three accessors a caller reads after a boot. A ninth
+/// Four futures, a constructor, and four accessors a caller reads after a boot. A tenth
 /// name is a way for the façade to do something, and the whole of issue #35 is that it may
 /// only ask.
 pub const CTX_SURFACE: &[&str] = &[
@@ -6764,6 +6764,7 @@ pub const CTX_SURFACE: &[&str] = &[
     "new",
     "payload",
     "timer",
+    "unserviceable",
 ];
 
 /// The four futures `Ctx` hands out.

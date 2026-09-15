@@ -20,6 +20,13 @@
 //! activity registry. Both are *additions* — a `Table::by_name`, a `Table::register`, a
 //! row read from media — and the `dispatch-wiring` rule is what makes each a line a
 //! reviewer writes rather than a commit.
+//!
+//! # A kind no row declares
+//!
+//! [`Table::poll_dispatch`] answers [`Produced::Unserviceable`]. It writes no record.
+//! Issue [#111](https://github.com/madmax983/waymaker/issues/111): a permanent failure
+//! record would block a later fix. A firmware update might add the row afterward, but it
+//! could never rescue a run that already failed.
 
 use core::task::{Context as Task, Poll};
 
@@ -75,24 +82,6 @@ impl<W, E> Activity<W, E> {
     }
 }
 
-/// Why a table could not answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Unhandled<E> {
-    /// The row ran and failed. `E` is the world's own reason.
-    Activity(E),
-    /// No row declares this number.
-    ///
-    /// The workflow asked for an activity this build does not have. It is recorded as an
-    /// `EffectFailed` with no payload, so the run makes progress: design document §08 has
-    /// no edge from an unresolved effect to a terminal record, so a refusal would strand
-    /// the run, and a [`Poll::Pending`] would spin for ever with nothing to say why.
-    ///
-    /// That decision is permanent — replay returns the recorded failure on every later
-    /// boot, including one whose firmware has the row. A table must therefore declare
-    /// every number its workflow asks for.
-    NoSuchActivity(ActivityKind),
-}
-
 /// A world, and the table that says which number is which activity.
 ///
 /// It borrows the rows and owns the world. The rows are a `const` a firmware writes once;
@@ -145,7 +134,7 @@ impl<'t, W, E> Table<'t, W, E> {
 }
 
 impl<W, E> ActivityDispatcher for Table<'_, W, E> {
-    type Error = Unhandled<E>;
+    type Error = E;
 
     fn poll_dispatch(
         &mut self,
@@ -154,18 +143,14 @@ impl<W, E> ActivityDispatcher for Table<'_, W, E> {
         kind: ActivityKind,
         input: &[u8],
         out: &mut [u8],
-    ) -> Poll<Result<Produced, Unhandled<E>>> {
+    ) -> Poll<Result<Produced, E>> {
         // By number, and by nothing else. The function pointer is copied out first, so the
         // borrow of `self.rows` ends before the row runs against `self.world`.
         let Some(perform) = self.row(kind).map(|row| row.perform) else {
-            return Poll::Ready(Err(Unhandled::NoSuchActivity(kind)));
+            return Poll::Ready(Ok(Produced::Unserviceable));
         };
         // The task's waker travels to the row and no further: this crate registers none of
         // its own, exactly as `Ctx` does not.
-        match perform(&mut self.world, task, id, input, out) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(produced)) => Poll::Ready(Ok(produced)),
-            Poll::Ready(Err(failed)) => Poll::Ready(Err(Unhandled::Activity(failed))),
-        }
+        perform(&mut self.world, task, id, input, out)
     }
 }

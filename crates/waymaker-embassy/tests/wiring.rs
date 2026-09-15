@@ -2,7 +2,9 @@
 //!
 //! Issue [#36](https://github.com/madmax983/waymaker/issues/36). What is here is that a
 //! table selects a row by its number, that a name reaches a log and nothing else, and that
-//! a kind no row declares is a clean error rather than a panic.
+//! a kind no row declares stops the boot cleanly rather than panicking. Issue
+//! [#111](https://github.com/madmax983/waymaker/issues/111): that stop writes no record. A
+//! firmware update that adds the row can still complete the run.
 //!
 //! The end-to-end run over real media is `crates/waymaker-drive/tests/dispatch.rs`.
 
@@ -15,7 +17,7 @@ use std::task::Wake;
 use waymaker_core::timer::TimerSpec;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RunId};
 use waymaker_embassy::dispatch::Produced;
-use waymaker_embassy::wiring::{Activity, Table, Unhandled};
+use waymaker_embassy::wiring::{Activity, Table};
 use waymaker_embassy::{ActivityDispatcher, Answer, Ctx, Halted, Handoff, Journal};
 
 const RUN: RunId = RunId(4);
@@ -113,7 +115,7 @@ fn dispatch_once(
     table: &mut Table<'_, World, Offline>,
     kind: ActivityKind,
     out: &mut [u8],
-) -> Poll<Result<Produced, Unhandled<Offline>>> {
+) -> Poll<Result<Produced, Offline>> {
     let mut task = Task::from_waker(Waker::noop());
     table.poll_dispatch(&mut task, effect(0), kind, b"in", out)
 }
@@ -149,7 +151,7 @@ fn a_second_number_reaches_a_second_row() {
 }
 
 #[test]
-fn a_kind_no_row_declares_is_an_error_rather_than_a_panic() {
+fn a_kind_no_row_declares_is_unserviceable_rather_than_a_panic() {
     let mut table = table(World::default());
     let mut out = [0_u8; 8];
 
@@ -157,8 +159,8 @@ fn a_kind_no_row_declares_is_an_error_rather_than_a_panic() {
 
     assert_eq!(
         answered,
-        Poll::Ready(Err(Unhandled::NoSuchActivity(ABSENT))),
-        "a workflow this firmware cannot service is a named refusal, not a panic"
+        Poll::Ready(Ok(Produced::Unserviceable)),
+        "a kind this firmware cannot service is a named answer, not a panic"
     );
     assert!(table.world().ran.is_empty(), "no row ran");
 }
@@ -173,7 +175,7 @@ fn a_rows_own_failure_travels_as_the_worlds_error() {
 
     let answered = dispatch_once(&mut table, DOWNLOAD, &mut out);
 
-    assert_eq!(answered, Poll::Ready(Err(Unhandled::Activity(Offline))));
+    assert_eq!(answered, Poll::Ready(Err(Offline)));
 }
 
 #[test]
@@ -345,8 +347,15 @@ fn a_table_reaches_the_world_only_after_the_journal_says_the_intent_is_durable()
     assert!(!ledger.failed);
 }
 
+/// A second table. It declares a row for `ABSENT`, which the first table lacked.
+///
+/// Issue [#111](https://github.com/madmax983/waymaker/issues/111). A table with no matching
+/// row writes nothing. The effect keeps its identity. A firmware update that adds the row
+/// can later complete it.
+const RESCUED: &[Activity<World, Offline>] = &[Activity::new(ABSENT, "rescue", download)];
+
 #[test]
-fn a_table_that_cannot_service_a_kind_records_a_failure_with_no_payload() {
+fn a_table_that_cannot_service_a_kind_leaves_the_effect_outstanding() {
     let mut ledger = Ledger {
         handed: false,
         resolved: None,
@@ -358,13 +367,61 @@ fn a_table_that_cannot_service_a_kind_records_a_failure_with_no_payload() {
     let mut ctx = Ctx::new(&mut ledger, &mut table, &mut out);
 
     let mut task = Task::from_waker(Waker::noop());
-    let _answered = pin!(ctx.activity::<()>(ABSENT, b"url")).poll(&mut task);
+    let answered = pin!(ctx.activity::<()>(ABSENT, b"url")).poll(&mut task);
 
     assert_eq!(
-        ledger.resolved,
-        Some(Vec::new()),
-        "the run makes progress: §08 has no edge from an unresolved effect to a terminal \
-         record, so a refusal here would strand it"
+        answered,
+        Poll::Pending,
+        "the boot stops here, not with a guess"
     );
-    assert!(ledger.failed);
+    assert_eq!(
+        ledger.resolved, None,
+        "§08 has no edge from an unresolved effect to a terminal record, so nothing is \
+         written -- a recorded refusal here would strand the run for good"
+    );
+    assert!(table.world().ran.is_empty(), "no row ran");
+}
+
+#[test]
+fn a_firmware_that_later_gains_the_row_completes_the_run_its_predecessor_could_not() {
+    // The row is missing. Nothing is recorded. The effect's identity stays open.
+    let mut stuck = Ledger {
+        handed: false,
+        resolved: None,
+        failed: false,
+        kept: Vec::new(),
+    };
+    let mut table = table(World::default());
+    let mut first_out = [0_u8; 8];
+    let stalled = {
+        let mut ctx = Ctx::new(&mut stuck, &mut table, &mut first_out);
+        let mut task = Task::from_waker(Waker::noop());
+        pin!(ctx.activity::<()>(ABSENT, b"url")).poll(&mut task)
+    };
+    assert_eq!(stalled, Poll::Pending);
+    assert_eq!(stuck.resolved, None);
+
+    // A firmware update. The same identity is redelivered to a table that now has the row.
+    let mut rescued = Ledger {
+        handed: false,
+        resolved: None,
+        failed: false,
+        kept: Vec::new(),
+    };
+    let mut rescuing = Table::over(World::default(), RESCUED);
+    let mut second_out = [0_u8; 8];
+    let mut ctx = Ctx::new(&mut rescued, &mut rescuing, &mut second_out);
+    let mut task = Task::from_waker(Waker::noop());
+    let answered = pin!(ctx.activity::<()>(ABSENT, b"url")).poll(&mut task);
+
+    assert!(
+        matches!(answered, Poll::Ready(Ok(()))),
+        "the same effect completes once the firmware can service it: {answered:?}"
+    );
+    assert_eq!(rescued.resolved, Some(Vec::new()));
+    assert_eq!(
+        rescuing.world().ran,
+        vec![("download", effect(0))],
+        "the row ran under the identity the first boot's schedule committed"
+    );
 }
