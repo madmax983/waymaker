@@ -8577,10 +8577,11 @@ fn check_no_projected_type_aliases(contents: &str) -> Vec<Violation> {
                 RULE,
                 DRIVER,
                 format!(
-                    "{found:?} aliases a qualified associated-type projection in \
-                     {EFFECT_PROTOCOL_PATH}: `<T as Trait>::Assoc` can name any struct the \
-                     trait's `impl` chooses, which no construction pin here can follow, so \
-                     the alias itself is refused"
+                    "{found:?} aliases an unresolvable target in {EFFECT_PROTOCOL_PATH}: \
+                     `<T as Trait>::Assoc` is a projection a trait's `impl` can name any \
+                     struct through, and a bare `T` is the alias's own generic parameter, \
+                     which a use site's own turbofish can name any type through — neither \
+                     can this pin follow, so the alias itself is refused"
                 ),
             )]
         }
@@ -17917,6 +17918,29 @@ mod deferred_answer_pins {
             + "type Unchecked<'a> = <Via as Alias>::Dispatch;\n\
                pub(crate) fn forge<'a>(intent: DurableIntent) -> Unchecked<'a> {\n\
                \x20   Unchecked { intent, bytes: &[] }\n}\n";
+        let details = effect_details(&source);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("Unchecked") && detail.contains("projection")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_dispatch_built_through_a_generic_identity_type_alias_is_reported() {
+        // Issue #187: `type Unchecked<T> = T;` has no `::` at all, so it read as a plain
+        // path with nothing projected through it. A use site's own turbofish —
+        // `Unchecked::<CheckedDispatch<'_>>` — supplies the real target instead, and this
+        // pin never read it. Refused the same way the qself shape above is: the alias
+        // itself, not the one construction site that happens to use it.
+        let source = tests_support::clean_effect_module()
+            + "type Unchecked<T> = T;\n\
+               pub(crate) fn forge<'a>(\n\
+               \x20   intent: DurableIntent,\n\
+               \x20   bytes: &'a [u8],\n\
+               ) -> Unchecked<CheckedDispatch<'a>> {\n\
+               \x20   Unchecked::<CheckedDispatch<'a>> { intent, bytes }\n}\n";
         let details = effect_details(&source);
         assert!(
             details
