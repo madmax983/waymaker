@@ -7061,6 +7061,34 @@ mod tests {
     }
 
     #[test]
+    fn a_visible_suffix_after_an_end_bang_comment_close_still_counts() {
+        // Codex, pull request #138, round 54, "Recognize the HTML comment end-bang
+        // close": HTML5's tokenizer accepts `--!>` as a genuine, if parse-error,
+        // comment close alongside the standard `-->` — `<!-- open\n--!>decision-id
+        // headline</div>` closes the comment right there, but a search for only
+        // the standard spelling left `in_html_comment` set through end of
+        // document, hiding the visible suffix and everything after it.
+        let mut inputs = clean_inputs(RULES);
+        let fifth = SETTLED_DECISIONS[4];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", fifth.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<div><!-- open\n--!>{} {}</div>\n",
+                    fifth.id, fifth.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == fifth.id),
+            "a visible suffix after an end-bang comment close was still hidden: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_an_escaped_or_encoded_comment_marker_still_counts() {
         // Codex, pull request #138, round 22: `\<!--` and `&lt;!--` both decode to text
         // containing `<!--`, but a real, unescaped one is always recognized by
@@ -7750,6 +7778,37 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_inside_a_markup_declaration_does_not_count() {
+        // Codex, pull request #138, round 54, "Exclude markup declarations from
+        // visible prose": `next_tag_start`'s "plausible tag start" check only
+        // admitted an ASCII letter or `/` after `<`, so `<!ignored ...>` — a
+        // parse-error "bogus comment" an HTML5 tokenizer still runs to the next
+        // `>` and never renders, the same family as a browser-visible
+        // `<!DOCTYPE html>` — was never recognized as a tag-like construct at
+        // all, and `visible_html_ranges` emitted the whole declaration, id and
+        // headline included, as ordinary visible text.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<!ignored {} {}>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "a decision inside a markup declaration was wrongly read as visible \
+             prose: {violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_multiline_svg_still_counts() {
         // Codex, pull request #138, round 50, "Carry foreign-content depth across
         // raw HTML lines": the round-49 fix re-scanned only the *current*
@@ -8173,6 +8232,20 @@ mod tests {
         // `- Status: <span hidden>accepted</span>` read its hidden value as an
         // ordinary, visible one. `opens_hidden_element` is now also checked.
         let contents = "# ADR\n\n- Status: <span hidden>accepted</span>\n\n- Status: proposed\n";
+        assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
+    }
+
+    #[test]
+    fn adr_status_ignores_a_decoy_value_hidden_behind_a_form_feed_boundary() {
+        // Codex, pull request #138, round 54, "Accept form feed as HTML attribute
+        // whitespace": HTML treats U+000C FORM FEED as attribute whitespace too,
+        // but `has_hidden_attribute`'s boundary checks were a hand-picked list of
+        // four bytes — space, tab, line feed, carriage return — that left form
+        // feed out, so `<span hidden\u{c}>` read as an ordinary, unsuppressed tag
+        // whose own name merely continued past `hidden`, and its browser-invisible
+        // body was read as the field's real value.
+        let contents =
+            "# ADR\n\n- Status: <span hidden\u{c}>accepted</span>\n\n- Status: proposed\n";
         assert_eq!(adr_status(contents).as_deref(), Some("proposed"));
     }
 

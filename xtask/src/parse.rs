@@ -1537,7 +1537,7 @@ fn attribute_value<'a>(span: &'a str, attribute: &str) -> Option<&'a str> {
             {
                 let after_name = index + attribute.len();
                 if !bytes.get(after_name).is_none_or(|&byte| {
-                    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'/' | b'>')
+                    byte.is_ascii_whitespace() || matches!(byte, b'=' | b'/' | b'>')
                 }) {
                     index = after_name;
                     continue;
@@ -1641,6 +1641,13 @@ fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFram
 /// start — but that same allowance let the *name* be spelled `hidden` and mistaken
 /// for the attribute, `<hidden>visible documentation</hidden>` chief among them,
 /// which is an element named `hidden`, not a `hidden` attribute on some other one.
+///
+/// Both boundary checks read the byte's own [`u8::is_ascii_whitespace`] rather than a
+/// hand-picked list of four (Codex, pull request #138, round 54, "Accept form feed as
+/// HTML attribute whitespace"): HTML treats U+000C FORM FEED as attribute whitespace
+/// too, and the hand-picked list — space, tab, line feed, carriage return — had left it
+/// out, so `<span hidden\u{c}>` read as an ordinary, unsuppressed tag whose own name
+/// happened to continue past `hidden` rather than a real boolean attribute.
 fn has_hidden_attribute(span: &str) -> bool {
     let bytes = span.as_bytes();
     let mut quote: Option<u8> = None;
@@ -1658,9 +1665,9 @@ fn has_hidden_attribute(span: &str) -> bool {
                     let before_ok = index
                         .checked_sub(1)
                         .and_then(|before| bytes.get(before))
-                        .is_none_or(|&byte| matches!(byte, b'/' | b' ' | b'\t' | b'\n' | b'\r'));
+                        .is_none_or(|&byte| byte == b'/' || byte.is_ascii_whitespace());
                     let after_ok = bytes.get(index + 6).is_none_or(|&byte| {
-                        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'/' | b'>')
+                        byte.is_ascii_whitespace() || matches!(byte, b'=' | b'/' | b'>')
                     });
                     if before_ok && after_ok {
                         return true;
@@ -2060,15 +2067,24 @@ fn scan_tag_close(line: &str, from: usize, quote: &mut Option<u8>) -> Option<usi
 /// round 41, finding 1) — the latter is [`find_any_tag`] returning `None` too, and only
 /// this function's own `Some` distinguishes the two.
 ///
-/// A `<` only counts here when a syntactically plausible tag could follow it — an
-/// ASCII letter (an opening tag's own name) or `/` (a closing tag) — not any `<`
-/// whatsoever (Codex, pull request #138, round 47, "Distinguish literal less-than
-/// signs from tag starts"): a browser tokenizes `<` as the start of markup only in
-/// those two cases, and `2 < 3` is ordinary visible text whose `<` is not one of
-/// them. Every caller of this function treats its `Some` as "an incomplete tag
-/// starts here, carry it across the line break" — reading `2 < 3`'s `<` that way
-/// swallowed everything from there to the next unrelated `>` anywhere later in the
-/// document as if it were that tag's own markup.
+/// A `<` only counts here when a syntactically plausible tag *or markup declaration*
+/// could follow it — an ASCII letter (an opening tag's own name), `/` (a closing tag),
+/// `!` or `?` (Codex, pull request #138, round 47, "Distinguish literal less-than
+/// signs from tag starts"; widened round 54, "Exclude markup declarations from visible
+/// prose") — not any `<` whatsoever: a browser tokenizes `<` as the start of markup
+/// only in those cases, and `2 < 3` is ordinary visible text whose `<` is none of them.
+/// `!` not followed by `--` (a real comment, intercepted separately above) or `?` both
+/// put an HTML5 tokenizer into "bogus comment state" — `<!ignored decision-id
+/// headline>` and `<?processing instruction?>` alike are parsed as an inert comment
+/// running to the next `>`, never displayed, even though neither spells a real tag —
+/// and a browser-visible `<!DOCTYPE html>` sits in the same family; the fixed-name
+/// checks elsewhere in this module never match a name starting `!` or `?`, so such a
+/// span falls through to the ordinary tag-markup path and is excised the same way any
+/// other tag's own markup already is, with no name it could collide with. Every caller
+/// of this function treats its `Some` as "an incomplete tag starts here, carry it
+/// across the line break" — reading `2 < 3`'s `<` that way swallowed everything from
+/// there to the next unrelated `>` anywhere later in the document as if it were that
+/// tag's own markup.
 fn next_tag_start(line: &str, from: usize) -> Option<usize> {
     let mut cursor = from;
     loop {
@@ -2080,7 +2096,7 @@ fn next_tag_start(line: &str, from: usize) -> Option<usize> {
         let plausible = line
             .as_bytes()
             .get(start + 1)
-            .is_some_and(|&byte| byte.is_ascii_alphabetic() || byte == b'/');
+            .is_some_and(|&byte| byte.is_ascii_alphabetic() || matches!(byte, b'/' | b'!' | b'?'));
         if plausible {
             return Some(start);
         }
@@ -2109,6 +2125,28 @@ fn find_comment_opener(line: &str, from: usize) -> Option<usize> {
         let (_, end) = find_any_tag(line, start)?;
         cursor = end;
     }
+}
+
+/// The byte offset just past the next HTML comment closer at or after `from` in
+/// `text` — the standard `-->`, or the end-bang parse-error recovery spelling `--!>` a
+/// browser's tokenizer also accepts as a genuine close (Codex, pull request #138, round
+/// 54, "Recognize the HTML comment end-bang close"): `<!-- note --!>All 6 recovery
+/// invariants` closes there, not at whatever `-->` a blind, single-spelling search kept
+/// waiting for — leaving the visible suffix on the same line, or every line after it,
+/// read as still inside the comment. Whichever spelling starts first wins; the two can
+/// never both match at the same position, since `-->`'s third byte is `-` and
+/// `--!>`'s is `!`.
+fn find_comment_close(text: &str, from: usize) -> Option<usize> {
+    let rest = text.get(from..)?;
+    let arrow = rest.find("-->").map(|start| (start, 3));
+    let bang = rest.find("--!>").map(|start| (start, 4));
+    let (start, len) = match (arrow, bang) {
+        (Some(a), Some(b)) if b.0 < a.0 => b,
+        (Some(a), _) => a,
+        (None, Some(b)) => b,
+        (None, None) => return None,
+    };
+    Some(from + start + len)
 }
 
 /// The earliest of a comment opener (`<!--`), a non-rendering element's opening tag, or
@@ -2368,11 +2406,11 @@ fn advance_past_non_rendering(
     let top = stack.last()?.clone();
     match next_non_rendering_marker(line, cursor, &top, foreign_content) {
         Some(NonRenderingAdvance::Comment(start)) => {
-            let Some(offset) = line[start..].find("-->") else {
+            let Some(end) = find_comment_close(line, start) else {
                 *in_html_comment = true;
                 return None;
             };
-            Some(start + offset + "-->".len())
+            Some(end)
         }
         Some(NonRenderingAdvance::Open(end, tag)) => {
             stack.push(tag);
@@ -2644,9 +2682,9 @@ fn visible_html_ranges(
         // `</template>` written *inside* such a comment be skipped rather than read as
         // the tracked element's real close.
         if *in_html_comment {
-            match line[cursor..].find("-->") {
-                Some(offset) => {
-                    cursor += offset + "-->".len();
+            match find_comment_close(line, cursor) {
+                Some(end) => {
+                    cursor = end;
                     *in_html_comment = false;
                     continue;
                 }
@@ -2706,11 +2744,11 @@ fn visible_html_ranges(
             }
             Some(HidingMarker::Comment(start)) => {
                 spans.push(VisibleHtmlSpan::Text(cursor..start));
-                let Some(offset) = line[start..].find("-->") else {
+                let Some(end) = find_comment_close(line, start) else {
                     *in_html_comment = true;
                     break;
                 };
-                cursor = start + offset + "-->".len();
+                cursor = end;
             }
             Some(HidingMarker::Tag(start, end, tag)) => {
                 spans.push(VisibleHtmlSpan::Text(cursor..start));
@@ -5277,9 +5315,7 @@ pub fn visible_source(contents: &str) -> String {
                     // same way the old search was, by slicing the search text there.
                     let mut cursor = start;
                     while let Some(open) = find_comment_opener(&contents[..range.end], cursor) {
-                        let end = contents[open..]
-                            .find("-->")
-                            .map_or(contents.len(), |close| open + close + "-->".len());
+                        let end = find_comment_close(contents, open).unwrap_or(contents.len());
                         hidden.push((open, end));
                         if end >= range.end {
                             break;
@@ -5467,8 +5503,8 @@ fn hide_non_rendering_in_html_line(
             // block-comment search, covering every comment in the block from its own
             // opener to its real close (or to end of document), so this only has to
             // step past it correctly rather than re-decide it.
-            Some(HidingMarker::Comment(start)) => match html[start..].find("-->") {
-                Some(offset) => cursor = start + offset + "-->".len(),
+            Some(HidingMarker::Comment(start)) => match find_comment_close(html, start) {
+                Some(end) => cursor = end,
                 None => break,
             },
             Some(HidingMarker::Tag(start, end, tag)) => {
