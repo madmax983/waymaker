@@ -13936,6 +13936,142 @@ mod tests {
     }
 
     #[test]
+    fn an_expression_position_include_invocation_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 39: `include_str!`
+        // and `include_bytes!` can only ever produce a literal, but bare `include!`
+        // splices the named file's own tokens in as Rust source — a file this
+        // per-file scan never opens, the same blind spot an out-of-line `mod name;`
+        // has — so `const _: () = include!("clone.inc");`, where `clone.inc` holds
+        // `{ impl Clone for Recovery { .. }; 0 }`, walked past
+        // `is_known_safe_expression_macro`'s old whitelist unseen: the invocation's
+        // own tokens are a single string literal with no brace in them anywhere.
+        // `include` is no longer on that whitelist, so the invocation itself is
+        // enough to trip this test — no separate file is needed to demonstrate the
+        // gap this closes.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: "const _: () = include!(\"clone.inc\");\n".to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].detail.contains("macro"),
+            "{}",
+            violations[0].detail
+        );
+    }
+
+    #[test]
+    fn a_glob_reexported_through_a_nested_module_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 39: `mod traits {
+        // mod nested { pub use core::clone::Clone as C; } pub use nested::*; } impl
+        // traits::C for Recovery { .. }` is legal Rust — `traits`' own glob
+        // re-exports `nested::C` as `traits::C` — but `direct_scope_module_aliases`
+        // built a nested module's synthetic scope only from its explicit aliases and
+        // its own nested modules' *qualified* aliases, never from a glob any of them
+        // declares, so `traits::C` had nothing registered to resolve against and
+        // fell through to the harmless-looking bare name `C`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    mod nested {\n",
+                "        pub use core::clone::Clone as C;\n",
+                "    }\n",
+                "    pub use nested::*;\n",
+                "}\n",
+                "impl traits::C for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn a_glob_with_no_reexport_of_the_pinned_name_is_still_accepted() {
+        // The negative case beside the last: a nested module's glob that never
+        // touches the trait being searched for must not make every qualified
+        // reference through it unresolvable — only `resolve_segment_chain`'s own
+        // "no matching alias" fallback is supposed to fail closed on a glob, and a
+        // name that *did* match an explicit alias must still resolve through it.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "mod traits {\n",
+                "    mod nested {\n",
+                "        pub use core::fmt::Debug as C;\n",
+                "    }\n",
+                "    pub use nested::*;\n",
+                "}\n",
+                "impl traits::C for Sealable {\n",
+                "}\n",
+                "pub struct Sealable;\n",
+            )
+            .to_owned(),
+        });
+        assert!(check_recovery_surface(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_procedural_derive_imported_under_a_builtin_name_is_rejected() {
+        // Found by Codex review of this change (PR #143), round 39: `use
+        // custom::Debug; #[derive(Debug)] struct Recovery;` is legal Rust whose
+        // `Debug` is not `core::fmt::Debug` at all — an ordinary `use` shadows the
+        // prelude name exactly as a `use .. as` rename would — and a third-party
+        // crate is free to name a procedural derive macro `Debug` on purpose, for
+        // ergonomics or as a drop-in replacement, with an expansion this scan cannot
+        // see. `every_resolution` chases the alias to `["custom", "Debug"]`, finds no
+        // further alias for `custom`, and `resolve_segment_chain`'s "no matching
+        // alias, take the last segment" fallback reports the string `"Debug"` again —
+        // indistinguishable, by name alone, from the literal, never-imported builtin.
+        // The whitelist trusted that resolved string with no way to tell the two
+        // apart.
+        let violations = check_recovery_surface(&recovery_source_with_struct(concat!(
+            "use custom::Debug;\n",
+            "#[derive(Debug)]\n",
+            "pub struct Recovery;\n",
+        )));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
+    fn an_unaliased_builtin_derive_is_still_accepted() {
+        // The negative case beside the last: an ordinary, never-rebound derive of
+        // one of the eight safe builtins must still be accepted, or every clean
+        // `#[derive(Debug, PartialEq, Eq)]` in this crate would start failing.
+        assert!(
+            check_recovery_surface(&recovery_source_with_struct(
+                "#[derive(Debug, PartialEq, Eq, Default, Hash, Ord, PartialOrd, Copy)]\n\
+                 pub struct Recovery;\n",
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn an_absolute_path_aliased_to_a_trait_in_the_same_file_is_rejected() {
         // Found by Codex review of this change (PR #143), round 34: `impl ::dep::C for
         // Recovery { .. }` is legal Rust — an absolute path reaches the extern prelude,

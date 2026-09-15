@@ -4184,6 +4184,53 @@ reaches and the crate root reaches directly — confirmed to compile under
 `cargo build -p waymaker-flash --no-default-features`, confirmed to be missed by
 `check-layering` before this fix and caught by it after, and reverted cleanly.
 
+Round 39 found three more, all on the same commit round 38 was found on. The first is
+`KNOWN_SAFE_EXPRESSION_MACROS`'s own asymmetry: `include_str!` and `include_bytes!` can
+only ever produce a string or byte-string literal, but `include!` splices the *named
+file's own tokens* in as Rust source, and `token_stream_contains_a_brace_group`'s brace
+scan reads only the invocation's own arguments — a single string literal for
+`include!("clone.inc")`, with no brace anywhere in it. The file that string names is
+never opened by this per-file scan, the same blind spot an out-of-line `mod name;` has,
+so `const _: () = include!("clone.inc");` in a production-reachable file, where
+`clone.inc` holds `{ impl Clone for Recovery { .. }; 0 }`, walked past the whitelist
+unseen. `include` is no longer on it; no source in this workspace calls it bare in
+expression position, so nothing accepted loses anything. The second is
+`direct_scope_module_aliases`'s own qualification one shape further: `mod traits { mod
+nested { pub use core::clone::Clone as C; } pub use nested::*; } impl traits::C for
+Recovery { .. }` is legal Rust — `traits`' own glob re-exports `nested::C` as
+`traits::C` — but the synthetic scope this function builds for a nested module is
+assembled only from that module's own explicit aliases and its nested modules' own
+*qualified* aliases, never from a glob any of them declares, so `traits::C` had nothing
+registered to resolve against and fell through to the harmless-looking bare name `C`.
+A glob anywhere in a nested module's own scope — its own direct glob, or one a deeper
+nested module already reduced to its own qualified marker — is now re-registered one
+level of qualification up as a `"name::*"` marker, and `resolve_segment_chain`'s own
+"no matching alias" fallback checks every qualifying prefix of the segments it could
+not otherwise resolve against that marker, not only the bare, unqualified case round 30
+already covered. The third is `push_resolved_names`'s own trust boundary: `use
+custom::Debug; #[derive(Debug)] struct Recovery;` is legal Rust whose `Debug` is not
+`core::fmt::Debug` at all — an ordinary `use` shadows the prelude name exactly as a
+`use .. as` rename would, and a third-party crate is free to name a procedural derive
+macro `Debug` on purpose — but `every_resolution` chases the alias to
+`["custom", "Debug"]`, finds no further alias for `custom`, and the same "take the last
+segment" fallback reports the string `"Debug"` again, indistinguishable by name alone
+from the literal builtin. `push_resolved_names` now also asks whether the derive path's
+own first segment, as written, was ever the local side of an alias at all; if it was,
+none of the eight non-`Clone` builtin names is trusted from that resolution, whatever
+string the fallback produced. `Clone` stays exempt, because resolving *to* it through an
+alias is round 13's own intended detection rather than something to distrust. All three
+were verified against real compilation: the `include!` gap needed no separate included
+file to demonstrate, since removing the name from the whitelist is what the invocation
+alone now trips; the glob re-export was injected as a real nested-module chain reaching
+`Recovery` in `waymaker-flash`'s own `recovery` module, confirmed to compile (visibility
+warnings only) and confirmed caught by `check-layering` before reverting; and the
+shadowed-builtin-derive finding, needing a real external proc-macro crate this
+workspace's layering forbids adding, was verified with a standalone two-crate example — a
+`#[proc_macro_derive(Debug)]` that emits `impl Clone for Recovery` — and shown live by
+calling `.clone()` on the derived type and watching the macro's own `unreachable!()`
+panic fire, the sharpest proof available that the import really does shadow the prelude
+derive.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of

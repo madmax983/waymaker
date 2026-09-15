@@ -1254,13 +1254,28 @@ fn resolve_segment_chain(segments: Vec<String>, aliases: &[UseAlias]) -> Vec<Str
                 }
             }
             if !matched {
-                if aliases
+                // Round 30: a glob import in the ambient scope could have bound this
+                // very name to anything, and this scan does not perform name
+                // resolution — see `GLOB_IMPORT_MARKER`. Round 39 generalizes it to a
+                // *qualified* candidate: `traits::C` is exactly as uncertain when
+                // `traits` itself has a glob nobody chased (`direct_scope_module_
+                // aliases`'s own `"traits::*"` marker) as a bare `C` is when the
+                // ambient scope does, even though no plain alias named `traits::C`
+                // was ever registered for either lookup above to match.
+                let stripped = strip_self_prefix(&current);
+                let glob_could_have_bound_this = aliases
                     .iter()
                     .any(|alias| alias.local == GLOB_IMPORT_MARKER)
-                {
-                    // Round 30: a glob import in the ambient scope could have bound
-                    // this very name to anything, and this scan does not perform name
-                    // resolution — see `GLOB_IMPORT_MARKER`.
+                    || (1..stripped.len()).any(|split| {
+                        let Some(prefix) = stripped.get(..split) else {
+                            return false;
+                        };
+                        let prefix = prefix.join("::");
+                        aliases
+                            .iter()
+                            .any(|alias| alias.local == format!("{prefix}::{GLOB_IMPORT_MARKER}"))
+                    });
+                if glob_could_have_bound_this {
                     finished.push(UNRESOLVED_DERIVE.to_owned());
                 } else if let Some(last) = current.last() {
                     finished.push(last.clone());
@@ -1606,9 +1621,15 @@ fn direct_scope_module_aliases<'a>(
         };
         let name = ident_name(&module.ident);
         let nested_items: Vec<&syn::Item> = nested.iter().collect();
+        let nested_qualified = direct_scope_module_aliases(nested_items.iter().copied());
         let scope: Vec<UseAlias> = direct_scope_aliases(nested_items.iter().copied())
             .into_iter()
-            .chain(direct_scope_module_aliases(nested_items.iter().copied()))
+            .chain(
+                nested_qualified
+                    .iter()
+                    .filter(|alias| !is_glob_marker_name(&alias.local))
+                    .cloned(),
+            )
             .collect();
         // Round 37: `alias.target` used to be copied straight onto the qualified
         // entry, which is right for an ordinary re-export (`pub use core::clone::Clone
@@ -1628,8 +1649,45 @@ fn direct_scope_module_aliases<'a>(
                 });
             }
         }
+        // Round 39 of Codex review on this change (PR #143): `mod traits { mod
+        // nested { pub use core::clone::Clone as C; } pub use nested::*; }` makes
+        // `traits::C` a legal, qualified reference to `Clone` through `traits`' own
+        // glob re-export — but this function's synthetic scope above is built only
+        // from `traits`' own explicit aliases and its nested modules' own qualified
+        // *aliases*, never from a glob any of them declares, so `traits::C` had
+        // nothing registered to resolve against and fell through to the
+        // harmless-looking bare name `C`. A glob anywhere in `nested_items` — this
+        // module's own direct glob, or one a nested module already reduced to its
+        // own `nested::*` marker — is exactly as uncertain one level of
+        // qualification up, so it is re-registered under `name` the same way an
+        // ordinary qualified alias already is; `resolve_segment_chain`'s own
+        // fallback is what a qualified candidate check against this marker.
+        for marker in glob_marker_alias(nested_items.iter().copied())
+            .into_iter()
+            .chain(
+                nested_qualified
+                    .into_iter()
+                    .filter(|alias| is_glob_marker_name(&alias.local)),
+            )
+        {
+            aliases.push(UseAlias {
+                local: format!("{name}::{}", marker.local),
+                target: Vec::new(),
+                absolute: false,
+            });
+        }
     }
     aliases
+}
+
+/// Whether `local` is a [`GLOB_IMPORT_MARKER`] — either the bare marker itself, or one
+/// qualified by [`direct_scope_module_aliases`] onto a chain of nested module names
+/// (`"traits::*"`, `"traits::nested::*"`).
+fn is_glob_marker_name(local: &str) -> bool {
+    local == GLOB_IMPORT_MARKER
+        || local
+            .rsplit_once("::")
+            .is_some_and(|(_, last)| last == GLOB_IMPORT_MARKER)
 }
 
 /// Strips any number of redundant `(..)` wrappers from a type, so `(Recovery)` and
@@ -2574,6 +2632,20 @@ fn is_known_safe_attribute_path(path: &syn::Path) -> bool {
 /// own caller also asks whether the name is [`shadowed_expression_macro_names`] before
 /// trusting it, because a *local* `use` can rebind any of them — see that function's own
 /// documentation for the round 36 finding this split exists to close.
+///
+/// `include` is deliberately absent, unlike its two siblings. Codex review of this
+/// change (PR #143), round 39: `include_str!` and `include_bytes!` can only ever
+/// produce a string or byte-string literal — their result is never parsed as Rust at
+/// all — but `include!` splices the *named file's own tokens* in as Rust source, and
+/// [`token_stream_contains_a_brace_group`]'s brace scan reads only the invocation's own
+/// arguments, which for `include!("clone.inc")` is a single string literal with no
+/// brace in it anywhere. The file `"clone.inc"` names is never opened by this per-file
+/// scan — the same blind spot an out-of-line `mod name;` has — so
+/// `const _: () = include!("clone.inc");` in a production-reachable file, where
+/// `clone.inc` holds `{ impl Clone for Recovery { .. }; 0 }`, walked past this check
+/// unseen. No source in this workspace calls bare `include!` in expression position, so
+/// removing it costs no accepted file anything; it now falls to the same
+/// cannot-rule-out refusal every other unrecognized macro invocation already gets.
 const KNOWN_SAFE_EXPRESSION_MACROS: &[&str] = &[
     "assert",
     "assert_eq",
@@ -2592,7 +2664,6 @@ const KNOWN_SAFE_EXPRESSION_MACROS: &[&str] = &[
     "file",
     "format",
     "format_args",
-    "include",
     "include_bytes",
     "include_str",
     "line",
@@ -2792,6 +2863,21 @@ fn collect_derive_names_from_meta(
 /// scan gave up chasing rather than one it chased all the way to a name it cannot
 /// expand. `DERIVABLE_BUILTIN_TRAITS` is every trait `derive` can name without a
 /// third-party macro; anything else fails closed the same way.
+///
+/// Round 39 found the same bypass one level earlier: `use custom::MakeClone as Debug;
+/// #[derive(Debug)]` — or the un-renamed `use custom::Debug;`, since a plain import
+/// shadows a name exactly as a `use .. as` one does — resolves `Debug` through that
+/// alias to `custom::MakeClone` (or `custom::Debug`), and when neither the crate root
+/// nor a real one names a further alias for it, `resolve_segment_chain`'s own "no
+/// matching alias, take the last segment" fallback reports whatever that path's last
+/// segment happens to spell, `"Debug"` included if the imported item shares the name.
+/// The whitelist then read the resolved string alone and trusted it as the concrete
+/// builtin, with no way to tell "the literal, never-rebound identifier `Debug`" from
+/// "a fallback guess that happens to read `Debug`". `Clone` is exempt from the new
+/// check: resolving *to* `Clone` through an alias is the intended detection round 13's
+/// own `Klon` test already relies on, so distrusting it here would reopen that gap
+/// rather than close this one — the risk is specific to the eight names this scan
+/// otherwise discards as harmless.
 fn push_resolved_names(
     paths: &syn::punctuated::Punctuated<syn::Path, syn::Token![,]>,
     aliases: &[UseAlias],
@@ -2809,11 +2895,19 @@ fn push_resolved_names(
         "PartialOrd",
     ];
     for path in paths {
+        // The path's own first segment, exactly as written — not the name resolution
+        // eventually lands on — because what matters here is whether *this* derive
+        // path was ever handed off to an alias at all, not what came back.
+        let locally_rebound = path.segments.first().is_some_and(|segment| {
+            let first = ident_name(&segment.ident);
+            aliases.iter().any(|alias| alias.local == first)
+        });
         for name in every_resolution(path, aliases) {
-            if name == UNRESOLVED_DERIVE
+            let trusted = name == UNRESOLVED_DERIVE
                 || name == LOCAL_SHADOWED_TYPE
-                || DERIVABLE_BUILTIN_TRAITS.contains(&name.as_str())
-            {
+                || name == "Clone"
+                || (!locally_rebound && DERIVABLE_BUILTIN_TRAITS.contains(&name.as_str()));
+            if trusted {
                 derives.push(name);
             } else {
                 derives.push(UNRESOLVED_DERIVE.to_owned());
