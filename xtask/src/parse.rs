@@ -3918,6 +3918,46 @@ fn well_known_bound_segments(segments: &[String]) -> Option<(&str, &str)> {
     }
 }
 
+/// The fieldless variant *ordinal* of a small, closed set of `core`/`std` enums this scan can
+/// never add to `qualified` at all — [`collect_dependency_qualified_constants`] walks a
+/// crate's own source tree, and there is no source tree here to walk: `core` and `std` are
+/// the toolchain, not a workspace crate `sources` could ever list. Each entry mirrors that
+/// enum's own real declaration order — zero for the first variant, one more for each after
+/// it — the identical rule [`item_enum_variant_constants`] already applies to a workspace
+/// enum one dependency edge away, so a match naming these variants is exactly as
+/// dense-detectable as one naming `waymaker_core::transition::Divergence`'s already is.
+///
+/// Codex's finding: `core::sync::atomic::Ordering`'s five variants — a real, reachable enum
+/// with no dependency edge this scan could ever walk source for — resolved to nothing, so a
+/// match naming all five with a trailing wildcard passed `has_dense_arm_patterns` unseen.
+/// Scoped to the one enum the finding demonstrates plus its two nearest well-known siblings,
+/// rather than a general "resolve any external path" feature this scan has no way to make
+/// safe for an arbitrary crate it cannot read at all: a real declaration always wins first,
+/// exactly the way [`well_known_integer_bound`]'s own fallback stands only where nothing real
+/// answered — this is the identical last resort, one dependency layer further out.
+fn well_known_std_enum_variant(segments: &[String]) -> Option<i128> {
+    const ENUMS: &[(&[&str], &[&str])] = &[
+        (
+            &["sync", "atomic", "Ordering"],
+            &["Relaxed", "Release", "Acquire", "AcqRel", "SeqCst"],
+        ),
+        (&["cmp", "Ordering"], &["Less", "Equal", "Greater"]),
+        (&["task", "Poll"], &["Ready", "Pending"]),
+    ];
+    let (root, rest) = segments.split_first()?;
+    if root != "core" && root != "std" {
+        return None;
+    }
+    let (variant, enum_path) = rest.split_last()?;
+    let enum_path: Vec<&str> = enum_path.iter().map(String::as_str).collect();
+    let index = ENUMS.iter().find_map(|&(path, variants)| {
+        (path == enum_path.as_slice())
+            .then(|| variants.iter().position(|name| *name == variant.as_str()))
+            .flatten()
+    })?;
+    i128::try_from(index).ok()
+}
+
 /// `expr`'s own integer literal, if it is one carrying an explicit suffix (`255u8`, never
 /// a bare `255`) — seen through any nesting of parentheses or brace groups, the same two
 /// wrappers every other literal-reading function here sees through.
@@ -7869,8 +7909,12 @@ fn resolve_qualified_path_at_any_depth(
         .iter()
         .map(|segment| ident_name(&segment.ident))
         .collect();
-    let (type_name, member) = well_known_bound_segments(&segments)?;
-    well_known_integer_bound(type_name, member)
+    if let Some((type_name, member)) = well_known_bound_segments(&segments) {
+        if let Some(value) = well_known_integer_bound(type_name, member) {
+            return Some(value);
+        }
+    }
+    well_known_std_enum_variant(&segments)
 }
 
 /// Whether some real, already-scanned entry in `qualified` answers `path` — the identical

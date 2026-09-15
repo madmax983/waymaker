@@ -22643,6 +22643,40 @@ mod deferred_answer_pins {
             "{violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_over_a_well_known_std_enums_variants_is_reported() {
+        // Codex's finding: `core::sync::atomic::Ordering`'s five variants — a real,
+        // reachable enum with no dependency edge this scan could ever walk source for,
+        // since `core` is the toolchain rather than a workspace crate `sources` could ever
+        // list — resolved to nothing, so a match naming all five with a trailing wildcard
+        // sixth arm passed `has_dense_arm_patterns` unseen. `well_known_std_enum_variant`
+        // now answers for this enum (and its two nearest well-known siblings,
+        // `core::cmp::Ordering` and `core::task::Poll`) the identical "declaration order is
+        // the ordinal" rule `item_enum_variant_constants` already applies to a workspace
+        // enum one dependency edge away. Verified against real rustc, warning-free: this
+        // match compiles, and `Relaxed` through `SeqCst` resolve to the dense `0..5`
+        // sequence the outer table's patterns actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_a_well_known_std_enum() -> u32 {\n    \
+             match core::sync::atomic::Ordering::Relaxed {\n        \
+             core::sync::atomic::Ordering::Relaxed => 9,\n        \
+             core::sync::atomic::Ordering::Release => 3,\n        \
+             core::sync::atomic::Ordering::Acquire => 27,\n        \
+             core::sync::atomic::Ordering::AcqRel => 1,\n        \
+             core::sync::atomic::Ordering::SeqCst => 81,\n        \
+             _ => 0,\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 6-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
