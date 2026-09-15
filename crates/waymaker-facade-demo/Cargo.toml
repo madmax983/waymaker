@@ -1,0 +1,36 @@
+[package]
+name = "waymaker-facade-demo"
+description = "The bridge from waymaker-drive to waymaker-embassy, and design document §06's two examples run through it. Test support: never linked into Waymaker's own firmware, never published, but written to run on the part."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+categories = ["development-tools::testing", "embedded", "no-std"]
+keywords = ["durable", "workflow", "embassy", "no-std"]
+publish = false
+
+[dependencies]
+# The kernel boundary this crate bridges: `Boundary`, `Suspended`, `Identity`, `Workflow`.
+waymaker-core.workspace = true
+# `Bounds`, for §10's reserve, which each example's workflow declares.
+waymaker-flash.workspace = true
+# `waymaker-drive`'s synchronous protocol, driven through the boundary above.
+waymaker-drive.workspace = true
+# The façade this crate is the bridge for: `Ctx`, the two examples' async syntax, and the
+# board clocks issue #34 adds. This is the one edge to `waymaker-embassy` anywhere in the
+# workspace's driver side — see issue #106.
+waymaker-embassy.workspace = true
+
+[dev-dependencies]
+# The in-memory NOR model and the crash injector. The two examples are run at every crash
+# point the injector lists, which is what makes "across a power cut" a loop rather than a
+# claim.
+waymaker-fault.workspace = true
+# Issue #34's board clocks: `tests/power_loss.rs` drives a persistent deadline across a
+# total power cut through `waymaker_rig::rtc::Rtc` and `waymaker_rig::epoch::RestoredEpoch`.
+waymaker-rig.workspace = true
+
+[lints]
+workspace = true

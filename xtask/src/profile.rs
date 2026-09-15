@@ -194,7 +194,7 @@ pub struct WorkspaceCrate {
 ///
 /// The three layers plus [`crate::policy::NO_STD_TEST_SUPPORT_CRATES`] — derived from the
 /// layering table rather than listed again, so a crate joining either category is gated here
-/// without anybody remembering a row. Those three test-support crates belong for the reason
+/// without anybody remembering a row. Those four test-support crates belong for the reason
 /// `policy` gives for their `#![no_std]`: each claims to be allocation-free, and
 /// `waymaker-drive`'s claim is issue #28's own "done when".
 #[must_use]
@@ -332,8 +332,8 @@ impl Cost {
 
 /// What callgrind said, and which engine crates it said it about.
 ///
-/// The second half is not decoration. This gate names six crates and holds each to zero heap
-/// blocks, and a crate the workloads never execute scores that zero for the wrong reason —
+/// The second half is not decoration. This gate names seven crates and holds each to zero
+/// heap blocks, and a crate the workloads never execute scores that zero for the wrong reason —
 /// it is the score a crate that had been deleted would get. Reach is measured in
 /// *instructions* rather than allocations for the obvious reason: every crate that ran has
 /// instructions, and a crate that ran correctly has no allocations.
@@ -1866,7 +1866,7 @@ fn=(15) with_capacity_in<waymaker_core::activity::ActivityKind, alloc::alloc::Gl
         assert_eq!(unreached.len(), engine_crates().len() - 2);
         let shortfall = report
             .shortfall_report()
-            .expect("a report that measured four of six gated crates is not a pass");
+            .expect("a report that measured only two of the gated crates is not a pass");
         for name in &unreached {
             assert!(
                 shortfall.contains(name.as_str()),

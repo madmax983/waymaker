@@ -183,3 +183,42 @@ fn the_schedule_index_of_an_effect_is_the_role_that_names_it() {
     assert_eq!(workload.schedule_index(5), None);
     assert_eq!(workload.completion_index(5), None);
 }
+
+#[test]
+fn a_diverging_workload_disagrees_with_the_base_one_at_exactly_one_effects_schedule() {
+    let base = Workload::new(SEED, 0, 5);
+    let Some(records) = base.records() else {
+        unreachable!("a run of five effects has a record count")
+    };
+    let mut base_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+    let mut declared_page = [0_u8; Workload::MAX_PAYLOAD_BYTES];
+    for effect in 0..5_u16 {
+        let Some(schedule) = base.schedule_index(effect) else {
+            unreachable!("an effect of this run")
+        };
+        let declared = base.diverging(effect);
+        for index in 0..records {
+            let same =
+                base.record(index, &mut base_page) == declared.record(index, &mut declared_page);
+            assert_eq!(
+                same,
+                index != schedule,
+                "effect {effect}, record {index}: diverging({effect}) must disagree with the \
+                 base workload at that effect's own schedule index ({schedule}) and nowhere \
+                 else"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_diverging_workload_names_no_effect_this_run_does_not_have() {
+    // An out-of-range effect names no schedule to diverge — `schedule_index` already answers
+    // `None` for it — so the declared workload is the base one, byte for byte. This is the
+    // one case `diverging` still degrades silently, and it is the narrow, honest one: there
+    // is no record for it to have disagreed at, unlike a caller passing a raw index that
+    // happened to name a `Start`, `Completion` or `Finish` record.
+    let base = Workload::new(SEED, 0, 5);
+    let declared = base.diverging(5);
+    assert_eq!(declared, base);
+}

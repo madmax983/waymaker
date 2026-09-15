@@ -2098,13 +2098,14 @@ fn ctx_facade() -> usize {
         Some(Conclusion::Refused) => 10,
         None => 11,
     });
+    kept = kept.wrapping_add(usize::from(ctx.unserviceable()));
 
     core::hint::black_box(kept.wrapping_add(dispatch_wiring()))
 }
 
 /// Issue #36's dispatch table, driven once per public function.
 ///
-/// It exists here because `waymaker-drive`'s OTA example implements
+/// It exists here because `waymaker-facade-demo`'s OTA example implements
 /// [`ActivityDispatcher`](waymaker_embassy::ActivityDispatcher) by hand, so nothing else in
 /// the workspace monomorphises the table — and a `facade` row that charged for a generic
 /// nobody names would be charging for nothing. `size-probe-reach` is what makes that a
@@ -2117,7 +2118,7 @@ fn dispatch_wiring() -> usize {
     use waymaker_core::{ActivityKind, EffectId, EffectSeq, RunId};
     use waymaker_embassy::ActivityDispatcher;
     use waymaker_embassy::dispatch::Produced;
-    use waymaker_embassy::wiring::{Activity, Table, Unhandled};
+    use waymaker_embassy::wiring::{Activity, Table};
 
     /// A stand-in world. The probe is never run.
     struct Fleet(usize);
@@ -2160,9 +2161,8 @@ fn dispatch_wiring() -> usize {
         &mut out,
     ) {
         Poll::Ready(Ok(Produced::Completed(len) | Produced::Failed(len))) => len,
-        Poll::Ready(Err(Unhandled::Activity(reason))) => reason,
-        Poll::Ready(Err(Unhandled::NoSuchActivity(kind))) => usize::from(kind.0),
-        Poll::Pending => 1,
+        Poll::Ready(Err(reason)) => reason,
+        Poll::Ready(Ok(Produced::Unserviceable)) | Poll::Pending => 1,
     };
     kept = kept.wrapping_add(table.name_of(asked).map_or(0, str::len));
     kept = kept.wrapping_add(table.world().0);

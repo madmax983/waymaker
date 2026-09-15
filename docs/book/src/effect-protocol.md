@@ -34,7 +34,7 @@ is crate-private, so that trust reaches one caller.
 ## What the media shows
 
 ```rust,ignore
-{{#include ../../../crates/waymaker-drive/tests/book.rs:a_journal_records_the_intent_before_the_outcome}}
+{{#include ../../../crates/waymaker-facade-demo/tests/book.rs:a_journal_records_the_intent_before_the_outcome}}
 ```
 
 ## The commit seal

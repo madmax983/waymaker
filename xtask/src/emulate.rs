@@ -55,6 +55,23 @@
 //! reset-cause register or a backup domain, so `docs::HARDWARE_TARGETS` stays `Not run`
 //! and this stage may not be cited to move a row of it. See
 //! [ADR 0040](https://github.com/madmax983/waymaker/blob/main/docs/adr/0040-the-emulator-runs-the-rig-and-attests-to-no-board.md).
+//!
+//! # What it now measures about the stack, on the ARM pair
+//!
+//! Each ARM image paints its own unused stack before the rig runs and reports how far the
+//! paint was disturbed after — [`StackUsage`], read from a fourth census line. This is a
+//! real, on-target figure where before there was none, and it closes a limit `CLAUDE.md`'s
+//! budgets section names: §04's runtime RAM figure is stack-blind for call-chain depth, and
+//! this is the depth for *this* image, on *this* run. It is not the same figure. This image
+//! links `waymaker-rig` and `waymaker-conformance` alongside the three layers, so what is
+//! reported is the whole call chain's depth, not the engine's share of it. It is a lower
+//! bound rather than an exact reading — a frame can reserve bytes it never writes, which the
+//! paint pattern cannot see — and it fails closed only for running out of room, against no
+//! invented §04 ceiling, never compared between the two ARM cores: different cores compile
+//! the same source into different instructions, so a different byte count is expected rather
+//! than a finding. It is ARM-only: the reading is a `cortex-m` register read with no Xtensa
+//! equivalent, so the ESP32-S3 reports no stack line and none is required of it. See
+//! [ADR 0045](https://github.com/madmax983/waymaker/blob/main/docs/adr/0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -336,7 +353,7 @@ pub fn qemu_args_for(machine: Machine, image: &Path, serial_log: &Path) -> Vec<S
 /// rig that may not have finished.
 #[must_use]
 pub fn xtensa_complete(log: &str) -> bool {
-    parse(log).is_some()
+    parse(log, MachineKind::Xtensa).is_some()
 }
 
 /// Whether the Xtensa serial log so far reports a terminal guest failure.
@@ -679,11 +696,72 @@ impl Census {
     }
 }
 
+/// How much of the painted stack one ARM run disturbed.
+///
+/// Read from an ARM image's own fourth census line, alongside [`Census`] rather than folded
+/// into it: the two are parsed together on ARM and always answered together there, but they
+/// are never compared the same way. [`Report::shortfall`]'s cross-machine equality check
+/// reads [`Census`] alone — every selected core executing the same deterministic plan must
+/// agree about what the rig did, and this is what a difference there would mean. Cores are
+/// not expected to use the same number of stack bytes doing it: a Cortex-M0 and a Cortex-M4
+/// compile the same source into different instructions, so a different figure here is
+/// expected and not itself a finding. `None` on a [`Row`] whose [`MachineKind`] is
+/// [`MachineKind::Xtensa`]: the reading is a `cortex-m` register read with no Xtensa
+/// equivalent, so the ESP32-S3 reports no stack line and none is required of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StackUsage {
+    /// Bytes disturbed, from the deepest point the run reached up to the stack pointer
+    /// reading taken before it started.
+    pub used: u32,
+    /// Bytes the paint covered: the whole region between the linker's `_stack_end` and that
+    /// same reading.
+    pub available: u32,
+}
+
+/// A duplicate of `waymaker_emu::stack::GUARD_BYTES`, kept as a literal rather than an import
+/// because nothing in this workspace depends on `waymaker-emu` — it is firmware, outside
+/// `default-members`, and no layer, test-support crate or host tool links it.
+///
+/// [`StackUsage::shortfall`] needs the value: `paint` declines to write anything at all once
+/// the region between the linker's `_stack_end` and its resolved bound is no wider than this
+/// margin, and a report reflecting that is not a measurement — but a reported `available` of,
+/// say, 50 is not `0` either, so a check that only refused an *empty* region would miss it.
+/// `the_duplicated_guard_bytes_matches_the_real_stack_module` reads the literal back out of
+/// [`tests_support::real_stack_module`] and fails if the two ever drift apart.
+const STACK_GUARD_BYTES: u32 = 128;
+
+impl StackUsage {
+    /// Why this is not a measurement, if it is not.
+    ///
+    /// Three ways, all "a measurement that did not happen is not a measurement that passed":
+    /// a region no wider than `STACK_GUARD_BYTES` is one `paint` declines to write anything
+    /// into at all, so nothing was painted and nothing was measured whether or not the report
+    /// happens to read as `0`; and a region disturbed all the way down could not tell a run
+    /// that used every byte from one that used one more than this image could see.
+    #[must_use]
+    pub fn shortfall(&self) -> Option<String> {
+        if self.available <= STACK_GUARD_BYTES {
+            return Some(format!(
+                "{} available bytes is no wider than the {} this image never paints, so nothing was painted and nothing was measured",
+                self.available, STACK_GUARD_BYTES
+            ));
+        }
+        if self.used >= self.available {
+            return Some(format!(
+                "used {} of {} available bytes: the paint was disturbed all the way down, so the true high-water mark could not be read",
+                self.used, self.available
+            ));
+        }
+        None
+    }
+}
+
 /// What became of one machine's boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The image ran, said what it did, and the census holds.
-    Ran(Census),
+    /// The image ran, said what it did, and the census holds. Stack usage is `Some` on ARM,
+    /// `None` on Xtensa — see [`StackUsage`].
+    Ran(Census, Option<StackUsage>),
     /// The run is not a measurement, and this is why.
     ///
     /// One variant rather than several, for [`crate::profile::Verdict::Unmeasurable`]'s
@@ -696,7 +774,17 @@ impl Outcome {
     #[must_use]
     pub const fn census(&self) -> Option<&Census> {
         match self {
-            Self::Ran(census) => Some(census),
+            Self::Ran(census, _) => Some(census),
+            Self::Unmeasurable(_) => None,
+        }
+    }
+
+    /// The stack usage, if there is one — `Some` on ARM, `None` on Xtensa or a run that
+    /// never reached a census at all.
+    #[must_use]
+    pub const fn stack(&self) -> Option<&StackUsage> {
+        match self {
+            Self::Ran(_, stack) => stack.as_ref(),
             Self::Unmeasurable(_) => None,
         }
     }
@@ -748,8 +836,11 @@ impl Report {
                 Outcome::Unmeasurable(why) => {
                     return Some(format!("{}: {why}", row.machine.name));
                 }
-                Outcome::Ran(census) => {
+                Outcome::Ran(census, stack) => {
                     if let Some(shortfall) = census.shortfall() {
+                        return Some(format!("{}: {shortfall}", row.machine.name));
+                    }
+                    if let Some(shortfall) = stack.as_ref().and_then(StackUsage::shortfall) {
                         return Some(format!("{}: {shortfall}", row.machine.name));
                     }
                 }
@@ -787,17 +878,23 @@ impl Report {
                 row.machine.qemu,
                 row.machine.architecture,
                 match &row.outcome {
-                    Outcome::Ran(census) => format!(
-                        "cases {}+{} · iterations {} · cuts {} · resumes {} · redeliveries {} · verdicts {} · effects {}",
-                        census.cases_passed,
-                        census.cases_exempt,
-                        census.iterations,
-                        census.cuts,
-                        census.resumes,
-                        census.redeliveries,
-                        census.verdicts,
-                        census.dispatched
-                    ),
+                    Outcome::Ran(census, stack) => {
+                        let mut cell = format!(
+                            "cases {}+{} · iterations {} · cuts {} · resumes {} · redeliveries {} · verdicts {} · effects {}",
+                            census.cases_passed,
+                            census.cases_exempt,
+                            census.iterations,
+                            census.cuts,
+                            census.resumes,
+                            census.redeliveries,
+                            census.verdicts,
+                            census.dispatched
+                        );
+                        if let Some(stack) = stack {
+                            let _ = write!(cell, " · stack {} of {}", stack.used, stack.available);
+                        }
+                        cell
+                    }
                     Outcome::Unmeasurable(why) => format!("unmeasurable: {why}"),
                 }
             );
@@ -815,22 +912,32 @@ impl Report {
             "\nWhat this establishes is that the rig executes on {cores}, and that {agreement} agree\n\
              about what it did. What it does not establish is a board: no emulated machine has a\n\
              NOR part, a supply to remove, a reset-cause register or a backup domain, so every\n\
-             row of the hardware table stays `Not run`. See ADR 0040."
+             row of the hardware table stays `Not run`. See ADR 0040.\n\n\
+             Stack is the ARM pair's own call-chain depth on this run, not the engine's share of\n\
+             it, and the two ARM cores are not required to agree: different cores compile the\n\
+             same source into different instructions. See ADR 0045."
         );
         out
     }
 }
 
-/// Reads a boot's own lines into a census.
+/// Reads a boot's own lines into a census and, on ARM, its stack usage.
 ///
 /// Pure, so that every way an image can fail to say what it did is a case in
 /// `tests` rather than a QEMU run inside a test. Returns `None` when a required line is
 /// absent — which is what an image that exited zero having printed nothing looks like.
+///
+/// `kind` decides whether a stack line is required: ARM images write one and Xtensa images
+/// never do, so an Xtensa boot with `cases`, `rig` and `ok` is complete without it — the
+/// fourth line ADR 0045 adds is [`MachineKind::Arm`]'s own requirement, not a requirement of
+/// this parser in general.
 #[must_use]
-pub fn parse(output: &str) -> Option<Census> {
+pub fn parse(output: &str, kind: MachineKind) -> Option<(Census, Option<StackUsage>)> {
     let mut census = Census::default();
+    let mut stack = StackUsage::default();
     let mut cases = false;
     let mut rig = false;
+    let mut stack_seen = false;
     let mut ok = false;
     for line in output.lines() {
         let Some(rest) = line.trim().strip_prefix(PREFIX) else {
@@ -852,12 +959,20 @@ pub fn parse(output: &str) -> Option<Census> {
             census.verdicts = field(fields, "verdicts")?;
             census.dispatched = field(fields, "dispatched")?;
             rig = true;
+        } else if let Some(fields) = rest.strip_prefix("stack ") {
+            stack.used = field(fields, "used")?;
+            stack.available = field(fields, "available")?;
+            stack_seen = true;
         }
     }
-    // All three, and `ok` is not enough on its own: the image writes it last, so a truncated
-    // run has the counts and not the word, and an image that printed only the word did not
-    // run. Requiring the set is what makes a partial read a failure.
-    (cases && rig && ok).then_some(census)
+    let stack_required = match kind {
+        MachineKind::Arm => stack_seen,
+        MachineKind::Xtensa => true,
+    };
+    // `ok` is not enough on its own: the image writes it last, so a truncated run has the
+    // counts and not the word, and an image that printed only the word did not run.
+    // Requiring the set is what makes a partial read a failure.
+    (cases && rig && ok && stack_required).then_some((census, stack_seen.then_some(stack)))
 }
 
 /// Reads `name=<number>` out of a space-separated field list.
@@ -887,16 +1002,16 @@ pub fn measure(root: &Path) -> Result<Report, String> {
     let mut rows = Vec::new();
     for machine in &machines {
         let outcome = match build(root, *machine).and_then(|image| start(*machine, &image, root)) {
-            Ok((census, output)) => {
+            Ok((parsed, output)) => {
                 rows.push(Row {
                     machine: *machine,
-                    outcome: census.map_or_else(
+                    outcome: parsed.map_or_else(
                         || {
                             Outcome::Unmeasurable(
                                 "the image ran and printed no census this gate can read, which is not a measurement that passed".to_owned(),
                             )
                         },
-                        Outcome::Ran,
+                        |(census, stack)| Outcome::Ran(census, stack),
                     ),
                     output,
                 });
@@ -1116,8 +1231,12 @@ fn flash_image(elf: &Path) -> Result<PathBuf, String> {
     Ok(flash)
 }
 
+/// A boot's parsed census and, on ARM, its stack usage — [`parse`]'s own return type, named
+/// so `start`, `start_arm` and `start_xtensa` need not each spell out the nested `Option`.
+type Parsed = Option<(Census, Option<StackUsage>)>;
+
 /// Starts `image` on `machine` and reads what it wrote.
-fn start(machine: Machine, image: &Path, root: &Path) -> Result<(Option<Census>, String), String> {
+fn start(machine: Machine, image: &Path, root: &Path) -> Result<(Parsed, String), String> {
     match machine.kind {
         MachineKind::Arm => start_arm(machine, image),
         MachineKind::Xtensa => start_xtensa(machine, image, root),
@@ -1125,7 +1244,7 @@ fn start(machine: Machine, image: &Path, root: &Path) -> Result<(Option<Census>,
 }
 
 /// Starts `image` on `machine` and reads what it wrote.
-fn start_arm(machine: Machine, image: &Path) -> Result<(Option<Census>, String), String> {
+fn start_arm(machine: Machine, image: &Path) -> Result<(Parsed, String), String> {
     let mut child = Command::new(EMULATOR)
         .args(qemu_args_for(machine, image, Path::new("")))
         .stdout(Stdio::piped())
@@ -1180,7 +1299,7 @@ fn start_arm(machine: Machine, image: &Path) -> Result<(Option<Census>, String),
             }
         ));
     }
-    Ok((parse(&output), output))
+    Ok((parse(&output, machine.kind), output))
 }
 
 /// Starts the flash image on the ESP32-S3 machine and reads what it wrote.
@@ -1216,11 +1335,7 @@ fn remove_stale_log(log: &Path) -> Result<(), String> {
     }
 }
 
-fn start_xtensa(
-    machine: Machine,
-    image: &Path,
-    root: &Path,
-) -> Result<(Option<Census>, String), String> {
+fn start_xtensa(machine: Machine, image: &Path, root: &Path) -> Result<(Parsed, String), String> {
     let log = image
         .parent()
         .map(|dir| dir.join("uart0.log"))
@@ -1258,7 +1373,7 @@ fn start_xtensa(
         if xtensa_complete(&log_text) {
             let _ = child.kill();
             let _ = child.wait();
-            break parse(&log_text);
+            break parse(&log_text, machine.kind);
         }
         // The guest says `failed`/`panicked` and then parks: the census will never come,
         // so failing now keeps the UART's own account in the error instead of burning the
@@ -1309,17 +1424,44 @@ pub const REQUIRED_ATTRIBUTES: &[&str] = &["#![no_std]", "#![no_main]"];
 
 /// The identifier the crate is allowed to name, and the keyword it is almost never.
 ///
-/// The whole of the ARM exception this crate carries is that a *macro* it invokes expands
+/// Most of the ARM exception this crate carries is that a *macro* it invokes expands
 /// to `unsafe`: `#[cortex_m_rt::entry]` writes the exported symbol the reset vector points
 /// at, and `debug::exit` performs the semihosting call. Neither is hand-written here, and
 /// this is what says so — the crate may name the lint (`unsafe_code`, in the `allow` it
-/// declares) and may never write the keyword on ARM. The Xtensa startup is the exception to
-/// the exception: there is no `cortex-m-rt` for Xtensa, so its stack install, `.bss`
-/// zeroing and UART pokes are hand-written behind a `#[cfg(target_arch = "xtensa")]` gate
-/// the rule below checks. Without the ARM half, `#![allow(unsafe_code)]` would be a licence
-/// for the whole crate rather than for two macro expansions, and the one place in this
-/// workspace where `unsafe` is permitted would be the one place nothing checks.
+/// declares) and may write the keyword on ARM only where [`PERMITTED_UNSAFE_FUNCTIONS`]
+/// names. The Xtensa startup is the exception to the exception: there is no `cortex-m-rt`
+/// for Xtensa, so its stack install, `.bss` zeroing and UART pokes are hand-written behind a
+/// `#[cfg(target_arch = "xtensa")]` gate the rule below checks. Without the ARM half,
+/// `#![allow(unsafe_code)]` would be a licence for the whole crate rather than for two macro
+/// expansions and one measurement, and the one place in this workspace where `unsafe` is
+/// permitted would be the one place nothing checks.
 pub const PERMITTED_LINT_NAME: &str = "unsafe_code";
+
+/// The one file [`PERMITTED_UNSAFE_FUNCTIONS`] is read from.
+///
+/// The crate-relative path rather than a bare file name: `check_image_attributes` matches
+/// `main.rs` by suffix to *impose* an obligation, where every file named that way is held to
+/// it and a decoy costs nothing. This suffix *grants* a permission, so a short one would let a
+/// `stack.rs` filed in any directory of the crate borrow it — a sharper version of the same
+/// limit, named in `CLAUDE.md`'s "what is not checked" rather than left implied.
+pub const STACK_MODULE: &str = "crates/waymaker-emu/src/stack.rs";
+
+/// The only functions in [`STACK_MODULE`] that may write the `unsafe` keyword.
+///
+/// The reset vector and the semihosting exit are macro expansions; this is the exception to
+/// the ARM half of [`PERMITTED_LINT_NAME`], hand-written rather than expanded, so it is
+/// pinned by name instead of being invisible to this scan the way a macro's own `unsafe` is.
+/// ADR 0045 is the reason either function needs it at all: a raw fill and a raw read, over
+/// the region between the linker's `_stack_end` and a stack-pointer reading taken before
+/// either runs.
+///
+/// A name alone is not the pin: `check_no_handwritten_unsafe` also requires each to be
+/// declared exactly once — `crate::source::declaration_count`, `effect-protocol`'s own
+/// guard against "a decoy above the real one is what a first-match scan reads" — and requires
+/// every `unsafe` inside to sit at that function body's own nesting depth,
+/// `crate::source::nesting_depth_at`, the guard `effect-protocol` also carries against a
+/// nested item or a closure hiding a second, unrelated `unsafe`.
+pub const PERMITTED_UNSAFE_FUNCTIONS: &[&str] = &["paint", "high_water_mark"];
 
 /// Fails a build in which the emulated image stops being the thing this gate started.
 ///
@@ -1331,11 +1473,13 @@ pub const PERMITTED_LINT_NAME: &str = "unsafe_code";
 /// a host binary would still run under nothing, and an unreasoned `allow` is the exception
 /// the workspace manifest says must be reviewable.
 ///
-/// The *`unsafe`* half: no file of the crate writes the keyword — except the Xtensa startup
-/// module, whose `unsafe` the crate root gates on `#[cfg(target_arch = "xtensa")]`. See
-/// [`PERMITTED_LINT_NAME`]: on ARM the exception stays scoped to two macro expansions, and
-/// the Xtensa hand-written half can never reach an ARM image because the gate is what
-/// decides whether the module compiles at all.
+/// The *`unsafe`* half: no file of the crate writes the keyword outside
+/// [`PERMITTED_UNSAFE_FUNCTIONS`] and the one linker-symbol block [`STACK_MODULE`] permits —
+/// except the Xtensa startup module, whose `unsafe` the crate root gates on
+/// `#[cfg(target_arch = "xtensa")]`. See [`PERMITTED_LINT_NAME`]: on ARM the exception stays
+/// scoped to two macro expansions and one measurement, and the Xtensa hand-written half can
+/// never reach an ARM image because the gate is what decides whether the module compiles at
+/// all.
 ///
 /// The *prefix* half: the image and [`PREFIX`] agree. The harness reads the image's lines to
 /// decide whether the run was a measurement, so a space added on one side and not the other
@@ -1453,22 +1597,35 @@ fn attribute_body<'a>(contents: &'a str, opener: &str) -> Option<&'a str> {
     rest.get(..end)
 }
 
-/// No file of the crate writes the `unsafe` keyword — except the Xtensa startup module.
+/// No file of the crate writes the `unsafe` keyword — except [`PERMITTED_UNSAFE_FUNCTIONS`]
+/// and the one linker-symbol block in [`STACK_MODULE`], and the Xtensa startup module.
 ///
-/// The carve-out is the gate, not the keyword: a file's `unsafe` is permitted only when the
-/// crate root declares that file's module behind `#[cfg(target_arch = "xtensa")]`, which is
-/// what decides whether the module compiles into an image at all. The Xtensa startup has no
-/// `cortex-m-rt` to expand, so its stack install, `.bss` zeroing and UART pokes cannot be
-/// spelled without the keyword; gating the module keeps that hand-written half out of every
-/// ARM image, where the exception covers two macro expansions and nothing else.
+/// Two carve-outs, checked per occurrence rather than once per file, because they are two
+/// different shapes of exemption. The Xtensa one is the gate, not the keyword: a file's
+/// `unsafe` is permitted *everywhere* in it once the crate root declares that file's module
+/// behind `#[cfg(target_arch = "xtensa")]`, which is what decides whether the module compiles
+/// into an image at all — the Xtensa startup has no `cortex-m-rt` to expand, so its stack
+/// install, `.bss` zeroing and UART pokes cannot be spelled without the keyword, and gating
+/// the module keeps that hand-written half out of every ARM image. The stack one is narrower
+/// and does not rely on any gate: [`STACK_MODULE`] is not itself excluded from ARM images, so
+/// only the exact spans [`PermittedStackSpans::collect`] resolves are exempt, and an `unsafe`
+/// anywhere else in that file — even a third function beside the two permitted ones — still
+/// fails it. Outside both carve-outs, the exception covers two macro expansions on ARM and
+/// nothing else.
 fn check_no_handwritten_unsafe(files: &[&crate::size::LayerSource]) -> Vec<crate::Violation> {
     let mut violations = Vec::new();
     let root = files.iter().find(|source| source.path.ends_with("main.rs"));
     for source in files {
         let code = crate::source::code_only(&source.contents);
+        let permitted = source
+            .path
+            .replace('\\', "/")
+            .ends_with(STACK_MODULE)
+            .then(|| PermittedStackSpans::collect(&code));
+        let is_xtensa_gated =
+            root.is_some_and(|root| xtensa_gated_module(&root.path, files, &source.path));
         let bytes = code.as_bytes();
         let mut at = 0;
-        let mut handwritten = false;
         while let Some(found) = code.get(at..).and_then(|rest| rest.find("unsafe")) {
             let start = at.saturating_add(found);
             let end = start.saturating_add("unsafe".len());
@@ -1480,23 +1637,229 @@ fn check_no_handwritten_unsafe(files: &[&crate::size::LayerSource]) -> Vec<crate
             // `unsafe_code` is the lint's name and the one thing this crate may say. The
             // keyword is never followed by an identifier byte, so the two cannot be confused.
             let is_the_lint = after.is_some_and(is_identifier_byte);
-            if is_word_start && !is_the_lint {
-                handwritten = true;
+            let is_permitted_stack = permitted.as_ref().is_some_and(|spans| spans.covers(start));
+            if is_word_start && !is_the_lint && !is_xtensa_gated && !is_permitted_stack {
+                violations.push(crate::Violation::new(
+                    RULE,
+                    source.path.clone(),
+                    "writes the `unsafe` keyword. The exception this crate carries is for two macro expansions on ARM — the reset vector and the semihosting exit — one measurement on ARM — the stack high-water mark, confined to the two functions PERMITTED_UNSAFE_FUNCTIONS names and the one linker-symbol block STACK_MODULE's own shape allows — and hand-written `unsafe` outside the `#[cfg(target_arch = \"xtensa\")]`-gated startup module is the thing nothing else would catch",
+                ));
                 break;
             }
             at = end;
         }
-        if handwritten
-            && !root.is_some_and(|root| xtensa_gated_module(&root.path, files, &source.path))
-        {
-            violations.push(crate::Violation::new(
-                RULE,
-                source.path.clone(),
-                "writes the `unsafe` keyword. The exception this crate carries is for two macro expansions on ARM — the reset vector and the semihosting exit — and hand-written `unsafe` outside the `#[cfg(target_arch = \"xtensa\")]`-gated startup module is the thing nothing else would catch",
-            ));
-        }
     }
     violations
+}
+
+/// The linker symbol naming the stack's lowest address, and the one the extern block must
+/// name.
+///
+/// `_stack_end`, not `__ebss`: naming the wrong one would be invisible to every rule here, so
+/// this is the one place the correct symbol is written down and checked rather than only
+/// argued in `crate::stack`'s own documentation — a module in `waymaker-emu`, which this
+/// crate does not have; the name is repeated for the reader who reaches this file first.
+const STACK_FLOOR_SYMBOL: &str = "_stack_end";
+
+/// The linker symbol naming the stack's highest address, and the extern block's other
+/// permitted name.
+///
+/// Named so `waymaker_emu::stack::clamp_to_stack_region` can hold a caller's reading inside
+/// memory this image actually owns, whatever the reading says — ADR 0045's soundness fix for
+/// `paint` and `high_water_mark` being safe `pub fn`s over a caller-supplied bound.
+const STACK_CEILING_SYMBOL: &str = "_stack_start";
+
+/// Every place [`PERMITTED_UNSAFE_FUNCTIONS`] and the one linker-symbol block permit `unsafe`
+/// in a `stack.rs`, computed once per file rather than re-derived per occurrence.
+struct PermittedStackSpans {
+    /// The absolute byte offset of the one legitimate `unsafe` keyword in each permitted
+    /// function that has exactly one, at that function's own nesting depth zero.
+    ///
+    /// A single offset per function, not a body range: `covers` checking containment alone
+    /// would permit a *second*, unrelated `unsafe` statement placed beside the legitimate one
+    /// at the same depth — a sibling rather than a nested decoy, and one nesting depth cannot
+    /// tell apart on its own. Requiring exactly one such offset and matching it exactly closes
+    /// that: a function with two depth-zero `unsafe` keywords permits neither, because which
+    /// one is real would be a guess.
+    function_unsafe_at: Vec<usize>,
+    /// The absolute byte offset of the `unsafe` keyword opening the one well-formed
+    /// `unsafe extern "C" { .. }` block, if the file has one — declaring only
+    /// [`STACK_FLOOR_SYMBOL`] and [`STACK_CEILING_SYMBOL`] and nothing else.
+    ///
+    /// A single offset, not the block's byte range: `covers` checking containment over the
+    /// whole span would permit a *second*, unrelated `unsafe` occurrence anywhere between the
+    /// braces — an attribute, or any other text this scan does not police the shape of — as
+    /// long as it left the two-static, no-`fn` count alone. Matching only the one keyword that
+    /// opens the block is `function_unsafe_at`'s own fix met here: the block's `unsafe extern`
+    /// is the sole thing the 2024 edition requires, so it is the sole thing permitted.
+    extern_block_unsafe_at: Option<usize>,
+}
+
+impl PermittedStackSpans {
+    /// Reads every permitted span out of `code`, a `stack.rs` already through
+    /// [`crate::source::code_only`].
+    fn collect(code: &str) -> Self {
+        let function_unsafe_at = PERMITTED_UNSAFE_FUNCTIONS
+            .iter()
+            .filter_map(|name| {
+                let header = format!("fn {name}");
+                // `declaration_count` rather than trusting the first match:
+                // `crate::source::braced_body` takes the first boundary match and the first
+                // `{` after it, so a bodiless `fn paint(..);` signature declared earlier in
+                // the file — a trait method, an `extern` declaration — would resolve the span
+                // onto whatever block follows it instead. A function declared more than once
+                // is refused the same way: which one is "the" permitted body would be a
+                // guess, and this rule does not guess. Neither check alone is enough: a lone
+                // bodiless signature has a `declaration_count` of exactly one too, so
+                // `has_a_body` is what actually tells the two apart.
+                if crate::source::declaration_count(code, &header) != 1
+                    || !has_a_body(code, &header)
+                {
+                    return None;
+                }
+                let body = crate::source::braced_body(code, &header)?;
+                let (from, _) = span_of(code, body);
+                sole_depth_zero_unsafe(body).map(|offset| from.saturating_add(offset))
+            })
+            .collect();
+        Self {
+            function_unsafe_at,
+            extern_block_unsafe_at: extern_block_unsafe_keyword(code),
+        }
+    }
+
+    /// Whether the `unsafe` starting at `start` in `code` is one of the offsets this file
+    /// permits.
+    fn covers(&self, start: usize) -> bool {
+        self.extern_block_unsafe_at == Some(start) || self.function_unsafe_at.contains(&start)
+    }
+}
+
+/// The byte offset of the one `unsafe` keyword in `body` that sits at the body's own nesting
+/// depth zero, if there is exactly one.
+///
+/// Depth zero: not inside a nested `fn`, `impl` or `mod` declared within the body, and not
+/// inside a closure or a call argument list either — `effect-protocol`'s own guard against a
+/// step "in a closure nothing runs", the same shape of decoy met here for the same reason.
+/// Two or more such occurrences is refused rather than picking the first: a sibling `unsafe`
+/// placed beside the legitimate one is a decoy depth alone cannot tell from the real one, so
+/// requiring exactly one is what actually closes it.
+fn sole_depth_zero_unsafe(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut at = 0;
+    let mut found = None;
+    while let Some(offset) = body.get(at..).and_then(|rest| rest.find("unsafe")) {
+        let start = at.saturating_add(offset);
+        let end = start.saturating_add("unsafe".len());
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index).copied());
+        let after = bytes.get(end).copied();
+        let is_word_start = before.is_none_or(|byte| !is_identifier_byte(byte));
+        let is_the_lint = after.is_some_and(is_identifier_byte);
+        if is_word_start && !is_the_lint && crate::source::nesting_depth_at(body, start) == 0 {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(start);
+        }
+        at = end;
+    }
+    found
+}
+
+/// Whether `code`'s one declaration of `header` — a token-boundary match, as
+/// [`crate::source::declaration_count`] counts it — reaches a `{` before it reaches a `;`.
+///
+/// A real function's signature cannot contain a bare `;`; a bodiless one — a trait method, an
+/// `extern "C"` declaration — always ends with one before any `{` of its own. Without this, a
+/// header with `declaration_count` of exactly one but no body of its own would still let
+/// [`crate::source::braced_body`] resolve onto whatever block happens to follow it.
+fn has_a_body(code: &str, header: &str) -> bool {
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+    code.match_indices(header).any(|(index, _)| {
+        let before = code
+            .get(..index)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !continues(character));
+        let rest = code.get(index + header.len()..).unwrap_or_default();
+        let after = rest
+            .chars()
+            .next()
+            .is_none_or(|character| !continues(character));
+        if !(before && after) {
+            return false;
+        }
+        match (rest.find('{'), rest.find(';')) {
+            (Some(brace), Some(semicolon)) => brace < semicolon,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    })
+}
+
+/// The byte range of `body`, a substring of `code`.
+///
+/// `body` is always a slice of `code` here — [`crate::source::braced_body`] only ever returns
+/// one — so the subtraction below is two offsets into the one allocation, never a comparison
+/// of unrelated pointers.
+fn span_of(code: &str, body: &str) -> (usize, usize) {
+    let start = body.as_ptr() as usize - code.as_ptr() as usize;
+    (start, start.saturating_add(body.len()))
+}
+
+/// The byte offset of the `unsafe` keyword opening the one well-formed
+/// `unsafe extern "C" { .. }` block in `code`, if it has one.
+///
+/// Well-formed means: the block declares [`STACK_FLOOR_SYMBOL`] and [`STACK_CEILING_SYMBOL`]
+/// and exactly two `static`s, and no `fn` — which is what stops
+/// `unsafe extern "C" fn trap_handler() { .. }`, a foreign *function* item whose `unsafe` also
+/// reads as "extern" immediately following it, from being read as this block. A second
+/// `unsafe extern` block declaring something else is scored on its own content and refused on
+/// its own account, so nothing here needs to also count how many such blocks the file has.
+/// Only the keyword's own offset is returned, not the block's range: `covers` matches it
+/// exactly, so an `unsafe` occurrence anywhere *inside* the braces — an attribute, or any
+/// other text this scan does not police the shape of — is refused rather than waved through
+/// as part of the block's own exemption.
+fn extern_block_unsafe_keyword(code: &str) -> Option<usize> {
+    let mut at = 0;
+    while let Some(found) = code.get(at..).and_then(|rest| rest.find("unsafe extern")) {
+        let keyword_start = at.saturating_add(found);
+        let after_keyword = keyword_start.saturating_add("unsafe".len());
+        let before_ok = keyword_start
+            .checked_sub(1)
+            .and_then(|index| code.as_bytes().get(index).copied())
+            .is_none_or(|byte| !is_identifier_byte(byte));
+        let rest = code.get(after_keyword..).unwrap_or_default();
+        let trimmed = rest.trim_start();
+        // A foreign block opens with `{` once its ABI string, if any, is skipped; a foreign
+        // *function* opens with `fn`. Whichever comes first in the raw text — after "extern"
+        // and its optional `"C"` — decides which this is, so the ABI string cannot be used to
+        // push a `{` in front of a `fn` this scan would otherwise catch.
+        let opens_block = trimmed
+            .trim_start_matches("extern")
+            .trim_start()
+            .trim_start_matches('"')
+            .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+            .trim_start_matches('"')
+            .trim_start()
+            .starts_with('{');
+        if before_ok && opens_block {
+            if let Some(body) = crate::source::braced_body(rest, "extern") {
+                let (from, to) = span_of(code, body);
+                let inner = &code[from..to];
+                let names_floor = crate::source::names_identifier(inner, STACK_FLOOR_SYMBOL);
+                let names_ceiling = crate::source::names_identifier(inner, STACK_CEILING_SYMBOL);
+                let two_statics = crate::source::declaration_count(inner, "static") == 2;
+                let no_fn = crate::source::declaration_count(inner, "fn") == 0;
+                if names_floor && names_ceiling && two_statics && no_fn {
+                    return Some(keyword_start);
+                }
+            }
+        }
+        at = after_keyword;
+    }
+    None
 }
 
 /// Whether `path` is the file of a module the crate declares, and every
@@ -3798,6 +4161,42 @@ pub mod tests_support {
             contents: clean_root(),
         }]
     }
+
+    /// The literal, shipped `stack.rs`.
+    ///
+    /// Not a caricature of its shape — the file itself, read at compile time. A hand-written
+    /// stand-in would drift from the real module the day either changed without the other,
+    /// and this is the one test in the suite that must answer for the actual file the
+    /// `emulate` stage links.
+    #[must_use]
+    pub fn real_stack_module() -> String {
+        include_str!("../../crates/waymaker-emu/src/stack.rs").to_owned()
+    }
+
+    /// A minimal `stack.rs` carrying exactly the shape this rule permits.
+    ///
+    /// [`super::PERMITTED_UNSAFE_FUNCTIONS`] and the linker-symbol block, for tests that
+    /// construct a decoy beside it rather than testing the shape itself —
+    /// [`real_stack_module`] already does that.
+    #[must_use]
+    pub fn clean_stack_module() -> String {
+        "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
+         pub fn paint(depth_from: usize) {\n    unsafe {\n        core::ptr::write_volatile(depth_from as *mut u8, 0xA5);\n    }\n}\n\
+         pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
+            .to_owned()
+    }
+
+    /// [`clean_sources`] with `stack_module` added at [`super::STACK_MODULE`]'s own path.
+    #[must_use]
+    pub fn sources_with_stack_module(stack_module: String) -> Vec<crate::size::LayerSource> {
+        let mut sources = clean_sources();
+        sources.push(crate::size::LayerSource {
+            crate_name: PACKAGE.to_owned(),
+            path: super::STACK_MODULE.to_owned(),
+            contents: stack_module,
+        });
+        sources
+    }
 }
 
 #[cfg(test)]
@@ -3806,11 +4205,11 @@ mod tests {
     use crate::pipeline::STAGES;
     use crate::size::LayerSource;
 
-    /// Exactly what the image writes, which is what makes this a test about the format
+    /// Exactly what an ARM image writes, which is what makes this a test about the format
     /// rather than about a string a test invented.
     fn clean_output() -> String {
         format!(
-            "{PREFIX} cases passed=21 exempt=2\n{PREFIX} rig iterations=12 cuts=12 resumes=12 unextendable=0 redeliveries=8 verdicts=24 dispatched=42\n{PREFIX} ok\n"
+            "{PREFIX} cases passed=21 exempt=2\n{PREFIX} rig iterations=12 cuts=12 resumes=12 unextendable=0 redeliveries=8 verdicts=24 dispatched=42\n{PREFIX} stack used=1024 available=12000\n{PREFIX} ok\n"
         )
     }
 
@@ -3828,7 +4227,14 @@ mod tests {
         }
     }
 
-    fn ran(name: &'static str, census: Census) -> Row {
+    fn clean_stack_usage() -> StackUsage {
+        StackUsage {
+            used: 1024,
+            available: 12000,
+        }
+    }
+
+    fn ran(name: &'static str, census: Census, stack: Option<StackUsage>) -> Row {
         let machine = MACHINES
             .iter()
             .find(|machine| machine.name == name)
@@ -3836,7 +4242,7 @@ mod tests {
             .unwrap_or(MACHINES[0]);
         Row {
             machine,
-            outcome: Outcome::Ran(census),
+            outcome: Outcome::Ran(census, stack),
             output: String::new(),
         }
     }
@@ -3845,7 +4251,13 @@ mod tests {
         Report {
             rows: MACHINES
                 .iter()
-                .map(|machine| ran(machine.name, clean_census()))
+                .map(|machine| {
+                    let stack = match machine.kind {
+                        MachineKind::Arm => Some(clean_stack_usage()),
+                        MachineKind::Xtensa => None,
+                    };
+                    ran(machine.name, clean_census(), stack)
+                })
                 .collect(),
             machines: MACHINES.to_vec(),
         }
@@ -3884,19 +4296,22 @@ mod tests {
 
     #[test]
     fn a_complete_boot_parses_into_the_census_it_printed() {
-        assert_eq!(parse(&clean_output()), Some(clean_census()));
+        assert_eq!(
+            parse(&clean_output(), MachineKind::Arm),
+            Some((clean_census(), Some(clean_stack_usage())))
+        );
     }
 
     #[test]
     fn a_boot_that_printed_nothing_is_not_a_census() {
         // The failure this whole gate exists for: an image whose `main` returned before it
         // reached the rig exits exactly the way a complete one does.
-        assert_eq!(parse(""), None);
+        assert_eq!(parse("", MachineKind::Arm), None);
     }
 
     #[test]
     fn a_boot_that_printed_only_the_last_word_is_not_a_census() {
-        assert_eq!(parse(&format!("{PREFIX} ok\n")), None);
+        assert_eq!(parse(&format!("{PREFIX} ok\n"), MachineKind::Arm), None);
     }
 
     #[test]
@@ -3904,7 +4319,7 @@ mod tests {
         // The counts are there and the word is not, which is what a run cut off mid-write
         // leaves. Accepting it would report on a rig that may not have finished.
         let truncated = clean_output().replace(&format!("{PREFIX} ok\n"), "");
-        assert_eq!(parse(&truncated), None);
+        assert_eq!(parse(&truncated, MachineKind::Arm), None);
     }
 
     #[test]
@@ -3913,13 +4328,94 @@ mod tests {
         // default the number to zero, which `Census::shortfall` would then report as a rig
         // that did nothing — the right verdict for the wrong reason.
         let missing = clean_output().replace(" cuts=12", "");
-        assert_eq!(parse(&missing), None);
+        assert_eq!(parse(&missing, MachineKind::Arm), None);
     }
 
     #[test]
     fn the_emulators_own_noise_is_ignored() {
         let noisy = format!("qemu: warning: something\n{}", clean_output());
-        assert_eq!(parse(&noisy), Some(clean_census()));
+        assert_eq!(
+            parse(&noisy, MachineKind::Arm),
+            Some((clean_census(), Some(clean_stack_usage())))
+        );
+    }
+
+    #[test]
+    fn a_boot_with_no_stack_line_is_not_a_census_on_arm() {
+        // The fourth required line on ARM, beside `cases`, `rig` and `ok`: a run this gate
+        // cannot read a stack figure from is not a run that measured one — on the machine
+        // where a stack figure is expected at all.
+        let missing =
+            clean_output().replace(&format!("{PREFIX} stack used=1024 available=12000\n"), "");
+        assert_eq!(parse(&missing, MachineKind::Arm), None);
+    }
+
+    #[test]
+    fn a_boot_with_no_stack_line_still_parses_on_xtensa() {
+        // The ESP32-S3 has no `cortex-m` register to read the reading from, so `parse` does
+        // not ask a stack line of it — `xtensa_transcript` below never writes one.
+        let missing =
+            clean_output().replace(&format!("{PREFIX} stack used=1024 available=12000\n"), "");
+        assert_eq!(
+            parse(&missing, MachineKind::Xtensa),
+            Some((clean_census(), None))
+        );
+    }
+
+    #[test]
+    fn a_clean_stack_usage_has_no_shortfall() {
+        assert_eq!(clean_stack_usage().shortfall(), None);
+    }
+
+    #[test]
+    fn a_stack_reported_empty_is_refused() {
+        let stack = StackUsage {
+            available: 0,
+            ..clean_stack_usage()
+        };
+        assert!(stack.shortfall().is_some());
+    }
+
+    #[test]
+    fn a_stack_used_to_the_edge_of_what_was_painted_is_refused() {
+        // The paint was disturbed all the way down, so the true high-water mark — which may
+        // be deeper still — could not be read. Reported rather than assumed clean.
+        let stack = StackUsage {
+            used: 12000,
+            available: 12000,
+        };
+        assert!(stack.shortfall().is_some());
+    }
+
+    #[test]
+    fn a_stack_region_no_wider_than_the_guard_is_refused_even_when_not_empty() {
+        // `paint` declines to write anything once the region is no wider than
+        // `STACK_GUARD_BYTES`, so a report reading `used=0 available=50` is not a clean
+        // measurement — it is one that never happened, exactly as an empty region is. Only
+        // checking `available == 0` would have missed this, and did before this test existed.
+        let stack = StackUsage {
+            used: 0,
+            available: STACK_GUARD_BYTES - 1,
+        };
+        assert!(stack.shortfall().is_some());
+    }
+
+    #[test]
+    fn the_duplicated_guard_bytes_matches_the_real_stack_module() {
+        // `xtask` cannot depend on `waymaker-emu` to import `stack::GUARD_BYTES` directly, so
+        // `STACK_GUARD_BYTES` is a literal copy of it. This reads the real constant back out
+        // of the shipped file and fails if the two are ever declared with different numbers.
+        let needle = "pub const GUARD_BYTES: usize = ";
+        let module = tests_support::real_stack_module();
+        let after = module
+            .find(needle)
+            .map(|index| &module[index + needle.len()..])
+            .expect("stack.rs declares GUARD_BYTES");
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let real: u32 = digits
+            .parse()
+            .expect("GUARD_BYTES is a plain integer literal");
+        assert_eq!(real, STACK_GUARD_BYTES);
     }
 
     #[test]
@@ -4005,15 +4501,39 @@ mod tests {
             .iter_mut()
             .find(|row| row.machine.kind == MachineKind::Xtensa)
             .unwrap();
-        esp32s3.outcome = Outcome::Ran(Census {
-            dispatched: 41,
-            ..clean_census()
-        });
+        esp32s3.outcome = Outcome::Ran(
+            Census {
+                dispatched: 41,
+                ..clean_census()
+            },
+            None,
+        );
         let shortfall = report.shortfall().unwrap_or_default();
         assert!(
             shortfall.contains("disagree"),
             "the cores disagreeing must be reported as such: {shortfall}"
         );
+    }
+
+    #[test]
+    fn two_arm_cores_that_disagree_about_stack_used_still_pass_the_gate() {
+        // The comparison this gate must not make: a Cortex-M0 and a Cortex-M4 compile the
+        // same source into different instructions, so a different stack figure is expected
+        // and is not itself a finding. Only `Census` is compared across machines.
+        let mut report = clean_report();
+        let cortex_m4 = report
+            .rows
+            .iter_mut()
+            .find(|row| row.machine.name == "cortex-m4")
+            .unwrap();
+        cortex_m4.outcome = Outcome::Ran(
+            clean_census(),
+            Some(StackUsage {
+                used: 2048,
+                ..clean_stack_usage()
+            }),
+        );
+        assert_eq!(report.shortfall(), None);
     }
 
     #[test]
@@ -4046,6 +4566,9 @@ mod tests {
             rendered.contains("does not establish is a board"),
             "{rendered}"
         );
+        // And says what the stack figure is not: a claim the ARM cores must agree on.
+        assert!(rendered.contains("not required to agree"), "{rendered}");
+        assert!(rendered.contains("stack 1024 of 12000"), "{rendered}");
     }
 
     #[test]
@@ -4764,7 +5287,10 @@ mod tests {
         // The ROM banner is the emulator's own noise — the guest's census lines end in a
         // bare `\n`, as the spike's verified UART log shows — and `parse` reads past
         // both.
-        assert_eq!(parse(&xtensa_transcript()), Some(clean_census()));
+        assert_eq!(
+            parse(&xtensa_transcript(), MachineKind::Xtensa),
+            Some((clean_census(), None))
+        );
         assert!(xtensa_complete(&xtensa_transcript()));
     }
 
@@ -4774,7 +5300,7 @@ mod tests {
         // report on a rig that may not have finished — the truncated write `parse`
         // already refuses.
         let partial = xtensa_transcript().replace(&format!("{PREFIX} ok\n"), "");
-        assert_eq!(parse(&partial), None);
+        assert_eq!(parse(&partial, MachineKind::Xtensa), None);
         assert!(!xtensa_complete(&partial));
     }
 
@@ -4895,7 +5421,13 @@ mod tests {
         let report = Report {
             rows: machines
                 .iter()
-                .map(|machine| ran(machine.name, clean_census()))
+                .map(|machine| {
+                    let stack = match machine.kind {
+                        MachineKind::Arm => Some(clean_stack_usage()),
+                        MachineKind::Xtensa => None,
+                    };
+                    ran(machine.name, clean_census(), stack)
+                })
                 .collect(),
             machines,
         };
@@ -5045,6 +5577,206 @@ mod tests {
         // tell the identifier from the keyword, every clean run would be a violation.
         assert_eq!(check(&tests_support::clean_sources()), Vec::new());
         assert!(tests_support::clean_root().contains(PERMITTED_LINT_NAME));
+    }
+
+    #[test]
+    fn the_real_stack_module_passes() {
+        // The literal shipped file, read at compile time — not a stand-in for its shape.
+        // ADR 0045's own claim: the linker-symbol block, and `unsafe` confined to the two
+        // functions `PERMITTED_UNSAFE_FUNCTIONS` names — nothing this rule should catch.
+        assert_eq!(
+            check(&tests_support::sources_with_stack_module(
+                tests_support::real_stack_module()
+            )),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn unsafe_in_paint_or_high_water_mark_is_permitted_only_in_stack_rs() {
+        // The exception is a (file, function) pair, not a function name alone: a decoy
+        // `fn paint` elsewhere in the crate must not borrow it.
+        let mut sources = tests_support::clean_sources();
+        sources.push(LayerSource {
+            crate_name: PACKAGE.to_owned(),
+            path: format!("crates/{PACKAGE}/src/nor.rs"),
+            contents: "pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0) };\n}\n".to_owned(),
+        });
+        assert!(!check(&sources).is_empty());
+    }
+
+    #[test]
+    fn unsafe_in_stack_rs_outside_the_two_named_functions_is_reported() {
+        // The exception is these two functions and no others: a third function in the same
+        // file, even one that looks like a helper the other two might plausibly call, still
+        // has to answer to this rule.
+        let sources = tests_support::sources_with_stack_module(format!(
+            "{}\npub fn extra() {{ unsafe {{ core::ptr::null::<u8>().read() }}; }}\n",
+            tests_support::clean_stack_module()
+        ));
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_stack_rs_in_another_directory_is_rejected() {
+        // The suffix names the crate-relative path rather than a bare file name precisely so
+        // this fails: a permission this loose would be worth more than the obligation
+        // `check_image_attributes` grants the same way for `main.rs`.
+        let mut sources = tests_support::clean_sources();
+        sources.push(LayerSource {
+            crate_name: PACKAGE.to_owned(),
+            path: format!("crates/{PACKAGE}/src/elsewhere/stack.rs"),
+            contents: "pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0) };\n}\n".to_owned(),
+        });
+        assert!(!check(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_bodiless_signature_above_the_real_function_does_not_borrow_its_exemption() {
+        // The first-match weakness `crate::source::declaration_count` alone does not close:
+        // a bodiless `fn high_water_mark(..);` signature has a `declaration_count` of exactly
+        // one too, so `braced_body`'s first `{` after it still resolves onto whatever block
+        // follows — here, a `mod` whose `static` initialiser runs `unsafe` at that block's own
+        // depth zero, which a nesting-depth check alone would not catch either. `has_a_body`
+        // is the check that tells a real function from a signature with no braces of its own.
+        let decoy = "pub trait Depth {\n    fn high_water_mark(depth_from: usize) -> u32;\n}\n\
+             mod guts {\n    pub static X: u32 = unsafe { core::mem::transmute(0u32) };\n}\n\
+             unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
+             pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0xA5) };\n}\n"
+            .to_owned();
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_function_item_is_not_the_permitted_extern_block() {
+        // `unsafe extern "C" fn trap_handler() { .. }` is a foreign *function*, and its
+        // `unsafe` is also immediately followed by the word `extern` — the naive test this
+        // rule used to make. The fix asks what actually opens next: a function, not a block.
+        let decoy = format!(
+            "{}\npub unsafe extern \"C\" fn trap_handler(slot: *mut u32) {{ let _ = slot; }}\n",
+            tests_support::clean_stack_module()
+        );
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_extern_block_naming_something_else_is_reported() {
+        // Each `unsafe extern` occurrence is scored on its own content. A second block that
+        // does not name the stack floor symbol, or declares more than the one static, is
+        // refused on its own account — nothing here needs to also count how many blocks the
+        // file has.
+        let decoy = format!(
+            "{}\nunsafe extern \"C\" {{\n    static mut SOMEBODY_ELSES_STATE: u32;\n}}\n",
+            tests_support::clean_stack_module()
+        );
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_unsafe_hidden_inside_the_extern_block_is_reported() {
+        // Before this test existed, `covers` treated the *whole* byte range of a well-formed
+        // extern block as exempt, so a second, unrelated `unsafe` occurrence sitting between
+        // the braces — beside the two permitted statics, not replacing either of them — was
+        // waved through as though it were the one keyword the 2024 edition requires. Only
+        // that one keyword's own offset is permitted now: this one is a sibling of it, at a
+        // different offset, and must be reported exactly as a sibling `unsafe` beside a
+        // permitted function's fill already is.
+        let decoy = "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n    unsafe {}\n}\n\
+             pub fn paint(depth_from: usize) {\n    unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0xA5) };\n}\n\
+             pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
+            .to_owned();
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_function_inside_paint_does_not_inherit_its_exemption() {
+        // `span_contains`'s old containment check permitted `unsafe` anywhere inside `fn
+        // paint`'s outer braces, including a nested item declared within it — the same shape
+        // of decoy `effect-protocol` refuses inside its own pinned bodies. Nesting depth,
+        // measured from the permitted function's own body, is what tells the two apart.
+        let decoy = "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
+             pub fn paint(depth_from: usize) {\n    \
+                 fn reconfigure_mpu() {\n        unsafe { core::arch::asm!(\"nop\") };\n    }\n    \
+                 reconfigure_mpu();\n    \
+                 unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0xA5) };\n\
+             }\n\
+             pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
+            .to_owned();
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_sibling_unsafe_beside_the_legitimate_one_is_reported() {
+        // Containment plus depth-zero is not uniqueness: a *second*, unrelated `unsafe`
+        // statement placed beside the legitimate fill — not nested inside it — sits at the
+        // same nesting depth and would pass a check that only asked "is this contained in the
+        // permitted function, at depth zero". `sole_depth_zero_unsafe` refuses the whole
+        // function once it finds two, because which one is real would be a guess.
+        let decoy = "unsafe extern \"C\" {\n    static _stack_end: u8;\n    static _stack_start: u8;\n}\n\
+             pub fn paint(depth_from: usize) {\n    \
+                 unsafe { core::ptr::write_volatile(0x4000_0000 as *mut u8, 0) };\n    \
+                 unsafe { core::ptr::write_volatile(depth_from as *mut u8, 0xA5) };\n\
+             }\n\
+             pub fn high_water_mark(depth_from: usize) -> u32 {\n    let deepest = unsafe { core::ptr::read_volatile(depth_from as *const u8) };\n    deepest as u32\n}\n"
+            .to_owned();
+        let sources = tests_support::sources_with_stack_module(decoy);
+        let violations = check(&sources);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("`unsafe` keyword")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_clean_stack_module_with_two_linker_symbols_passes() {
+        // The positive twin of the sibling-unsafe test above: exactly one `unsafe` per
+        // permitted function, and an extern block naming both `_stack_end` and `_stack_start`
+        // — the shape `clamp_to_stack_region` needs — is not itself a violation.
+        let sources = tests_support::sources_with_stack_module(tests_support::clean_stack_module());
+        assert_eq!(check(&sources), Vec::new());
     }
 
     #[test]

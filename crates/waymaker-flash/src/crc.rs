@@ -48,9 +48,20 @@
 //! to seal a scheduled-effect record — 20 bytes under [`crc32`] and 10 under [`crc16`],
 //! since neither seal covers itself — and ~1.0 ms for a full 512-byte page. So it is not,
 //! as this comment once claimed, a cost nobody can measure; it is a cost against which §04
-//! states no latency budget at all. Both stay bitwise until a profile of a real workload
-//! says otherwise, and that would be a superseding ADR — the `integrity-check` gate rule
-//! fails a build that adds a table here, or a local array, without one.
+//! states no latency budget at all. A real *table* stays out until a profile of a real
+//! workload on real flash says otherwise, and that would be a superseding ADR — the
+//! `integrity-check` gate rule fails a build that adds a table here, or a local array,
+//! without one.
+//!
+//! [ADR 0046](https://github.com/madmax983/waymaker/blob/main/docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md)
+//! answers issue #153's follow-up. A host-side instruction profile showed both checksums as
+//! a large share of engine instructions. `crc16` folds two nibble-rounds per byte through a
+//! plain multiply instead of eight bit-rounds — no table, no array, same algorithm, same
+//! answer, checked exhaustively in [`crc16_nibble_round`]'s own doc comment and tests. This
+//! works only because `0x1021`'s three set bits — 0, 5 and 12 — each land a 4-bit nibble
+//! in its own span with no overlap. `crc32`'s reflected polynomial has no such gaps. It
+//! stays the eight-round bitwise loop. ADR 0046 declines a table for it: a host
+//! instruction count is not the real-flash test ADR 0010 asked for.
 //!
 //! One property the choice gives up, recorded because it is the only place the two
 //! candidates genuinely differ: ISO-HDLC is primitive, so its Hamming distance falls from 4
@@ -74,9 +85,9 @@
     reason = "`pub` here would make `size-probe-reach` demand a probe call for a private helper"
 )]
 pub(crate) const fn crc16(bytes: &[u8]) -> u16 {
-    // Named once and used eight times below, rather than spelled eight times: the
-    // `integrity-check` gate counts how many times `0x1021` appears in this function's
-    // body, and a repeated literal would read as a changed polynomial.
+    // Named once, used twice below: the `integrity-check` gate counts how many times
+    // `0x1021` appears in this function's body, and a repeated literal would read as a
+    // changed polynomial.
     const POLY: u16 = 0x1021;
     let mut crc: u16 = 0xFFFF;
     let mut rest = bytes;
@@ -85,54 +96,30 @@ pub(crate) const fn crc16(bytes: &[u8]) -> u16 {
     // this workspace and a `const fn` has no `for` loop over a slice to reach for.
     while let Some((byte, tail)) = rest.split_first() {
         crc ^= (*byte as u16) << 8;
-        // The eight bit-rounds below are unrolled by hand rather than left as a `while
-        // bit < 8` loop: the loop counter's own increment, compare and backward branch
-        // cost as much as a bit-round itself, and this is a fixed trip count known at
-        // every call site. No table and no array is introduced — each round is the same
-        // single conditional shift-and-xor the loop body already was.
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
-        crc = if crc & 0x8000 == 0 {
-            crc << 1
-        } else {
-            (crc << 1) ^ POLY
-        };
+        // Two nibble-rounds per byte, not eight bit-rounds: see `crc16_nibble_round` for
+        // the identity this relies on. No table and no array is introduced.
+        crc = crc16_nibble_round(crc, POLY);
+        crc = crc16_nibble_round(crc, POLY);
         rest = tail;
     }
     crc
+}
+
+/// One nibble-round of CRC-16/CCITT-FALSE, folded to a multiply.
+///
+/// This does the work of four bitwise rounds in one step. `poly` sets three bits: 0, 5,
+/// and 12. A 4-bit nibble reaches no higher than bit 3, so its copy at each set bit lands
+/// in its own 4-bit span — `0..=3`, `5..=8`, `12..=15` — with a gap before the next span
+/// starts. No span overlaps another, so adding the three copies never carries. With no
+/// carry, a plain multiply and an XOR-based fold give the same result. The test module
+/// checks this exhaustively, for every 16-bit CRC state, against a bitwise reference.
+///
+/// This identity is specific to `0x1021`. CRC-32/ISO-HDLC's reflected polynomial spreads
+/// bits so their spans overlap, so the same fold would carry. See the test module and ADR
+/// 0046 for that case.
+const fn crc16_nibble_round(crc: u16, poly: u16) -> u16 {
+    let nibble = crc >> 12;
+    (crc << 4) ^ nibble.wrapping_mul(poly)
 }
 
 /// CRC-32/ISO-HDLC over `bytes` — the one zlib, gzip and PNG use.
@@ -150,56 +137,38 @@ pub(crate) const fn crc16(bytes: &[u8]) -> u16 {
     reason = "`pub` here would make `size-probe-reach` demand a probe call for a private helper"
 )]
 pub(crate) const fn crc32(bytes: &[u8]) -> u32 {
-    // `crc16`'s reason: named once, used eight times, so the pinned polynomial literal
-    // still appears exactly once in this function's body.
+    // Named once, used eight times below, so the pinned polynomial literal still appears
+    // exactly once in this function's body.
     const POLY: u32 = 0xEDB8_8320;
     let mut crc: u32 = 0xFFFF_FFFF;
     let mut rest = bytes;
 
     while let Some((byte, tail)) = rest.split_first() {
         crc ^= *byte as u32;
-        // Unrolled for `crc16`'s reason: eight fixed rounds, no table, no array — just the
-        // loop counter's own bookkeeping removed.
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
-        crc = if crc & 1 == 0 {
-            crc >> 1
-        } else {
-            (crc >> 1) ^ POLY
-        };
+        // Unrolled by hand: eight fixed rounds, no table, no array — just the loop
+        // counter's own bookkeeping removed. `crc16_nibble_round` folds four rounds at
+        // once for its own polynomial; this polynomial has no such fold (see that
+        // function's doc comment), so this stays bit by bit.
+        //
+        // A mask trick for a reflected check that tests bit 0 rather than bit 15: `crc &
+        // 1` is already 0 or 1, and negating it gives `0x0000` or `0xFFFF_FFFF` — `POLY`
+        // or `0` with no compare, conditional move, or register shuffling to feed one.
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
+        let mask = 0u32.wrapping_sub(crc & 1);
+        crc = (crc >> 1) ^ (mask & POLY);
         rest = tail;
     }
     crc ^ 0xFFFF_FFFF
@@ -261,6 +230,46 @@ mod tests {
                 assert_ne!(crc32(&flipped), clean32, "byte {index} bit {bit}");
             }
         }
+    }
+
+    #[test]
+    fn crc16_nibble_round_matches_four_bitwise_rounds_for_every_crc_state() {
+        // Issue #153 / ADR 0046: `crc16_nibble_round` must equal four rounds of the plain
+        // bitwise loop. Checked for every 16-bit state, not only a state with an isolated
+        // top nibble — the low 12 bits carry forward through the real `crc16` loop too,
+        // and this proves the fold holds with them set as well as clear.
+        const POLY: u16 = 0x1021;
+
+        fn four_bitwise_rounds(mut crc: u16) -> u16 {
+            for _ in 0..4 {
+                let mask = 0u16.wrapping_sub(crc >> 15);
+                crc = (crc << 1) ^ (mask & POLY);
+            }
+            crc
+        }
+
+        for crc in 0..=u16::MAX {
+            let reference = four_bitwise_rounds(crc);
+            let folded = crc16_nibble_round(crc, POLY);
+            assert_eq!(folded, reference, "crc {crc:#06x}");
+        }
+    }
+
+    #[test]
+    fn crc32_does_not_reduce_to_a_nibble_multiply() {
+        // ADR 0046 declines the same shortcut for CRC-32/ISO-HDLC: its reflected polynomial
+        // sets bits across the whole word, so a nibble's four rounds do not equal a plain
+        // multiply. This pins that fact so nobody applies CRC-16's trick here without
+        // re-deriving it.
+        const POLY: u32 = 0xEDB8_8320;
+
+        let mut folded = 1u32;
+        for _ in 0..4 {
+            let mask = 0u32.wrapping_sub(folded & 1);
+            folded = (folded >> 1) ^ (mask & POLY);
+        }
+
+        assert_ne!(folded, 1u32.wrapping_mul(POLY));
     }
 
     #[test]
