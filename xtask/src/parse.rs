@@ -5229,6 +5229,24 @@ fn segments_could_reach_target<'a>(
     };
     *budget = spent;
 
+    // `super` steps back out of a module entered by name (issue #169's plain
+    // relative descent) to the scope that named it. `scope` is already that
+    // scope, unmoved, because descent by name never touches it — so
+    // escaping is one token, not a further decrement the way a `super`
+    // consumed on the lexical ancestor stack needs: `consume_scope_prefix`
+    // would refuse to move `scope` at all here on a device with only one
+    // nesting level, since `*scope > 0` is its own floor, leaving `super`
+    // unstripped and compared as an ordinary segment. One entered module
+    // only, since `scope` cannot say which of several nested parents a
+    // second `super` would need (issue #197, Codex review of the PR:
+    // `consume_self_prefix` only strips `self`, so a `super` left
+    // unconsumed here reported a target the path never really reaches).
+    let entered = if entered.is_some() && segments.first().map(String::as_str) == Some("super") {
+        segments.remove(0);
+        None
+    } else {
+        entered
+    };
     let items: &'a [syn::Item] = if let Some(entered_items) = entered {
         consume_self_prefix(&mut segments);
         entered_items
@@ -15342,6 +15360,65 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_super_qualified_alias_target_reached_through_module_descent_does_not_count() {
+        // Codex review of PR #204: once resolution had stepped into a module
+        // by name, only `self` was ever consumed from a further alias
+        // target — `super` was left as an unresolved, literal segment, so
+        // its own last segment still matched `target` by name even though
+        // `super` was never followed back to the scope it really names.
+        // Confirmed against real `rustc`: `traits::Marker`, aliasing
+        // `super::CheckedDispatch` from inside `traits`, constructs `Decoy`
+        // — `CheckedDispatch` is itself only an alias for it at the root,
+        // never a distinct guarded type. `Unchecked`'s two live cfg
+        // branches route this through the fail-closed search: the
+        // deterministic resolver picks the harmless `Decoy` branch first,
+        // leaving the `traits::Marker` branch for this search alone to
+        // judge.
+        let counts = struct_literal_counts(
+            "type CheckedDispatch = Decoy;\n\
+             mod traits {\n\
+             \x20   pub type Marker = super::CheckedDispatch;\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = traits::Marker;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_super_qualified_alias_target_that_really_reaches_the_target_still_counts() {
+        // The control for the test above: with no further alias hiding
+        // `CheckedDispatch`'s own name at the root, the same
+        // `super::`-qualified chain really does construct it.
+        let counts = struct_literal_counts(
+            "mod traits {\n\
+             \x20   pub type Marker = super::CheckedDispatch;\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = traits::Marker;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 }
 

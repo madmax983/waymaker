@@ -5793,5 +5793,22 @@ segment is `self`/`super`, not from its length; the deterministic resolver stays
 narrow as it was, since this search is a backstop over it and widening what it alone can
 find still counts every real construction. `a_block_local_alias_still_qualifies_a_further_segment`
 and its control, `a_self_qualified_path_still_does_not_reach_a_block_local_alias_of_its_first_segment`,
-are the regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge,
-or a rule id.
+are the regression.
+
+The same round found a seventh, back to an over-count and reaching one hop deeper than the
+round before it: once resolution had stepped into a module by name (issue #169's descent),
+only `self` was ever stripped from a further alias target — a leading `super` was left
+sitting in the segments as an ordinary token, so `traits::Marker`, whose own target is
+`super::CheckedDispatch`, counted as reaching a target spelled `"CheckedDispatch"` even
+when that name is itself only a root-scope alias for `Decoy`, confirmed against real
+`rustc`: the construction is `Decoy`, never a distinct guarded type. `super` now escapes an
+entered module back to the scope that named it — which `scope` already *is*, since module
+descent by name never moves it, so escaping is stripping the one token rather than a
+further decrement `consume_scope_prefix`'s own floor would refuse to take on a
+single-level file. Scoped to one entered module only: `scope` cannot say which of several
+nested parents a second `super` would need, and a deeper chain is left the same residual
+`resolve_segments_from` — the deterministic resolver sharing this exact limitation — already
+has. `a_super_qualified_alias_target_reached_through_module_descent_does_not_count` and its
+control, `a_super_qualified_alias_target_that_really_reaches_the_target_still_counts`, are
+the regression. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.
