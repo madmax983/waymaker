@@ -7717,6 +7717,39 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_after_a_dialog_implicitly_closing_a_hidden_p_still_counts() {
+        // Codex, pull request #138, round 53, "Include every element that implicitly
+        // closes a hidden p": round 50's `p` arm only carried the first, largest group
+        // of HTML5's own list of tags whose start closes a still-open `<p>` — the
+        // specification scatters nine more across separate clauses, `<dialog>` among
+        // them. `<p hidden>ignored<dialog>All 6 recovery invariants` has its `<dialog>`
+        // closing the hidden `<p>` just as surely as a `<div>` (already covered) would,
+        // but the incomplete list left the hidden stack open past it, hiding the
+        // decision after it. A leading `x` keeps this construct from starting a
+        // block-level `HtmlBlock` at all — `<p>` and `<dialog>` are both
+        // `HTML_BLOCK_TAG_NAMES` — so it reaches `track_non_rendering_html`'s inline
+        // path, the one this finding is about.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\nx<p hidden>ignored<dialog>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_multiline_svg_still_counts() {
         // Codex, pull request #138, round 50, "Carry foreign-content depth across
         // raw HTML lines": the round-49 fix re-scanned only the *current*
@@ -8755,6 +8788,33 @@ mod tests {
         let (claude_md, adrs, obligations) = spec_inputs();
         let clause = SPEC_CLAUSES.first().expect("the table is not empty");
         let encoded = clause.discharged_by.replace('/', "&sol;");
+        let linked = claude_md.replace(
+            &format!("| {} |", clause.discharged_by),
+            &format!("| <a href=\"{encoded}\">recovery proof</a> |"),
+        );
+        let violations = check_recovery_spec(Some(&linked), &adrs, Some(&obligations));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.subject == clause.id
+                    && violation.detail.contains("discharged by")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discharge_written_as_a_raw_html_link_with_a_semicolon_free_numeric_reference_still_counts()
+    {
+        // Codex, pull request #138, round 53, "Decode numeric references without
+        // semicolons": HTML5's tokenizer never requires the terminating `;` on a
+        // *numeric* character reference the way it does on a named one — the reference
+        // resolves as soon as a non-digit byte ends it, semicolon or not — so a
+        // destination spelled `tests&#47spine.rs`, with no `;` after the digits, still
+        // resolves to `tests/spine.rs` in a browser, but the old semicolon-requiring
+        // scan left it undecoded.
+        let (claude_md, adrs, obligations) = spec_inputs();
+        let clause = SPEC_CLAUSES.first().expect("the table is not empty");
+        let encoded = clause.discharged_by.replace('/', "&#47");
         let linked = claude_md.replace(
             &format!("| {} |", clause.discharged_by),
             &format!("| <a href=\"{encoded}\">recovery proof</a> |"),

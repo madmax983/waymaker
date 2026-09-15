@@ -1194,6 +1194,14 @@ fn non_rendering_element_nests(tag: &str) -> bool {
 /// own implicit close, exposing nothing after it — HTML5's rules per element, not one
 /// list shared by all of them, are what `top`'s own match arm names.
 ///
+/// `<p>`'s own arm is the complete list the specification's "in body" insertion mode
+/// gives — every start tag whose own clause says "close a p element" before doing
+/// anything else (Codex, pull request #138, round 53, "Include every element that
+/// implicitly closes a hidden p"; round 50's own list only carried the first, largest
+/// group of that spec text and missed nine more scattered through the rest of it, `<dialog>`,
+/// `<hgroup>`, `<search>` among them — `<p hidden>ignored<dialog>All 6 recovery
+/// invariants</dialog>` was one of the ones round 50 still got wrong).
+///
 /// `<template>` and an arbitrary `hidden`-suppressed element are deliberately not
 /// covered by any arm here (falling through to `false`): both genuinely nest, and a
 /// repeated `<template>` (or a `<div hidden>` nested inside another) really does open a
@@ -1215,9 +1223,14 @@ fn implicitly_closed_by(top: &str, next_tag: &str) -> bool {
                 | "article"
                 | "aside"
                 | "blockquote"
+                | "center"
+                | "dd"
                 | "details"
+                | "dialog"
+                | "dir"
                 | "div"
                 | "dl"
+                | "dt"
                 | "fieldset"
                 | "figcaption"
                 | "figure"
@@ -1230,14 +1243,20 @@ fn implicitly_closed_by(top: &str, next_tag: &str) -> bool {
                 | "h5"
                 | "h6"
                 | "header"
+                | "hgroup"
                 | "hr"
+                | "li"
+                | "listing"
                 | "main"
                 | "menu"
                 | "nav"
                 | "ol"
                 | "p"
+                | "plaintext"
                 | "pre"
+                | "search"
                 | "section"
+                | "summary"
                 | "table"
                 | "ul"
         ),
@@ -2889,21 +2908,31 @@ fn anchor_href(html: &str) -> Option<&str> {
 /// `value` with every HTML character reference it carries resolved to the text it
 /// names, the way a browser resolves an attribute value before using it (Codex, pull
 /// request #138, round 44, finding 3; widened to the full named-reference set round 52,
-/// "Decode the full HTML named-reference set"): a raw anchor's destination can itself
-/// encode part of its path as a reference — `tests&#47;spine.rs` and `tests&sol;spine.rs`
-/// are the same destination, `tests/spine.rs`, as a reader's click — and comparing the
-/// undecoded source text against a real repository path finds none of them. Decodes
-/// every semicolon-terminated named reference [`NAMED_CHARACTER_REFERENCES`] lists and
-/// a numeric reference, decimal (`&#47;`) or hexadecimal (`&#x2F;`/`&#X2F;`); a name that
-/// table does not list, or a `&` with no terminating `;` at all, is left exactly as
-/// written — [`NAMED_CHARACTER_REFERENCES`]'s own doc comment says which narrower scope
-/// remains.
+/// "Decode the full HTML named-reference set"; widened to a semicolon-optional numeric
+/// reference round 53, "Decode numeric references without semicolons"): a raw anchor's
+/// destination can itself encode part of its path as a reference — `tests&#47;spine.rs`,
+/// `tests&#47spine.rs` and `tests&sol;spine.rs` are all the same destination,
+/// `tests/spine.rs`, as a reader's click — and comparing the undecoded source text
+/// against a real repository path finds none of them.
+///
+/// A numeric reference is tried first and does not need a terminating `;` at all
+/// (`numeric_character_reference_at`'s own doc comment says why); only once that fails
+/// does a semicolon-terminated named reference get a turn, since — unlike a numeric
+/// one — the specification's own semicolon-optional form for a named reference is a
+/// second, fixed legacy list [`NAMED_CHARACTER_REFERENCES`] deliberately does not carry
+/// (that table's own doc comment says why). A name that table does not list, or a `&`
+/// that is neither, is left exactly as written.
 fn decode_character_references(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(offset) = rest.find('&') {
         out.push_str(&rest[..offset]);
         let after_amp = &rest[offset + 1..];
+        if let Some((character, consumed)) = numeric_character_reference_at(after_amp) {
+            out.push(character);
+            rest = &after_amp[consumed..];
+            continue;
+        }
         let Some(semicolon) = after_amp.find(';') else {
             out.push('&');
             rest = after_amp;
@@ -2912,9 +2941,6 @@ fn decode_character_references(value: &str) -> String {
         let entity = &after_amp[..semicolon];
         if let Some(named) = named_character_reference(entity) {
             out.push_str(named);
-            rest = &after_amp[semicolon + 1..];
-        } else if let Some(character) = numeric_character_reference(entity) {
-            out.push(character);
             rest = &after_amp[semicolon + 1..];
         } else {
             out.push('&');
@@ -5081,18 +5107,51 @@ fn named_character_reference(entity: &str) -> Option<&'static str> {
         .map(|&(_, value)| value)
 }
 
-/// The character a numeric HTML character reference (the digits between `&#` and `;`,
-/// exclusive of both, `x`/`X`-prefixed for hexadecimal) resolves to.
-fn numeric_character_reference(entity: &str) -> Option<char> {
-    let digits = entity.strip_prefix('#')?;
-    let value = match digits
+/// The character a numeric HTML character reference starting at `after_amp` (the text
+/// immediately following the `&`) resolves to, along with how many of `after_amp`'s own
+/// bytes it consumes — the `#` and any `x`/`X` prefix, the digits themselves, and a
+/// terminating `;` only if one is actually there.
+///
+/// HTML5's own tokenizer never requires the semicolon on a numeric reference the way it
+/// does on a named one (Codex, pull request #138, round 53, "Decode numeric references
+/// without semicolons"): the "Numeric character reference end state" resolves and emits
+/// a character as soon as a non-digit byte (or the end of input) is reached, semicolon
+/// or not — omitting one is merely a parse error a browser still recovers from, not a
+/// reason to leave the reference undecoded. `tests&#47spine.rs` therefore still resolves
+/// to `tests/spine.rs`, the digits `47` ending where the non-digit `s` begins. A *named*
+/// reference's own semicolon-optional form is a different, narrower thing —
+/// [`NAMED_CHARACTER_REFERENCES`]'s own doc comment says why this decoder does not carry
+/// it — and this function's own scan for digits never mistakes one for the other, since
+/// a numeric reference always starts with a literal `#`.
+fn numeric_character_reference_at(after_amp: &str) -> Option<(char, usize)> {
+    let rest = after_amp.strip_prefix('#')?;
+    let (hex, digits) = rest
         .strip_prefix('x')
-        .or_else(|| digits.strip_prefix('X'))
-    {
-        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-        None => digits.parse::<u32>().ok()?,
+        .or_else(|| rest.strip_prefix('X'))
+        .map_or((false, rest), |hex_digits| (true, hex_digits));
+    let digit_len = digits
+        .find(|character: char| {
+            !(if hex {
+                character.is_ascii_hexdigit()
+            } else {
+                character.is_ascii_digit()
+            })
+        })
+        .unwrap_or(digits.len());
+    if digit_len == 0 {
+        return None;
+    }
+    let value = if hex {
+        u32::from_str_radix(&digits[..digit_len], 16).ok()?
+    } else {
+        digits[..digit_len].parse::<u32>().ok()?
     };
-    char::from_u32(value)
+    let character = char::from_u32(value)?;
+    let mut consumed = after_amp.len() - digits.len() + digit_len;
+    if digits[digit_len..].starts_with(';') {
+        consumed += 1;
+    }
+    Some((character, consumed))
 }
 
 /// `contents` with every fenced code block, blockquote and HTML comment removed,
