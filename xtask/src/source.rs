@@ -19062,6 +19062,37 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn an_if_chain_with_wrapping_sub_equals_zero_links_is_reported() {
+        // Codex's finding: `if n.wrapping_sub(0) == 0 { .. } else if n.wrapping_sub(1) == 0
+        // { .. } else { .. }` names an equality ladder whose every link's own unresolved
+        // side is `n.wrapping_sub(k)` for a different `k` — the identical shape
+        // `xor_equals_zero_scrutinee` already closed one operator over, since `a - b == 0`
+        // if and only if `a == b` regardless of which side names the scrutinee.
+        // `wrapping_sub_equals_zero_scrutinee` now recognises this shape the same way.
+        // Verified against real rustc, warning-free, and by disassembly that a fifteen-case
+        // `u8` ladder of this exact shape still emits a sixty-byte `.Lswitch.table`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn wrapping_sub_equals_zero_if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn wrapping_sub_equals_zero_if_chain_table(nibble: u8) -> u32 \
+             {\n    if nibble.wrapping_sub(0) == 0 {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(0)\n    } else if \
+             nibble.wrapping_sub(1) == 0 {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(1)\n    } else if \
+             nibble.wrapping_sub(2) == 0 {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(2)\n    } else {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_guard_ordering_an_upper_half_u128_value_does_not_wrongly_prune_a_live_arm() {
         // Codex's next-round finding: an upper-half `u128` value (above `i128::MAX`) is
         // stored here as its own two's-complement bit pattern reinterpreted as a

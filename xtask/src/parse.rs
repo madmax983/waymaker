@@ -7478,8 +7478,8 @@ fn if_chain_condition_value(
     let right_value = literal_or_const_value(&binary.right, resolve);
     match (left_value, right_value) {
         (None, Some(value)) => {
-            if let Some(xor_scrutinee) = xor_equals_zero_scrutinee(&binary.left, value, resolve) {
-                return Some(xor_scrutinee);
+            if let Some(scrutinee) = equals_zero_scrutinee(&binary.left, value, resolve) {
+                return Some(scrutinee);
             }
             Some((
                 strip_parens(&binary.left).to_token_stream().to_string(),
@@ -7488,8 +7488,8 @@ fn if_chain_condition_value(
             ))
         }
         (Some(value), None) => {
-            if let Some(xor_scrutinee) = xor_equals_zero_scrutinee(&binary.right, value, resolve) {
-                return Some(xor_scrutinee);
+            if let Some(scrutinee) = equals_zero_scrutinee(&binary.right, value, resolve) {
+                return Some(scrutinee);
             }
             Some((
                 strip_parens(&binary.right).to_token_stream().to_string(),
@@ -7499,6 +7499,19 @@ fn if_chain_condition_value(
         }
         _ => None,
     }
+}
+
+/// [`xor_equals_zero_scrutinee`] and [`wrapping_sub_equals_zero_scrutinee`], tried in turn —
+/// factored out so [`if_chain_condition_value`] tries every alternate equality spelling this
+/// scan recognises at each of its own two symmetric call sites, rather than growing a longer
+/// `if let` chain there for every one this scan learns.
+fn equals_zero_scrutinee(
+    unresolved_side: &syn::Expr,
+    other_side_value: i128,
+    resolve: &Resolve<'_>,
+) -> Option<(String, i128, bool)> {
+    xor_equals_zero_scrutinee(unresolved_side, other_side_value, resolve)
+        .or_else(|| wrapping_sub_equals_zero_scrutinee(unresolved_side, other_side_value, resolve))
 }
 
 /// `unresolved_side == 0`'s own alternate spelling of an equality test, when
@@ -7543,6 +7556,54 @@ fn xor_equals_zero_scrutinee(
             strip_parens(&xor.right).to_token_stream().to_string(),
             value,
             is_definitely_unsigned(&xor.left, resolve),
+        )),
+        _ => None,
+    }
+}
+
+/// [`xor_equals_zero_scrutinee`]'s own twin for the other arithmetic spelling of an equality
+/// test a hand-written lookup-table ladder can use: `scrutinee.wrapping_sub(value) == 0`,
+/// exactly as equivalent to `scrutinee == value` as the XOR form is — `a - b == 0` if and only
+/// if `a == b`, regardless of which side of the subtraction names the scrutinee and which the
+/// value, so a resolvable *receiver* is exactly as valid a value to test against as a
+/// resolvable *argument* is.
+///
+/// Codex's finding: `n.wrapping_sub(0) == 0`, `n.wrapping_sub(1) == 0`, .. names an equality
+/// ladder whose every link's own unresolved side is `n.wrapping_sub(k)` for a different `k`,
+/// the identical shape [`xor_equals_zero_scrutinee`] closed one operator over — declined here
+/// only when the call does not name exactly `wrapping_sub` with exactly one argument, since
+/// `wrapping_add`, `saturating_sub` and the rest are not the identical equivalence.
+fn wrapping_sub_equals_zero_scrutinee(
+    unresolved_side: &syn::Expr,
+    other_side_value: i128,
+    resolve: &Resolve<'_>,
+) -> Option<(String, i128, bool)> {
+    if other_side_value != 0 {
+        return None;
+    }
+    let syn::Expr::MethodCall(call) = strip_parens(unresolved_side) else {
+        return None;
+    };
+    if call.method != "wrapping_sub" {
+        return None;
+    }
+    let mut args = call.args.iter();
+    let arg = args.next()?;
+    if args.next().is_some() {
+        return None;
+    }
+    let receiver_value = literal_or_const_value(&call.receiver, resolve);
+    let arg_value = literal_or_const_value(arg, resolve);
+    match (receiver_value, arg_value) {
+        (None, Some(value)) => Some((
+            strip_parens(&call.receiver).to_token_stream().to_string(),
+            value,
+            is_definitely_unsigned(arg, resolve),
+        )),
+        (Some(value), None) => Some((
+            strip_parens(arg).to_token_stream().to_string(),
+            value,
+            is_definitely_unsigned(&call.receiver, resolve),
         )),
         _ => None,
     }
