@@ -56,6 +56,7 @@ be superseded.
 | [0045](0045-the-emulator-paints-the-stack-and-reports-a-high-water-mark.md) | The emulator paints the stack, and reports a high-water mark | accepted |
 | [0046](0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md) | CRC-16 folds its nibble round to a multiply, and CRC-32 stays bitwise | accepted |
 | [0047](0047-a-shape-catalogue-holds-the-suite-to-the-writers.md) | A shape catalogue holds the suite to the writers | accepted |
+| [0048](0048-the-rigs-four-owed-rows-close-on-authority-not-a-mark.md) | The rig's four owed rows close on authority, not a mark | accepted |
 | [0049](0049-an-unserviceable-kind-is-an-answer-not-a-record.md) | An unserviceable kind is an answer, not a record | accepted |
 
 ## Reading the numbers
@@ -76,7 +77,7 @@ In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
 0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033 → 0034 →
 0035 → 0036 → 0037 → 0038 → 0039 → 0040 → 0041 → 0042 → 0043 → 0044 → 0045 → 0046 → 0047 →
-0048.
+0048 → 0049.
 
 ## Writing one
 
