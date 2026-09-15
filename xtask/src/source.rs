@@ -21684,6 +21684,105 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_dense_match_over_constants_folding_an_ordering_of_a_confirmed_signed_negative_is_reported()
+    {
+        // Codex's finding: `const BASE: i8 = -1; const P0: u8 = if BASE < 0 { 0 } else { 100 };`
+        // names a negative operand whose type is confirmed *signed* rather than unsigned, and
+        // `evaluate_ordering_op` used to refuse every negative operand it could not confirm
+        // unsigned — leaving `BASE < 0` unresolved even though `is_definitely_signed` already
+        // proves `BASE`'s stored `i128` bit pattern already is its true, negative value.
+        // Verified against real rustc: `BASE < 0` is `true`, so `P0` through `P14` fold to the
+        // dense `0..14` sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = if BASE < 0 {{ {n} }} else {{ 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_signed_negative_ordering(nibble: u32) -> u32 {{\n    \
+             const BASE: i8 = -1;\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_computed_by_a_while_loop_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 100; while x > 0 { x -= 1; } x };`
+        // names a block whose statements are a `let` and a `while` loop — `evaluate_block`'s
+        // own statement-count invariant had no term at all for the loop statement, so the
+        // block always looked one statement longer than `const_item_count +
+        // block_let_statement_count + block_mutation_statement_count + ignored_lets` could
+        // ever sum to, and every constant built this way refused as unresolved regardless of
+        // what the loop itself computed. Verified against real rustc: decrementing `x` from
+        // 100 while it exceeds `n` leaves `x == n`, so `P0` through `P14` fold to the dense
+        // `0..14` sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8; while x > {n} {{ x -= 1; }} x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_while_loop(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_while_loop_whose_condition_never_folds_to_false_is_refused_rather_than_hung() {
+        // `evaluate_while_loop`'s own bound: an unbounded interpreter over arbitrary source
+        // would make a crate whose constant never terminates able to hang this gate, so a
+        // condition that stays true past `MAX_WHILE_LOOP_ITERATIONS` iterations has to refuse
+        // the block rather than loop forever computing it. This module never reports a
+        // violation over `P0` at all, because the whole constant refuses to resolve — the
+        // point of this test is that it *returns*, not that it flags anything.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn never_terminates(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let mut x = 0u8; while x < 255 { x += 0; } x };\n    \
+             match nibble {\n        P0 => 0,\n        _ => 1,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_dense_match_over_constants_with_an_unsuffixed_bitwise_not_is_reported() {
         // Codex's finding: `const P0: u8 = !255;` names an operand with no suffix, no cast
         // and no path — `evaluate_bitwise_not`'s three fallbacks all correctly decline it,

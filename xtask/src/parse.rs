@@ -3124,6 +3124,39 @@ fn block_mutation_statement_count(block: &syn::Block) -> usize {
     block_mutation_stmts(block).len()
 }
 
+/// Every `while` loop statement `block` declares directly, in source order —
+/// [`block_mutation_stmts`]'s own loop twin, read the identical way: a `#[cfg(test)]`-gated
+/// one is skipped. A `while` loop needs no trailing semicolon to stand as a statement (it is
+/// one of the handful of expression forms `rustc` accepts bare in statement position), so
+/// both `Stmt::Expr` shapes are matched here rather than only the `Some(_)` one
+/// `block_mutation_stmts` requires of an assignment.
+fn block_while_stmts(block: &syn::Block) -> Vec<&syn::ExprWhile> {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| !stmt_is_cfg_test(stmt))
+        .filter_map(|stmt| {
+            let syn::Stmt::Expr(expr, _) = stmt else {
+                return None;
+            };
+            let syn::Expr::While(while_expr) = strip_parens(expr) else {
+                return None;
+            };
+            Some(while_expr)
+        })
+        .collect()
+}
+
+/// [`block_while_stmts`]'s own statement count — `evaluate_block`'s `rest.len()` invariant's
+/// missing term. Codex's finding: a block whose only statements are `const`/`let`
+/// declarations, a `while` loop mutating one of them, and a tail expression was refused
+/// outright, because nothing on either side of that invariant ever counted the loop
+/// statement — the block always looked one statement longer than its own name-counting
+/// terms could account for, whatever the loop's own condition and body folded to.
+fn block_while_statement_count(block: &syn::Block) -> usize {
+    block_while_stmts(block).len()
+}
+
 /// Every `use` declared *directly* in `items`, flattened into one [`UseScope`] — not
 /// recursing into a nested `mod` or `fn`, each of which is its own scope, the same split
 /// [`item_const_exprs`] makes for a `const`.
@@ -3922,6 +3955,73 @@ fn resolve_sequential_let(
     }
 }
 
+/// A bound on how many times [`evaluate_while_loop`] will run one loop's body before
+/// refusing rather than resolving. A source loop with no discoverable termination is a
+/// hazard this scan must never inherit — an unbounded interpreter here would make a single
+/// pull request able to hang `cargo xtask check-layering` itself — so a loop that has not
+/// finished within this many iterations is refused the identical way an unresolvable
+/// condition already is, rather than guessed at or silently accepted as never-terminating.
+const MAX_WHILE_LOOP_ITERATIONS: u32 = 4096;
+
+/// Runs `while_expr` to its own completion against `resolved`/`local_types` — the loop twin
+/// of [`resolve_sequential_let`] and the mutation arm of [`resolve_block_sequential`] beside
+/// it, called from that function's own per-statement walk. Each iteration folds the
+/// condition against the scope as it stands and, while it is non-zero, walks the loop
+/// body's own statements with [`resolve_block_sequential`] before folding the condition
+/// again — so a `let` or a mutation inside the body is resolved the identical way one
+/// outside it would be, against the same two maps, in the order it actually executes.
+///
+/// `resolve_block_sequential` already refuses with `None` rather than guess at a statement
+/// it cannot resolve, so a body this scan cannot fold all the way through refuses the whole
+/// loop the identical way; a condition that never folds to a known value, or a loop that has
+/// not finished within [`MAX_WHILE_LOOP_ITERATIONS`] iterations, refuses it too. Never by
+/// returning as though the loop had ended — [`resolve_block_sequential`]'s own caller,
+/// `evaluate_block`, would otherwise resolve the rest of the block from a `resolved` map the
+/// loop never actually finished mutating, which is a wrong answer rather than an unresolved
+/// one.
+fn evaluate_while_loop(
+    while_expr: &syn::ExprWhile,
+    resolve: &Resolve<'_>,
+    local_types: &mut std::collections::HashMap<String, String>,
+    resolved: &mut std::collections::HashMap<String, i128>,
+) -> Option<()> {
+    for _ in 0..MAX_WHILE_LOOP_ITERATIONS {
+        let condition_resolve_value = |path: &syn::Path| {
+            path.get_ident()
+                .map(ident_name)
+                .and_then(|candidate| resolved.get(&candidate).copied())
+                .or_else(|| (resolve.value)(path))
+        };
+        let condition_resolve_unsigned = |path: &syn::Path| {
+            resolved_local_name(path, resolved).map_or_else(
+                || (resolve.unsigned)(path),
+                |candidate| {
+                    local_types
+                        .get(&candidate)
+                        .is_some_and(|name| is_unsigned_type_name(name))
+                },
+            )
+        };
+        let condition_resolve_width = |path: &syn::Path| {
+            resolved_local_name(path, resolved).map_or_else(
+                || (resolve.width)(path),
+                |candidate| local_types.get(&candidate).map(String::as_str),
+            )
+        };
+        let condition_resolve = Resolve {
+            value: &condition_resolve_value,
+            unsigned: &condition_resolve_unsigned,
+            width: &condition_resolve_width,
+        };
+        let condition = literal_or_const_value(&while_expr.cond, &condition_resolve)?;
+        if condition == 0 {
+            return Some(());
+        }
+        resolve_block_sequential(&while_expr.body, resolve, local_types, resolved)?;
+    }
+    None
+}
+
 fn resolve_block_sequential(
     block: &syn::Block,
     resolve: &Resolve<'_>,
@@ -3942,9 +4042,26 @@ fn resolve_block_sequential(
             resolve_sequential_let(local, init, resolve, local_types, resolved);
             continue;
         }
-        let syn::Stmt::Expr(expr, Some(_)) = stmt else {
+        let syn::Stmt::Expr(expr, semi) = stmt else {
             continue;
         };
+        // Codex's finding: a `while` loop statement needs no trailing semicolon, so it has
+        // to be recognised before the `semi.is_none()` refusal below — which exists for the
+        // mutation shape alone — would otherwise skip it as silently as any other
+        // unrecognised expression statement. Skipping it silently would not merely refuse to
+        // resolve the block: `evaluate_block`'s own statement-count invariant now counts this
+        // statement (`block_while_statement_count`), so the block would pass that check and
+        // then be resolved from a `resolved` map the loop never actually mutated — the wrong
+        // answer, not merely an unresolved one. `evaluate_while_loop` runs the loop for real
+        // and this arm propagates its failure with `?` rather than falling through to
+        // `continue`, for the identical reason `current_value` below does.
+        if let syn::Expr::While(while_expr) = strip_parens(expr) {
+            evaluate_while_loop(while_expr, resolve, local_types, resolved)?;
+            continue;
+        }
+        if semi.is_none() {
+            continue;
+        }
         let Some((name, op, rhs_expr)) = mutation_target(expr) else {
             continue;
         };
@@ -4053,10 +4170,15 @@ fn evaluate_block(block: &syn::Block, resolve: &Resolve<'_>) -> Option<i128> {
     // half of the identical invariant: a compound-assignment statement (`x += 1;`) binds no
     // new name at all, so it belongs on neither side of the name-counting terms, but it is
     // still one production statement `rest` counts and one this scan now folds.
+    // `block_while_statement_count` is Codex's next-round finding's own term: a `while` loop
+    // binds no new name either, and until it was added here `rest` counted a loop statement
+    // that neither side of this sum accounted for at all, refusing the whole block regardless
+    // of whether `resolve_block_sequential` below could actually run the loop.
     if rest.len()
         != const_item_count
             + block_let_statement_count(block)
             + block_mutation_statement_count(block)
+            + block_while_statement_count(block)
             + ignored_lets
     {
         return None;
@@ -4369,6 +4491,17 @@ fn pattern_is_definitely_unsigned(pattern: &syn::Pat, resolve: &Resolve<'_>) -> 
 /// whichever domain it is really meant as, so requiring proof of *its* type as well would
 /// refuse cases (`huge_u128 < 0`, the right side an ordinary, unsuffixed `0`) that are not
 /// actually ambiguous either.
+///
+/// Codex's next-round finding after that: `is_definitely_unsigned` is not the only proof
+/// that resolves the ambiguity — [`is_definitely_signed`] resolves it the other way. A
+/// negative operand confirmed signed is not a large `u128` value wrapped around at all; the
+/// stored `i128` bit pattern already *is* its true value, and reinterpreting it as `u128`
+/// would compute the wrong ordering rather than merely fail to compute one. So a negative
+/// operand is ambiguous, and this function refuses, only when it is confirmed as *neither* —
+/// and the `u128` reinterpretation is applied only when some negative operand is confirmed
+/// unsigned, never merely because one is present, so a comparison with every negative
+/// operand confirmed signed (and none confirmed unsigned) is folded as an ordinary signed
+/// comparison instead.
 fn evaluate_ordering_op(
     op: syn::BinOp,
     left_expr: &syn::Expr,
@@ -4377,14 +4510,18 @@ fn evaluate_ordering_op(
 ) -> Option<i128> {
     let left = literal_or_const_value(left_expr, resolve)?;
     let right = literal_or_const_value(right_expr, resolve)?;
-    if (left < 0 && !is_definitely_unsigned(left_expr, resolve))
-        || (right < 0 && !is_definitely_unsigned(right_expr, resolve))
-    {
+    let left_ambiguous = left < 0
+        && !is_definitely_unsigned(left_expr, resolve)
+        && !is_definitely_signed(left_expr, resolve);
+    let right_ambiguous = right < 0
+        && !is_definitely_unsigned(right_expr, resolve)
+        && !is_definitely_signed(right_expr, resolve);
+    if left_ambiguous || right_ambiguous {
         return None;
     }
-    let ordering = if left >= 0 && right >= 0 {
-        left.cmp(&right)
-    } else {
+    let reinterpret_as_unsigned = (left < 0 && is_definitely_unsigned(left_expr, resolve))
+        || (right < 0 && is_definitely_unsigned(right_expr, resolve));
+    let ordering = if reinterpret_as_unsigned {
         #[allow(
             clippy::cast_sign_loss,
             reason = "reinterpreting the shared 128-bit storage as unsigned, once an \
@@ -4393,6 +4530,8 @@ fn evaluate_ordering_op(
         )]
         let unsigned_ordering = (left as u128).cmp(&(right as u128));
         unsigned_ordering
+    } else {
+        left.cmp(&right)
     };
     Some(i128::from(match op {
         syn::BinOp::Lt(_) => ordering.is_lt(),
