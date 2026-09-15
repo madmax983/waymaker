@@ -14201,6 +14201,70 @@ mod tests {
     }
 
     #[test]
+    fn a_locally_declared_trait_of_the_same_name_is_not_the_real_one() {
+        // Found by Codex review of this change (PR #143), round 41: `trait Clone {
+        // fn conjure() -> Self; } impl Clone for Recovery { .. }` is legal Rust whose
+        // `Clone` is a local, unrelated trait — Rust resolves the unqualified name to
+        // the nearest declaration in scope, and a trait declared right here shadows
+        // `core::clone::Clone` for this whole scope exactly as a local struct already
+        // shadows an imported type (round 29). Nothing registered a trait
+        // declaration's own name as a local shadow, so this legal, harmless code was
+        // rejected as though it implemented the real `Clone`.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Clone {\n",
+                "    fn conjure() -> Self;\n",
+                "}\n",
+                "impl Clone for super::Recovery {\n",
+                "    fn conjure() -> Self {\n",
+                "        unimplemented!()\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn a_locally_declared_trait_does_not_hide_a_real_qualified_clone_impl() {
+        // The negative case beside the last: a local `trait Clone` must shadow only
+        // an *unqualified* reference to the name, not a fully qualified one — Rust's
+        // own name resolution bypasses local shadowing entirely once a path is
+        // qualified, and this scan must agree.
+        let mut sources = recovery_source_with_struct(concat!(
+            "mod clone_impl;\n",
+            "#[derive(Debug, PartialEq, Eq)]\n",
+            "pub struct Recovery;\n",
+        ));
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-flash".to_owned(),
+            path: "crates/waymaker-flash/src/recovery/clone_impl.rs".to_owned(),
+            contents: concat!(
+                "trait Clone {\n",
+                "    fn conjure() -> Self;\n",
+                "}\n",
+                "impl core::clone::Clone for super::Recovery {\n",
+                "    fn clone(&self) -> Self {\n",
+                "        super::Recovery\n",
+                "    }\n",
+                "}\n",
+            )
+            .to_owned(),
+        });
+        let violations = check_recovery_surface(&sources);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+    }
+
+    #[test]
     fn an_absolute_path_aliased_to_a_trait_in_the_same_file_is_rejected() {
         // Found by Codex review of this change (PR #143), round 34: `impl ::dep::C for
         // Recovery { .. }` is legal Rust — an absolute path reaches the extern prelude,

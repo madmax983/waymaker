@@ -1535,18 +1535,20 @@ fn direct_scope_opaque_module_aliases<'a>(
     aliases
 }
 
-/// A synthetic, self-referential alias for every struct, enum or union directly
-/// declared in `items`, each resolving to [`LOCAL_SHADOWED_TYPE`] rather than to its
-/// own name.
+/// A synthetic, self-referential alias for every struct, enum, union or trait
+/// directly declared in `items`, each resolving to [`LOCAL_SHADOWED_TYPE`] rather than
+/// to its own name.
 ///
 /// [`trait_implementors_for_pinned_type`] registers this for every scope that is not
 /// the pinned type's own file-level declaration site, because a locally declared
 /// item's name always resolves to that local declaration before it resolves to
 /// anything an enclosing scope or an import could mean by the same identifier — the
 /// same rule [`direct_scope_aliases`]'s own alias shadowing already applies to a `use`
-/// or `type` alias redeclared in a nested scope (round 24), extended here to a struct,
-/// enum or union item, which registers no alias of its own and so was invisible to
-/// that mechanism entirely.
+/// or `type` alias redeclared in a nested scope (round 24), extended here to an item
+/// that registers no alias of its own and so was invisible to that mechanism entirely.
+/// A trait declaration is in the same namespace a struct, enum or union name occupies
+/// — both are items of the *type* namespace, which is what the sentinel's own name
+/// means — so `LOCAL_SHADOWED_TYPE` already says the right thing about either.
 ///
 /// Found by Codex review of this change (PR #143), round 29: a production-reachable
 /// child file, or an inline module nested anywhere the module tree reaches, declaring
@@ -1554,7 +1556,15 @@ fn direct_scope_opaque_module_aliases<'a>(
 /// Recovery` resolved to the bare name `Recovery` exactly as a genuine implementor of
 /// the pinned type would — nothing distinguished "the name `Recovery`, resolved with no
 /// alias in play" from "the name `Recovery`, resolved to a *different* declaration of
-/// that name local to this very scope".
+/// that name local to this very scope". Round 41 found the identical shape on the
+/// *trait* side: `trait Clone { fn conjure() -> Self; } impl Clone for Recovery { .. }`
+/// is legal Rust whose `Clone` is this local, unrelated trait — Rust resolves an
+/// unqualified name to the nearest declaration in scope, and a trait declared right
+/// here shadows `core::clone::Clone` for every unqualified reference inside this same
+/// scope exactly as a local struct already shadows an imported type — but nothing
+/// registered a trait declaration's own name here, so a bare `Clone` resolved as
+/// though no local declaration existed and was rejected as implementing the real
+/// trait it does not.
 fn shadow_aliases_for_local_types<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
 ) -> Vec<UseAlias> {
@@ -1567,6 +1577,7 @@ fn shadow_aliases_for_local_types<'a>(
             syn::Item::Struct(declared) => ident_name(&declared.ident),
             syn::Item::Enum(declared) => ident_name(&declared.ident),
             syn::Item::Union(declared) => ident_name(&declared.ident),
+            syn::Item::Trait(declared) => ident_name(&declared.ident),
             _ => continue,
         };
         aliases.push(UseAlias {

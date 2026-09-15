@@ -4264,6 +4264,28 @@ that emits `impl Clone for Recovery` — confirmed live by calling `.clone()` on
 was shown with a single-file `rustc` compile of `assert!(evil!())`, `evil!` declared
 locally as an ordinary `macro_rules!`, confirmed live the same way.
 
+Round 41 found a false *positive* rather than another way through: `trait Clone { fn
+conjure() -> Self; } impl Clone for Recovery { .. }` is legal Rust whose `Clone` is a
+local, unrelated trait — Rust resolves an unqualified name to the nearest declaration
+in scope, and a trait declared right here shadows `core::clone::Clone` for every
+unqualified reference inside this same scope exactly as a local struct, enum or union
+already shadows an imported type (round 29's own finding). `shadow_aliases_for_local_
+types` registered a self-referential shadow for the first three but never for a trait
+declaration, so a bare `Clone` resolved as though no local declaration existed at all
+and was rejected as implementing the real trait it plainly does not — the `super::`
+self-type behind it then failed closed on its own unrelated grounds, compounding a
+harmless file into a reported violation. `LOCAL_SHADOWED_TYPE` needed no new sentinel
+and no change to `resolve_segment_chain`'s own handling of it: a trait declaration is
+already in the *type* namespace a struct, enum or union name occupies, which is what
+the sentinel's name has always meant, so this is a shadow declaration this function had
+simply never asked about `Item::Trait`. A fully qualified `impl core::clone::Clone for
+Recovery` sitting in the very same scope is unaffected, because a qualified path never
+consults the bare-name shadow at all — the same way Rust's own resolution bypasses
+local shadowing once a path is qualified. Verified against the real crate: the exact
+local-trait-and-impl pair was injected into `waymaker-flash`'s own `recovery` module,
+confirmed to compile, confirmed to be a false positive under `check-layering` before
+this fix and cleared by it after.
+
 Issue #84 then closes a gap the second review round of issue #26 had only stated: four
 modules refused storage that was "not the device this was validated against", and all four
 decided it by comparing a `Geometry` — a description of a part number, which two chips of
