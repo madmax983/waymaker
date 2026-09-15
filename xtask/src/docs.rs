@@ -7722,6 +7722,74 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_inside_a_script_reached_through_an_svg_integration_point_does_not_count() {
+        // Codex, pull request #138, round 51, finding 1, "Exit foreign mode at HTML
+        // integration points": `<foreignObject>` is one of the three SVG elements
+        // that switches parsing of its own descendants back to ordinary HTML rules
+        // — a self-closing `/` ignored, like anywhere else in an HTML document —
+        // even while the enclosing `<svg>` is still open, so `<script />` inside
+        // one is not bodyless the way it is directly inside `<svg>`; it is a real,
+        // open `<script>` whose raw-text body a browser never renders, the same as
+        // one reached with no foreign content around it at all. The round-49/50
+        // fix tracked only a bare depth of open foreign-content roots, blind to an
+        // intervening integration point, so this self-closing read was still
+        // exempted and the decision's id and headline — genuinely inert script
+        // text no reader ever sees — satisfied the check.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<svg><foreignObject><script />{} {}</script></foreignObject></svg>\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_after_a_self_closing_script_in_an_svg_nested_in_a_template_still_counts() {
+        // Codex, pull request #138, round 51, finding 2, "Update foreign context
+        // while scanning hidden content": `next_non_rendering_marker`'s search for
+        // what is relevant to an open `<template>` jumped straight from the
+        // template's own opener to the fixed `<script>` it found elsewhere in the
+        // block, never consuming the intervening `<svg>` along the way — so
+        // `foreign_content` stayed at whatever it already was (nothing, this being
+        // the first foreign content anywhere in the block), and the self-closing
+        // `<script />` read as though no foreign content were open at all, pushed
+        // as a genuinely unclosed raw-text element that `</svg>` could never pop
+        // and `</template>` could never reach. Everything after it, including the
+        // decision that immediately follows `</template>`, was hidden clear
+        // through to end of document.
+        let mut inputs = clean_inputs(RULES);
+        let first = SETTLED_DECISIONS[0];
+        for adr in &mut inputs.adrs {
+            if adr.name == SETTLED_DECISIONS_ADR {
+                let without_heading_id = adr
+                    .contents
+                    .replace(&format!("({})", first.id), "(elsewhere)");
+                adr.contents = format!(
+                    "{without_heading_id}\n<template>\n<svg><script /></svg>\n</template>{} {}\n",
+                    first.id, first.headline
+                );
+            }
+        }
+        let violations = check_settled_decisions(&inputs.adrs);
+        assert!(
+            !violations.iter().any(|v| v.subject == first.id),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_decision_after_a_raw_text_end_tag_trapped_in_a_quoted_attribute_still_counts() {
         // Codex, pull request #138, round 40, finding 3: `find_closing_tag`'s
         // quote-aware tokenization, built for `<template>`'s genuinely parsed

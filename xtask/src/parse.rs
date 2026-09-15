@@ -975,7 +975,7 @@ pub fn markdown_prose(contents: &str, inline_code: InlineCode) -> String {
     let mut pending_raw_text_close: Option<PendingRawTextClose> = None;
     // Foreign-content depth for self-closing scripts (Codex, round 49) — see
     // `track_non_rendering_html`'s own doc comment.
-    let mut foreign_content: u32 = 0;
+    let mut foreign_content: Vec<ForeignFrame> = Vec::new();
     for (event, range) in parser {
         // `in_html_comment` as well (Codex, pull request #138, round 20): `pulldown-cmark`
         // ends an `HtmlBlock` at a blank line even when a comment inside it never closed,
@@ -1371,34 +1371,6 @@ fn find_any_opening_tag(line: &str, from: usize) -> Option<(usize, usize, &'stat
         .min_by_key(|&(start, _, _)| start)
 }
 
-/// The byte range and lowercase name of the earliest opening tag, at or after `from` in
-/// `line`, whose name [`implicitly_closed_by`] lists as closing `top` — HTML5's
-/// per-element optional-end-tag rules, generalized from a same-name-only reopen search
-/// (Codex, pull request #138, round 50, "Honor implicit closes triggered by different
-/// tag names"): `<p hidden>ignored<div>All 6 recovery invariants</div>` has its `<div>`
-/// closing the hidden `<p>` just as surely as a second `<p>` would, and a search for
-/// only `top`'s own name never saw it. Scanned tag by tag through [`find_any_tag`], the
-/// same way [`find_any_opening_tag`]'s fixed, short list already is, since the set of
-/// names that can close a given `top` is not fixed at one.
-fn find_implicit_close_reopen(
-    line: &str,
-    from: usize,
-    top: &str,
-) -> Option<(usize, usize, String)> {
-    let mut cursor = from;
-    loop {
-        let (start, end) = find_any_tag(line, cursor)?;
-        let span = &line[start..end];
-        if !span.starts_with("</") {
-            let name = markup_tag_name(span).to_ascii_lowercase();
-            if implicitly_closed_by(top, &name) {
-                return Some((start, end, name));
-            }
-        }
-        cursor = end;
-    }
-}
-
 /// The HTML5 void elements: tags with no content and no closing tag of their own.
 /// `hidden` on one of these suppresses nothing beyond the tag's own markup, which
 /// [`is_html_block_tag`]'s sibling handling already excludes — there is no body to
@@ -1466,19 +1438,136 @@ fn is_self_closing_tag(span: &str, name: &str) -> bool {
     is_foreign_content_root(name) && ends_with_self_closing_slash(span)
 }
 
-/// Updates `foreign_content` — a running count of how many `<svg>`/`<math>` foreign-
-/// content roots are currently open — from one already-consumed tag's own markup
+/// One namespace-changing element currently open, in the order opened — a genuine LIFO
+/// stack, closed by a matching name the same way the non-rendering `stack: Vec<String>`
+/// already is, rather than a bare depth (Codex, pull request #138, round 51, finding 1:
+/// "Exit foreign mode at HTML integration points"). A foreign-content root (`<svg>`,
+/// `<math>`) and an HTML integration point opened inside one (`<foreignObject>`,
+/// `<desc>`, a `<annotation-xml>` carrying a matching `encoding`, or a `MathML` text
+/// integration point) are tracked on the same stack, because an integration point's own
+/// descendants are parsed under ordinary HTML rules — a self-closing `/` ignored, the
+/// same as anywhere else in an HTML document — even while the enclosing root is still
+/// open, and only a further foreign root opened *inside* the integration point
+/// re-enters foreign content for its own descendants
+/// (`<foreignObject><svg><script /></svg></foreignObject>`). A depth alone cannot tell
+/// which state a matching close should restore once nesting like that is possible.
+struct ForeignFrame {
+    name: String,
+    /// Whether HTML5 honors a self-closing `/` on a descendant tag while this frame is
+    /// the innermost open one — true for a foreign-content root, false for an HTML
+    /// integration point.
+    honors_self_closing: bool,
+}
+
+/// Whether a self-closing `/` is currently honored — the innermost open [`ForeignFrame`]
+/// is a foreign-content root rather than an HTML integration point, or the stack is
+/// simply empty (never honored outside foreign content at all).
+fn honors_self_closing_now(foreign_content: &[ForeignFrame]) -> bool {
+    foreign_content
+        .last()
+        .is_some_and(|frame| frame.honors_self_closing)
+}
+
+/// Whether `name` is one of the HTML5 elements that switches parsing of its own
+/// descendants back to ordinary HTML rules while nested inside open foreign content
+/// (Codex, pull request #138, round 51, finding 1) — the two SVG integration points
+/// whose own name is never one of the fixed non-rendering elements
+/// (`<title>`, SVG's third integration point, is already tracked as raw-text RCDATA by
+/// [`find_any_opening_tag`], which takes priority before this ever runs), a `MathML`
+/// `<annotation-xml>` carrying an `encoding` attribute matching `text/html` or
+/// `application/xhtml+xml` case-insensitively (checked against `span`, the tag's own
+/// complete markup, rather than trusted from the name alone — any other encoding, or
+/// none, leaves its content ordinary `MathML`), and the `MathML` text integration
+/// points, which admit HTML content the same way.
+fn is_html_integration_point(span: &str, name: &str) -> bool {
+    match name.to_ascii_lowercase().as_str() {
+        "foreignobject" | "desc" | "mi" | "mo" | "mn" | "ms" | "mtext" => true,
+        "annotation-xml" => attribute_value(span, "encoding").is_some_and(|value| {
+            value.eq_ignore_ascii_case("text/html")
+                || value.eq_ignore_ascii_case("application/xhtml+xml")
+        }),
+        _ => false,
+    }
+}
+
+/// The value of `attribute` on a well-formed opening tag's own markup `span`, if it
+/// carries one — [`anchor_href`]'s generalization to an arbitrary attribute name, used
+/// here only to read `<annotation-xml>`'s `encoding` (Codex, pull request #138, round
+/// 51, finding 1). Quote-tracked the same way [`anchor_href`] already is, so a value
+/// that merely *contains* `attribute=` inside another attribute's own quoted value is
+/// never mistaken for the real one.
+fn attribute_value<'a>(span: &'a str, attribute: &str) -> Option<&'a str> {
+    let bytes = span.as_bytes();
+    let lower = span.to_ascii_lowercase();
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+            None if lower.as_bytes().get(index..index + attribute.len())
+                == Some(attribute.as_bytes())
+                && index.checked_sub(1).is_none_or(|before| {
+                    bytes.get(before).is_some_and(u8::is_ascii_whitespace)
+                }) =>
+            {
+                let after_name = index + attribute.len();
+                if !bytes.get(after_name).is_none_or(|&byte| {
+                    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'/' | b'>')
+                }) {
+                    index = after_name;
+                    continue;
+                }
+                let after_name_whitespace = span
+                    .get(after_name..)?
+                    .find(|character: char| !character.is_whitespace())
+                    .map_or(span.len(), |offset| after_name + offset);
+                if bytes.get(after_name_whitespace) != Some(&b'=') {
+                    index = after_name;
+                    continue;
+                }
+                let after_equals = after_name_whitespace + 1;
+                let value_start = span
+                    .get(after_equals..)?
+                    .find(|character: char| !character.is_whitespace())
+                    .map_or(span.len(), |offset| after_equals + offset);
+                let value_quote = *bytes.get(value_start)?;
+                if value_quote != b'"' && value_quote != b'\'' {
+                    let end = span
+                        .get(value_start..)?
+                        .find(|character: char| character.is_whitespace() || character == '>')
+                        .map_or(span.len(), |offset| value_start + offset);
+                    return Some(&span[value_start..end]);
+                }
+                let value_start = value_start + 1;
+                let end = value_start + span.get(value_start..)?.find(value_quote as char)?;
+                return Some(&span[value_start..end]);
+            }
+            Some(_) | None => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Updates `foreign_content` — the currently open foreign-content roots and HTML
+/// integration points, innermost last — from one already-consumed tag's own markup
 /// (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
 /// foreign content"; carried across lines round 50, "Carry foreign-content depth
-/// across raw HTML lines").
+/// across raw HTML lines"; widened to a real stack round 51, "Exit foreign mode at
+/// HTML integration points").
 ///
-/// HTML5 acknowledges the self-closing flag on *any* start tag — not only `<svg>` or
-/// `<math>` themselves — once the parser is inside foreign content: `<svg><script
-/// /></svg>` (likewise an SVG `<style />`) never opens a genuinely unclosed
-/// `<script>` the way a bare `<script />` does outside one, where the slash is
-/// ignored and a real `</script>` is still needed. A root's own self-closing form
-/// (`<svg />`) never opens one, the same [`is_self_closing_tag`] check
-/// [`find_any_hidden_opening_tag`] already applies to the root itself.
+/// HTML5 acknowledges the self-closing flag on *any* start tag while the innermost open
+/// frame [`honors_self_closing_now`] — a root's own descendants, but not an integration
+/// point's — so a self-closing tag of either kind still never opens a frame: `<svg
+/// /></svg>` (likewise `<foreignObject/>`) has no body. A close only pops when its name
+/// matches the innermost open frame, the same "close only what actually opened"
+/// discipline the non-rendering stack already applies — a close for anything else,
+/// including one that was never tracked here at all (an ordinary `</title>` at the
+/// document's own top level, say — SVG's `<title>` integration point is not on this
+/// function's own list, since [`find_any_opening_tag`]'s fixed non-rendering handling
+/// already intercepts it first, every place this function is ever reached from), is a
+/// silent no-op.
 ///
 /// Every caller that consumes an ordinary tag's markup calls this on it, the same way
 /// `open_non_rendering`/`open_non_rendering_tag` is threaded and updated across
@@ -1486,15 +1575,30 @@ fn is_self_closing_tag(span: &str, name: &str) -> bool {
 /// one line (or in one construct) and a self-closing child reached on a later one
 /// (or in a later construct) are the same running document, not two separate
 /// searches with no memory of each other.
-fn track_foreign_content_depth(span: &str, foreign_content: &mut u32) {
+fn track_foreign_content_depth(span: &str, foreign_content: &mut Vec<ForeignFrame>) {
     let name = markup_tag_name(span);
-    if !is_foreign_content_root(name) {
+    if span.starts_with("</") {
+        if foreign_content
+            .last()
+            .is_some_and(|frame| frame.name.eq_ignore_ascii_case(name))
+        {
+            foreign_content.pop();
+        }
         return;
     }
-    if span.starts_with("</") {
-        *foreign_content = foreign_content.saturating_sub(1);
-    } else if !ends_with_self_closing_slash(span) {
-        *foreign_content += 1;
+    if ends_with_self_closing_slash(span) {
+        return;
+    }
+    if is_foreign_content_root(name) {
+        foreign_content.push(ForeignFrame {
+            name: name.to_ascii_lowercase(),
+            honors_self_closing: true,
+        });
+    } else if is_html_integration_point(span, name) {
+        foreign_content.push(ForeignFrame {
+            name: name.to_ascii_lowercase(),
+            honors_self_closing: false,
+        });
     }
 }
 
@@ -1666,27 +1770,31 @@ fn opens_hidden_element(line: &str) -> Option<String> {
 /// `<template>`), and only a close matching the *top* of the stack pops it, the same
 /// "close only what actually opened" discipline round 30 already applies one level up.
 ///
-/// `foreign_content` is a second, independent depth — `<svg>`/`<math>` are ordinary,
+/// `foreign_content` is a second, independent stack — `<svg>`/`<math>` are ordinary,
 /// visible elements, never hidden by this alone, but HTML5 acknowledges the
-/// self-closing flag on *any* start tag while the parser is inside one (Codex, pull
-/// request #138, round 49, "Avoid pushing self-closing scripts in foreign content"):
-/// `<svg><script /></svg>` never opens a genuinely unclosed `<script>` the way a bare
-/// `<script />` does outside one, where the slash is ignored and a real `</script>`
-/// is still needed. Each self-contained `Event::InlineHtml` construct arrives with no
-/// memory of the ones around it, unlike a block-level line this module can re-scan
-/// from its own start, so this depth has to be carried the same way `stack` already
-/// is, tracked here unconditionally so every caller gets it for free.
+/// self-closing flag on *any* start tag while the innermost open frame
+/// [`honors_self_closing_now`] (Codex, pull request #138, round 49, "Avoid pushing
+/// self-closing scripts in foreign content"; round 51, "Exit foreign mode at HTML
+/// integration points"): `<svg><script /></svg>` never opens a genuinely unclosed
+/// `<script>` the way a bare `<script />` does outside one, where the slash is ignored
+/// and a real `</script>` is still needed — but `<svg><foreignObject><script
+/// /></foreignObject></svg>` does, because an HTML integration point's own descendants
+/// are parsed under ordinary HTML rules regardless of the still-open `<svg>` around it.
+/// Each self-contained `Event::InlineHtml` construct arrives with no memory of the ones
+/// around it, unlike a block-level line this module can re-scan from its own start, so
+/// this stack has to be carried the same way `stack` already is, tracked here
+/// unconditionally so every caller gets it for free.
 fn track_non_rendering_html(
     html: &str,
     stack: &mut Vec<String>,
-    foreign_content: &mut u32,
+    foreign_content: &mut Vec<ForeignFrame>,
 ) -> bool {
     if html.starts_with("<!--") {
         return true;
     }
     track_foreign_content_depth(html, foreign_content);
     let self_closing_in_foreign_content =
-        *foreign_content > 0 && ends_with_self_closing_slash(html);
+        honors_self_closing_now(foreign_content) && ends_with_self_closing_slash(html);
     // Cloned rather than borrowed, for the reason `advance_past_non_rendering` now
     // does the same (Codex, pull request #138, round 42, finding 3): `stack` holds
     // owned names since it can carry an arbitrary `hidden`-suppressed one, not only
@@ -1994,7 +2102,11 @@ fn find_comment_opener(line: &str, from: usize) -> Option<usize> {
 /// checked after `Tag` — a tie between the two would mean a fixed non-rendering
 /// element also carries `hidden`, and its own, more specific handling is what should
 /// win — but still ahead of `Markup`, for the same reason `Tag` is.
-fn next_hiding_marker(line: &str, from: usize, foreign_content: u32) -> Option<HidingMarker> {
+fn next_hiding_marker(
+    line: &str,
+    from: usize,
+    foreign_content: &[ForeignFrame],
+) -> Option<HidingMarker> {
     let mut candidates: Vec<(usize, HidingMarker)> = Vec::new();
     // Tokenized via `find_comment_opener`, not a raw substring search (Codex, pull
     // request #138, round 47, "Ignore comment markers inside pending tag
@@ -2022,7 +2134,7 @@ fn next_hiding_marker(line: &str, from: usize, foreign_content: u32) -> Option<H
         // opened on an earlier `Event::Html` line is invisible to anything that
         // only reads this one.
         let span = &line[start..end];
-        if !(ends_with_self_closing_slash(span) && foreign_content > 0) {
+        if !(ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content)) {
             candidates.push((start, HidingMarker::Tag(start, end, tag)));
         }
     }
@@ -2032,7 +2144,7 @@ fn next_hiding_marker(line: &str, from: usize, foreign_content: u32) -> Option<H
         // 50, "Skip self-closing hidden elements inside foreign content"): `<g
         // hidden />` inside an `<svg>` has no body either, whatever name it carries.
         let span = &line[start..end];
-        if !(ends_with_self_closing_slash(span) && foreign_content > 0) {
+        if !(ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content)) {
             candidates.push((start, HidingMarker::Hidden(start, end, name)));
         }
     }
@@ -2065,6 +2177,17 @@ enum NonRenderingAdvance {
     /// "Finish multiline raw-text close tags before popping") — not resolved yet,
     /// carrying the quote state the scan left off in (round 46).
     PendingClose(Option<u8>),
+    /// Nothing relevant to `top` was found anywhere in the rest of `line` — carrying
+    /// the cursor the internal walk actually reached, past every complete tag it
+    /// already consumed and tracked along the way (Codex, pull request #138, round 51,
+    /// finding 2: "Update foreign context while scanning hidden content"). A caller
+    /// that fell back to its *own*, un-advanced cursor to look for a trailing
+    /// incomplete tag would re-walk that same ground — and, since `foreign_content`
+    /// is mutated as the walk passes over it, re-evaluate a self-closing tag's
+    /// exemption against namespace state the first, complete pass had already moved
+    /// past, exactly the way `<template><svg><script /></svg></template>` did before
+    /// this variant existed.
+    Exhausted(usize),
 }
 
 /// The next thing relevant to the innermost currently-open non-rendering element `top`,
@@ -2110,52 +2233,75 @@ enum NonRenderingAdvance {
 /// its end, the way an explicit close tag resumes past itself — so the reopening tag's
 /// own markup is left for the caller's normal, unhidden processing, the same as any
 /// other ordinary tag.
+///
+/// Walked one tag at a time from `cursor`, rather than combining several independent
+/// searches that could each start further ahead (Codex, pull request #138, round 51,
+/// finding 2: "Update foreign context while scanning hidden content") — every tag this
+/// walk passes over on the way to whatever it finds relevant updates `foreign_content`
+/// the same way an ordinary tag's markup does at the top level, so a foreign-content
+/// root opened between `cursor` and the returned marker is not invisible to it:
+/// `<template><svg><script /></svg></template>` used to jump straight from the
+/// template's own opener to the fixed `<script>` open without ever consuming the
+/// intervening `<svg>`, leaving `foreign_content` at whatever it already was and
+/// wrongly reading the self-closing `<script />` as though no foreign content were open
+/// at all — pushed as a genuinely unclosed raw-text element that `</template>` could
+/// never pop.
 fn next_non_rendering_marker(
     line: &str,
     cursor: usize,
     top: &str,
-    foreign_content: u32,
+    foreign_content: &mut Vec<ForeignFrame>,
 ) -> Option<NonRenderingAdvance> {
     if !non_rendering_element_nests(top) {
+        // A raw-text element's body is opaque to tag parsing altogether — a browser is
+        // not looking for `<svg>` or anything else in there, only for its own literal
+        // close — so no foreign-content tracking runs on this path.
         return find_raw_text_closing_tag(line, cursor, top).map(|(_, close)| match close {
             RawTextClose::Whole(end) => NonRenderingAdvance::Close(end),
             RawTextClose::Pending(quote) => NonRenderingAdvance::PendingClose(quote),
         });
     }
-    let close = find_closing_tag(line, cursor, top)
-        .map(|(start, end)| (start, NonRenderingAdvance::Close(end)));
-    // Self-closing inside foreign content is not a further open either (Codex, pull
-    // request #138, round 49): `<template><svg><script /></svg></template>` has no
-    // body and no `</script>` for this nested `<script>`, the same as at the top
-    // level. `foreign_content` is the caller's own running depth (round 50), not a
-    // re-scan of this one line.
-    let fixed_open = find_any_opening_tag(line, cursor).and_then(|(start, end, tag)| {
-        let span = &line[start..end];
-        if ends_with_self_closing_slash(span) && foreign_content > 0 {
-            None
-        } else {
-            Some((start, NonRenderingAdvance::Open(end, tag.to_owned())))
+    let mut cursor = cursor;
+    loop {
+        let comment = find_comment_opener(line, cursor);
+        let Some((start, end)) = find_any_tag(line, cursor) else {
+            return Some(comment.map_or(
+                NonRenderingAdvance::Exhausted(cursor),
+                NonRenderingAdvance::Comment,
+            ));
+        };
+        if let Some(comment_start) = comment
+            && comment_start < start
+        {
+            return Some(NonRenderingAdvance::Comment(comment_start));
         }
-    });
-    let implicit_close = find_implicit_close_reopen(line, cursor, top)
-        .map(|(start, _, _)| (start, NonRenderingAdvance::Close(start)));
-    // Skipped when `top` is itself one of `implicitly_closed_by`'s own optional-end-tag
-    // names, since `find_implicit_close_reopen` above already covers a same-name
-    // reopen for those (`<li>` closing `<li>` is one of its own table rows) — searched
-    // separately only for a genuinely nesting element (`<template>`, or an arbitrary
-    // `hidden`-suppressed one), where a same-named child really does open a second
-    // level rather than closing the first.
-    let top_reopen = (!implicitly_closed_by(top, top))
-        .then(|| find_opening_tag(line, cursor, top))
-        .flatten()
-        .map(|(start, end)| (start, NonRenderingAdvance::Open(end, top.to_owned())));
-    let comment =
-        find_comment_opener(line, cursor).map(|start| (start, NonRenderingAdvance::Comment(start)));
-    [close, fixed_open, implicit_close, top_reopen, comment]
-        .into_iter()
-        .flatten()
-        .min_by_key(|&(start, _)| start)
-        .map(|(_, marker)| marker)
+        let span = &line[start..end];
+        let closing = span.starts_with("</");
+        let name = markup_tag_name(span).to_ascii_lowercase();
+        if closing {
+            if name == top {
+                return Some(NonRenderingAdvance::Close(end));
+            }
+        } else if implicitly_closed_by(top, &name) {
+            return Some(NonRenderingAdvance::Close(start));
+        } else if matches!(name.as_str(), "script" | "style" | "title" | "template") || name == top
+        {
+            // Self-closing while `foreign_content` currently honors it is not a
+            // further open either (Codex, pull request #138, round 49; round 51,
+            // "Exit foreign mode at HTML integration points" — `foreign_content` has
+            // already been carried forward through every tag walked past above, so
+            // an HTML integration point opened earlier on this same walk correctly
+            // stops this from being exempted too).
+            if !(ends_with_self_closing_slash(span) && honors_self_closing_now(foreign_content)) {
+                return Some(NonRenderingAdvance::Open(end, name));
+            }
+        }
+        // Not relevant to `top` — carry its own namespace effect forward (a no-op for
+        // anything that is not a foreign-content root or an HTML integration point)
+        // and keep walking.
+        track_foreign_content_depth(span, foreign_content);
+        cursor = end;
+    }
 }
 
 /// Advances past one close, one nested open, or one nested comment, relative to the
@@ -2186,65 +2332,60 @@ fn advance_past_non_rendering(
     in_html_comment: &mut bool,
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
-    foreign_content: u32,
+    foreign_content: &mut Vec<ForeignFrame>,
 ) -> Option<usize> {
     // Cloned rather than borrowed (Codex, pull request #138, round 42, finding 3):
     // the stack widened from `Vec<&'static str>` to `Vec<String>` so it can hold an
     // arbitrary `hidden`-suppressed name, and a borrow of its last element would
     // still be live across the `stack.push`/`stack.pop` calls below.
     let top = stack.last()?.clone();
-    let mut cursor = cursor;
-    loop {
-        match next_non_rendering_marker(line, cursor, &top, foreign_content) {
-            Some(NonRenderingAdvance::Comment(start)) => {
-                let Some(offset) = line[start..].find("-->") else {
-                    *in_html_comment = true;
-                    return None;
-                };
-                return Some(start + offset + "-->".len());
-            }
-            Some(NonRenderingAdvance::Open(end, tag)) => {
-                stack.push(tag);
-                return Some(end);
-            }
-            Some(NonRenderingAdvance::Close(end)) => {
-                stack.pop();
-                return Some(end);
-            }
-            Some(NonRenderingAdvance::PendingClose(quote)) => {
-                *pending_raw_text_close = Some(PendingRawTextClose { quote });
+    match next_non_rendering_marker(line, cursor, &top, foreign_content) {
+        Some(NonRenderingAdvance::Comment(start)) => {
+            let Some(offset) = line[start..].find("-->") else {
+                *in_html_comment = true;
                 return None;
-            }
-            None => {
-                if !non_rendering_element_nests(&top) {
-                    return None;
-                }
-                let start = next_tag_start(line, cursor)?;
-                let mut quote: Option<u8> = None;
-                if let Some(end) = scan_tag_close(line, start + 1, &mut quote) {
-                    // A complete tag, but not one `next_non_rendering_marker` found
-                    // relevant — not `top`'s own name, not one of the fixed three, no
-                    // comment opener, no close (Codex, pull request #138, round 45,
-                    // "Carry nested multiline tags through hidden blocks"). An
-                    // ordinary, irrelevant child like `<span title="<!--">` is skipped
-                    // over, the same way the top-level scan already skips one via
-                    // `HidingMarker::Markup`, and the search resumes past it rather
-                    // than mistaking its own, already-complete markup for an
-                    // unresolved tag.
-                    cursor = end;
-                    continue;
-                }
-                let closing = line[start..].starts_with("</");
-                let name = markup_tag_name(&line[start..]).to_ascii_lowercase();
-                *pending_tag = Some(PendingTag {
-                    name,
-                    closing,
-                    quote,
-                    text: line[start..].to_owned(),
-                });
-                return None;
-            }
+            };
+            Some(start + offset + "-->".len())
         }
+        Some(NonRenderingAdvance::Open(end, tag)) => {
+            stack.push(tag);
+            Some(end)
+        }
+        Some(NonRenderingAdvance::Close(end)) => {
+            stack.pop();
+            Some(end)
+        }
+        Some(NonRenderingAdvance::PendingClose(quote)) => {
+            *pending_raw_text_close = Some(PendingRawTextClose { quote });
+            None
+        }
+        // Resumed from the cursor the walk itself reached, not the one this call
+        // started from (Codex, pull request #138, round 51, finding 2): every
+        // complete tag up to `end` was already consumed and tracked by
+        // `next_non_rendering_marker`'s own walk, so re-deriving it here from
+        // `cursor` would re-mutate `foreign_content` for ground already covered.
+        // Only a trailing *incomplete* tag — one whose own `>` lands on a later
+        // line — can remain at `end`, the same "carry it across the line break"
+        // case the top-level scan already handles ("Carry nested multiline tags
+        // through hidden blocks", round 45).
+        Some(NonRenderingAdvance::Exhausted(end)) => {
+            let start = next_tag_start(line, end)?;
+            let mut quote: Option<u8> = None;
+            scan_tag_close(line, start + 1, &mut quote);
+            let closing = line[start..].starts_with("</");
+            let name = markup_tag_name(&line[start..]).to_ascii_lowercase();
+            *pending_tag = Some(PendingTag {
+                name,
+                closing,
+                quote,
+                text: line[start..].to_owned(),
+            });
+            None
+        }
+        // Reached only for a raw-text element (`<script>`, `<style>`, `<title>`),
+        // whose opaque body needs no incomplete-tag capture at all — a split
+        // *close* tag is `PendingClose` instead, handled above.
+        None => None,
     }
 }
 
@@ -2362,7 +2503,7 @@ struct PendingRawTextClose {
 fn resolve_pending_tag(
     line: &str,
     open_non_rendering: &mut Vec<String>,
-    foreign_content: &mut u32,
+    foreign_content: &mut Vec<ForeignFrame>,
     pending: PendingTag,
 ) -> Result<usize, PendingTag> {
     let PendingTag {
@@ -2384,15 +2525,12 @@ fn resolve_pending_tag(
     // The full tag text, not just this line's own portion (Codex, round 43, finding
     // 3): `hidden` may sit on any line the tag spans, not only the last one — and
     // (round 50) so can the `/` of a foreign-content root's own cross-line
-    // self-closing form, `<svg\n/>`.
+    // self-closing form, `<svg\n/>`. Delegated to `track_foreign_content_depth` itself
+    // (round 51) rather than a hand-written open/close pair, so a cross-line HTML
+    // integration point (`<foreignObject\n>`) is carried the same way a cross-line
+    // foreign-content root already was.
     let full_text = text + &line[..end];
-    if closing {
-        if is_foreign_content_root(&name) {
-            *foreign_content = foreign_content.saturating_sub(1);
-        }
-    } else if is_foreign_content_root(&name) && !ends_with_self_closing_slash(&full_text) {
-        *foreign_content += 1;
-    }
+    track_foreign_content_depth(&full_text, foreign_content);
     let open_top = open_non_rendering.last().cloned();
     let open_top_nests = open_top.as_deref().is_some_and(non_rendering_element_nests);
     let matches_open_top = open_top.as_deref() == Some(name.as_str()) && open_top_nests;
@@ -2432,7 +2570,7 @@ fn visible_html_ranges(
     open_non_rendering: &mut Vec<String>,
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
-    foreign_content: &mut u32,
+    foreign_content: &mut Vec<ForeignFrame>,
 ) -> Vec<VisibleHtmlSpan> {
     let mut spans = Vec::new();
     // Resolved before anything else, ahead of even `pending_tag` (Codex, pull request
@@ -2492,7 +2630,7 @@ fn visible_html_ranges(
                 in_html_comment,
                 pending_tag,
                 pending_raw_text_close,
-                *foreign_content,
+                foreign_content,
             ) {
                 Some(end) => {
                     cursor = end;
@@ -2501,7 +2639,7 @@ fn visible_html_ranges(
                 None => break,
             }
         }
-        match next_hiding_marker(line, cursor, *foreign_content) {
+        match next_hiding_marker(line, cursor, foreign_content) {
             None => {
                 // `next_hiding_marker` finding nothing is ambiguous on its own: either
                 // there is no more `<` at all (the remainder really is visible text),
@@ -2846,7 +2984,7 @@ pub fn visible_source(contents: &str) -> String {
     // `open_non_rendering` is (Codex, pull request #138, round 49, "Avoid pushing
     // self-closing scripts in foreign content"; round 50, "Carry foreign-content depth
     // across raw HTML lines") — see `track_non_rendering_html`'s own doc comment.
-    let mut foreign_content: u32 = 0;
+    let mut foreign_content: Vec<ForeignFrame> = Vec::new();
     // A comment nested inside an open `<template>`, kept apart from the block-comment
     // search below: that is a document-wide search over already-*closed* blocks, not a
     // state a currently open nesting element carries across lines.
@@ -3011,7 +3149,7 @@ fn hide_non_rendering_in_inline_html(
     range: std::ops::Range<usize>,
     open_non_rendering: &mut Vec<String>,
     non_rendering_start: &mut Option<usize>,
-    foreign_content: &mut u32,
+    foreign_content: &mut Vec<ForeignFrame>,
     hidden: &mut Vec<(usize, usize)>,
 ) {
     let was_open = !open_non_rendering.is_empty();
@@ -3050,7 +3188,7 @@ fn hide_non_rendering_in_html_line(
     pending_tag: &mut Option<PendingTag>,
     pending_raw_text_close: &mut Option<PendingRawTextClose>,
     in_template_comment: &mut bool,
-    foreign_content: &mut u32,
+    foreign_content: &mut Vec<ForeignFrame>,
     hidden: &mut Vec<(usize, usize)>,
 ) {
     let mut cursor = if let Some(pending) = pending_raw_text_close.take() {
@@ -3087,7 +3225,7 @@ fn hide_non_rendering_in_html_line(
                 in_template_comment,
                 pending_tag,
                 pending_raw_text_close,
-                *foreign_content,
+                foreign_content,
             ) {
                 Some(end) => {
                     if open_non_rendering.is_empty()
@@ -3101,7 +3239,7 @@ fn hide_non_rendering_in_html_line(
                 None => break,
             }
         }
-        match next_hiding_marker(html, cursor, *foreign_content) {
+        match next_hiding_marker(html, cursor, foreign_content) {
             None => break,
             // Skipped rather than hidden here: this function's caller has its own
             // block-comment search, covering every comment in the block from its own
@@ -3209,7 +3347,7 @@ pub fn unordered_list_item_value(contents: &str, prefix: &str) -> Option<String>
     // across `Event::InlineHtml` constructs the same way `open_non_rendering_tag` is
     // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
     // foreign content") — see `track_non_rendering_html`'s own doc comment.
-    let mut foreign_content: u32 = 0;
+    let mut foreign_content: Vec<ForeignFrame> = Vec::new();
 
     for (event, range) in Parser::new_ext(contents, Options::empty()).into_offset_iter() {
         let hidden = in_fence
@@ -3445,7 +3583,7 @@ pub fn heading_lines(contents: &str) -> Vec<String> {
     // across `Event::InlineHtml` constructs the same way `open_non_rendering_tag` is
     // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
     // foreign content") — see `track_non_rendering_html`'s own doc comment.
-    let mut foreign_content: u32 = 0;
+    let mut foreign_content: Vec<ForeignFrame> = Vec::new();
     let mut collecting = false;
     let mut current = String::new();
     let mut lines = Vec::new();
@@ -3558,7 +3696,7 @@ pub fn table_rows(contents: &str) -> Vec<String> {
     // across `Event::InlineHtml` constructs the same way `open_non_rendering_tag` is
     // (Codex, pull request #138, round 49, "Avoid pushing self-closing scripts in
     // foreign content") — see `track_non_rendering_html`'s own doc comment.
-    let mut foreign_content: u32 = 0;
+    let mut foreign_content: Vec<ForeignFrame> = Vec::new();
 
     for event in Parser::new_ext(contents, Options::ENABLE_TABLES) {
         let hidden = in_fence
