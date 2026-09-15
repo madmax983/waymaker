@@ -5709,5 +5709,15 @@ Whether the search may consult `block_items` at all is now decided once, from th
 the original path, not per hop. `exhausting_the_budget_counts_the_construction_rather_than_clearing_it`,
 `a_module_is_still_tried_when_a_same_named_alias_did_not_reach_the_target`, and
 `a_self_qualified_path_does_not_reach_a_block_local_alias` — each with its own control — are
-the three regressions. No new ADR: nothing here moves a must-not-own cell, a dependency edge,
-or a rule id.
+the three regressions.
+
+A further review of the same pull request found a fourth: `own_modules` can return more than
+one sibling module of one name, declared under mutually exclusive `cfg` branches, the same
+way `own_aliases` can return more than one alias — but module descent took the first match
+and stopped there. Taking a hop's every same-named module as a further live branch needed
+module descent to recurse rather than loop in place, the way an alias hop already did: once a
+name can name more than one live module, "the one match" is no longer a thing a loop can just
+step into and carry on from. `segments_could_reach_target` no longer loops at all — every hop,
+alias or module, is its own recursive call now. `a_second_live_module_of_one_name_is_still_tried`
+and its control are the regression. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.

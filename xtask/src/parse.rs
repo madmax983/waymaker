@@ -5059,12 +5059,19 @@ fn path_could_reach_target<'a>(
 /// generic parameter was refused instead of searched).
 ///
 /// A hop tries every alias candidate it finds *and* — when none of them reach
-/// `target` — a sibling module of the same name, rather than treating a matching
-/// alias as ruling a same-named module out. An unevaluated `cfg` can make a module
-/// and an alias of one name mutually exclusive the same way it can two aliases (issue
-/// #197, Codex review of the PR: a live module was never tried once a live alias of
-/// the same name had already been, so a construction reachable only through the
-/// module was missed).
+/// `target` — every sibling module of the same name, rather than treating a matching
+/// alias, or the first same-named module, as ruling the rest out. An unevaluated
+/// `cfg` can make a module and an alias of one name mutually exclusive the same way
+/// it can two aliases, and it can do the same to two modules of one name declared
+/// under different branches (issue #197, Codex review of the PR: a live module was
+/// never tried once a live alias of the same name had already been, so a
+/// construction reachable only through the module was missed; and only the first of
+/// two same-named live modules was ever descended into, so a construction reachable
+/// only through the second was missed too).
+///
+/// Every hop recurses rather than looping in place, module descent included: once a
+/// name can name more than one live module, "the one match" is no longer a thing a
+/// loop can just step into and carry on from.
 ///
 /// `cache` is [`path_could_reach_target`]'s own — see there.
 #[allow(clippy::too_many_arguments)]
@@ -5072,109 +5079,123 @@ fn segments_could_reach_target<'a>(
     mut segments: Vec<String>,
     stack: &[&'a [syn::Item]],
     mut scope: usize,
-    mut entered: Option<&'a [syn::Item]>,
+    entered: Option<&'a [syn::Item]>,
     block_items: &[&'a syn::Item],
     innermost_scope: usize,
     block_eligible: bool,
-    mut shadow: &[String],
+    shadow: &[String],
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
 ) -> bool {
-    loop {
-        // A missed count is the danger this search exists to close, so running out
-        // of budget answers "could reach" rather than "could not" — see this
-        // function's own docs.
-        let Some(spent) = budget.checked_sub(1) else {
+    // A missed count is the danger this search exists to close, so running out of
+    // budget answers "could reach" rather than "could not" — see this function's
+    // own docs.
+    let Some(spent) = budget.checked_sub(1) else {
+        return true;
+    };
+    *budget = spent;
+
+    let items: &'a [syn::Item] = if let Some(entered_items) = entered {
+        consume_self_prefix(&mut segments);
+        entered_items
+    } else {
+        consume_scope_prefix(&mut segments, &mut scope);
+        stack.get(scope).copied().unwrap_or_default()
+    };
+    // A block-local alias applies only here: the original path was eligible, no
+    // module entered by name, and still at the scope the search started from.
+    // `super`/`self` above may have just moved `scope` past it, so this reads the
+    // state after consuming a prefix.
+    let block_applies = block_eligible && entered.is_none() && scope == innermost_scope;
+
+    let Some(first) = segments.first().cloned() else {
+        return false;
+    };
+
+    // Only the path's own first segment is ever a shadowed generic parameter's
+    // name — every later hop's `first` comes from an alias's own target, a real
+    // name written somewhere else in the file, never the identifier that could
+    // collide with a generic parameter here. Every recursive call below passes an
+    // empty slice, so `shadowed` is never consulted again after this hop.
+    let shadowed = shadow.contains(&first);
+    let no_shadow: &[String] = &[];
+
+    // Block-local aliases are not cached: `block_items` has no one contiguous
+    // scope to key a cache entry on, and it is small — one construction site's
+    // own enclosing blocks. Not shadow-gated — see this function's own docs.
+    let block_candidates: Vec<UseAlias> = if block_applies {
+        own_aliases(block_items.iter().copied())
+    } else {
+        Vec::new()
+    };
+    let module_alias_candidates: Vec<UseAlias> = if shadowed {
+        Vec::new()
+    } else {
+        cache.aliases_of(items).iter().cloned().collect()
+    };
+    let matches: Vec<UseAlias> = block_candidates
+        .into_iter()
+        .chain(module_alias_candidates)
+        .filter(|candidate| candidate.local == first)
+        .collect();
+
+    for alias in matches {
+        let mut resolved = alias.target;
+        resolved.extend(segments.get(1..).unwrap_or_default().iter().cloned());
+        if resolved.last().is_some_and(|last| last.as_str() == target) {
             return true;
-        };
-        *budget = spent;
-
-        let items: &'a [syn::Item] = if let Some(entered_items) = entered {
-            consume_self_prefix(&mut segments);
-            entered_items
-        } else {
-            consume_scope_prefix(&mut segments, &mut scope);
-            stack.get(scope).copied().unwrap_or_default()
-        };
-        // A block-local alias applies only here: the original path was eligible,
-        // no module entered by name, and still at the scope the search started
-        // from. `super`/`self` above may have just moved `scope` past it, so this
-        // reads the state after consuming a prefix.
-        let block_applies = block_eligible && entered.is_none() && scope == innermost_scope;
-
-        let Some(first) = segments.first().cloned() else {
-            return false;
-        };
-
-        // Only the path's own first segment is ever a shadowed generic parameter's
-        // name — every later hop's `first` comes from an alias's own target, a real
-        // name written somewhere else in the file, never the identifier that could
-        // collide with a generic parameter here.
-        let shadowed = shadow.contains(&first);
-        shadow = &[];
-
-        // Block-local aliases are not cached: `block_items` has no one contiguous
-        // scope to key a cache entry on, and it is small — one construction site's
-        // own enclosing blocks. Not shadow-gated — see this function's own docs.
-        let block_candidates: Vec<UseAlias> = if block_applies {
-            own_aliases(block_items.iter().copied())
-        } else {
-            Vec::new()
-        };
-        let module_candidates: Vec<UseAlias> = if shadowed {
-            Vec::new()
-        } else {
-            cache.aliases_of(items).iter().cloned().collect()
-        };
-        let matches: Vec<UseAlias> = block_candidates
-            .into_iter()
-            .chain(module_candidates)
-            .filter(|candidate| candidate.local == first)
-            .collect();
-
-        for alias in matches {
-            let mut resolved = alias.target;
-            resolved.extend(segments.get(1..).unwrap_or_default().iter().cloned());
-            if resolved.last().is_some_and(|last| last.as_str() == target) {
-                return true;
-            }
-            if !alias.absolute
-                && segments_could_reach_target(
-                    resolved,
-                    stack,
-                    scope,
-                    entered,
-                    block_items,
-                    innermost_scope,
-                    block_eligible,
-                    shadow,
-                    target,
-                    budget,
-                    cache,
-                )
-            {
-                return true;
-            }
         }
-
-        // No alias reached `target` — a sibling module of the same name is still a
-        // live possibility, not ruled out by an alias that did not pan out.
-        if segments.len() > 1 && !shadowed {
-            let module = cache
-                .modules_of(items)
-                .iter()
-                .find(|(name, _)| *name == first)
-                .map(|(_, module_items)| *module_items);
-            if let Some(module_items) = module {
-                segments.remove(0);
-                entered = Some(module_items);
-                continue;
-            }
+        if !alias.absolute
+            && segments_could_reach_target(
+                resolved,
+                stack,
+                scope,
+                entered,
+                block_items,
+                innermost_scope,
+                block_eligible,
+                no_shadow,
+                target,
+                budget,
+                cache,
+            )
+        {
+            return true;
         }
-
-        return segments.last().is_some_and(|last| last.as_str() == target);
     }
+
+    // No alias reached `target` — every sibling module of the same name is still a
+    // live possibility, not ruled out by an alias that did not pan out, or by
+    // another same-named module that did not either.
+    if segments.len() > 1 && !shadowed {
+        let remaining: Vec<String> = segments.get(1..).unwrap_or_default().to_vec();
+        let modules: Vec<&'a [syn::Item]> = cache
+            .modules_of(items)
+            .iter()
+            .filter(|(name, _)| *name == first)
+            .map(|(_, module_items)| *module_items)
+            .collect();
+        for module_items in modules {
+            if segments_could_reach_target(
+                remaining.clone(),
+                stack,
+                scope,
+                Some(module_items),
+                block_items,
+                innermost_scope,
+                block_eligible,
+                no_shadow,
+                target,
+                budget,
+                cache,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    segments.last().is_some_and(|last| last.as_str() == target)
 }
 
 /// Something [`struct_literal_counts`] can count literals inside of, with the
@@ -14880,6 +14901,53 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_second_live_module_of_one_name_is_still_tried() {
+        // Codex review of PR #204: two inline modules can share one name under
+        // mutually exclusive `cfg`, the same as two aliases can. Taking only the
+        // first matching module missed a construction reachable only through the
+        // second.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\nmod traits {\n\
+             \x20   pub type Marker = Decoy;\n\
+             }\n\
+             #[cfg(feature = \"a\")]\nmod traits {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             use traits::Marker as Unchecked;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn two_live_modules_of_one_name_do_not_count_an_unrelated_name() {
+        // The control for the test above.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\nmod traits {\n\
+             \x20   pub type Marker = Decoy;\n\
+             }\n\
+             #[cfg(feature = \"a\")]\nmod traits {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             use traits::Marker as Unchecked;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "Unrelated",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 }
 
