@@ -6106,3 +6106,27 @@ its control, `an_unconditional_block_local_alias_that_really_reaches_the_target_
 are the regression, the first confirmed RED against the pre-fix code (`total: 1` against
 an expected `0`) before this fix landed. No new ADR: nothing here moves a must-not-own
 cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a seventeenth, in a different primitive: a plain
+`struct`/`enum`/`union`/`trait` declaration was invisible to `declares_name` entirely, so
+neither `live_named_items_in_scope` nor `preferred_alias` ever saw it competing for a
+name at all. Confirmed against real `rustc`: `mod m { pub struct Unchecked; #[cfg(feature
+= "a")] pub type Unchecked = Decoy; #[cfg(feature = "b")] pub type Unchecked =
+CheckedDispatch; }` can only ever compile with neither feature enabled — enabling either
+collides with the unconditional struct (`E0428`) — so neither `#[cfg]`-gated alias is ever
+a live branch, yet both were treated as live and the `CheckedDispatch` one counted, an
+over-count in the same direction as the fourteenth and sixteenth rounds' own findings.
+`declares_name` and `is_namespace_unambiguous` now also recognize a `struct`, `enum`,
+`union` or `trait` declaration of the name, exactly as they already recognize a `mod` or a
+`type` alias — all six are unambiguously in the type namespace, so two of any of them
+sharing one name in one scope are a real `E0428`/`E0255` the same way. Since neither
+`own_aliases` nor `own_modules` ever produces an entry for a plain `struct`/`enum`/
+`union`/`trait`, becoming the scope's one live, namespace-unambiguous declaration this way
+correctly excludes every conditional alias of the name from `live_aliases_of` without
+itself ever appearing as a candidate to chase — the search falls through to comparing the
+name directly, which is what a real build actually does.
+`an_unconditional_struct_shadows_conflicting_cfg_gated_type_aliases_of_one_name` and its
+control, `a_conflicting_type_alias_still_counts_with_no_competing_struct`, are the
+regression, the first confirmed RED against the pre-fix code (`total: 1` against an
+expected `0`) before this fix landed. No new ADR: nothing here moves a must-not-own cell,
+a dependency edge, or a rule id.

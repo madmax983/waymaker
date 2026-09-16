@@ -5472,17 +5472,30 @@ struct LiveDeclaration<'a> {
     item: &'a syn::Item,
 }
 
-/// Whether `item` declares `first` — as a `mod` by that name, or as the
-/// local name of a `use`/`type` alias. The one predicate [`live_named_items_in_scope`]
-/// and [`live_block_declarations`] both key their shadowing rule on: real Rust
-/// refuses two items of one name in one scope together (`E0428`/`E0255`)
-/// whichever kinds they are, so a `mod X` and a `type X = ..` in the same
-/// scope collide exactly as two aliases would — but only when they share a
-/// namespace; see [`is_namespace_unambiguous`] for the case this predicate
-/// alone cannot tell apart.
+/// Whether `item` declares `first` — as a `mod`, `struct`, `enum`, `union` or
+/// `trait` by that name, or as the local name of a `use`/`type` alias. The
+/// one predicate [`live_named_items_in_scope`] and [`live_block_declarations`]
+/// both key their shadowing rule on: real Rust refuses two items of one name
+/// in one scope together (`E0428`/`E0255`) whichever kinds they are, so a
+/// `struct X` and a `type X = ..` in the same scope collide exactly as two
+/// aliases would — but only when they share a namespace; see
+/// [`is_namespace_unambiguous`] for the case this predicate alone cannot
+/// tell apart. Codex review of PR #204: an unconditional `struct`/`enum`/
+/// `union`/`trait` declaration named the same as a `#[cfg]`-gated `type`
+/// alias of it was invisible to this predicate entirely, so neither
+/// [`live_named_items_in_scope`] nor [`preferred_alias`] ever saw it
+/// competing for the name at all — `mod m { struct Unchecked; #[cfg(feature
+/// = "a")] type Unchecked = Decoy; #[cfg(feature = "b")] type Unchecked =
+/// CheckedDispatch; }` left both cfg'd aliases counted as live branches, even
+/// though enabling either feature collides with the unconditional struct
+/// (`E0428`) and can never compile at all — confirmed against real `rustc`.
 fn declares_name(item: &syn::Item, first: &str) -> bool {
     match item {
         syn::Item::Mod(module) => ident_name(&module.ident) == first,
+        syn::Item::Struct(item) => ident_name(&item.ident) == first,
+        syn::Item::Enum(item) => ident_name(&item.ident) == first,
+        syn::Item::Union(item) => ident_name(&item.ident) == first,
+        syn::Item::Trait(item) => ident_name(&item.ident) == first,
         _ => own_aliases(core::iter::once(item))
             .iter()
             .any(|alias| alias.local == first),
@@ -5490,24 +5503,33 @@ fn declares_name(item: &syn::Item, first: &str) -> bool {
 }
 
 /// Whether `item`'s own namespace is knowable without name resolution. A
-/// `mod` or a `type` alias is always in the type namespace, so two of
-/// either sharing one name in one scope are a real `E0428`/`E0255` — but a
-/// `use` item can import a value, a type or a trait, and this scanner has
-/// no way to tell which. `use values::traits;` importing a *value* named
-/// `traits` does not collide with `mod traits { .. }` at all — confirmed
-/// against real `rustc` — so a `use` must never be treated as the one
-/// unconditional declaration that shadows a `mod`/`type` of the same name,
-/// nor as something a `mod`/`type` shadows (Codex review of PR #204:
-/// `live_named_items_in_scope`'s shadowing rule, and `preferred_alias`'s
-/// own pick, had both applied to a `use` exactly as they do to a `mod` or
-/// a `type`, so an unconditional value import could make the fail-closed
-/// scan skip a same-named module entirely — a missed count, the danger
-/// this whole mechanism exists to close). A `use` is therefore always kept
-/// as an independently live candidate rather than guessed about, the same
-/// residual [what is not checked](../../CLAUDE.md#what-is-not-checked)
-/// already states for a same-spelled alias across namespaces.
+/// `mod`, a `type` alias, a `struct`, an `enum`, a `union` or a `trait` is
+/// always in the type namespace, so two of any of these sharing one name in
+/// one scope are a real `E0428`/`E0255` — but a `use` item can import a
+/// value, a type or a trait, and this scanner has no way to tell which.
+/// `use values::traits;` importing a *value* named `traits` does not collide
+/// with `mod traits { .. }` at all — confirmed against real `rustc` — so a
+/// `use` must never be treated as the one unconditional declaration that
+/// shadows a same-named item of one of the other kinds, nor as something one
+/// of them shadows (Codex review of PR #204: `live_named_items_in_scope`'s
+/// shadowing rule, and `preferred_alias`'s own pick, had both applied to a
+/// `use` exactly as they do to a `mod` or a `type`, so an unconditional value
+/// import could make the fail-closed scan skip a same-named module entirely
+/// — a missed count, the danger this whole mechanism exists to close). A
+/// `use` is therefore always kept as an independently live candidate rather
+/// than guessed about, the same residual
+/// [what is not checked](../../CLAUDE.md#what-is-not-checked) already states
+/// for a same-spelled alias across namespaces.
 const fn is_namespace_unambiguous(item: &syn::Item) -> bool {
-    matches!(item, syn::Item::Mod(_) | syn::Item::Type(_))
+    matches!(
+        item,
+        syn::Item::Mod(_)
+            | syn::Item::Type(_)
+            | syn::Item::Struct(_)
+            | syn::Item::Enum(_)
+            | syn::Item::Union(_)
+            | syn::Item::Trait(_)
+    )
 }
 
 /// Picks which of `items`' own `use`/`type` aliases named `first` is the
@@ -24372,6 +24394,61 @@ mod cfg_alias_ambiguity_tests {
              fn forge<CheckedDispatch>() -> u8 {\n\
              \x20   type CheckedDispatch = inner::CheckedDispatch;\n\
              \x20   let _ = CheckedDispatch { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_struct_shadows_conflicting_cfg_gated_type_aliases_of_one_name() {
+        // Codex review of PR #204, confirmed against real `rustc`: `pub struct
+        // Unchecked;` beside `#[cfg(feature = "a")] pub type Unchecked =
+        // Decoy;` and `#[cfg(feature = "b")] pub type Unchecked =
+        // CheckedDispatch;` in one module can only ever compile with neither
+        // feature enabled — enabling either collides with the unconditional
+        // struct (`E0428`) — so neither `#[cfg]`-gated alias is ever a live
+        // branch. `declares_name` had never recognized a plain
+        // `struct`/`enum`/`union`/`trait` declaration as competing for the
+        // name at all, so both aliases were treated as live and the
+        // `CheckedDispatch` branch was wrongly counted.
+        let counts = struct_literal_counts(
+            "mod m {\n\
+             \x20   pub struct Unchecked;\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   pub type Unchecked = Decoy;\n\
+             \x20   #[cfg(feature = \"b\")]\n\
+             \x20   pub type Unchecked = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = m::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_conflicting_type_alias_still_counts_with_no_competing_struct() {
+        // The control: with no unconditional struct/enum/union/trait of the
+        // same name in scope, the two `#[cfg]`-gated aliases really are both
+        // live under different builds, and the one that reaches the guarded
+        // type must still be counted.
+        let counts = struct_literal_counts(
+            "mod m {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   pub type Unchecked = Decoy;\n\
+             \x20   #[cfg(feature = \"b\")]\n\
+             \x20   pub type Unchecked = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = m::Unchecked { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
             "CheckedDispatch",
