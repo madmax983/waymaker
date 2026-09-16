@@ -25134,8 +25134,16 @@ mod cfg_alias_ambiguity_tests {
         let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
             .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+        // A CI run measured 7.58s against a 6s ceiling this test first held,
+        // on the same host that runs `many_ambiguous_aliases_and_literals_
+        // resolve_quickly` in 1.6-2.3s — this fixture asks for more work
+        // (200 distinctly-gated sites, not 200 literals sharing one site),
+        // so it needs its own, wider margin rather than the sibling test's.
+        // The regressed shape (the site-keyed cache) measured 77-81s for
+        // this same fixture — an order of magnitude past 20s either way —
+        // so 20s still separates "fixed" from "regressed" with real margin.
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(6),
+            start.elapsed() < std::time::Duration::from_secs(20),
             "took {:?} for {MODULES} modules and {SITES} distinctly-gated sites",
             start.elapsed()
         );
