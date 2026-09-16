@@ -1242,7 +1242,18 @@ Stated so that nobody mistakes silence for coverage:
   construction is counted when *any* live alias sharing its name could reach it, not only
   the one declaration `resolve_local_alias_chain`/`resolve_segments_from` would pick — for a
   bare construction path or a qualified one, and chased into a module a multi-segment alias
-  target names, mirroring `resolve_segments_from`'s own `own_modules` descent.
+  target names, mirroring `resolve_segments_from`'s own `own_modules` descent. What that
+  search still does not do is intersect a candidate's own `cfg` with the construction
+  *site's* own enclosing `cfg`: a candidate declared under `feature = "a"` is treated as a
+  live branch even when the function containing the literal is itself only compiled under
+  `not(feature = "a")`, so no build ever has both — a real, `rustc`-confirmed over-count
+  (Codex review of PR #204) that needs a general `cfg`-vs-`cfg` satisfiability check beside
+  `Cfg::requires_test`, enclosing-`cfg` accumulation in the visitor, and a wider
+  `AliasLookupCache` key than `(scope, name)` to stay sound, none of which exists yet. See
+  issue [#206](https://github.com/madmax983/waymaker/issues/206), filed rather than chased
+  under review-driven time pressure for the same reason issues #171/#186/#193 were: it needs
+  new machinery across several pieces, and getting one wrong in the exclude direction is a
+  missed count, the opposite failure mode from the one it would fix.
   `resolved_path_uses` and `future_trait_implementors` still have the wider residual, because
   they need `resolve_segments`'s and `resolve_segments_from`'s one deterministic answer for
   reasons of their own — see the Status section's own paragraph on issue #185 for why
@@ -6338,3 +6349,34 @@ the function/`const` on purpose, since `resolve_segments_from`'s own tie-break p
 first candidate when nothing else decides it, and a naive test with the declaration order
 reversed would have passed by coincidence of that tie-break rather than by the fix. No new
 ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a twenty-fifth, and it is a real gap — confirmed
+against real `rustc` — but not one this round fixes. `path_could_reach_target`'s own search
+treats two same-named declarations under mutually exclusive `#[cfg]` flags as separate live
+branches whenever neither is provably unconditional, an accepted residual (this scanner
+cannot evaluate `cfg`). What it had never asked is whether a candidate's own `cfg` can even
+coexist with the *construction site's* own enclosing `cfg`: `#[cfg(not(feature = "a"))] type
+Unchecked = Decoy; #[cfg(feature = "a")] type Unchecked = CheckedDispatch;` beside a
+`#[cfg(not(feature = "a"))] fn forge() { let _ = self::Unchecked { .. }; }` can never
+construct `CheckedDispatch` from `forge` in any build — `forge` itself only exists where
+`feature = "a"` is off, and in that exact build the `feature = "a"` alias does not exist
+either — yet the search counted it regardless of `forge`'s own gating. Investigated rather
+than fixed: closing it soundly needs four new pieces at once, not a completion of what
+exists — a general `Cfg`-vs-`Cfg` satisfiability check beside `Cfg::requires_test` (which
+only ever answers "does this formula entail `test`", never "can these two formulas both
+hold"); enclosing-`cfg` accumulation through `struct_literal_counts`'s own visitor, a stack
+discipline it does not currently keep at all; the check has to run while a candidate's
+source `syn::Item` (and its own `attrs`) is still in hand, before `own_aliases`/`own_modules`
+erase it into a `UseAlias`/a bare item slice with no `cfg` attached; and `AliasLookupCache`'s
+own cache key would have to widen past `(scope, name)`, since liveness would no longer be a
+pure function of those two things — and a wider key risks reintroducing the exact
+O(file-size)-per-construction-site cost issue #197 fixed
+(`many_ambiguous_aliases_and_literals_resolve_quickly`'s own regression), because two call
+sites with genuinely different enclosing `cfg` could no longer share one cached answer the
+way most calls in one file do today. Getting any one of the four wrong in the *exclude*
+direction is a missed count — the opposite failure mode from the over-count this finding
+itself reports, and the one this whole mechanism exists to avoid above all else. Filed as
+issue [#206](https://github.com/madmax983/waymaker/issues/206) rather than chased under
+review pressure, the same bar issues #171/#186/#193 were opened at: a real finding whose fix
+needs new machinery across several pieces rather than a narrow, provably-correct change. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
