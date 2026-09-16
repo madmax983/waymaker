@@ -6299,3 +6299,42 @@ feature-off build) before landing; `a_named_field_struct_does_not_suppress_a_val
 is the control, confirmed the fallback still substitutes a value alias when the
 unconditional winner is a record struct, which binds no value for it to compete with. No
 new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a twenty-fourth, and it is a gap in the twenty-third
+round's own fix rather than a new class of bug: the twenty-third round's check only
+recognized a unit or tuple struct as an unconditional value-namespace winner, but a free
+function, a `const` and a `static` each bind their name in the value namespace
+unconditionally too — and, sharper still, none of the three had ever been recognized by
+`declares_name` at all, so a plain `fn allowed() {}` could not even become a candidate,
+let alone shadow a competing `use`. Confirmed against real `rustc`: `fn allowed() {}`
+beside `#[cfg(feature = "a")] use values::forbidden as allowed;` compiles only with the
+feature off, where `allowed()` calls the local function; enabling the feature collides in
+the value namespace (E0255), so the `use` can never be live wherever the function is
+unconditional — yet with the function invisible to `declares_name`, the tie-break between
+`chosen` and the terminal fallback's own `uses` pick had nothing stopping it from landing
+on the `use` instead, rewriting a feature-off call to `values::forbidden`, a name no
+compiling configuration of it ever reaches. `declares_name` now also recognizes
+`Item::Fn`, `Item::Const` and `Item::Static`, each by its own identifier; a new
+`is_unconditional_value_declaration` generalizes the twenty-third round's
+`is_unit_or_tuple_struct` check to cover all four shapes, and `preferred_alias`'s new
+check runs *before* the `chosen` tie-break is ever computed — not only after, the way the
+twenty-third round's narrower, struct-only check did — because with the function now a
+candidate, the tie-break itself could pick the `use` directly and return its alias before
+ever reaching a later check. Widening `declares_name` was checked against every other
+caller it feeds (`preferred_alias`'s own candidate filter, `live_named_items_in_scope`'s
+three callers, and `resolve_segments_from`'s module-descent live-item filter): all five
+only ever extract a `use`/`type` alias or a `mod` from what they're handed, and neither a
+`fn`, a `const` nor a `static` produces anything for either extraction, so becoming
+visible as a *candidate* changes nothing about what those callers do with one. A foreign
+function or `static` declared inside an `extern` block is the same shape once more but is
+left unrecognized: `declares_name` compares one item against one name, and a
+`syn::Item::ForeignMod` names none of its own — it holds a list of `ForeignItem`s, each
+with a name of its own — which needs machinery this function does not attempt, stated as a
+residual rather than chased further.
+`an_unconditional_function_excludes_a_cfg_gated_value_alias_of_one_name` and
+`an_unconditional_const_excludes_a_cfg_gated_value_alias_of_one_name` are the regressions,
+each confirmed RED against the pre-fix code — with the competing `use` declared *before*
+the function/`const` on purpose, since `resolve_segments_from`'s own tie-break prefers the
+first candidate when nothing else decides it, and a naive test with the declaration order
+reversed would have passed by coincidence of that tie-break rather than by the fix. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.

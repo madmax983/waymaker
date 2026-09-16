@@ -5599,6 +5599,15 @@ struct LiveDeclaration<'a> {
 /// in the type namespace exactly as a `mod` does, so `extern crate self as
 /// m;` beside a `#[cfg]`-gated `mod m { .. }` collides the moment the
 /// feature is enabled, confirmed against real `rustc`.
+///
+/// A free function, a `const` and a `static` each bind a name too, in the
+/// *value* namespace rather than the type namespace the six kinds above
+/// occupy (Codex review of PR #204): before this arm, none of the three was
+/// recognized as declaring anything at all, since the fallback below only
+/// ever produces an entry for a `use`/`type` alias — so a plain `fn allowed()
+/// {}` was invisible to every caller of this function, unable to shadow a
+/// competing `use` the way [`is_unconditional_value_declaration`] now lets
+/// it.
 fn declares_name(item: &syn::Item, first: &str) -> bool {
     match item {
         syn::Item::Mod(module) => ident_name(&module.ident) == first,
@@ -5613,6 +5622,9 @@ fn declares_name(item: &syn::Item, first: &str) -> bool {
                 .map_or_else(|| ident_name(&item.ident), |(_, rename)| ident_name(rename));
             name == first
         }
+        syn::Item::Fn(item) => ident_name(&item.sig.ident) == first,
+        syn::Item::Const(item) => ident_name(&item.ident) == first,
+        syn::Item::Static(item) => ident_name(&item.ident) == first,
         _ => own_aliases(core::iter::once(item))
             .iter()
             .any(|alias| alias.local == first),
@@ -5669,6 +5681,29 @@ const fn is_unit_or_tuple_struct(item: &syn::Item) -> bool {
             ..
         })
     )
+}
+
+/// Whether `item` unconditionally binds `first`'s value-namespace meaning —
+/// a unit or tuple struct's own implicit constructor
+/// ([`is_unit_or_tuple_struct`]), a free function, a `const`, or a `static`.
+/// Confirmed against real `rustc` (Codex review of PR #204): `fn allowed()
+/// {}` beside a `#[cfg]`-gated `use values::forbidden as allowed;` compiles
+/// only feature-off, where `allowed()` calls the local function; enabling
+/// the feature collides in the value namespace (E0255), so the `use` can
+/// never be live wherever the function, `const` or `static` is unconditional
+/// — the identical shape [`is_unit_or_tuple_struct`] already covers for a
+/// struct's own constructor, met here for every other item kind whose name
+/// is unconditionally a value. A foreign function or `static` declared
+/// inside an `extern` block is the same shape once more but is not
+/// recognized here: [`declares_name`] compares one item against one name,
+/// and a `syn::Item::ForeignMod` names none of its own — it holds a list of
+/// `ForeignItem`s, each with a name of its own — which needs machinery this
+/// function does not attempt, left as a residual.
+const fn is_unconditional_value_declaration(item: &syn::Item) -> bool {
+    matches!(
+        item,
+        syn::Item::Fn(_) | syn::Item::Const(_) | syn::Item::Static(_)
+    ) || is_unit_or_tuple_struct(item)
 }
 
 /// Picks which of `items`' own `use`/`type` aliases named `first` is the
@@ -5735,6 +5770,27 @@ fn preferred_alias<'a>(
         .filter(|item| !has_cfg_test(item_attrs(item)))
         .filter(|item| declares_name(item, first))
         .collect();
+    // An unconditional value-namespace declaration — a unit/tuple struct's
+    // own constructor, a free function, a `const` or a `static` — already
+    // owns a terminal (value) position outright, before any tie-break among
+    // `candidates` is even computed (Codex review of PR #204, one round
+    // later than the struct-only version below): `fn allowed() {}` and a
+    // `#[cfg]`-gated `use values::forbidden as allowed;` are neither one
+    // namespace-unambiguous (so `unconditional_winner` below finds neither),
+    // and the arbitrary `prefer_last`/`first` tie-break that decided `chosen`
+    // could pick the `use` outright — returning its alias immediately,
+    // before the struct-only check further down was ever reached. A
+    // competing `use` here is either impossible code (E0255, if it too is
+    // unconditional) or dead code under every configuration that also
+    // compiles this declaration (if it is `#[cfg]`-gated), never a second,
+    // live answer to substitute.
+    if terminal
+        && candidates
+            .iter()
+            .any(|item| is_unconditional_value_declaration(item) && !has_any_cfg(item_attrs(item)))
+    {
+        return None;
+    }
     let unconditional_winner = candidates
         .iter()
         .find(|item| is_namespace_unambiguous(item) && !has_any_cfg(item_attrs(item)))
@@ -5753,24 +5809,6 @@ fn preferred_alias<'a>(
         return Some(alias);
     }
     if !terminal {
-        return None;
-    }
-    // A unit or tuple struct's own name is *also* the value namespace's
-    // unconditional winner — its implicit constructor, callable as
-    // `Allowed` or `Allowed(0)` — unlike a record/braced struct, which has
-    // no constructor and never occupies the value namespace at all
-    // (confirmed against real `rustc`). So when the unconditional winner
-    // above is one of the two, it already owns this position outright and
-    // the value-namespace fallback below must not run at all: a competing
-    // `use` importing a value of the same name is either impossible code
-    // (E0255, if it too is unconditional) or dead code under every
-    // configuration that also compiles this struct (if it is `#[cfg]`-gated)
-    // — never a second, live answer this fallback may substitute (Codex
-    // review of PR #204: `struct Allowed(u8);` beside a `#[cfg]`-gated
-    // `use values::forbidden as Allowed;` still had this fallback rewrite a
-    // feature-off `Allowed(0)` call to `values::forbidden`, a name no
-    // compiling configuration of that call ever reaches).
-    if unconditional_winner.is_some_and(is_unit_or_tuple_struct) {
         return None;
     }
     let uses: Vec<&&'a syn::Item> = candidates
@@ -26019,6 +26057,68 @@ mod alias_scope_tests {
         let paths = resolved_path_uses(code).expect("the fixture parses");
         assert!(
             paths
+                .iter()
+                .any(|path| path.segments == ["values", "forbidden"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_unconditional_function_excludes_a_cfg_gated_value_alias_of_one_name() {
+        // Codex review of PR #204, round 24: before this fix, a plain `fn`
+        // was invisible to `declares_name` entirely — the fallback arm only
+        // ever produces an entry for a `use`/`type` alias — so it could
+        // never even become a candidate, let alone shadow a competing
+        // `use`. `fn allowed() {}` beside a `#[cfg(feature = "a")] use
+        // values::forbidden as allowed;` compiles only with the feature
+        // off, where `allowed()` calls the local function; enabling the
+        // feature collides in the value namespace (E0255), confirmed
+        // against real `rustc`, so the `use` can never be live wherever
+        // the function is unconditional. The `use` is declared *before*
+        // the function on purpose: `resolve_segments_from`'s own tie-break
+        // prefers the first candidate when nothing else decides it, so
+        // this ordering is what actually exercises the fix rather than
+        // getting the right answer from that tie-break by coincidence.
+        let code = "mod values {\n\
+             \x20   pub fn forbidden() {}\n\
+             }\n\
+             #[cfg(feature = \"a\")]\n\
+             use values::forbidden as allowed;\n\
+             fn allowed() {}\n\
+             fn forge() {\n\
+             \x20   allowed();\n\
+             }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.segments == ["values", "forbidden"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_unconditional_const_excludes_a_cfg_gated_value_alias_of_one_name() {
+        // The same shape one item kind over, proving
+        // `is_unconditional_value_declaration` closes the whole class
+        // rather than only the function case above: `const allowed: u8 =
+        // 0;` beside a `#[cfg]`-gated `use values::forbidden as allowed;`
+        // compiles only feature-off, where `allowed` names the local
+        // constant; enabling the feature collides the same way, confirmed
+        // against real `rustc`. The `use` is declared first for the same
+        // ordering reason as the function test above.
+        let code = "mod values {\n\
+             \x20   pub const forbidden: u8 = 1;\n\
+             }\n\
+             #[cfg(feature = \"a\")]\n\
+             use values::forbidden as allowed;\n\
+             const allowed: u8 = 0;\n\
+             fn forge() -> u8 {\n\
+             \x20   allowed\n\
+             }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths
                 .iter()
                 .any(|path| path.segments == ["values", "forbidden"]),
             "{paths:?}"
