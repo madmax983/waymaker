@@ -1185,7 +1185,7 @@ fn a_schedule_admitted_by_a_weaker_reserve_can_strand_a_stricter_retry() {
     // later, stricter firmware cannot tell that schedule apart from one its own formula
     // admitted.
     //
-    // ADR 0053 documents this as a precondition on how a fleet may be upgraded, not a code
+    // ADR 0054 documents this as a precondition on how a fleet may be upgraded, not a code
     // fix: this test is the falsifier that shows the gap is real and bounded. It reruns
     // ADR 0052's own torn-outcome scenario one `outcome_bytes` short — the room a schedule
     // gets under the rule before issue #95's `redelivery_slack` — and shows the retry a

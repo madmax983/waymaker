@@ -1,4 +1,4 @@
-# ADR 0053: the capacity reserve formula is a fleet precondition
+# ADR 0054: the capacity reserve formula is a fleet precondition
 
 - Status: accepted
 - Date: 2026-09-15

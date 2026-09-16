@@ -6,11 +6,28 @@
 //! a build this repository does not run. This module gives `cargo xtask size` a real image
 //! to read them from.
 //!
-//! Each function here is a direct copy of an already-tested body: the two shipped
-//! algorithms from `waymaker-flash/src/crc.rs`, and the three rejected candidates from
+//! Each function here is a direct copy of an already-tested body, frozen at the shape it
+//! had when ADR 0010 measured it: the two candidates ADR 0010 shipped from
+//! `waymaker-flash/src/crc.rs`, and the three rejected candidates from
 //! `waymaker-flash/tests/integrity.rs`. Neither file exports its version — the first is
 //! `pub(crate)` to that crate, the second lives in a test binary — so a copy is the only
-//! way to link one here. This file changes names only, never logic.
+//! way to link one here. This file changes names only, never logic — which means it is a
+//! historical snapshot rather than a live mirror, and it no longer describes what
+//! `crc32` actually does:
+//! [ADR 0046](../../../docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md)
+//! moved `crc16` from `crc16_ccitt_false_bitwise_candidate`'s shape to a closed-form
+//! multiply that needs no table at all, and
+//! [ADR 0053](../../../docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md)
+//! later moved `crc32` from `crc32_iso_hdlc_bitwise_candidate`'s shape to a nibble table.
+//! Both candidates below stay exactly as ADR 0010 left them —
+//! the comparison this file exists to reproduce is ADR 0010's bitwise-versus-table
+//! trade-off, and changing either candidate's body to match the current `crc.rs` would
+//! make that comparison a comparison against itself. `adr0010_shipped` on each, in
+//! `xtask::size::CHECKSUM_CANDIDATES`, means "the algorithm ADR 0010 chose", not "the
+//! bytes `crc.rs` currently computes with" — CRC-32/ISO-HDLC and CRC-16/CCITT-FALSE are
+//! still both true today, only bitwise no longer is. The field used to be named plain
+//! `shipped`, which is exactly the claim that stopped being true; it was renamed once a
+//! report reader had no way to tell the two apart from the rendered output alone.
 //!
 //! # Why five functions and not one call each
 //!
@@ -40,7 +57,7 @@ pub(crate) fn probe() -> usize {
     core::hint::black_box(kept)
 }
 
-/// CRC-32/ISO-HDLC, bitwise. The algorithm Waymaker ships.
+/// CRC-32/ISO-HDLC, bitwise. What ADR 0010 shipped; ADR 0053 moved `crc32` to a nibble table.
 ///
 /// A direct copy of `waymaker_flash::crc::crc32`. Check value `0xCBF4_3926`.
 #[inline(never)]
@@ -164,7 +181,7 @@ const fn crc32c_fold_table<const N: usize>() -> [u32; N] {
     table
 }
 
-/// CRC-16/CCITT-FALSE, bitwise. The algorithm Waymaker ships.
+/// CRC-16/CCITT-FALSE, bitwise. What ADR 0010 shipped; ADR 0046 moved `crc16` to a closed-form multiply.
 ///
 /// A direct copy of `waymaker_flash::crc::crc16`. Check value `0x29B1`.
 #[inline(never)]
