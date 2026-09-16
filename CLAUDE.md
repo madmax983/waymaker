@@ -1373,6 +1373,17 @@ Stated so that nobody mistakes silence for coverage:
   the ungated path a line somebody wrote on purpose, not one that cannot be written. Nothing
   in the workspace obliges a future dispatcher to use the gated writer; that is rung 0.4's,
   and it is stated here so its absence is a decision.
+- **That a reserve formula is safe to tighten across a firmware upgrade.** `Reserve` is
+  recomputed fresh from `Bounds` on every boot, and nothing about it is on media. A schedule
+  a weaker firmware admitted carries no record of what its own formula promised, so a later
+  firmware whose formula asks for more can meet the same stranding ADR 0052 closed for one
+  firmware version, reopened across two.
+  [ADR 0054](docs/adr/0054-the-capacity-reserve-formula-is-a-fleet-precondition.md) states
+  this as a precondition on how a fleet is upgraded rather than closing it in code — the
+  same shape ADR 0036 and ADR 0037 already use for version-range and read-set ordering — and
+  `a_schedule_admitted_by_a_weaker_reserve_can_strand_a_stricter_retry` in
+  `crates/waymaker-flash/tests/capacity.rs` is the falsifier: the stall it drives is real,
+  but bounded — no byte moves, and every later boot meets the same refusal.
 - **That a device is an *instance* rather than a geometry, in `capacity`.** Issue
   [#84](https://github.com/madmax983/waymaker/issues/84) closed this for `append`,
   `recovery` and `swap`: each now borrows `storage` for the whole life of its protocol, so a
@@ -4703,13 +4714,34 @@ reserve a second time, for a kind whose own retry-safety turns out to depend on 
 sizes of a workflow's declared `Bounds` — `RunStarted`'s in particular, since
 `run_input_bytes` can dwarf everything else `Reserve::for_layout` prices — is what
 `redeliverable_kind`'s narrower scope avoids rather than chases. A third finding on the same
-mechanism is filed rather than fixed here: `redelivery_slack` is unversioned across a
+mechanism was filed rather than fixed here: `redelivery_slack` is unversioned across a
 firmware upgrade, since `Reserve` is recomputed fresh from `Bounds` on every boot and nothing
 about it is on media, so a schedule admitted by firmware that predates this fix carries no
-record of the weaker guarantee it left behind — see issue
-[#188](https://github.com/madmax983/waymaker/issues/188), filed rather than fixed because no
-device has ever run this firmware to make the scenario reachable today. See
+record of the weaker guarantee it left behind. See
 [ADR 0052](docs/adr/0052-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md).
+
+Issue [#188](https://github.com/madmax983/waymaker/issues/188) then closes that third
+finding — not with a code fix, since none is warranted while no device has ever run this
+firmware, but with a precondition and a falsifier. `Reserve::for_layout`'s formula is a
+policy, not a record: nothing about it reaches media, and `Recovery`/`Scan` decode bytes and
+a seal, never a reserve, so a bank carries no copy of the formula that admitted it. Any
+change that makes `Reserve` reserve more — `redelivery_slack` included — is therefore safe
+only from a fleet whose firmware all shares that formula or a stricter one; a device that
+admitted a schedule under a weaker formula and is then upgraded can meet the same stranding
+ADR 0052 closed for one firmware version, reopened across two.
+[ADR 0054](docs/adr/0054-the-capacity-reserve-formula-is-a-fleet-precondition.md) states that
+as a precondition on how a fleet is upgraded, the same shape ADR 0036 already states for
+widening `oldest`/`current` and ADR 0037 already states for the read set — an ordering no
+binary can check, so it is stated where an operator reads it. The falsifier is
+`a_schedule_admitted_by_a_weaker_reserve_can_strand_a_stricter_retry` in
+`crates/waymaker-flash/tests/capacity.rs`: it reruns ADR 0052's own torn-outcome scenario one
+`outcome_bytes` short — the room the pre-issue-#95 formula left — and shows both halves of
+the claim: the current reserve really does refuse a schedule the old formula admitted, and
+the refusal is safe rather than a hazard — no byte moves, and it repeats identically on every
+later boot. `Reserve::for_layout`, `Recovery` and `Scan` are unchanged; closing the residual
+for real needs a wire-format field or a dependency `recovery-surface` deliberately does not
+grant today, and both stay owed to rung 0.4's dispatcher or later, per ADR 0054's own
+alternatives.
 
 Issue #99 then closes the route Codex found on issue #32's fourth review round. A
 `pub const BEST_EFFORT: Self = Self::AfterBoot { ticks: 0 }` on `impl TimerSpec`, reached
