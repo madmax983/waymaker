@@ -7176,3 +7176,23 @@ against this test's own 30s ceiling at 20 atoms and 8 levels (13.95s with the fi
 order of margin the sibling `many_differently_nested_..._resolve_quickly` test already keeps
 against its own regressed shape) before landing. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a fourth, and it is a missed count rather than an
+over-count — the dangerous direction this whole mechanism exists to close first.
+`live_block_declarations`'s own `site_guaranteed` check asked whether *any* coexisting item's
+`cfg` was guaranteed by the site's, with no regard for which namespace that item occupies —
+but `unconditional`, right beside it, is already restricted to a namespace-unambiguous winner
+through `live_named_items_in_scope`'s own `is_namespace_unambiguous` check, for exactly the
+reason issue #193 states of `block_shadow`: a value-only declaration (a `const`, a `static`,
+a `fn`) or an ambiguous `use` can never be proven to occupy the type namespace a struct-
+literal path always resolves in. Confirmed against real `rustc`: a block-local `#[cfg(feature
+= "a")] const Unchecked: u8 = 0;`, gated identically to a `#[cfg(feature = "a")]` construction
+site, never shadows a module-scope `#[cfg(feature = "a")] type Unchecked = CheckedDispatch;`
+— the two occupy different namespaces entirely — but the unrestricted check still treated the
+`const` as a guaranteed shadow and skipped module scope outright, missing the real
+construction the outer alias reaches. `site_guaranteed` now requires
+`is_namespace_unambiguous` too, the identical test `unconditional` already passes through.
+`a_value_only_site_guaranteed_declaration_does_not_shadow_a_type_namespace_module_scope_one`
+is the regression, confirmed RED against the pre-fix code (`total: 0` against an expected `1`)
+before landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.

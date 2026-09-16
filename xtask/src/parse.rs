@@ -7180,9 +7180,24 @@ fn live_block_declarations<'a>(
             false,
         );
         let coexisting = coexisting_with_site(scope_live, site_cfg, cache);
-        let site_guaranteed = coexisting
-            .iter()
-            .any(|item| cache.guaranteed_by(&attrs_cfg(item_attrs(item)), site_cfg));
+        // Restricted to a namespace-unambiguous item, the same test
+        // `unconditional` above is already restricted to (via
+        // `live_named_items_in_scope`'s own `is_namespace_unambiguous`
+        // check) — a value-only declaration (a `const`, a `static`, a
+        // `fn`) or an ambiguous `use` can never be proven to occupy the
+        // type namespace a struct-literal path always resolves in, so
+        // treating either as a guaranteed shadow of a type-namespace
+        // module-scope declaration is a missed count: `#[cfg(feature =
+        // "a")] const Unchecked: u8 = 0;` beside a site gated the
+        // identical `feature = "a"` never shadows a module-scope
+        // `#[cfg(feature = "a")] type Unchecked = CheckedDispatch;` in
+        // real Rust — the two occupy different namespaces — but the
+        // unrestricted check still skipped module scope over it (Codex
+        // review of PR #209, issue #206).
+        let site_guaranteed = coexisting.iter().any(|item| {
+            is_namespace_unambiguous(item)
+                && cache.guaranteed_by(&attrs_cfg(item_attrs(item)), site_cfg)
+        });
         live.extend(
             coexisting
                 .into_iter()
@@ -27277,6 +27292,35 @@ mod cfg_alias_ambiguity_tests {
              fn forge() -> u8 {\n\
              \x20   #[cfg(feature = \"b\")]\n\
              \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_value_only_site_guaranteed_declaration_does_not_shadow_a_type_namespace_module_scope_one()
+    {
+        // Codex review of PR #209 (issue #206): `site_guaranteed` asked
+        // whether *any* coexisting item's own `cfg` was guaranteed by the
+        // site's, with no regard for which namespace that item occupies. A
+        // block-local `const` of the same name, gated identically to the
+        // construction site, occupies only the value namespace and never
+        // shadows a type-namespace module-scope alias — confirmed against
+        // real `rustc` — but the unrestricted check still treated it as a
+        // guaranteed shadow and skipped module scope outright, missing the
+        // real construction the outer alias reaches.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Unchecked = CheckedDispatch;\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   const Unchecked: u8 = 0;\n\
              \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
