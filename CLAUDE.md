@@ -1313,14 +1313,74 @@ Stated so that nobody mistakes silence for coverage:
   the first version wrong in exactly the direction this residual-limit bullet exists to
   catch: it only ever added a shadowing item's own names and never reset, so a nested item one
   level inside the shadowing one inherited a shadow real Rust never gives it, hiding a real
-  alias the pre-#181 code had resolved correctly. A block-local item sharing a name with a
-  sibling module or alias stays open, filed as issue
-  [#193](https://github.com/madmax983/waymaker/issues/193): closing it needs a block's own
-  item declarations to become a scope of their own too, ahead of every module-level lookup —
-  more machinery than the generic-parameter half needed, the same standing #169 itself had on
-  PR #160 before it was filed rather than chased. A `struct`, `enum`, `union` or `type` alias
+  alias the pre-#181 code had resolved correctly. The block-local-item half of #181 is now
+  closed too, by issue
+  [#193](https://github.com/madmax983/waymaker/issues/193). A `struct`, `enum`, `union` or
+  `trait` a block declares directly now shadows a same-named sibling module or alias too,
+  not only a generic type parameter, for a *qualified* reference (`X::Y`) — a trait is on
+  that list because it occupies the same namespace the other three do, which a fourth Codex
+  round found `block_item_shadow_names` missing after the first three landed. A *bare*,
+  single-segment reference is narrower still, for a reason a fifth round found: only a unit
+  or tuple `struct` also occupies the value namespace, so a bare shadow can be wrong in the
+  dangerous direction for the other three shapes (see the Status section's own paragraph on
+  #193 for both rounds). It lives in its own `block_shadow` list rather than the generic
+  parameter's `shadow`, because the two reset at different points — confirmed against
+  `rustc`, not assumed: `E0401`'s "nested items are independent... for name resolution" is
+  about a generic parameter, and does not make a nested `fn` or `impl` blind to its
+  enclosing block's own item declarations the way it makes one blind to that block's own
+  generics. `block_shadow` therefore persists through a nested `fn`, `impl` or `trait` in
+  the same block, and resets only at a `mod` boundary — the one place a nested item really
+  does lose visibility into what declared it. Every visitor built on
+  `resolve_segments`/`resolve_segments_from` carries a `visit_block` override for it:
+  `resolved_path_uses`, `name_uses`, `struct_literal_counts`, and
+  `generic_assoc_type_bindings_naming`. That last one, issue #184's own caller, had been
+  calling both functions with the wrong argument count since #181 landed, and the crate did
+  not compile until this fix. Any `#[cfg(..)]`-gated declaration is excluded from
+  `block_shadow`, not only a `#[cfg(test)]` one: shadowing suppresses a real
+  resolution, the opposite of what `own_aliases` does with an alias behind an
+  unevaluated `cfg` (issue #51), so the safe direction here is the opposite too —
+  Codex found this on review of the pull request, against a `#[cfg(feature = "x")]`
+  example. A `let`-bound name is left out on
+  purpose rather than left open: it occupies only Rust's value namespace, never the type or
+  module namespace `resolve_segments`'s callers resolve in, so it cannot shadow a path any
+  of them reads — issue #193's own reproducer names one only as part of the `let _ = ...`
+  statement that reads the already-shadowed struct, not as a second shadowing mechanism.
+  A block-local `use`/`type` alias's own *target* is resolved with no shadow check at
+  all, in either list: Codex found that checking it against the *use* site's
+  `block_shadow` let a deeper block's own shadow reach back into an alias declared
+  outside it, which is wrong in the other direction (`type Local = Wrapper::X;`
+  declared before a nested block's own `struct Wrapper;` must still resolve through
+  the real `Wrapper` when `Local` is used inside that block). `resolve_segments_loop`
+  closes that by never re-checking an alias's own substituted text, matching what
+  this scanner's own module-level alias-chasing already does — but the precise
+  answer, checking the target against *its own declaration site's* shadow rather
+  than none at all, needs each block-local item paired with a shadow snapshot taken
+  where it was declared, and this fix does not add that.
+  `resolve_local_alias_chain` and `alias_could_reach_target` — the two routes
+  `struct_literal_counts` and `generic_assoc_type_bindings_naming` resolve a
+  block-local reference through — read only `own_aliases`,
+  which has never read a `struct`/`enum`/`union` declaration; neither consults
+  `block_shadow`. So an outer `type Alias = Disallowed;` still answers for a bare
+  `Alias` a deeper block shadows with a struct of its own, and a module-level
+  `use Disallowed as Alias;` still answers the same way through
+  `alias_could_reach_target`'s own fallback. The precise fix needs each
+  declaration — alias or item — paired with the depth it was made at; a shortcut
+  (block-local items always win) was checked against the reverse nesting and found
+  to turn an over-count into a missed one, which is the direction a construction
+  pin must never move in. Both routes exist only for those two construction pins,
+  where an extra count is accepted and a missed one is not, so both stay
+  over-counting — pinned by a test rather than chased into a fix likelier to trade
+  one gap for a worse one (Codex review of PR #203, round 3). The same round found
+  a third, older instance of the same shape: `own_modules` reads only `stack`, the
+  file/module-level ancestor chain, so a block-local `mod` has never shadowed a
+  same-named sibling module — unchanged since before #181, so #193 neither caused
+  nor worsened it. All three are one class of gap, filed together as issue
+  [#205](https://github.com/madmax983/waymaker/issues/205) rather than chased
+  further here.
+  A `struct`, `enum`, `union` or `type` alias
   can declare its own generic type parameter too, and none of the five overrides tracks one:
-  a residual narrower than #193's, left stated rather than closed, since none of the pinned
+  a residual narrower than the block-local-item gap issue #193 closed, left stated rather
+  than closed, since none of the pinned
   rules this scanner backs constructs a struct literal or a suffix path from inside one of
   those declarations today. Nor does
   it carry a namespace: two `use` items can bind one local name in different namespaces — a
@@ -1593,6 +1653,20 @@ Stated so that nobody mistakes silence for coverage:
   cannot resolve" already names for this alias-resolution machinery (a glob import, an
   out-of-line module, a macro expansion, an unevaluated `cfg`). Left as a residual rather
   than chased further, per this project's own two-or-three-round guidance.
+- **Whether a block-local `use` overrides a shadowed generic parameter's own name, when the
+  `use`'s own target is a value rather than a type.** Issue #205, round 3, then round 4:
+  `generic_assoc_type_bindings_naming` treats any same-named block-local declaration as
+  reason enough to ask the fail-closed backstop whether a shadowed name reaches the guarded
+  type, `use` included. A `use` importing a value of the same name as the parameter (`use
+  values::CheckedDispatch;` where that names a function) can make the backstop report a
+  match that a real build would still resolve to the parameter — the same "same-spelled
+  alias across namespaces" residual named below, met here for a shadowed generic parameter
+  rather than an ordinary path. Narrowing the gate to a namespace-unambiguous declaration
+  closes that over-count and reopens a real miss instead: a `use` importing a same-named
+  *type* alias is exactly as valid an override as a `mod`, and this scanner cannot tell the
+  two `use` shapes apart without resolving what each one names. Accepted as an over-count
+  rather than chased further, for the reason every bullet in this list gives: a missed count
+  is the danger, not an extra one.
 - **That the run half of a redelivered identity is the device's.** §14's guarantee is about
   a `(RunId, EffectSeq)` pair, and only the sequence half is read from media: `ReplayCursor`
   takes it from the schedule record, and the `RunId` is an argument to `Driver::new` that no
@@ -6102,6 +6176,149 @@ still states no latency budget for a checksum to be on the critical path of, and
 "compiles to a table load" claim is a disassembly with reproduction steps rather than
 something CI re-derives on every run.
 
+Issue #193 closes the other half of #181's own residual: a block-local `struct`,
+`enum` or `union` now shadows a same-named sibling module or `use` alias too, not
+only a generic type parameter. `block_item_shadow_names` reads a block's own
+directly-declared items, skipping any `#[cfg(..)]`-gated one — not only a
+`#[cfg(test)]`-gated one, which the first version wrongly stopped at: Codex found on
+review that shadowing suppresses a real resolution, the opposite of what
+`own_aliases` does with an alias behind an unevaluated `cfg`, so the safe reading
+here is the opposite too, and a `#[cfg(feature = "x")]`-gated struct still shadowed
+in every build before this fix. Its names go into a *new*, separate list, `block_shadow`, not the generic
+parameter's own `shadow` — the review round that found this checked the claim
+against `rustc` rather than assuming it, and the two lists reset at different points
+because real Rust treats them differently. `E0401`'s "nested items are
+independent... for name resolution" is about a generic parameter; it does not make a
+nested `fn` or `impl` blind to its own enclosing block's item declarations, so
+`block_shadow` persists through a nested `fn`, `impl` or `trait` in the same block
+and resets only at a `mod` boundary, via a new `reset_shadows_for_module` helper.
+`shadow` keeps #181's own reset at all four. Every visitor built on
+`resolve_segments`/`resolve_segments_from` carries a `visit_block` override that
+extends `block_shadow` on the way in and truncates it on the way out —
+`resolved_path_uses` and `name_uses` gained one, and `struct_literal_counts` folded
+it into the `visit_block` override it already had for `block_items`. A `let`-bound
+name is deliberately not tracked: it names a value, never a type or a module, so it
+cannot shadow a path any of these functions resolve — stated in
+[what is not checked](#what-is-not-checked) rather than left implied by the fix.
+
+Fixing this surfaced a real, separate compile break on this branch:
+`generic_assoc_type_bindings_naming` (issue #184's own scan, merged one commit after
+#181 added the `shadow` parameter) still called `resolve_segments`/
+`resolve_segments_from` with the pre-#181 argument count, because the two issues were
+developed concurrently and #184's PR was based on a commit before #181 landed. The
+branch had not compiled since that merge. This change threads `shadow_generic_params!`
+and both shadow fields through its visitor too, both for the fix and to make the
+crate build again. A second caller left uncovered would have been the same defect
+issue #193 exists to close, one function over. `struct_literal_counts`'s and
+`generic_assoc_type_bindings_naming`'s own `visit_block` overrides moved the extend/
+truncate pair into a shared `enter_block` helper, and their own alias-then-segments
+resolution moved into a shared `resolve_with_block_alias`, because writing either
+out by hand twice pushed both functions past `clippy::too_many_lines`.
+`cargo xtask check-layering` reports the same 57 rules `ok` on the workspace as it
+did before this change: the fix widens what a *scanner* resolves, and no production
+file in this workspace happens to declare a block-local item sharing a sibling
+module's or alias's name today. No new ADR: nothing here moves a must-not-own cell,
+a dependency edge, or a rule id.
+
+Codex review of the pull request found two more real gaps, both fixed on this same
+branch before it merged. The first: `block_item_shadow_names` excluded only a
+`#[cfg(test)]`-gated declaration, so one behind any other condition —
+`#[cfg(feature = "x")]`, say — still shadowed unconditionally, even in a build where
+it does not exist. Shadowing suppresses a real resolution, the opposite of what
+`own_aliases` does by keeping an alias behind an unevaluated `cfg` available, so the
+safe reading is the opposite too: switched to `has_any_cfg`, the same distinction
+`struct_derives` already draws for the same reason. The second is sharper: a
+block-local alias's own target — the right-hand side of `type Local = Wrapper::X;`
+— was being checked against the *use* site's `block_shadow`, so a block nested
+*deeper* than `Local`'s own declaration, one that shadows `Wrapper` with a struct of
+its own, stopped `Local` from resolving through the real module even though
+`Wrapper` genuinely named that module where the alias was written. `resolve_segments_from`
+is now two functions: the shadow check, and `resolve_segments_loop` underneath it,
+which a block-local alias's leftover head calls directly — skipping the check
+entirely, the same way this scanner's own module-level alias substitutions already
+do, rather than checking against the wrong site's shadow. [What is not checked](#what-is-not-checked)
+now names the residual this still leaves: the precise fix would check a target
+against *its own* declaration-site shadow, which needs each block-local item
+paired with a shadow snapshot this change does not add.
+
+A third round found two more, both real, both left as documented residuals rather
+than fixed: `resolve_local_alias_chain` and `alias_could_reach_target` — the two
+routes `struct_literal_counts` and `generic_assoc_type_bindings_naming` resolve a
+block-local reference through — read only `own_aliases`, which is blind to a
+`struct`/`enum`/`union` declaration the same way it always was; neither consults
+`block_shadow` at all. So an outer block's `type Alias = Disallowed;` still answers
+for a bare `Alias` inside a deeper block that shadows it with a struct of its own,
+and a module-level `use Disallowed as Alias;` still answers the same way even when
+a block-local `struct Alias;` genuinely shadows it. Telling the two apart needs each
+declaration — alias or item — paired with the depth it was made at, compared
+against the other; a first attempt at a shortcut (treat `block_shadow` as always
+winning) was checked against the reverse nesting and found to turn the fix into a
+worse bug — a *missed* count, where the current behavior is only an *extra* one.
+Both routes exist solely for `struct_literal_counts` and
+`generic_assoc_type_bindings_naming`, both construction pins, where an extra count
+is the accepted-safe direction and a missed one is the danger this file's own
+`alias_could_reach_target` doc already states — so both are pinned by a test
+showing the current, over-counting behavior stays exactly what it is, rather than
+chased into a fix likely to trade one review round for a worse one. The same round
+found a third instance, older than #193 itself: `own_modules` reads only `stack`,
+so a block-local `mod` has never shadowed a same-named sibling module, unchanged
+since before #181. All three are one class of gap — each declaration needs pairing
+with the depth it was made at, compared across kinds — filed as issue
+[#205](https://github.com/madmax983/waymaker/issues/205) rather than fixed here,
+per this project's own two-or-three-round review guidance.
+
+A fourth round found a real gap in `block_item_shadow_names` itself, separate from
+the three above and fixed here: it matched `Item::Struct`, `Item::Enum` and
+`Item::Union` and fell through `_ => None` on `Item::Trait`, so a block-local
+`trait Alias {}` never entered `block_shadow` at all. A trait name occupies the
+same namespace a struct, enum or union does — real Rust resolves `dyn Alias` or
+`Alias::CONST` to a block-local trait declaration the identical way it resolves
+`Alias { .. }` to a block-local struct — so a trait shadowing a module-level
+`use Disallowed as Alias;` was invisible to `resolved_path_uses` and `name_uses`,
+which stepped past the local trait and reported the module's own alias instead.
+`block_item_shadow_names` now matches `Item::Trait` too, verified red against the
+unpatched match arm before landing.
+
+A fifth round found a sharper problem in the mechanism that fourth round's own fix
+extended rather than in `block_item_shadow_names` itself: `block_shadow` refuses a
+shadowed head segment regardless of how many segments the path has, and Rust's
+namespaces do not work that way. `struct`, `enum`, `union` and `trait` all occupy
+the type/module namespace; only a unit or tuple `struct` also occupies the value
+namespace, and this scanner has no way to tell the four shapes apart. Codex's own
+repro was `use TimerSpec::BestEffort as Chosen; fn f() { enum Chosen {} let _ok =
+TimerSpec::AtPersistentTime; let _bad = Chosen; }`: `Chosen` names a *value*
+import, and a bare, zero-variant `enum Chosen` — type/module namespace only —
+cannot shadow it for a bare reference in real Rust, but `block_shadow` refused it
+anyway, so `timer-capability`'s own `CLOCK_SPEC_CONSTRUCTION` pin saw only the
+allowed `TimerSpec::AtPersistentTime` reference and missed the disallowed one
+reached through `Chosen` entirely — a **missed** violation, the dangerous
+direction for a check built on `resolved_path_uses`/`name_uses`, unlike issue
+#185's own over-counting residuals on `struct_literal_counts`. A *qualified* head
+segment (`X::Y`) is always type/module namespace at that segment, whichever of
+the four shapes declared it, so refusing there stays sound; `resolve_segments_from`
+now only refuses a shadowed `block_shadow` name when the path has more than one
+segment, leaving a bare one to resolve through `own_aliases`/`own_modules` as it
+did before block_shadow existed. `shadow` (issue #181's generic type parameters)
+keeps its unrestricted check: a type parameter never occupies the value namespace
+on its own, so a bare one has no namespace ambiguity to guess at.
+
+That narrowing reopened the fourth round's own fix for exactly one shape — a
+*bare* trait-object bound (`dyn Alias`, one segment) is now unshadowed again,
+resolving through the module alias the same way it did before the trait arm was
+added — while a *qualified* reference through the same trait (`Alias::CONST`)
+stays correctly shadowed. Left as a residual rather than chased further: the
+danger runs the other way for this one. A bare `dyn Alias` resolving to the
+sibling module's alias is an over-strict false positive on legitimate code (the
+same direction the fourth round's own fix was closing), never a missed violation,
+so it is the safe side of the same trade the fifth round's own fix makes for the
+dangerous case. Closing it too needs the same position-aware, per-namespace
+machinery — knowing whether a path was reached from a type position or a value
+position, and threading that through every caller of `resolve_segments`/
+`resolve_segments_from` — that this project has already declined to build twice
+for the same underlying limitation (see
+[what is not checked](#what-is-not-checked)'s own bullet on this file's alias
+resolution). Both directions are pinned by a test rather than left implied.
+
 Merging this branch (issue #197's fifteenth round, above) with `main`'s own issue #153 and
 #189 work found one real collision, in code neither line of work knew the other had
 touched. Both independently met the same build break — `generic_assoc_type_bindings_naming`
@@ -6838,3 +7055,85 @@ shape and empty-attrs fast path as every other statement-level override in this 
 regressions, each confirmed RED against the pre-fix code (no such override) before
 landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
 rule id.
+
+Issue #205 found that `generic_assoc_type_bindings_naming` had no fail-closed backstop,
+unlike `struct_literal_counts`. `resolve_local_alias_chain` cannot see a block-local `mod`.
+So a binding qualified through one was never checked. Real `rustc` reads `mod traits { pub
+use CheckedDispatch as Marker; } fn forge<T: Alias<Dispatch = traits::Marker>>() {}` as a
+live use of the guarded type. The old code missed it. A missed count is the dangerous
+direction. The fix runs the same `path_could_reach_target` search `struct_literal_counts`
+already uses, for each guarded name the deterministic walk did not find. `struct_literal_counts`
+itself needed no change: its own backstop already covers every shape issue #205 named.
+
+Codex review of PR #208 found the fix's own first version wrong in the direction issue #189
+already guards against. The backstop ran even when the binding's head segment named an
+in-scope generic parameter. `path_could_reach_target`'s own "shadowed, no override" answer
+conservatively assumes reachable — right for `struct_literal_counts`'s question (could this
+parameter be instantiated with the guarded type), wrong for this one (does this identifier
+name the guarded type as written). So `pub fn forge<CheckedDispatch, T: Alias<Dispatch =
+CheckedDispatch>>() {}` — issue #189's own case, a sibling parameter that merely shares the
+guarded name — started reporting a match again. The backstop now runs on a shadowed name
+only when a real block-local declaration of it exists to decide between the two readings;
+with none, the identifier can only ever mean the parameter, exactly as issue #189 settled.
+Checked against real `rustc` both ways: a nested item's own generics reset away from an
+outer parameter of the same name (issue #181), so a binding in a *nested* item's own bound
+already found the guarded type through the block-local module; a binding in the *same*
+item's body, naming that item's own parameter through a same-named sibling module, does not
+compile at all (`E0220`) — the parameter always wins there, and the backstop's own
+conservative answer in that dead case is an accepted over-count, not a miss.
+
+A third round of the same review found "a real block-local declaration of it exists" was
+still too wide: `live_block_declarations` returns a bare `use` too, and a `use` can import a
+value. `fn outer<CheckedDispatch>() { use values::CheckedDispatch; let _: dyn
+Alias<Dispatch = CheckedDispatch>; }` compiles — the bound still means the parameter, not
+the imported function, checked against real `rustc` — but the backstop ran anyway and
+reported a match, since it will happily chase the `use`'s own path to a last segment that
+coincidentally spells the guarded name. That looked like issue #189's exact false positive
+again, one level removed, and the gate was narrowed to ask for a *namespace-unambiguous*
+block-local item instead — `is_namespace_unambiguous`: a `mod`, `type`, `struct`, `enum`,
+`union`, `trait` or `extern crate` — never a bare `use`.
+
+A fourth round found that narrowing wrong: a `use` importing a same-named *type* alias
+(`mod values { pub type Hidden = CheckedDispatch; } fn outer<Hidden>() { use values::Hidden;
+let _: dyn Alias<Dispatch = Hidden>; }`, checked against real `rustc`) is exactly as real an
+override as a `mod`, and excluding every bare `use` missed it — the dangerous direction. This
+scanner cannot tell the two `use` shapes apart without resolving what each one names, which
+is the same "same-spelled alias across namespaces" residual [what is not
+checked](#what-is-not-checked) already states for every other caller in this file. The third
+round's narrowing is reverted: the gate is "any live block-local declaration" again, and the
+round-three false positive is accepted rather than chased — a missed count is the danger this
+whole mechanism exists to close, not an extra one. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+Merging this branch (issue #206's own PR) with `main`'s issue #193 and #205 work found one
+real behavior change, in the seam between the two — neither review touched the same lines,
+so neither caught it. Issue #193 gave `Literals::visit_expr_struct` a `block_shadowed` gate
+so a bare or qualified head segment shadowed by an unconditional block-local declaration is
+excluded from the fail-closed backstop; issue #206's own round 2 (above) separately made the
+backstop itself run whenever the path is not `block_shadowed`, full stop, rather than only
+when a cheap, `cfg`-blind `resolves_to_name` disagreed. Combined literally, `resolves_to_name`
+dropped out of the count entirely except inside `block_shadowed`'s own branch. One of main's
+own regression tests, `path_could_reach_target_does_not_consult_block_shadow_for_a_type_only_shape`,
+pinned the old, `resolves_to_name`-first structure's own accepted over-count for a *bare*
+reference shadowed by a block-local `enum` — `resolve_segments` deliberately never refuses a
+bare reference through `block_shadow` (only through the narrower `value_shadow`, since most
+of the four shadowing shapes occupy no value namespace to be safely conservative about), so
+the old shortcut resolved straight through to a module-scope alias the enum should have
+blocked. Bringing `resolves_to_name` back as an unconditional second route to a count would
+have reverted round 2's own fix outright — the exact structure that fix replaced, and the
+exact shape round 2's own regression test still guards against elsewhere in this file. The
+two fixes are not reconcilable as separately written for this one path, and round 2's is the
+one worth keeping: it corrects an outright wrong claim (a `cfg`-gated candidate the
+construction site itself can never coexist with), where the `enum` case is merely an
+accepted, safe-direction imprecision `resolve_segments` already documents as deliberate and
+unfixed. The merged code keeps round 2's structure — `path_could_reach_target` runs whenever
+the path is not `block_shadowed` — and the test's own expectation moves from the old
+shortcut's `1` to `0`: `live_block_declarations` (unchanged by either PR) already treats an
+unconditional block-local declaration of *any* of the four shapes, not only an alias, as
+shadowing everything further out, so the backstop's own independent search finds nothing
+reachable once it is actually asked. The fixture was never compilable Rust either way — an
+`enum` with no unit variant cannot be built with `Name { .. }` syntax — so neither answer
+ever corresponded to a real missed or extra count in a shipping build; this is a side effect
+of unifying two fixes that happened to converge on the more principled one, not a new,
+targeted fix of its own. No new ADR: nothing here moves a must-not-own cell, a dependency
+edge, or a rule id.
