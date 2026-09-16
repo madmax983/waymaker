@@ -5294,16 +5294,23 @@ fn scope_key(items: &[syn::Item]) -> ScopeKey {
 /// depend on a site's `cfg`, so caching it this way is still exact — each
 /// site's own `cfg` is applied afterward, cheaply, over this already-small
 /// cached list ([`coexisting_with_site`]), by
-/// [`AliasLookupCache::live_aliases_of`] and
-/// [`AliasLookupCache::live_modules_of`] — one cache read serves both, since
-/// both start from the identical `(scope, name)` answer.
+/// [`AliasLookupCache::live_modules_of`]. [`AliasLookupCache::live_aliases_of`]
+/// caches a further step too — see its own doc.
 ///
 /// Holds no block-local lookup: [`segments_could_reach_target`]'s `block_items` is a
 /// scattered slice of references, not one contiguous scope, so it has no single
 /// address to key a cache entry on — [`live_block_declarations`] runs it uncached.
+///
+/// One `use`/`type` alias, tagged with the `cfg` of the item that declared
+/// it — [`AliasLookupCache::live_aliases_of`]'s own cache entry, so a
+/// site's own `cfg` can be checked against each alias without re-expanding
+/// the item it came from.
+type TaggedAliases = std::rc::Rc<[(Cfg, UseAlias)]>;
+
 #[derive(Default)]
 struct AliasLookupCache<'a> {
     candidates: std::collections::HashMap<(ScopeKey, String), std::rc::Rc<[&'a syn::Item]>>,
+    aliases: std::collections::HashMap<(ScopeKey, String), TaggedAliases>,
 }
 
 impl<'a> AliasLookupCache<'a> {
@@ -5336,6 +5343,14 @@ impl<'a> AliasLookupCache<'a> {
     /// sole caller ([`struct_literal_counts`]) is always resolving a
     /// construction path, never a value (Codex review of PR #204) — see
     /// [`live_named_items_in_scope`]'s own doc for why that matters here.
+    ///
+    /// [`own_aliases`] walks a `use` item's whole tree, so a group naming
+    /// many bindings costs more than one lookup. This expansion is cached
+    /// too, one call per `(scope, name)`, each alias tagged with its own
+    /// item's `cfg` — not re-expanded on every site (Codex review of the
+    /// fix: a first version called [`own_aliases`] fresh per site, over
+    /// this already-small candidate list, which still reopened a narrower
+    /// version of the per-site cost this whole cache exists to avoid).
     fn live_aliases_of(
         &mut self,
         items: &'a [syn::Item],
@@ -5343,9 +5358,27 @@ impl<'a> AliasLookupCache<'a> {
         site_cfg: &Cfg,
     ) -> Vec<UseAlias> {
         let candidates = self.candidates_of(items, first);
-        own_aliases(coexisting_with_site(candidates.iter().copied(), site_cfg))
-            .into_iter()
-            .filter(|candidate| candidate.local == first)
+        let tagged = self
+            .aliases
+            .entry((scope_key(items), first.to_owned()))
+            .or_insert_with(|| {
+                candidates
+                    .iter()
+                    .flat_map(|item| {
+                        let cfg = attrs_cfg(item_attrs(item));
+                        own_aliases(core::iter::once(*item))
+                            .into_iter()
+                            .filter(|candidate| candidate.local == first)
+                            .map(move |alias| (cfg.clone(), alias))
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            })
+            .clone();
+        tagged
+            .iter()
+            .filter(|(cfg, _)| site_cfg.could_coexist_with(cfg))
+            .map(|(_, alias)| alias.clone())
             .collect()
     }
 
