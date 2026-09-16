@@ -1180,6 +1180,10 @@ struct AssocBindings<'a, 'ast> {
     // (issue #193, Codex review of PR #203, round 2) — see
     // `block_item_value_shadow_names`.
     value_shadow: Vec<String>,
+    // Issue #205: the walk below cannot see a block-local `mod`. These two fields
+    // run `path_could_reach_target` as a backstop, the same way `Literals` does.
+    alias_search_budget: usize,
+    alias_lookup_cache: AliasLookupCache<'ast>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
@@ -1276,11 +1280,13 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
                     || self.value_shadow.contains(&name)
                     || (path.segments.len() > 1 && self.block_shadow.contains(&name))
             });
-            if !shadowed {
-                // `false`: an associated-type binding's value is always
-                // type-namespace, never a value — real Rust's own grammar
-                // decides that, not a segment count (Codex review of PR
-                // #204).
+            // `false`: an associated-type binding's value is always
+            // type-namespace, never a value — real Rust's own grammar
+            // decides that, not a segment count (Codex review of PR
+            // #204).
+            let resolved = if shadowed {
+                None
+            } else {
                 let (resolved, _) = resolve_with_block_alias(
                     path,
                     &self.stack,
@@ -1290,11 +1296,81 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
                     &self.block_items,
                     false,
                 );
-                if let Some(name) = resolved
-                    .last()
-                    .filter(|last| self.names.contains(&last.as_str()))
-                {
-                    self.found.push(name.clone());
+                Some(resolved)
+            };
+            if let Some(name) = resolved
+                .as_ref()
+                .and_then(|segments| segments.last())
+                .filter(|last| self.names.contains(&last.as_str()))
+            {
+                self.found.push(name.clone());
+            }
+            // Issue #205, round 2 (Codex): this must run even when `shadowed`.
+            // A block-local declaration can shadow an outer generic parameter
+            // for a binding used in that item's own body — real Rust reads
+            // `fn outer<Traits>() { mod Traits { .. } let _: dyn Alias<Dispatch
+            // = Traits::Marker>; }` that way (checked against `rustc`), the
+            // same rule `struct_literal_counts` already relies on for a
+            // struct literal.
+            //
+            // But when `shadowed` and no block-local declaration of that
+            // name exists at all, the identifier can only ever mean the
+            // parameter — issue #189's own case, still true here. Calling
+            // the backstop then would reintroduce it:
+            // `path_could_reach_target`'s own "shadowed, no override" answer
+            // conservatively assumes reachable, which is right for
+            // `struct_literal_counts`'s question (could this parameter be
+            // instantiated with the guarded type) and wrong for this one
+            // (does this identifier name the guarded type). So the backstop
+            // runs on a shadowed name only once some block-local declaration
+            // of it exists to actually decide between the two.
+            //
+            // Codex review of PR #208, rounds 3 and 4, tried narrowing this
+            // to a namespace-unambiguous declaration only — never a bare
+            // `use`, which can import a value. That closed round 3's own
+            // false positive (a `use` importing a same-named function) but
+            // reopened a real miss round 4 found: a `use` importing a
+            // same-named *type* alias (`mod values { pub type Hidden =
+            // CheckedDispatch; } fn outer<Hidden>() { use values::Hidden; let
+            // _: dyn Alias<Dispatch = Hidden>; }`, checked against real
+            // `rustc`) is exactly as real an override, and this scanner
+            // cannot tell the two `use` shapes apart without resolving what
+            // each one names — the same "same-spelled alias across
+            // namespaces" residual [what is not
+            // checked](../../CLAUDE.md#what-is-not-checked) already states.
+            // Reverted to "any live declaration": a miss is the danger this
+            // whole mechanism exists to close, so an over-count from a
+            // wrong-namespace `use` is accepted, not chased further.
+            let first = path
+                .segments
+                .first()
+                .map(|segment| ident_name(&segment.ident));
+            let overridable = !shadowed
+                || first.is_some_and(|first| {
+                    !live_block_declarations(&self.block_items, &first)
+                        .0
+                        .is_empty()
+                });
+            if overridable {
+                for name in self.names {
+                    let already = resolved
+                        .as_ref()
+                        .and_then(|segments| segments.last())
+                        .map(String::as_str)
+                        == Some(*name);
+                    if !already
+                        && path_could_reach_target(
+                            path,
+                            &self.stack,
+                            &self.block_items,
+                            &self.shadow,
+                            name,
+                            self.alias_search_budget,
+                            &mut self.alias_lookup_cache,
+                        )
+                    {
+                        self.found.push((*name).to_owned());
+                    }
                 }
             }
         }
@@ -1333,6 +1409,8 @@ pub fn generic_assoc_type_bindings_naming(
         shadow: Vec::new(),
         block_shadow: Vec::new(),
         value_shadow: Vec::new(),
+        alias_search_budget: alias_search_budget(&file.items),
+        alias_lookup_cache: AliasLookupCache::default(),
     };
     visitor.visit_file(&file);
     Ok(visitor.found)
@@ -5658,10 +5736,10 @@ impl<'a> AliasLookupCache<'a> {
     /// The live `use`/`type` aliases in `items` whose local name is `first` —
     /// see [`live_named_items_in_scope`] for what "live" excludes. `false`:
     /// this cache exists only for [`segments_could_reach_target`]'s own
-    /// search, whose sole caller ([`struct_literal_counts`]) is always
-    /// resolving a construction path, never a value (Codex review of PR
-    /// #204) — see [`live_named_items_in_scope`]'s own doc for why that
-    /// matters here.
+    /// search. Every caller ([`struct_literal_counts`], and since issue
+    /// #205, [`generic_assoc_type_bindings_naming`]) always resolves a
+    /// construction path, never a value (Codex review of PR #204) — see
+    /// [`live_named_items_in_scope`]'s own doc for why that matters here.
     fn live_aliases_of(&mut self, items: &'a [syn::Item], first: &str) -> std::rc::Rc<[UseAlias]> {
         self.aliases
             .entry((scope_key(items), first.to_owned()))
@@ -6384,9 +6462,10 @@ fn live_named_items_in_scope<'a>(
 /// `block_items` without ever finding an unconditional declaration.
 ///
 /// Passes `false` for [`live_named_items_in_scope`]'s own `value_position`:
-/// this function exists only for [`segments_could_reach_target`]'s search,
-/// whose sole caller ([`struct_literal_counts`]) always resolves a
-/// construction path, never a value (Codex review of PR #204).
+/// this function exists only for [`segments_could_reach_target`]'s search.
+/// Every caller ([`struct_literal_counts`], and since issue #205,
+/// [`generic_assoc_type_bindings_naming`]) always resolves a construction
+/// path, never a value (Codex review of PR #204).
 fn live_block_declarations<'a>(
     block_items: &[Vec<&'a syn::Item>],
     first: &str,
@@ -24542,6 +24621,143 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_block_local_module_of_a_guarded_name_is_reported() {
+        // Issue #205: a block-local `mod` is invisible to the deterministic walk.
+        // Real Rust still reads this as a live use of the guarded name (checked
+        // against `rustc`). The fail-closed backstop below closes the gap.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn outer() {\n\
+             \x20   mod traits { pub use CheckedDispatch as Marker; }\n\
+             \x20   fn forge<T: Alias<Dispatch = traits::Marker>>() {}\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_deeper_blocks_alias_over_an_outer_items_own_struct_is_reported()
+     {
+        // Issue #205, shape 1. The innermost declaration always wins. This
+        // case never reaches the new backstop above: the deterministic walk
+        // finds the real, inner alias first. This test pins that the outer
+        // block's own unrelated struct still cannot hide it.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn outer() {\n\
+             \x20   struct Hidden;\n\
+             \x20   {\n\
+             \x20       type Hidden = CheckedDispatch;\n\
+             \x20       fn forge<T: Alias<Dispatch = Hidden>>() {}\n\
+             \x20   }\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_block_local_module_sharing_an_outer_generic_name_is_reported()
+     {
+        // Codex review of PR #208, issue #205, round 1. A nested item's own
+        // generic parameter resets `shadow` (issue #181). So `forge`'s own
+        // `T` replaces the outer `Traits` before its bound is checked. The
+        // backstop runs and finds the module. Checked against real `rustc`:
+        // this compiles.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn outer<Traits>() {\n\
+             \x20   mod Traits { pub use CheckedDispatch as Marker; }\n\
+             \x20   fn forge<T: Alias<Dispatch = Traits::Marker>>() {}\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_in_a_body_through_a_module_that_shadows_an_outer_generic_is_reported() {
+        // Codex review of PR #208, issue #205, round 2. Here the binding sits
+        // in `outer`'s own body, not in a nested item's own generics, so
+        // `shadow` still holds `outer`'s `Traits` when the bound is checked.
+        // Checked against real `rustc`: this compiles, and the block-local
+        // `mod Traits` wins over the outer parameter — the same rule
+        // `struct_literal_counts` already relies on for a struct literal
+        // (`Codex review of PR #204`'s own `type T = Decoy; let _ = T {};`).
+        // The backstop must run even though `shadowed` is true here, or this
+        // binding is missed.
+        let found = generic_assoc_type_bindings_naming(
+            "fn outer<Traits>() {\n\
+             \x20   mod Traits { pub type Marker = CheckedDispatch; }\n\
+             \x20   let _: Box<dyn Alias<Dispatch = Traits::Marker>>;\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_naming_its_own_items_parameter_through_a_sibling_module_is_not_a_miss() {
+        // The complementary case: a bound naming its *own* item's generic
+        // parameter through a same-named sibling module never compiles at
+        // all (checked against real `rustc`: `E0220`, associated type not
+        // found). Running the backstop unconditionally can still report a
+        // match here — the search only sees a block-local `mod Traits` and a
+        // shadowed head segment, and returns `true` before ever asking
+        // whether the surrounding code compiles. That is an over-count, the
+        // safe direction: no real construction exists to miss. This test
+        // pins the actual behavior so a future change is not surprised by it.
+        let found = generic_assoc_type_bindings_naming(
+            "fn outer() {\n\
+             \x20   mod Traits { pub type Marker = CheckedDispatch; }\n\
+             \x20   struct Wrapper<Traits: Alias<Dispatch = Traits::Marker>>(Traits);\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_value_only_use_sharing_a_shadowed_generic_names_name_is_an_accepted_over_count() {
+        // Codex review of PR #208, round 3, then round 4. A `use` can import
+        // a value, and a shadowed type parameter has nothing to do with the
+        // value namespace — checked against real `rustc`, this compiles, and
+        // the bound still means the parameter, not the imported function.
+        // Round 3 tried excluding a bare `use` from the override check to
+        // catch exactly this. Round 4 found that reopened a real miss: a
+        // `use` importing a same-named *type* looks identical to this scanner,
+        // and this scanner cannot tell the two apart without resolving what
+        // each one names — the same "same-spelled alias across namespaces"
+        // residual this file already accepts elsewhere. So this case is an
+        // accepted over-count again, not something to chase further; see
+        // `a_generic_bound_bound_through_a_use_alias_that_resolves_to_a_type_is_reported`
+        // for the real-miss case this trades against.
+        let found = generic_assoc_type_bindings_naming(
+            "fn outer<CheckedDispatch>() {\n\
+             \x20   use values::CheckedDispatch;\n\
+             \x20   let _: Box<dyn Alias<Dispatch = CheckedDispatch>>;\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_use_alias_that_resolves_to_a_type_is_reported() {
+        // Codex review of PR #208, round 4. A `use` importing a same-named
+        // *type* alias is exactly as real an override as a `mod` — checked
+        // against real `rustc`, this compiles, and the bound resolves to the
+        // block-local `use`, not the outer generic parameter.
+        let found = generic_assoc_type_bindings_naming(
+            "mod values {\n    pub type Hidden = CheckedDispatch;\n}\n\
+             fn outer<Hidden>() {\n\
+             \x20   use values::Hidden;\n\
+             \x20   let _: Box<dyn Alias<Dispatch = Hidden>>;\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
     }
 
     #[test]

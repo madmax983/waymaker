@@ -1651,6 +1651,20 @@ Stated so that nobody mistakes silence for coverage:
   cannot resolve" already names for this alias-resolution machinery (a glob import, an
   out-of-line module, a macro expansion, an unevaluated `cfg`). Left as a residual rather
   than chased further, per this project's own two-or-three-round guidance.
+- **Whether a block-local `use` overrides a shadowed generic parameter's own name, when the
+  `use`'s own target is a value rather than a type.** Issue #205, round 3, then round 4:
+  `generic_assoc_type_bindings_naming` treats any same-named block-local declaration as
+  reason enough to ask the fail-closed backstop whether a shadowed name reaches the guarded
+  type, `use` included. A `use` importing a value of the same name as the parameter (`use
+  values::CheckedDispatch;` where that names a function) can make the backstop report a
+  match that a real build would still resolve to the parameter — the same "same-spelled
+  alias across namespaces" residual named below, met here for a shadowed generic parameter
+  rather than an ordinary path. Narrowing the gate to a namespace-unambiguous declaration
+  closes that over-count and reopens a real miss instead: a `use` importing a same-named
+  *type* alias is exactly as valid an override as a `mod`, and this scanner cannot tell the
+  two `use` shapes apart without resolving what each one names. Accepted as an over-count
+  rather than chased further, for the reason every bullet in this list gives: a missed count
+  is the danger, not an extra one.
 - **That the run half of a redelivered identity is the device's.** §14's guarantee is about
   a `(RunId, EffectSeq)` pair, and only the sequence half is read from media: `ReplayCursor`
   takes it from the schedule record, and the `RunId` is an argument to `Driver::new` that no
@@ -6725,3 +6739,52 @@ item's own attribute and an enclosing `impl`'s, against `resolved_path_uses` and
 — `struct_literal_counts` and `generic_assoc_type_bindings_naming` need none, because neither
 ever resolves a path from inside an attribute's own token stream. No new ADR: nothing here
 moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #205 found that `generic_assoc_type_bindings_naming` had no fail-closed backstop,
+unlike `struct_literal_counts`. `resolve_local_alias_chain` cannot see a block-local `mod`.
+So a binding qualified through one was never checked. Real `rustc` reads `mod traits { pub
+use CheckedDispatch as Marker; } fn forge<T: Alias<Dispatch = traits::Marker>>() {}` as a
+live use of the guarded type. The old code missed it. A missed count is the dangerous
+direction. The fix runs the same `path_could_reach_target` search `struct_literal_counts`
+already uses, for each guarded name the deterministic walk did not find. `struct_literal_counts`
+itself needed no change: its own backstop already covers every shape issue #205 named.
+
+Codex review of PR #208 found the fix's own first version wrong in the direction issue #189
+already guards against. The backstop ran even when the binding's head segment named an
+in-scope generic parameter. `path_could_reach_target`'s own "shadowed, no override" answer
+conservatively assumes reachable — right for `struct_literal_counts`'s question (could this
+parameter be instantiated with the guarded type), wrong for this one (does this identifier
+name the guarded type as written). So `pub fn forge<CheckedDispatch, T: Alias<Dispatch =
+CheckedDispatch>>() {}` — issue #189's own case, a sibling parameter that merely shares the
+guarded name — started reporting a match again. The backstop now runs on a shadowed name
+only when a real block-local declaration of it exists to decide between the two readings;
+with none, the identifier can only ever mean the parameter, exactly as issue #189 settled.
+Checked against real `rustc` both ways: a nested item's own generics reset away from an
+outer parameter of the same name (issue #181), so a binding in a *nested* item's own bound
+already found the guarded type through the block-local module; a binding in the *same*
+item's body, naming that item's own parameter through a same-named sibling module, does not
+compile at all (`E0220`) — the parameter always wins there, and the backstop's own
+conservative answer in that dead case is an accepted over-count, not a miss.
+
+A third round of the same review found "a real block-local declaration of it exists" was
+still too wide: `live_block_declarations` returns a bare `use` too, and a `use` can import a
+value. `fn outer<CheckedDispatch>() { use values::CheckedDispatch; let _: dyn
+Alias<Dispatch = CheckedDispatch>; }` compiles — the bound still means the parameter, not
+the imported function, checked against real `rustc` — but the backstop ran anyway and
+reported a match, since it will happily chase the `use`'s own path to a last segment that
+coincidentally spells the guarded name. That looked like issue #189's exact false positive
+again, one level removed, and the gate was narrowed to ask for a *namespace-unambiguous*
+block-local item instead — `is_namespace_unambiguous`: a `mod`, `type`, `struct`, `enum`,
+`union`, `trait` or `extern crate` — never a bare `use`.
+
+A fourth round found that narrowing wrong: a `use` importing a same-named *type* alias
+(`mod values { pub type Hidden = CheckedDispatch; } fn outer<Hidden>() { use values::Hidden;
+let _: dyn Alias<Dispatch = Hidden>; }`, checked against real `rustc`) is exactly as real an
+override as a `mod`, and excluding every bare `use` missed it — the dangerous direction. This
+scanner cannot tell the two `use` shapes apart without resolving what each one names, which
+is the same "same-spelled alias across namespaces" residual [what is not
+checked](#what-is-not-checked) already states for every other caller in this file. The third
+round's narrowing is reverted: the gate is "any live block-local declaration" again, and the
+round-three false positive is accepted rather than chased — a missed count is the danger this
+whole mechanism exists to close, not an extra one. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
