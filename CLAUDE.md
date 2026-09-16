@@ -6711,3 +6711,17 @@ same push-pop shape and empty-attrs fast path as `visit_field_value`/`visit_expr
 `an_enum_variants_own_cfg_excludes_a_candidate_the_enums_cfg_would_not` is the regression,
 confirmed RED against the pre-fix code (no such override) before landing. No new ADR:
 nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a thirteenth, in the same family as the ninth and twelfth:
+`syn::Field` — a struct or enum *declaration*'s own field, as opposed to `syn::FieldValue`
+in a struct *literal*, which round 7 already handles — carries its own `attrs` too, and its
+own declared type can hide an expression the default descent still reaches: an array
+length, `#[cfg(not(feature = "a"))] field: [u8; { let _ = Unchecked { .. }; 0 }]`. Nothing
+folded the field's own condition into `enclosing_cfg` before `visit_field` reached it, so
+the nested literal was checked against the enclosing struct's own `cfg` alone: an
+over-count, the same direction as every finding since the fourth. A `visit_field` override
+closes it, the same push-pop shape and empty-attrs fast path as `visit_field_value`/
+`visit_variant`.
+`a_declaration_fields_own_cfg_excludes_a_candidate_the_structs_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.

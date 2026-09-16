@@ -5291,6 +5291,27 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         self.enclosing_cfg = outer_cfg;
     }
 
+    // A struct or enum *declaration*'s own field's `cfg` is otherwise
+    // unseen: `syn::Field` carries its own `attrs`, separate from
+    // `syn::FieldValue`'s (a struct *literal*'s own field, already handled
+    // above), and its own type can hide an expression — an array length —
+    // that `visit_field` reaches with no override folding the field's own
+    // condition in first (Codex review of the fix, round 9). Same
+    // empty-attrs fast path as the other statement-level overrides.
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_field(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_field(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
     shadow_generic_params!();
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
@@ -26853,6 +26874,27 @@ mod cfg_alias_ambiguity_tests {
              \x20   #[cfg(not(feature = \"a\"))]\n\
              \x20   V = { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 },\n\
              \x20   Other,\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_declaration_fields_own_cfg_excludes_a_candidate_the_structs_cfg_would_not() {
+        // Codex review of the fix, round 9: `syn::Field` (a struct or enum
+        // *declaration*'s own field, as opposed to `syn::FieldValue` in a
+        // struct literal) carries its own `attrs` too, and its own type can
+        // hide an expression — an array length, here — that `visit_field`
+        // reaches with no override folding the field's own `cfg` in first.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct Holder {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   field: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
              }",
             "CheckedDispatch",
             FnScope::None,
