@@ -5759,6 +5759,26 @@ const fn is_unconditional_value_declaration(item: &syn::Item) -> bool {
 /// a construction path folds that fact into `terminal` itself before
 /// calling here, rather than this function trying to tell the two apart
 /// from `first` alone.
+///
+/// A unit/tuple struct's own constructor, a free function, a `const` or a
+/// `static` is also an unconditional *value*-namespace winner when
+/// `terminal` (Codex review of PR #204, two rounds later): folded into this
+/// same `unconditional_winner` find rather than checked separately, so
+/// `chosen` can never land on an arbitrary `prefer_last`/`first` tie-break
+/// between it and a same-named `use` the way a check placed only after
+/// `chosen` was already picked would allow. But such a winner only
+/// *suppresses* the terminal fallback below when the `use`/`type` alias
+/// that fallback would otherwise pick is itself `#[cfg]`-gated: a
+/// conditionally-live import can never coexist with an unconditional
+/// declaration of the same name in the same namespace (E0255), so
+/// substituting it is never a live answer — but an *unconditional*
+/// competing alias is a namespace this scanner already knows is distinct,
+/// proven by the fact that both compiled together at all, and suppressing
+/// it would throw away a resolution that already worked (Codex review of PR
+/// #204, one round further still): `use core::fmt::Debug as Allowed; fn
+/// Allowed() {}` compiles — different namespaces — and a trait bound `T:
+/// Allowed` still names `core::fmt::Debug`, never the function, confirmed
+/// against real `rustc`.
 fn preferred_alias<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     first: &str,
@@ -5770,30 +5790,13 @@ fn preferred_alias<'a>(
         .filter(|item| !has_cfg_test(item_attrs(item)))
         .filter(|item| declares_name(item, first))
         .collect();
-    // An unconditional value-namespace declaration — a unit/tuple struct's
-    // own constructor, a free function, a `const` or a `static` — already
-    // owns a terminal (value) position outright, before any tie-break among
-    // `candidates` is even computed (Codex review of PR #204, one round
-    // later than the struct-only version below): `fn allowed() {}` and a
-    // `#[cfg]`-gated `use values::forbidden as allowed;` are neither one
-    // namespace-unambiguous (so `unconditional_winner` below finds neither),
-    // and the arbitrary `prefer_last`/`first` tie-break that decided `chosen`
-    // could pick the `use` outright — returning its alias immediately,
-    // before the struct-only check further down was ever reached. A
-    // competing `use` here is either impossible code (E0255, if it too is
-    // unconditional) or dead code under every configuration that also
-    // compiles this declaration (if it is `#[cfg]`-gated), never a second,
-    // live answer to substitute.
-    if terminal
-        && candidates
-            .iter()
-            .any(|item| is_unconditional_value_declaration(item) && !has_any_cfg(item_attrs(item)))
-    {
-        return None;
-    }
     let unconditional_winner = candidates
         .iter()
-        .find(|item| is_namespace_unambiguous(item) && !has_any_cfg(item_attrs(item)))
+        .find(|item| {
+            (is_namespace_unambiguous(item)
+                || (terminal && is_unconditional_value_declaration(item)))
+                && !has_any_cfg(item_attrs(item))
+        })
         .copied();
     let chosen = unconditional_winner.or_else(|| {
         if prefer_last {
@@ -5811,15 +5814,28 @@ fn preferred_alias<'a>(
     if !terminal {
         return None;
     }
+    // Only a genuine `use`/`type` alias can ever produce an entry from
+    // `own_aliases` — a unit/tuple struct, a function, a `const` and a
+    // `static` never do — so this fallback's own candidate pool is narrowed
+    // to exactly those two kinds rather than "not namespace-unambiguous":
+    // the latter would also admit a function or a `const`, whose presence
+    // or absence in the pool could otherwise change which item an ordering-
+    // dependent `prefer_last`/`first` pick lands on with no effect on
+    // correctness either way, since neither ever resolves to anything.
     let uses: Vec<&&'a syn::Item> = candidates
         .iter()
-        .filter(|item| !is_namespace_unambiguous(item))
+        .filter(|item| matches!(item, syn::Item::Use(_) | syn::Item::Type(_)))
         .collect();
     let picked = if prefer_last {
         uses.last()
     } else {
         uses.first()
     };
+    if unconditional_winner.is_some_and(is_unconditional_value_declaration)
+        && picked.is_some_and(|item| has_any_cfg(item_attrs(item)))
+    {
+        return None;
+    }
     picked.and_then(|item| {
         own_aliases(core::iter::once(**item))
             .into_iter()
@@ -26121,6 +26137,32 @@ mod alias_scope_tests {
             !paths
                 .iter()
                 .any(|path| path.segments == ["values", "forbidden"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_unconditional_value_alias_still_resolves_past_an_unconditional_function() {
+        // Codex review of PR #204, round 26: an unconditional competing
+        // `use` must not be suppressed the way a `#[cfg]`-gated one is —
+        // `use core::fmt::Debug as Allowed;` beside an unconditional `fn
+        // Allowed() {}` compiles cleanly, confirmed against real `rustc`,
+        // because a trait import and a function occupy different
+        // namespaces with nothing conditional about either one. A trait
+        // bound `T: Allowed` still names `core::fmt::Debug`, never the
+        // function — the round-24 fix's own early check could not tell
+        // this apart from its own demonstrated case, since it fired on any
+        // unconditional value declaration regardless of whether the
+        // competing alias was itself conditional.
+        let code = "use core::fmt::Debug as Allowed;\n\
+             #[allow(non_snake_case)]\n\
+             fn Allowed() {}\n\
+             fn forge<T: Allowed>() {}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "fmt", "Debug"]),
             "{paths:?}"
         );
     }

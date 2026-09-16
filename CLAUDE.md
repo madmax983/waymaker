@@ -6380,3 +6380,42 @@ issue [#206](https://github.com/madmax983/waymaker/issues/206) rather than chase
 review pressure, the same bar issues #171/#186/#193 were opened at: a real finding whose fix
 needs new machinery across several pieces rather than a narrow, provably-correct change. No
 new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a twenty-sixth, and it is a real regression in the
+twenty-fourth round's own fix — the sharpest kind, since it is `resolved_path_uses`/
+`name_uses` themselves that carry it, not the narrower fail-closed backstop. Those two scans
+pass `value_position = true` for *every* path they visit, type-position and value-position
+alike — an already-accepted, documented residual, since telling the two apart there would
+need the same per-syntactic-role machinery round 22 gave `struct_literal_counts` and its
+three siblings but deliberately did not give these two general scans. The twenty-fourth
+round's own check fired on any unconditional value declaration among the candidates,
+regardless of whether the competing `use` it would have suppressed was itself conditional —
+so it could not tell `fn allowed() {}` beside a genuinely `#[cfg]`-gated `use` (its own
+demonstrated case, where suppressing is correct) from `fn Allowed() {}` beside a wholly
+*unconditional* `use core::fmt::Debug as Allowed;` (where it is not): confirmed against real
+`rustc`, the second pair compiles cleanly — a trait import and a function occupy different
+namespaces with nothing conditional about either one — and a trait bound `T: Allowed` still
+means `core::fmt::Debug`, never the function. Before the twenty-fourth round even existed
+this resolved correctly, because a plain `fn` was invisible to `declares_name` and the `use`
+was the only candidate; the twenty-fourth round's own widening is what put a second,
+unrelated candidate in the running and let its check treat both cases alike. The fix folds
+the value-declaration check into the very same `unconditional_winner` find that already
+decides `chosen` — so `chosen` can never land on an arbitrary `prefer_last`/`first` tie-break
+between a value declaration and a same-named `use`, the exact failure mode a check placed
+only *after* `chosen` was already picked could not prevent — and narrows the terminal
+fallback's own suppression to fire only when the specific `use`/`type` candidate it would
+otherwise pick is itself `#[cfg]`-gated: an *unconditional* competing alias is a namespace
+this scanner already knows is distinct, proven by the fact that both compiled together at
+all, so substituting it is exactly as safe an answer as this fallback has always given.
+`uses` itself is narrowed too, from "not namespace-unambiguous" to exactly `Item::Use`/
+`Item::Type` — the only two kinds `own_aliases` ever produces anything for — since leaving a
+function or a `const` in that pool made which item an ordering-dependent pick landed on
+matter in a way it should not: `own_aliases` never resolves either one, so a `.first()`/
+`.last()` tie-break that happened to land on the function instead of the genuine `use` was
+silently losing the correct answer to declaration order alone.
+`an_unconditional_value_alias_still_resolves_past_an_unconditional_function` is the
+regression, confirmed RED against the pre-fix code (resolving to the bare name `Allowed`
+rather than `["core", "fmt", "Debug"]`) before landing; the twenty-fourth round's own two
+tests were re-run alongside it and stayed green, confirming the narrower suppression still
+fires exactly where that round's own repro needs it to. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
