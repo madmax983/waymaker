@@ -6798,3 +6798,43 @@ push-pop shape and empty-attrs fast path as the other statement-level overrides.
 `a_foreign_items_own_cfg_excludes_a_candidate_the_externs_cfg_would_not` is the
 regression, confirmed RED against the pre-fix code (no such override) before landing. No
 new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found an eighteenth, and it is the module twin of round
+fourteen's own finding: module descent — both `try_module_scope_candidates`'s own hop
+and `try_block_local_candidates`'s block-local one — passed `site_cfg` through unchanged
+to the recursive call after entering a module, rather than conjoining the selected
+module's own `cfg` first, exactly the bug round fourteen closed for an alias hop.
+Confirmed against real `rustc`: `#[cfg(feature = "a")] mod m { #[cfg(not(feature = "a"))]
+pub type X = CheckedDispatch; #[cfg(feature = "a")] pub type X = Decoy; }` can only ever
+resolve `m::X` to `Decoy` — `m` exists only under `feature = "a"`, and in that exact
+build `X` only has its `feature = "a"` declaration — yet the unfixed search still
+reached `CheckedDispatch`, because the module's own `cfg` coexists with the
+unconditional site on its own, and `X`'s own `cfg` then coexists with that same
+unconditional `site_cfg` too, the two never checked against each other.
+`AliasLookupCache::live_modules_of` now tags each live module with its own `cfg`,
+mirroring `live_aliases_of`'s own tag; `try_module_scope_candidates` conjoins it with
+`site_cfg` before recursing, and `try_block_local_candidates`'s module branch reuses the
+`declaration_cfg` it already computes for its alias branch, since the found module *is*
+`declaration.item`. `a_module_hop_cannot_combine_with_a_mutually_exclusive_further_cfg`
+and `a_block_local_module_hop_cannot_combine_with_a_mutually_exclusive_further_cfg` are
+the regressions, both confirmed RED against the pre-fix code (`total: 1` against an
+expected `0`) before landing. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
+
+Codex review of the same commit found a nineteenth and a twentieth, both in the same
+family as the ninth, twelfth and sixteenth: two more node kinds carry their own `attrs`
+that none of `Literals`'s overrides reached. Stable Rust lets a generic type or const
+parameter carry its own `#[cfg(..)]`, and a type parameter's default can hide an
+expression the same way a declaration field's or a function parameter's own can, while a
+const parameter's default is an expression that can construct the target directly. And a
+parameter in a function-*pointer* type is `syn::BareFnArg`, a separate node from
+`syn::PatType` (an ordinary function declaration's parameter) with its own `attrs` the
+`visit_pat_type` override does not cover. Three overrides close them —
+`visit_type_param`, `visit_const_param` and `visit_bare_fn_arg` — the same push-pop
+shape and empty-attrs fast path as every other statement-level override in this family.
+`a_type_params_own_cfg_excludes_a_candidate_the_items_cfg_would_not`,
+`a_const_params_own_cfg_excludes_a_candidate_the_items_cfg_would_not` and
+`a_bare_fn_args_own_cfg_excludes_a_candidate_the_aliass_cfg_would_not` are the
+regressions, each confirmed RED against the pre-fix code (no such override) before
+landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.
