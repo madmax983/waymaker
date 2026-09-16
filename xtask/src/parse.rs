@@ -816,19 +816,59 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
     Ok(visitor.found)
 }
 
-/// The five `syn::visit::Visit` overrides that keep `self.shadow` correct
-/// across a generics-bearing item's own body (issue #181).
+/// The `syn::visit::Visit` overrides that keep `self.shadow` correct across a
+/// generics-bearing item's own body (issue #181).
 ///
-/// One macro, not five methods copied into each visitor. Every path-
-/// resolving visitor here needs the same five overrides, over its own
-/// `self.shadow` field. One shared body keeps them from drifting apart, and
-/// keeps each visitor's own `impl` short enough for `clippy::too_many_lines`.
-/// A visitor's own `visit_item_mod` stays outside this macro — each already
-/// has its own, for `self.stack` — but must reset `self.shadow` to empty
-/// around it too: a module inherits no generics either.
+/// One macro, not many methods copied into each visitor. Every path-resolving
+/// visitor in this file needs the same overrides, over its own `self.shadow`
+/// field. One shared body stops them from drifting apart. It also keeps each
+/// visitor's own `impl` short enough for `clippy::too_many_lines`.
 ///
-/// Defined here, above its first use in this file. A `macro_rules!` macro
-/// is visible only after its own definition.
+/// `visit_item_fn`, `visit_item_impl`, `visit_item_trait`, `visit_item_struct`,
+/// `visit_item_enum`, `visit_item_union`, `visit_item_type`, and
+/// `visit_item_trait_alias` each reset `self.shadow`. A top-level item does not
+/// inherit generics from an enclosing item (rustc `E0401`).
+///
+/// `visit_impl_item_fn`, `visit_trait_item_fn`, `visit_impl_item_type`, and
+/// `visit_trait_item_type` each extend `self.shadow` instead. Each of these is
+/// a *member* of its own `impl` or `trait`, so it also sees that item's own
+/// generics — the same reason a generic associated type extends rather than
+/// resets (Codex review of PR #201, second round).
+///
+/// A visitor's own `visit_item_mod` stays outside this macro. Each visitor
+/// already has one, for `self.stack`. It must still reset `self.shadow`
+/// around the module: a module inherits no generics either.
+///
+/// `syn::ItemTraitAlias` (`trait Foo<T: Bound<Assoc = X>> = Bar;`, not stable
+/// Rust today) is parsed as a real, structured item, so it needs the same
+/// reset a struct, an enum, a union, or a `type` alias gets. A generic `const`
+/// item is not: `syn` cannot parse its syntax at all and falls back to an
+/// opaque `Item::Verbatim`, so no visitor ever reaches its bounds and no
+/// override is needed for it. A generic `syn::ForeignItemType` (a `type`
+/// inside an `extern` block) needs no override for a different reason: `syn`
+/// does parse its generics, but rustc refuses them outright, on stable and on
+/// nightly alike, so no such item can ever appear in code that compiles.
+///
+/// Issue #202: `visit_item_struct`, `visit_item_enum`, `visit_item_union`,
+/// `visit_item_type`, `visit_item_trait_alias`, `visit_trait_item_type`, and
+/// `visit_impl_item_type` used to live only in `AssocBindings`
+/// (`generic_assoc_type_bindings_naming`). The other three callers of this
+/// macro (`resolved_path_uses`, `struct_literal_counts`, `name_uses`) missed
+/// them, so a struct's, an enum's, a union's, a type alias's, or a generic
+/// associated type's own generic parameter could still be shadowed by a
+/// same-named module or alias.
+///
+/// `visit_attribute` clears `self.shadow` for the span of one attribute, then
+/// restores it. Confirmed against real `rustc` (Codex review of PR #207): an
+/// item's own outer attribute resolves in the scope outside the item, before
+/// its own generics exist, so no generic parameter — the item's own or an
+/// enclosing one's — may ever shadow a module or an alias there. A generic
+/// type parameter is never a valid macro-path segment in the first place, at
+/// any nesting depth, so clearing `self.shadow` outright is correct rather
+/// than only reordering one item kind's own reset against its own attributes.
+///
+/// Defined here, above its first use in this file. A `macro_rules!` macro is
+/// visible only after its own definition.
 macro_rules! shadow_generic_params {
     () => {
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -858,6 +898,54 @@ macro_rules! shadow_generic_params {
         fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
             let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
             syn::visit::visit_item_trait(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_struct(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_enum(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_union(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_type(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_item_trait_alias(&mut self, node: &'ast syn::ItemTraitAlias) {
+            let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_item_trait_alias(self, node);
+            self.shadow = outer;
+        }
+
+        fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
+            let added = extend_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_trait_item_type(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+            let added = extend_generic_shadow(&mut self.shadow, &node.generics);
+            syn::visit::visit_impl_item_type(self, node);
+            self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+            let outer = core::mem::take(&mut self.shadow);
+            syn::visit::visit_attribute(self, node);
             self.shadow = outer;
         }
     };
@@ -936,66 +1024,12 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
         self.block_items.pop();
     }
 
-    // Unlike `struct_literal_counts` and `resolved_path_uses`, this scan reads an
-    // assoc-type binding on *every* generics-bearing item, not only a function, an
-    // `impl` or a `trait` — `struct Wrapper<T: Alias<Dispatch = X>>` is exactly the
-    // shape this function exists to check. So a struct's, an enum's, a union's or a
-    // generic `type` alias's own parameters need the same enter/restore `shadow`
-    // handling the macro above gives a function, an `impl` and a `trait` (Codex
-    // review of #189: a module-level `type Hidden = CheckedDispatch;` beside
-    // `struct Wrapper<Hidden: Alias<Dispatch = Hidden>>;` resolved `Hidden` through
-    // the module alias instead of seeing it shadowed by the struct's own parameter).
-    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
-        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
-        syn::visit::visit_item_struct(self, node);
-        self.shadow = outer;
-    }
-
-    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
-        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
-        syn::visit::visit_item_enum(self, node);
-        self.shadow = outer;
-    }
-
-    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
-        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
-        syn::visit::visit_item_union(self, node);
-        self.shadow = outer;
-    }
-
-    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
-        syn::visit::visit_item_type(self, node);
-        self.shadow = outer;
-    }
-
-    // A generic associated type's own parameters, e.g. `type Assoc<U>: Bound<Value =
-    // X>;`. Additive, not a reset (Codex review of PR #201, second round): a GAT is a
-    // *member* of its trait or impl, so it sees that item's own generics too, the same
-    // way `visit_impl_item_fn`/`visit_trait_item_fn` above do for an ordinary method.
-    fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
-        let added = extend_generic_shadow(&mut self.shadow, &node.generics);
-        syn::visit::visit_trait_item_type(self, node);
-        self.shadow.truncate(self.shadow.len() - added);
-    }
-
-    fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
-        let added = extend_generic_shadow(&mut self.shadow, &node.generics);
-        syn::visit::visit_impl_item_type(self, node);
-        self.shadow.truncate(self.shadow.len() - added);
-    }
-
-    // `syn::ItemTraitAlias` (`trait Foo<T: Bound<Assoc = X>> = Bar;`, not stable Rust
-    // today) carries its own `generics` too, and `syn` parses it as a real, structured
-    // item — unlike a generic `const` item, whose syntax `syn` cannot parse at all and
-    // falls back to an opaque `Item::Verbatim` for, so no visitor ever reaches its
-    // bounds structurally and no override is needed there. A top-level item resets,
-    // the same as a struct, an enum, a union or a `type` alias.
-    fn visit_item_trait_alias(&mut self, node: &'ast syn::ItemTraitAlias) {
-        let outer = reset_generic_shadow(&mut self.shadow, &node.generics);
-        syn::visit::visit_item_trait_alias(self, node);
-        self.shadow = outer;
-    }
+    // This scan reads an assoc-type binding on *every* generics-bearing item, not
+    // only a function, an `impl`, or a `trait` — `struct Wrapper<T: Alias<Dispatch =
+    // X>>` is exactly the shape this function exists to check. `shadow_generic_params!()`
+    // above covers a struct's, an enum's, a union's, a type alias's, a trait alias's,
+    // and a generic associated type's own parameters too (issue #202), so no further
+    // override is needed here.
 
     // Fires for a `Assoc = Type` binding anywhere a trait bound allows one: a type
     // parameter's own bounds, a `where` clause, or a `dyn`/`impl Trait` bound — every
@@ -26770,6 +26804,190 @@ mod generic_shadow_tests {
             "a nested fn wrongly inherited its parent's shadow, hiding the real construction: \
              {counts:?}"
         );
+    }
+
+    // Issue #202: `shadow_generic_params!()` tracked a function's, an `impl`'s and a
+    // `trait`'s own generic parameters, but not a struct's, an enum's, a union's, a
+    // type alias's, or a generic associated type's. `AssocBindings`
+    // (`generic_assoc_type_bindings_naming`) had its own, separate overrides for all
+    // six shapes; the other three callers of the shared macro did not.
+
+    #[test]
+    fn a_structs_own_generic_parameter_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nstruct \
+             Wrapper<TimerSpec: Spec> {\n    field: TimerSpec::BestEffort,\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a struct's own generic parameter did not shadow the sibling module's alias: \
+             {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_enums_own_generic_parameter_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nenum \
+             Wrapper<TimerSpec: Spec> {\n    V(TimerSpec::BestEffort),\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "an enum's own generic parameter did not shadow the sibling module's alias: \
+             {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_unions_own_generic_parameter_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nunion \
+             Wrapper<TimerSpec: Spec> {\n    v: TimerSpec::BestEffort,\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a union's own generic parameter did not shadow the sibling module's alias: \
+             {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_type_aliass_own_generic_parameter_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\ntype \
+             Wrapper<TimerSpec: Spec> = TimerSpec::BestEffort;\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a type alias's own generic parameter did not shadow the sibling module's alias: \
+             {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_generic_associated_types_own_parameter_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\ntrait \
+             Wrapper {\n    type Assoc<TimerSpec: Spec> = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a GAT's own generic parameter did not shadow the sibling module's alias: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_impls_generic_associated_types_own_parameter_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nimpl Wrapper \
+             for Forge {\n    type Assoc<TimerSpec: Spec> = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "an impl GAT's own generic parameter did not shadow the sibling module's alias: \
+             {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn struct_literal_counts_respects_a_structs_own_generic_parameter_shadowing() {
+        // A construction buried in a field's array-length expression — the same
+        // shape used to bury a `Clone` impl there in this file's own review
+        // history (issues #92 and #197).
+        let code = "mod CheckedDispatch {\n    pub use Disallowed as Sneaky;\n}\nstruct \
+             Wrapper<CheckedDispatch: Spec> {\n    field: [(); { CheckedDispatch::Sneaky {}; \
+             0 }],\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(
+            counts.total, 0,
+            "a struct's own generic parameter did not shadow the sibling module's alias: \
+             {counts:?}"
+        );
+    }
+
+    #[test]
+    fn name_uses_respects_a_structs_own_generic_parameter_shadowing() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nstruct \
+             Wrapper<TimerSpec: Spec> {\n    field: TimerSpec::BestEffort,\n}\n";
+        let names = name_uses(code).expect("the fixture parses");
+        assert!(
+            names.names_decision("TimerSpec::BestEffort"),
+            "{:?}",
+            names.paths
+        );
+        assert!(!names.names_decision("Disallowed"), "{:?}", names.paths);
+    }
+
+    // Codex review of PR #207: an item's own outer attributes resolve in the scope
+    // outside the item, before its own generics exist — confirmed against real
+    // `rustc`. A generic parameter must never shadow a module or an alias inside the
+    // item's own attribute, at any nesting depth, because a generic type parameter is
+    // never a valid macro-path segment in the first place.
+
+    #[test]
+    fn an_items_own_attribute_does_not_resolve_through_its_own_generic_parameter() {
+        let code = "mod Marker {\n    pub use Disallowed as guard;\n}\n#[Marker::guard]\nstruct \
+             S<Marker>(Marker);\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "an item's own generic parameter wrongly shadowed a module named from its own \
+             attribute: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_methods_own_attribute_does_not_resolve_through_an_enclosing_generic_parameter() {
+        // Confirmed against real `rustc`: the enclosing `impl`'s own generic parameter
+        // does not shadow the module either, for a method's own attribute.
+        let code = "mod Marker {\n    pub use Disallowed as guard;\n}\nstruct \
+             Holder<Marker>(Marker);\nimpl<Marker> Holder<Marker> {\n    #[Marker::guard]\n    \
+             fn f<T>(_x: T) {}\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "an enclosing impl's generic parameter wrongly shadowed a module named from a \
+             method's own attribute: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn name_uses_does_not_shadow_an_items_own_attribute_through_its_generic_parameter() {
+        let code = "mod Marker {\n    pub use Disallowed as guard;\n}\n#[Marker::guard]\nstruct \
+             S<Marker>(Marker);\n";
+        let names = name_uses(code).expect("the fixture parses");
+        assert!(names.names_decision("Disallowed"), "{:?}", names.paths);
     }
 }
 
