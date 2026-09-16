@@ -7137,3 +7137,42 @@ ever corresponded to a real missed or extra count in a shipping build; this is a
 of unifying two fixes that happened to converge on the more principled one, not a new,
 targeted fix of its own. No new ADR: nothing here moves a must-not-own cell, a dependency
 edge, or a rule id.
+
+Codex review of the merge commit found three more real gaps, all in the same shape as the
+family of `Literals` overrides above. First: a method's `self` parameter is `syn::Receiver`,
+a separate node from `syn::PatType` with its own `attrs` — stable arbitrary self types let it
+carry an explicit type (`self: SomeType`) that can hide an expression an existing override
+never reached. Second: a `match` arm's own struct or tuple-struct pattern field is
+`syn::FieldPat`, with its own `attrs` separate from a declaration field's (`visit_field`) and
+a struct literal's own field (`visit_field_value`) — its own sub-pattern can carry a const
+generic argument that hides an expression the same way either of those can. Both close with
+`visit_receiver`/`visit_field_pat` overrides, the identical push-pop shape and empty-attrs
+fast path every other statement-level override in this family already has.
+`a_receivers_own_cfg_excludes_a_candidate_the_methods_cfg_would_not` and
+`a_field_pats_own_cfg_excludes_a_candidate_the_arms_cfg_would_not` are the regressions, both
+confirmed RED against the pre-fix code (the two new overrides stubbed to a bare delegate, no
+`cfg` folding) before landing.
+
+Third, and different from every finding above: `Cfg::key`'s own `commutative_key` sorts a
+combinator's children but never deduplicates them, and `all`/`any` are idempotent —
+`all(P, P, P)` is exactly `P` — so a predicate repeated as several separate children of one
+combinator still rendered a longer, distinct key at every count. `enclosing_cfg` accumulates
+one more copy of an identical predicate per level of *nested* items that each carry it —
+unlike round 8's own flattening fix, which collapses a `cfg`-bearing item's `all` into its
+parent's but does nothing about the same predicate appearing as more than one child of the
+result — so a construction nested `N` levels inside identically-gated items missed
+`AliasLookupCache::could_coexist`'s cache at every one of `N` distinct depths and
+independently repeated the same worst-case, unsatisfiable enumeration `N` times.
+`commutative_key` now also calls `dedup` after `sort`, so every duplicate — made consecutive
+by the sort — collapses to one. Sound rather than approximate, for the same reason `dedup`ing
+before the sort would not be: two semantically identical `Cfg` values (one true fact, spelled
+`N` times) can only ever agree on `could_coexist_with`'s answer, so sharing the cache entry
+never returns a wrong one for either.
+`a_predicate_repeated_across_nested_functions_shares_one_cache_key` is the regression, nested
+functions rather than nested modules on purpose — a module does not inherit its enclosing
+scope's own declarations, so a construction site nested inside one could not reach the target
+type at all and the test would exercise nothing. Confirmed RED against the pre-fix code: 58.6s
+against this test's own 30s ceiling at 20 atoms and 8 levels (13.95s with the fix, the same
+order of margin the sibling `many_differently_nested_..._resolve_quickly` test already keeps
+against its own regressed shape) before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.

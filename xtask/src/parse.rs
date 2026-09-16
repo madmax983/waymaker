@@ -324,10 +324,22 @@ impl Cfg {
     }
 
     /// [`Cfg::key_raw`]'s helper for `All`/`Any`: every child's own key,
-    /// sorted so the operands' written order does not matter.
+    /// sorted so the operands' written order does not matter, and
+    /// deduplicated so a repeated operand does not either (Codex review of
+    /// PR #209, issue #206): `all`/`any` are idempotent (`x && x` and
+    /// `x || x` are both just `x`), so `all(a, a, b)` and `all(a, b)` are
+    /// the same formula, but sorting alone still renders them as two
+    /// different keys — `enclosing_cfg` conjoins one more identical child
+    /// per level of nesting a repeated predicate is declared under (a
+    /// module inside a module, each carrying the same `#[cfg(..)]`), so
+    /// every depth missed [`AliasLookupCache::could_coexist`]'s cache and
+    /// independently repeated the same worst-case enumeration. Sorting
+    /// first makes every duplicate consecutive, so `dedup` after it removes
+    /// all of them, not only adjacent-in-source ones.
     fn commutative_key(tag: &str, children: &[Self]) -> String {
         let mut child_keys: Vec<String> = children.iter().map(Self::key_raw).collect();
         child_keys.sort();
+        child_keys.dedup();
         format!("{tag}({child_keys:?})")
     }
 
@@ -5916,6 +5928,47 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         let outer_cfg = self.enclosing_cfg.clone();
         self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
         syn::visit::visit_bare_fn_arg(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A method's `self` parameter has its own `attrs`, separate from
+    // `visit_pat_type`'s — an *explicit* receiver type (`self: P<Self, ..>`,
+    // stable arbitrary self types) can hide an expression in a const generic
+    // argument the same way a declaration field's or a function parameter's
+    // own type can (Codex review of PR #209, issue #206). Same empty-attrs
+    // fast path as the other statement-level overrides.
+    fn visit_receiver(&mut self, node: &'ast syn::Receiver) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_receiver(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_receiver(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A `match` arm's own struct or tuple-struct *pattern*'s field has its
+    // own `attrs`, separate from a declaration field's (`visit_field`) and a
+    // struct literal's own field (`visit_field_value`) — `syn::FieldPat`'s
+    // own pattern can carry a const generic argument that hides an
+    // expression the same way either of those can (Codex review of PR #209,
+    // issue #206). Same empty-attrs fast path as the other statement-level
+    // overrides.
+    fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_field_pat(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_field_pat(self, node);
         self.enclosing_cfg = outer_cfg;
     }
 
@@ -28050,6 +28103,60 @@ mod cfg_alias_ambiguity_tests {
     }
 
     #[test]
+    fn a_receivers_own_cfg_excludes_a_candidate_the_methods_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): a method's `self` parameter is
+        // `syn::Receiver`, not `syn::PatType` — a separate node with its own
+        // `attrs`, and stable arbitrary self types let it carry an explicit
+        // type (`self: SomeType`) that can hide an expression the same way an
+        // ordinary parameter's own type can.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct S;\n\
+             impl S {\n\
+             \x20   fn f(\n\
+             \x20       #[cfg(not(feature = \"a\"))]\n\
+             \x20       self: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
+             \x20   ) {}\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_field_pats_own_cfg_excludes_a_candidate_the_arms_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): a struct or tuple-struct
+        // *pattern*'s own field is `syn::FieldPat`, with its own `attrs`
+        // separate from a declaration field's (`visit_field`) and a struct
+        // literal's own field (`visit_field_value`) — its own sub-pattern can
+        // carry a const generic argument that hides an expression the same
+        // way either of those can.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct Wrap<const N: u8>;\n\
+             struct S {\n\
+             \x20   x: Wrap<0>,\n\
+             }\n\
+             fn f(s: S) {\n\
+             \x20   match s {\n\
+             \x20       S {\n\
+             \x20           #[cfg(not(feature = \"a\"))]\n\
+             \x20           x: Wrap::<{ let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }>,\n\
+             \x20           #[cfg(feature = \"a\")]\n\
+             \x20           x: _,\n\
+             \x20       } => {}\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
     fn many_differently_nested_but_equivalent_cfg_predicates_resolve_quickly() {
         // Codex review of the fix, round 8: `Cfg::key` sorted a single
         // combinator's own children (round 7) but never flattened nested
@@ -28091,6 +28198,65 @@ mod cfg_alias_ambiguity_tests {
     }
 
     #[test]
+    fn a_predicate_repeated_across_nested_functions_shares_one_cache_key() {
+        // Codex review of PR #209 (issue #206): round 8's own flattening
+        // (`Cfg::normalized`) splices a nested `all` of the same kind into
+        // its parent, but never deduplicates the result — `all`/`any` are
+        // idempotent, so `all(P, P, P)` is exactly `P`, but it still rendered
+        // as a three-element key distinct from a two- or one-element one.
+        // Nesting a function inside a function, each carrying the identical
+        // `#[cfg(..)]` (a nested `fn` is still a `syn::Item`, reached through
+        // the same `visit_item` override an outer one is), makes
+        // `enclosing_cfg` accumulate one more copy of that same predicate per
+        // level — flattened into one `All` by round 8's fix, but with a
+        // growing number of identical children the key never collapsed, so
+        // every depth missed the memoized answer and independently repeated
+        // the same worst-case, unsatisfiable enumeration. Nested functions
+        // rather than nested modules on purpose: a module does not inherit
+        // its enclosing scope's own declarations, so a construction site
+        // nested inside one could not reach `Unchecked` at all and this test
+        // would exercise nothing.
+        use std::fmt::Write as _;
+
+        let flags: Vec<String> = (0..20)
+            .map(|index| format!("feature = \"z{index}\""))
+            .collect();
+        let candidate_flags = flags.join(", ");
+        let mut src = format!(
+            "#[cfg(any({candidate_flags}))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(any({candidate_flags})))]\ntype Unchecked = Decoy;\n"
+        );
+        for depth in 1..=8usize {
+            let mut body = "let _ = self::Unchecked { intent: 0, bytes: 0 };".to_owned();
+            for level in (0..depth).rev() {
+                body = format!(
+                    "#[cfg(not(any({candidate_flags})))]\nfn wrap{depth}_{level}() {{ {body} }}"
+                );
+            }
+            let _ = writeln!(src, "{body}");
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        // Reproduced unfixed (no `dedup` in `commutative_key`) at 58.6s; fixed,
+        // 13.95s locally in the same debug profile CI runs. This test's own
+        // 20-atom, 8-level fixture is heavier than the sibling
+        // `many_differently_nested_..._resolve_quickly` test's 6.93s (each of
+        // these 8 sites pays its own growing chain of identical children,
+        // where the sibling's stays one child at every depth), so it needs
+        // more of today's demonstrated CI margin than that test's 20s ceiling
+        // gives: 30s keeps real headroom below both the regressed shape and
+        // observed runner variance.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "took {:?} for 8 sites, each nesting the identical predicate one more level deep",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn a_repeated_site_candidate_cfg_pair_is_not_recomputed() {
         // Codex review of the fix: `Cfg::could_coexist_with`'s own worst
         // case is exponential in the atoms two formulas name together, and
@@ -28107,7 +28273,7 @@ mod cfg_alias_ambiguity_tests {
         // gated sites, if that answer were recomputed instead of cached,
         // this would not finish anywhere near the ceiling below.
         use std::fmt::Write as _;
-        let flags = (0..16)
+        let flags = (0..20)
             .map(|index| format!("feature = \"x{index}\""))
             .collect::<Vec<_>>()
             .join(", ");
