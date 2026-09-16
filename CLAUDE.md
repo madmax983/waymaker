@@ -6641,3 +6641,33 @@ rotation only produces as many distinct orderings as there are atoms and would s
 stressing the cache, and pass, past that count — confirmed RED at 63s against a 20s ceiling
 for eight sites over one 20-atom pair before landing. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+A further round found an eleventh, and it is the tenth's own fix taken further rather than a
+new class of gap: sorting one combinator's own children left `Cfg::key` blind to shape —
+`enclosing_cfg` nests one `all` per level of `visit_item`/`visit_impl_item`/etc. it has
+descended through, whether or not that level carries a `cfg` of its own, so the identical
+20-atom predicate inherited at two different nesting depths — two functions wrapped in a
+different number of enclosing modules, say — rendered to two different keys and missed the
+cache on every distinct depth, recreating the same tens-of-seconds regression. `key` now
+normalizes before rendering: `all`/`any` are associative, so a same-kind child is spliced
+into its parent rather than kept nested (`all(all(a, b), c)` is exactly `all(a, b, c)`, and
+splicing an empty child list — an unconditional level's own contribution — adds nothing),
+and a combinator left with exactly one child collapses to that child. Both are real
+algebraic identities, not an approximation, so this never changes what a formula means —
+only two of its equivalent shapes now share one rendering.
+`many_differently_nested_but_equivalent_cfg_predicates_resolve_quickly` is the regression,
+confirmed RED at 65s against a 20s ceiling for eight sites nesting one 20-atom predicate at
+eight different depths before landing. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
+
+The same round found a twelfth, back in what feeds the check: `syn::Variant` carries its own
+`attrs`, and `syn` dispatches it through `visit_variant`, which none of `Literals`'s
+overrides intercepted — a discriminant expression's own literal
+(`#[cfg(not(feature = "a"))] V = { let _ = Unchecked { .. }; 0 }`) was checked against the
+enclosing enum's own `cfg` alone, missing the variant's own narrower one: an over-count, the
+same direction as every finding since the fourth. A `visit_variant` override closes it, the
+same push-pop shape and empty-attrs fast path as `visit_field_value`/`visit_expr`/
+`visit_arm`.
+`an_enum_variants_own_cfg_excludes_a_candidate_the_enums_cfg_would_not` is the regression,
+confirmed RED against the pre-fix code (no such override) before landing. No new ADR:
+nothing here moves a must-not-own cell, a dependency edge, or a rule id.

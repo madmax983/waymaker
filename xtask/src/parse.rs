@@ -255,36 +255,90 @@ impl Cfg {
     /// [`AliasLookupCache`]'s own outer key, which [`AliasLookupCache`]'s
     /// own doc says is a different, already-tried-and-reverted mistake.
     ///
-    /// Canonical rather than a bare `{self:?}` (Codex review of the fix,
-    /// round 7): `all`/`any` are commutative, so `all(a, b)` and
-    /// `all(b, a)` are the same formula with the operands written in a
-    /// different order, but their derived `Debug` text differs — several
-    /// functions each writing their own permutation of one large predicate
-    /// therefore missed the cache entirely and each independently paid
-    /// [`Cfg::could_coexist_with`]'s own worst case, exponential in the
-    /// atoms the two formulas name together. `key` now sorts each `all`/
-    /// `any`'s own children's keys before joining them, so two orderings of
-    /// the same operands render identically; a genuinely different formula
-    /// still renders differently, because the leaves (`Test`, `Atom`) are
-    /// still rendered with `Debug`'s own escaping and the recursion is
-    /// still exact about structure, only blind to one commutative
-    /// reordering.
+    /// Normalizes first (round 8), then renders and sorts each `all`/`any`'s
+    /// own children (round 7) — see [`Cfg::normalized`] for what the first
+    /// step buys beyond the second.
     fn key(&self) -> String {
+        self.normalized().key_raw()
+    }
+
+    /// [`Cfg::key`]'s own rendering, over an already-[`Cfg::normalized`]
+    /// tree: sorts each `all`/`any`'s own children's keys before joining
+    /// them, so two orderings of one operand list render identically — a
+    /// genuinely different formula still renders differently, because the
+    /// leaves (`Test`, `Atom`) are still rendered with `Debug`'s own
+    /// escaping and the recursion is still exact about structure, only
+    /// blind to a commutative reordering (Codex review of the fix, round
+    /// 7).
+    fn key_raw(&self) -> String {
         match self {
             Self::Test => "Test".to_owned(),
             Self::Atom(name) => format!("Atom({name:?})"),
             Self::All(children) => Self::commutative_key("All", children),
             Self::Any(children) => Self::commutative_key("Any", children),
-            Self::Not(inner) => format!("Not({})", inner.key()),
+            Self::Not(inner) => format!("Not({})", inner.key_raw()),
         }
     }
 
-    /// [`Cfg::key`]'s helper for `All`/`Any`: every child's own key, sorted
-    /// so the operands' written order does not matter.
+    /// [`Cfg::key_raw`]'s helper for `All`/`Any`: every child's own key,
+    /// sorted so the operands' written order does not matter.
     fn commutative_key(tag: &str, children: &[Self]) -> String {
-        let mut child_keys: Vec<String> = children.iter().map(Self::key).collect();
+        let mut child_keys: Vec<String> = children.iter().map(Self::key_raw).collect();
         child_keys.sort();
         format!("{tag}({child_keys:?})")
+    }
+
+    /// A shape-normalized copy of this formula, by two real algebraic
+    /// identities rather than an approximation — never changes what the
+    /// formula means (Codex review of the fix, round 8). `all`/`any` are
+    /// associative, so a same-kind child is spliced into its parent rather
+    /// than kept as a nested node (`all(all(a, b), c)` is exactly
+    /// `all(a, b, c)`); and a combinator left with exactly one child after
+    /// that collapses to that child (`all(a)` is exactly `a`).
+    ///
+    /// `enclosing_cfg` nests one `all` per level of `visit_item`/
+    /// `visit_impl_item`/etc. it has descended through, whether or not that
+    /// level carries a `cfg` of its own — an unconditional item still folds
+    /// in an empty `all()`, which splicing then drops entirely, since
+    /// splicing an empty child list adds nothing to its parent. So the
+    /// identical predicate reached at two different nesting depths — two
+    /// different nested nested modules or functions, say — normalizes to
+    /// one flat, sorted shape and shares one [`Cfg::key`], where the un-
+    /// normalized tree shapes differed and missed
+    /// [`AliasLookupCache::could_coexist`]'s cache on every distinct depth.
+    fn normalized(&self) -> Self {
+        match self {
+            Self::Test => Self::Test,
+            Self::Atom(name) => Self::Atom(name.clone()),
+            Self::Not(inner) => Self::Not(Box::new(inner.normalized())),
+            Self::All(children) => Self::flattened(children, true),
+            Self::Any(children) => Self::flattened(children, false),
+        }
+    }
+
+    /// [`Cfg::normalized`]'s helper: normalizes every child, splices in the
+    /// children of any that normalized to the same kind of combinator
+    /// (`is_all` says which), and collapses the result to its own single
+    /// child when exactly one remains.
+    fn flattened(children: &[Self], is_all: bool) -> Self {
+        let mut flat = Vec::with_capacity(children.len());
+        for child in children {
+            let normalized_child = child.normalized();
+            match (&normalized_child, is_all) {
+                (Self::All(grandchildren), true) | (Self::Any(grandchildren), false) => {
+                    flat.extend(grandchildren.iter().cloned());
+                }
+                _ => flat.push(normalized_child),
+            }
+        }
+        if flat.len() == 1 {
+            return flat.remove(0);
+        }
+        if is_all {
+            Self::All(flat)
+        } else {
+            Self::Any(flat)
+        }
     }
 }
 
@@ -5179,6 +5233,27 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         let outer_cfg = self.enclosing_cfg.clone();
         self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
         syn::visit::visit_field_value(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // An enum variant's own `cfg` is otherwise unseen: `syn::Variant`
+    // carries its own `attrs`, and `syn` dispatches it through
+    // `visit_variant`, which none of the overrides above intercept — a
+    // discriminant expression's own literal was checked against the
+    // enum's own `cfg` alone, missing the variant's own narrower one
+    // (Codex review of the fix, round 8). Same empty-attrs fast path as
+    // `visit_field_value`/`visit_expr`/`visit_arm`.
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_variant(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_variant(self, node);
         self.enclosing_cfg = outer_cfg;
     }
 
@@ -26726,6 +26801,69 @@ mod cfg_alias_ambiguity_tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(20),
             "took {:?} for 8 sites, each its own distinct ordering of one 20-atom pair",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_enum_variants_own_cfg_excludes_a_candidate_the_enums_cfg_would_not() {
+        // Codex review of the fix, round 8: `syn::Variant` carries its own
+        // `attrs`, and `syn` dispatches it through `visit_variant`, which
+        // none of the overrides above intercept — a discriminant
+        // expression's own literal was checked against the enum's own
+        // `cfg` alone, missing the variant's own narrower one.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             enum E {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   V = { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 },\n\
+             \x20   Other,\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn many_differently_nested_but_equivalent_cfg_predicates_resolve_quickly() {
+        // Codex review of the fix, round 8: `Cfg::key` sorted a single
+        // combinator's own children (round 7) but never flattened nested
+        // `All`s of the same kind — `enclosing_cfg` nests one `All` per
+        // level of `visit_item` it has descended through, so the identical
+        // 20-atom predicate inherited at two different nesting depths
+        // rendered to two different keys and missed the memoization cache
+        // on every one of them.
+        use std::fmt::Write as _;
+
+        let flags: Vec<String> = (0..20)
+            .map(|index| format!("feature = \"y{index}\""))
+            .collect();
+        let candidate_flags = flags.join(", ");
+        let mut src = format!(
+            "#[cfg(any({candidate_flags}))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(any({candidate_flags})))]\ntype Unchecked = Decoy;\n"
+        );
+        for depth in 0..8usize {
+            let mut body = "let _ = self::Unchecked { intent: 0, bytes: 0 };".to_owned();
+            for level in (0..depth).rev() {
+                body = format!("fn wrap{depth}_{level}() {{ {body} }}");
+            }
+            let _ = write!(
+                src,
+                "#[cfg(not(any({candidate_flags})))]\nfn forge{depth}() {{\n{body}\n}}\n"
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?} for 8 sites, each nesting the same 20-atom pair at its own depth",
             start.elapsed()
         );
     }
