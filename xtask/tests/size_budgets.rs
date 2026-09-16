@@ -94,13 +94,13 @@ fn adr_0010s_five_checksum_candidates_are_measured_rather_than_typed_by_hand() {
         .expect("this checkout declares the `crc-candidates` feature");
     assert_eq!(candidates.len(), 5, "{candidates:?}");
 
-    let shipped: Vec<&str> = candidates
+    let adr0010_shipped: Vec<&str> = candidates
         .iter()
-        .filter(|candidate| candidate.shipped)
+        .filter(|candidate| candidate.adr0010_shipped)
         .map(|candidate| candidate.name.as_str())
         .collect();
     assert_eq!(
-        shipped,
+        adr0010_shipped,
         vec!["crc32-iso-hdlc-bitwise", "crc16-ccitt-false-bitwise"],
         "{candidates:?}"
     );

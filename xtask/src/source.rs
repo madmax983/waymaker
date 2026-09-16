@@ -4686,9 +4686,14 @@ pub struct ChecksumParameter {
 /// initial value could not be lost — and then let CRC-32's initial value vouch for its own
 /// final xor. A pin that cannot fail is worse than no pin, because the report says it
 /// checked.
+///
+/// ADR 0053 moved each polynomial out of `crc16`/`crc32` themselves and into a per-nibble
+/// helper — `crc16_nibble` and `crc32_nibble` — so the two rows naming a polynomial are
+/// retargeted there rather than at the checksum functions. The initial-value and final-xor
+/// rows stay on `crc16`/`crc32`, because ADR 0053 did not touch where those live.
 pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
     ChecksumParameter {
-        function: "crc16",
+        function: "crc16_nibble",
         role: "CRC-16/CCITT-FALSE polynomial",
         literal: "0x1021",
         occurrences: 1,
@@ -4700,7 +4705,7 @@ pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
         occurrences: 1,
     },
     ChecksumParameter {
-        function: "crc32",
+        function: "crc32_nibble",
         role: "CRC-32/ISO-HDLC reflected polynomial",
         literal: "0xEDB8_8320",
         occurrences: 1,
@@ -4710,6 +4715,121 @@ pub const INTEGRITY_CHECK_PARAMETERS: &[ChecksumParameter] = &[
         role: "CRC-32/ISO-HDLC initial value and final xor",
         literal: "0xFFFF_FFFF",
         occurrences: 2,
+    },
+];
+
+/// A dense `match` [`INTEGRITY_CHECK_PATH`] is permitted to compile into a lookup table,
+/// and the shape [`INTEGRITY_CHECK_TABLES`] pins it to.
+///
+/// [ADR 0053](https://github.com/madmax983/waymaker/blob/main/docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md)
+/// supersedes ADR 0010's table-free conclusion for exactly one table — `crc32`'s.
+/// `crc16`'s own nibble reduction needed none, so [`INTEGRITY_CHECK_TABLES`] holds one
+/// entry rather than two. Structural rather than textual, the way `EFFECT_STEP_BODIES` and
+/// `WIRING_SELECTION_BODIES` each pin a body's *shape* rather than its bytes: `function`
+/// names the `const fn` whose body is the table, `helper` the `const fn` every arm must
+/// call, and `arms` how many literal, distinct, zero-based arms it must have — `helper(0)`
+/// through `helper(arms - 1)`, each exactly once, and `helper(` exactly `arms` times in
+/// total so a seventeenth arm calling something out of range cannot hide behind the other
+/// sixteen being correct.
+///
+/// No `[u32; 16]` ever appears in `crc.rs` for this table: LLVM's switch-to-lookup-table
+/// pass is what turns this exact shape into one, verified by disassembly at the time ADR
+/// 0045 was written rather than assumed, so the array ban below cannot see it at all and
+/// this pin is what stands in for that ban on the one table this file is allowed to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumTable {
+    /// The `const fn` whose whole body is a dense `match` compiled into a table.
+    pub function: &'static str,
+    /// The match's own discriminant expression, exactly as source spells it.
+    pub selector: &'static str,
+    /// The `const fn` every arm must call, with the arm's own literal as its argument.
+    pub helper: &'static str,
+    /// How many arms: `0` through `arms - 1`, no gap, no repeat, nothing past the range,
+    /// each arm's pattern the same number as the argument it passes `helper` — checked as
+    /// one exact, whitespace-normalised shape rather than as sixteen independent counts,
+    /// which two swapped arm patterns would still satisfy while computing a different
+    /// table. The last arm is `_ =>` rather than the literal `arms - 1`, because that is
+    /// how source spells an exhaustive match over a masked byte; the pin follows the same
+    /// spelling.
+    pub arms: u8,
+}
+
+/// The one table ADR 0053 permits, in a checksum module ADR 0010 otherwise still bans one from.
+///
+/// See [`ChecksumTable`] for what each field pins and why a `match` needs a structural pin
+/// where an array gets a textual one.
+pub const INTEGRITY_CHECK_TABLES: &[ChecksumTable] = &[ChecksumTable {
+    function: "crc32_nibble_table",
+    selector: "nibble & 0xF",
+    helper: "crc32_nibble",
+    arms: 16,
+}];
+
+/// The exact body ADR 0053 pins each top-level checksum to — the one shape it may have
+/// rather than a set of things it must contain.
+///
+/// ADR 0053 moved each polynomial out of `crc16`/`crc32` and into a per-nibble helper, so
+/// [`INTEGRITY_CHECK_PARAMETERS`] pinning the helper's own body only proves the helper
+/// still computes with the right polynomial — nothing ties the top-level function to it.
+/// Three rounds of review on the pull request that introduced these two pins found the same
+/// shape of gap each time a presence-and-count check replaced the last one: a `crc32`
+/// rewritten to call something else passed while `crc32_nibble`/`crc32_nibble_table` sat
+/// unused beside it; a discarded `let _ = helper(0);`, called the pinned number of times,
+/// passed while the return value was computed some other way; `helper(0)` for both the high
+/// and the low nibble passed the same call count and the same pinned assignment shape while
+/// reading the wrong nibble; and, sharpest, both pinned updates fit inside `if false { .. }`
+/// — present, in order, exactly once each — while a *different* statement outside that dead
+/// block computed the returned value. Every one of those is a body that contains the right
+/// text somewhere; none of them is the right body. `is exactly` is therefore what this pins,
+/// the same way [`INTEGRITY_CHECK_TABLES`]'s own shape is checked by equality rather than by
+/// counting the calls its arms make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChecksumRoute {
+    /// The top-level checksum function, by name.
+    pub function: &'static str,
+    /// The function's own leading statements, in order, before the byte loop — the initial
+    /// value and the slice it walks.
+    pub prelude: &'static [&'static str],
+    /// The loop every byte is walked with, exactly as source spells its header, up to and
+    /// including its opening brace.
+    pub loop_header: &'static str,
+    /// The complete extraction-and-call statement for one nibble's fold, in the order the
+    /// loop performs them — not merely a call to the helper somewhere in the body, and not
+    /// merely present: this is checked as part of the one body the function is allowed to
+    /// have, so a copy sitting in dead code is a body that no longer matches.
+    pub updates: &'static [&'static str],
+    /// The loop's own last statement, advancing to the next byte.
+    pub loop_trailer: &'static str,
+    /// The function's own last statement, exactly as source spells it, following the loop's
+    /// closing brace.
+    pub returns: &'static str,
+}
+
+/// Both top-level checksums' routes into the helper ADR 0053 gave each. See
+/// [`ChecksumRoute`] for what each field pins and why this exists beside
+/// [`INTEGRITY_CHECK_TABLES`] rather than folded into it.
+pub const INTEGRITY_CHECK_ROUTING: &[ChecksumRoute] = &[
+    ChecksumRoute {
+        function: "crc16",
+        prelude: &["let mut crc: u16 = 0xFFFF;", "let mut rest = bytes;"],
+        loop_header: "while let Some((byte, tail)) = rest.split_first() {",
+        updates: &[
+            "let hi = (((crc >> 12) as u8) ^ (*byte >> 4)) & 0xF; crc = (crc << 4) ^ crc16_nibble(hi);",
+            "let lo = (((crc >> 12) as u8) ^ (*byte & 0xF)) & 0xF; crc = (crc << 4) ^ crc16_nibble(lo);",
+        ],
+        loop_trailer: "rest = tail;",
+        returns: "crc",
+    },
+    ChecksumRoute {
+        function: "crc32",
+        prelude: &["let mut crc: u32 = 0xFFFF_FFFF;", "let mut rest = bytes;"],
+        loop_header: "while let Some((byte, tail)) = rest.split_first() {",
+        updates: &[
+            "let lo = (crc ^ (*byte as u32)) & 0xF; crc = (crc >> 4) ^ crc32_nibble_table(lo as u8);",
+            "let hi = (crc ^ ((*byte >> 4) as u32)) & 0xF; crc = (crc >> 4) ^ crc32_nibble_table(hi as u8);",
+        ],
+        loop_trailer: "rest = tail;",
+        returns: "crc ^ 0xFFFF_FFFF",
     },
 ];
 
@@ -9110,6 +9230,62 @@ fn check_boundary_type(pin: &MemberPin<'_>, code: &str, pinned: &BoundaryType) -
     violations
 }
 
+/// Whether `source` declares `function` exactly once, counted structurally rather than by
+/// the textual `declaration_count` every other pin in this module reads — `None` when it
+/// does, so a caller can `continue` straight past the violation this pushes.
+///
+/// Codex's finding: a textual `fn {function}` search does not see that `fn r#{function}`
+/// names the same item. A private nested module can keep an exact, plain-spelled decoy
+/// under the pinned name while the real, module-scope function is renamed to its raw form —
+/// `fn r#crc32` — and changed; a textual count sees exactly one `fn crc32` (the decoy) and
+/// waves the routing, table and parameter pins through to check it, while the unqualified
+/// `crc32` the shipped `Catalogued` binding calls still resolves the altered raw-identifier
+/// function. `crate::parse::fn_declaration_count` already un-raws identifiers for this
+/// reason (issue #62); this is that check wired to the checksum module's own pins, reading
+/// the raw `source.contents` rather than the comment-and-test-module-stripped text every
+/// other check here works from, since `syn` needs to parse real Rust to see through the
+/// nested module a textual scan cannot look inside honestly in the first place.
+#[must_use]
+fn checksum_declared_once(
+    source: &crate::size::LayerSource,
+    function: &str,
+    pin: &str,
+) -> Option<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+    if let Err(error) = crate::parse::parse_rust(&source.contents) {
+        return Some(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{INTEGRITY_CHECK_PATH} could not be parsed ({error}); an unreadable source \
+                 fails closed rather than approving what it cannot see"
+            ),
+        ));
+    }
+    // `fns_named` is `fn_declaration_count`'s twin with one more thing un-raws right:
+    // it already skips `#[cfg(test)]` items, the way `without_test_modules` blanks them
+    // for every other check in this rule. Codex found that `fn_declaration_count` alone
+    // does not, so a test-only helper sharing a pinned checksum's name — a reference
+    // implementation used by nothing but a test, say — was reported as a second shipped
+    // declaration and failed the gate over code that never ships.
+    let declarations = crate::parse::fns_named(&source.contents, function).len();
+    if declarations == 1 {
+        return None;
+    }
+    Some(Violation::new(
+        RULE,
+        ADAPTER,
+        format!(
+            "{INTEGRITY_CHECK_PATH} declares `fn {function}` {declarations} times, not once \
+             — counted structurally and outside `#[cfg(test)]`, so `fn r#{function}` counts \
+             as the same declaration and a test-only one of this name does not; the {pin} \
+             pin reads the first one a textual scan finds, so more than one leaves it \
+             checking a function nobody ships",
+        ),
+    ))
+}
+
 /// One pinned boundary type declares no associated constant.
 ///
 /// `check_boundary_type` pins members; it reads no `impl`, so a constant is invisible to it
@@ -9196,6 +9372,10 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
 
     for parameter in INTEGRITY_CHECK_PARAMETERS {
         let header = format!("fn {}", parameter.function);
+        if let Some(violation) = checksum_declared_once(source, parameter.function, "parameter") {
+            violations.push(violation);
+            continue;
+        }
         let Some(body) = braced_body(&code, &header) else {
             violations.push(Violation::new(
                 RULE,
@@ -9223,6 +9403,228 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
         }
     }
 
+    // ADR 0053's one exception to the array ban below: a dense `match` LLVM compiles into
+    // a table, pinned by shape because no array ever appears for the ban to see. Checked
+    // against the same `code` the parameter loop above used, so a table introduced only
+    // under `#[cfg(test)]` is not what this is pinned against.
+    violations.extend(check_integrity_check_tables(source, &code));
+
+    violations.extend(check_integrity_check_module_tree(sources, source));
+    violations
+}
+
+/// Every module-qualified constant `scanned_sources` declares, across the whole tree, run to
+/// a fixed point — alongside its own unsignedness mirror and its own declared-type mirror —
+/// factored out of [`check_integrity_check_module_tree`] to keep that function under
+/// clippy's line count.
+///
+/// Codex's finding: `qualified` used to start empty and grow only as `match_expressions`
+/// reached each inline module, so a match textually *before* the `mod` it references — or
+/// one in another file of the same tree entirely — never resolved. Rust's own item lookup is
+/// neither order- nor file-dependent inside one module tree, so this collects every
+/// module-qualified constant the whole tree declares, from every scanned source, before any
+/// of them is checked for a dense match. `prefixes` is what makes an out-of-line
+/// `mod indices;` resolve at all: without a declaration's own name seeded as that file's
+/// prefix, `indices.rs`'s own top-level constants have no module to be qualified under,
+/// because the declaration naming them lives in a different file.
+///
+/// Codex's forty-fourth-round finding: a single pass over the tree, each file scanned in
+/// isolation, cannot resolve a constant whose own initializer names a *different* file's
+/// module — `pub const P0: u8 = super::base::BASE + 0;` in an out-of-line `indices.rs`
+/// sibling to a `base` module declared in another file entirely — because
+/// `qualified_constants_with_prefix` used to see nothing beyond the one file it was handed,
+/// regardless of which order the tree's files were visited in. Run to a fixed point instead,
+/// feeding each pass's accumulated map back in as the next pass's own seed: a dependency
+/// chain across files needs at most as many passes as there are files to fully resolve, so
+/// bounding the loop at `scanned_sources.len()` (mirroring `resolve_scope_consts`'s own
+/// bounded fixed point) is exact rather than a heuristic cutoff, and a pass that adds
+/// nothing new stops the loop early.
+///
+/// Codex's next-round finding: `qualified_unsigned` was never collected here at all, so
+/// every caller downstream had nothing to thread through but an empty map — a qualified
+/// constant's own unsignedness stayed invisible to any match outside the one file that
+/// declared it, however far `qualified` itself had already reached across the tree.
+/// Collected in lockstep with `qualified`, at the identical key, from the identical
+/// fixed-point pass: `qualified_constants_with_prefix` now returns both maps together.
+///
+/// Codex's next-round finding: `qualified_types` was never collected here either, for the
+/// identical reason `qualified_unsigned` once was not — a declared type is not an
+/// unsignedness, and `bounds.rs` declaring `const OFF: bool = false;` needed its own `bool`
+/// ascription to reach a guard spelled `!bounds::OFF` in a different file of the same tree.
+/// Collected in lockstep with `qualified` and `qualified_unsigned`, at the identical key,
+/// from the identical fixed-point pass: `qualified_constants_with_prefix` now returns all
+/// three maps together.
+///
+/// Codex's next-round finding: this used to iterate `scanned_sources` — one entry per
+/// physical file — and look up *a* prefix for each one with `prefixes.iter().find`, so a
+/// file [`module_path_prefixes`] now visits under more than one module path (two legal
+/// `#[path = "shared.rs"] mod ...;` declarations naming the same file under two different
+/// names) was only ever scanned under whichever prefix `find` happened to return first. The
+/// loop now walks `prefixes` itself instead — which, since that fix, may name one physical
+/// path more than once — so a shared file is parsed and qualified once per distinct module
+/// path that legally reaches it, and a constant reachable only through the discarded alias
+/// is no longer silently absent from `qualified`. The fixed-point bound moves from
+/// `scanned_sources.len()` to `prefixes.len()`, its own now-larger upper bound on how many
+/// passes a cross-file dependency chain could need; the `progressed` check below still ends
+/// the loop the moment a pass adds nothing new.
+#[allow(
+    clippy::type_complexity,
+    reason = "the value map and its unsignedness and declared-type mirrors, returned \
+              together the same way they are threaded together through every caller — a \
+              type alias would name the trio once more than the signature already does"
+)]
+fn collect_tree_qualified_constants(
+    scanned_sources: &[&crate::size::LayerSource],
+    prefixes: &[(String, Vec<String>)],
+) -> (
+    std::collections::HashMap<String, i128>,
+    std::collections::HashMap<String, bool>,
+    std::collections::HashMap<String, String>,
+) {
+    let mut qualified = std::collections::HashMap::new();
+    let mut qualified_unsigned = std::collections::HashMap::new();
+    let mut qualified_types = std::collections::HashMap::new();
+    for _ in 0..prefixes.len().max(1) {
+        let mut progressed = false;
+        for (path, prefix) in prefixes {
+            let Some(scanned) = scanned_sources
+                .iter()
+                .find(|source| source.path.replace('\\', "/") == *path)
+            else {
+                continue;
+            };
+            if let Ok((found, found_unsigned, found_types)) =
+                crate::parse::qualified_constants_with_prefix(
+                    &scanned.contents,
+                    prefix,
+                    &qualified,
+                    &qualified_unsigned,
+                    &qualified_types,
+                )
+            {
+                for (name, value) in found {
+                    if qualified.insert(name.clone(), value).is_none() {
+                        progressed = true;
+                    }
+                    if let Some(unsigned) = found_unsigned.get(&name) {
+                        qualified_unsigned.insert(name.clone(), *unsigned);
+                    }
+                    if let Some(type_name) = found_types.get(&name) {
+                        qualified_types.insert(name, type_name.clone());
+                    }
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    (qualified, qualified_unsigned, qualified_types)
+}
+
+/// [`collect_tree_qualified_constants`]'s own cross-crate half: every module-qualified
+/// constant and enum-variant discriminant `crate_name`'s own crate root declares, across its
+/// whole reachable tree, keyed under `crate_prefix` the way a fully-qualified reference from
+/// outside that crate would spell it (`waymaker_core::transition::Divergence::A`, not
+/// `crate::transition::Divergence::A`).
+///
+/// Codex's finding: a match over `waymaker_core::transition::Divergence`'s own four unit
+/// variants — a real enum a real dependency declares, reachable from `waymaker-flash`
+/// without adding one — resolved every arm to nothing, because [`collect_tree_qualified_constants`]
+/// only ever sees the checksum module's own tree and this scan had no way to look one layer
+/// down its one legal dependency edge. `waymaker-core` is not a heuristic guess: it is the
+/// one crate `waymaker-flash`'s own row in `policy::LAYERS` names, so this closes the exact
+/// gap the finding demonstrates rather than a general "resolve any crate" feature.
+///
+/// Returns three empty maps when `crate_name`'s own crate root is not among `sources` at
+/// all — every test in this module that does not explicitly add one, and any workspace this
+/// scan runs over before that crate exists — the identical fail-soft standing
+/// `module_path_prefixes` already gives a tree it cannot walk.
+#[allow(
+    clippy::type_complexity,
+    reason = "the value map and its unsignedness and declared-type mirrors, returned \
+              together the same way `collect_tree_qualified_constants` already does"
+)]
+fn collect_dependency_qualified_constants(
+    sources: &[crate::size::LayerSource],
+    crate_name: &str,
+    crate_prefix: &str,
+) -> (
+    std::collections::HashMap<String, i128>,
+    std::collections::HashMap<String, bool>,
+    std::collections::HashMap<String, String>,
+) {
+    let empty = (
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+        std::collections::HashMap::new(),
+    );
+    let Some(root) = sources
+        .iter()
+        .find(|source| source.crate_name == crate_name && source.path.ends_with("src/lib.rs"))
+    else {
+        return empty;
+    };
+    let Ok((production_reachable, test_only)) = module_tree(sources, root) else {
+        return empty;
+    };
+    let Ok(prefixes) = module_path_prefixes(sources, root, vec![crate_prefix.to_owned()]) else {
+        return empty;
+    };
+    let scanned_sources: Vec<&crate::size::LayerSource> = sources
+        .iter()
+        .filter(|source| {
+            let path = source.path.replace('\\', "/");
+            production_reachable.contains(&path) && !test_only.contains(&path)
+        })
+        .collect();
+    let (mut qualified, qualified_unsigned, qualified_types) =
+        collect_tree_qualified_constants(&scanned_sources, &prefixes);
+    // Codex's finding, met in full: `collect_tree_qualified_constants` folds only `const`
+    // items — the *value*-scanning half `qualified_constants_with_prefix` runs — and never
+    // an enum's own variants, which only `MatchVisitor::visit_item_enum` records, as part of
+    // the full match-expression scan this function deliberately does not run over a
+    // dependency crate's own code. `item_enum_variant_constants` is that one piece pulled
+    // out on its own, run per scanned file the same way `collect_tree_qualified_constants`
+    // already runs `qualified_constants_with_prefix` per file, and merged in afterward —
+    // local declarations (there are none here; this is the whole map) still would have won
+    // on a name collision, the identical priority `check_integrity_check_module_tree`'s own
+    // merge into the checksum module's tree gives its own local declarations over this
+    // function's answer.
+    //
+    // Codex's finding, met here too: this used to look up *a* prefix for each scanned file
+    // with `find`, the identical shape [`collect_tree_qualified_constants`] once had — so a
+    // dependency file `module_path_prefixes` reaches under more than one module path was
+    // only ever scanned for enum variants under one of them. Walking `prefixes` directly,
+    // as that function now does, parses the shared file once per prefix instead.
+    for (path, prefix) in &prefixes {
+        let Some(scanned) = scanned_sources
+            .iter()
+            .find(|source| source.path.replace('\\', "/") == *path)
+        else {
+            continue;
+        };
+        let Ok(file) = crate::parse::parse_rust(&scanned.contents) else {
+            continue;
+        };
+        for (key, value) in crate::parse::item_enum_variant_constants(&file.items, prefix) {
+            qualified.entry(key).or_insert(value);
+        }
+    }
+    (qualified, qualified_unsigned, qualified_types)
+}
+
+/// The array ban and the dense-match-table scan, both walked across the checksum module's
+/// whole tree rather than the single named function [`check_integrity_check_tables`] pins —
+/// factored out to keep `check_integrity_check` under clippy's line count.
+fn check_integrity_check_module_tree(
+    sources: &[crate::size::LayerSource],
+    source: &crate::size::LayerSource,
+) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+    let mut violations = Vec::new();
+
     // The checksum module and anything it is split into. Codex asked for this on PR #58:
     // a table in `crc/table.rs` that `crc.rs` imports is the same 1 KiB of rodata, and a
     // rule that read one file would have called it absent.
@@ -9242,6 +9644,39 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
             vec![source]
         }
     };
+    // Codex found a second gap in the same review: the check above only ever looks inside
+    // the one function name `INTEGRITY_CHECK_TABLES` pins, so a second dense match — calling
+    // the same helper from a function of its own, or an unrelated one calling something
+    // else entirely — passes every rule here. This scan is shape-derived rather than
+    // name-derived, the way `SEALING_FUNCTIONS`'s own routing scan is: every `match` in the
+    // tree is a candidate, and one is only excused when it is, exactly, the one table
+    // `INTEGRITY_CHECK_TABLES` names — counted, so a byte-identical copy under a second
+    // function name is still a second table rather than a coincidence.
+    let prefixes =
+        module_path_prefixes(sources, source, vec![root_module_name()]).unwrap_or_default();
+    let (mut qualified, mut qualified_unsigned, mut qualified_types) =
+        collect_tree_qualified_constants(&scanned_sources, &prefixes);
+    // Codex's finding: `waymaker-flash`'s own tree has no way to see an enum variant
+    // declared in `waymaker-core` — its own must-not-own cell names it the only crate this
+    // one may depend on — so a match over such an enum's variants (`Divergence::A`, and so
+    // on, fully qualified as `waymaker_core::transition::Divergence::A`) resolved every arm
+    // to nothing and a dense table shaped that way passed unseen. Local declarations win on
+    // a name collision, matching the standing `path_is_definitely_unsigned`'s own
+    // real-declaration-over-primitive-bound rule already has: `or_insert` never overwrites
+    // an entry `collect_tree_qualified_constants` above already produced.
+    let (dependency_qualified, dependency_unsigned, dependency_types) =
+        collect_dependency_qualified_constants(sources, "waymaker-core", "waymaker_core");
+    for (key, value) in dependency_qualified {
+        qualified.entry(key).or_insert(value);
+    }
+    for (key, value) in dependency_unsigned {
+        qualified_unsigned.entry(key).or_insert(value);
+    }
+    for (key, value) in dependency_types {
+        qualified_types.entry(key).or_insert(value);
+    }
+
+    let mut allowed_table_hits = vec![0_usize; INTEGRITY_CHECK_TABLES.len()];
     for scanned in scanned_sources {
         let scanned_code = without_test_modules(&code_only(&scanned.contents));
         for name in array_items(&scanned_code) {
@@ -9251,15 +9686,1096 @@ pub fn check_integrity_check(sources: &[crate::size::LayerSource]) -> Vec<Violat
                 format!(
                     "{} declares `{name}` as an array, which is a lookup table; ADR 0010 \
                      measured what one costs — 64 B of rodata for a nibble table, 1024 B \
-                     for a byte table, against an 8 KiB incremental code-flash budget — so \
-                     adding one is a superseding ADR, not an optimisation",
+                     for a byte table, against an 8 KiB incremental code-flash budget — and \
+                     ADR 0053 already spent one nibble table's worth of that as a `match` \
+                     `INTEGRITY_CHECK_TABLES` pins by shape rather than as an array; a \
+                     second one, spelled as an array, is still a superseding ADR, not an \
+                     optimisation",
                     scanned.path.replace('\\', "/")
+                ),
+            ));
+        }
+
+        check_checksum_module_macros(scanned, &mut violations);
+        check_checksum_module_crate_root_patterns(scanned, &mut violations);
+        check_checksum_module_const_call_initializers(scanned, &mut violations);
+
+        // Codex's finding: this used to take *a* prefix for `scanned` via `find`, so a file
+        // `module_path_prefixes` now reaches under more than one module path — the shared
+        // half of two legal `#[path = "shared.rs"] mod ...;` declarations — was checked for
+        // a dense match under only one of them. A `super::`-relative pattern inside such a
+        // file resolves differently depending on which alias is in effect, so scanning it
+        // once under an arbitrarily chosen prefix could resolve a pattern to nothing under
+        // the alias that was dropped, the identical way an unresolved arm anywhere else lets
+        // a dense table through. Every prefix the file is legally reachable under gets its
+        // own pass here; a genuinely shared file scanning as dense twice for the one
+        // permitted table would still fail closed rather than passing unseen, and no file in
+        // this tree is reachable under more than one prefix today.
+        let scanned_path = scanned.path.replace('\\', "/");
+        let scanned_prefixes: Vec<&Vec<String>> = prefixes
+            .iter()
+            .filter(|(path, _)| *path == scanned_path)
+            .map(|(_, prefix)| prefix)
+            .collect();
+        let empty_prefix = Vec::new();
+        let passes: Vec<&Vec<String>> = if scanned_prefixes.is_empty() {
+            vec![&empty_prefix]
+        } else {
+            scanned_prefixes
+        };
+        for prefix in passes {
+            check_checksum_module_dense_matches(
+                scanned,
+                &qualified,
+                &qualified_unsigned,
+                &qualified_types,
+                prefix,
+                &mut allowed_table_hits,
+                &mut violations,
+            );
+        }
+    }
+    for (table, count) in INTEGRITY_CHECK_TABLES.iter().zip(&allowed_table_hits) {
+        if *count != 1 {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "the checksum module's own tree declares {count} dense match(es) shaped \
+                     like `{}`'s pinned table rather than exactly one — a second copy \
+                     anywhere in the tree is still a second 64 B table, whatever function \
+                     holds it",
+                    table.function
                 ),
             ));
         }
     }
 
     violations
+}
+
+/// [`check_integrity_check_module_tree`]'s macro half, factored out to keep that function
+/// under clippy's line count: every macro `scanned` declares or invokes, outside
+/// `#[cfg(test)]`, pushed as a violation.
+///
+/// Codex's twenty-seventh-round finding: neither the array ban above nor
+/// [`check_checksum_module_dense_matches`] below reads what a macro expands to — `syn`
+/// does not expand one, and this module's own contract says so — so a `macro_rules!`
+/// table or a wrapper invocation that expands to a dense match is invisible to both,
+/// whatever it expands to. Rather than reasoning about what a given macro produces, every
+/// macro the tree names outside `#[cfg(test)]` is refused outright.
+fn check_checksum_module_macros(
+    scanned: &crate::size::LayerSource,
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::macro_uses(&scanned.contents) {
+        Ok(macros) => {
+            for name in macros {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} names the macro `{name}`, and neither this scan nor `syn` \
+                         expands one — a macro can expand to a dense match or to an array, \
+                         either of which would be a lookup table invisible to every check \
+                         above; the checksum module's own tree needs no macro to compute \
+                         its arithmetic, so it may declare or invoke none outside its own \
+                         tests",
+                        scanned.path.replace('\\', "/")
+                    ),
+                ));
+            }
+        }
+        Err(error) => violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{} could not be parsed ({error}) while scanning for macros; an unreadable \
+                 source fails closed rather than approving what it cannot see",
+                scanned.path.replace('\\', "/")
+            ),
+        )),
+    }
+}
+
+/// [`check_integrity_check_module_tree`]'s crate-root-pattern half, factored out to keep
+/// that function under clippy's line count: every bare `crate::NAME` pattern `scanned`
+/// writes, pushed as a violation.
+///
+/// Codex's thirty-fifth-round finding: `resolve_anchored_single_segment` resolves
+/// `crate::NAME` as always-unresolved — correctly, since the checksum module is itself
+/// `crate::crc` rather than the crate's true root — but [`missing_value`] and
+/// [`fully_dense_arm_patterns`] both fail a match's *entire* dense-table check the moment
+/// any one arm is unresolved. A table built from `crate::P0` through `crate::P15` would
+/// never be recognised as dense at all, and would pass every check above by looking
+/// exactly like an ordinary match this scan simply could not follow. Rather than
+/// reasoning about what such a pattern resolves to, its mere presence is refused outright
+/// — the checksum module has every constant it needs inside the tree this scan already
+/// reads, so it has no legitimate reason to pattern-match against its crate's own root.
+fn check_checksum_module_crate_root_patterns(
+    scanned: &crate::size::LayerSource,
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::crate_root_pattern_uses(&scanned.contents) {
+        Ok(patterns) => {
+            for name in patterns {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} matches the pattern `{name}`, anchored at the crate's own \
+                         root — a constant this scan's own tree cannot see the value of, \
+                         so a match built from a run of such patterns would never be \
+                         recognised as the dense table it might be; the checksum module's \
+                         own tree holds every constant it needs, so it may pattern-match \
+                         against none outside it",
+                        scanned.path.replace('\\', "/")
+                    ),
+                ));
+            }
+        }
+        Err(error) => violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{} could not be parsed ({error}) while scanning for crate-root patterns; \
+                 an unreadable source fails closed rather than approving what it cannot see",
+                scanned.path.replace('\\', "/")
+            ),
+        )),
+    }
+}
+
+/// [`check_integrity_check_module_tree`]'s const-call-initializer half, factored out to
+/// keep that function under clippy's line count: every `const` `scanned` declares whose
+/// own initializer is a call expression, pushed as a violation.
+///
+/// Codex's thirty-ninth-round finding: `const P0: u8 = index(0);` through `P14` is
+/// `Expr::Call`, which `literal_or_const_value` does not evaluate on purpose — doing that
+/// in general means interpreting an arbitrary function body, which this scan does not
+/// attempt — so `resolve_scope_consts` folds none of them, and [`missing_value`] and
+/// [`fully_dense_arm_patterns`] both fail a match's *entire* dense-table check the moment
+/// any one arm is unresolved. A table built entirely from such constants would never be
+/// recognised as dense at all. Rather than reasoning about which calls are safe to
+/// evaluate, any `const` whose initializer is a call is refused outright, independent of
+/// whether anything ever pattern-matches on it — the checksum module's own arithmetic
+/// needs no indirection through a function call to compute a constant.
+fn check_checksum_module_const_call_initializers(
+    scanned: &crate::size::LayerSource,
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    match crate::parse::const_call_initializer_uses(&scanned.contents) {
+        Ok(names) => {
+            for name in names {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "{} declares `{name}` with a call as its own initializer — a \
+                         value this scan does not evaluate, so a match built from a run \
+                         of such constants would never be recognised as the dense table \
+                         it might be; the checksum module's own arithmetic needs no \
+                         function call to compute a constant",
+                        scanned.path.replace('\\', "/")
+                    ),
+                ));
+            }
+        }
+        Err(error) => violations.push(Violation::new(
+            RULE,
+            ADAPTER,
+            format!(
+                "{} could not be parsed ({error}) while scanning for const-call \
+                 initializers; an unreadable source fails closed rather than approving \
+                 what it cannot see",
+                scanned.path.replace('\\', "/")
+            ),
+        )),
+    }
+}
+
+/// [`check_integrity_check_module_tree`]'s dense-match half, factored out to keep that
+/// function under clippy's line count: every `match` `scanned` declares, checked against
+/// [`INTEGRITY_CHECK_TABLES`]'s one permitted shape, bumping `allowed_table_hits` for a
+/// match — so a byte-identical duplicate is still counted rather than merely permitted — and
+/// pushing a violation for anything else dense enough to be a second table.
+fn check_checksum_module_dense_matches(
+    scanned: &crate::size::LayerSource,
+    qualified: &std::collections::HashMap<String, i128>,
+    qualified_unsigned: &std::collections::HashMap<String, bool>,
+    qualified_types: &std::collections::HashMap<String, String>,
+    prefix: &[String],
+    allowed_table_hits: &mut [usize],
+    violations: &mut Vec<Violation>,
+) {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let matches = match crate::parse::match_expressions_with_prefix(
+        &scanned.contents,
+        qualified,
+        qualified_unsigned,
+        qualified_types,
+        prefix,
+    ) {
+        Ok(matches) => matches,
+        Err(error) => {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{} could not be parsed ({error}); an unreadable source fails closed \
+                     rather than approving what it cannot see",
+                    scanned.path.replace('\\', "/")
+                ),
+            ));
+            return;
+        }
+    };
+    for found in &matches {
+        if !has_dense_arm_patterns(found) {
+            continue;
+        }
+        let arm_count = found.arms.len();
+        let selector = squeezed(&found.selector);
+        let pinned = call_shaped_uniformly(found).and_then(|callee| {
+            INTEGRITY_CHECK_TABLES.iter().position(|table| {
+                squeezed(table.selector) == selector
+                    && table.helper == callee
+                    && usize::from(table.arms) == arm_count
+            })
+        });
+        match pinned {
+            Some(index) => {
+                if let Some(count) = allowed_table_hits.get_mut(index) {
+                    *count += 1;
+                }
+            }
+            None => violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{} declares a {arm_count}-arm dense match over `{selector}`, which LLVM \
+                     compiles into a lookup table the same way `INTEGRITY_CHECK_TABLES` pins \
+                     `crc32_nibble_table` — and it is not that one table, so ADR 0053's \
+                     superseding decision does not cover it; a second table is still a \
+                     decision, not an optimisation, whether its arms call a helper or carry \
+                     a literal value each",
+                    scanned.path.replace('\\', "/")
+                ),
+            )),
+        }
+    }
+}
+
+/// [`INTEGRITY_CHECK_TABLES`]'s half of `check_integrity_check`, factored out to keep that
+/// function under clippy's line count: for each pinned table, verifies its `function` body
+/// exists and calls `helper(0)` through `helper(arms - 1)` each exactly once, with no call
+/// to `helper(` outside that range.
+fn check_integrity_check_tables(source: &crate::size::LayerSource, code: &str) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
+    for table in INTEGRITY_CHECK_TABLES {
+        let header = format!("fn {}", table.function);
+        if let Some(violation) = checksum_declared_once(source, table.function, "table") {
+            violations.push(violation);
+            continue;
+        }
+        let Some(body) = braced_body(code, &header) else {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so ADR 0053's pinned \
+                     table has nothing to check its shape against"
+                ),
+            ));
+            continue;
+        };
+        if !table_body_matches_pinned_shape(body, table) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{}` in {INTEGRITY_CHECK_PATH} is not the exact `match {} {{ 0 => {}(0), \
+                     1 => {}(1), ..., _ => {}({}) }}` ADR 0053 pins, in that order — Codex found \
+                     that counting calls alone lets two arms swap patterns, or the match be \
+                     replaced by something else calling the same functions, and still pass",
+                    table.function,
+                    table.selector,
+                    table.helper,
+                    table.helper,
+                    table.helper,
+                    table.arms - 1
+                ),
+            ));
+        }
+
+        // Codex's fifth-round finding: `braced_body` starts reading at the `fn` header and
+        // never looks at what precedes it, so downgrading or removing either function's
+        // `#[inline(always)]` passed every check above — even though ADR 0053's whole
+        // argument for this table's shape is that LLVM only builds the lookup table when
+        // `crc32_nibble` is force-inlined into each of `crc32_nibble_table`'s arms first; a
+        // soft `#[inline]` measured as a real function call per nibble instead, 5-21%
+        // slower on the workloads ADR 0053 profiled.
+        for header_name in [table.function, table.helper] {
+            let header = format!("fn {header_name}");
+            if let Some(violation) = checksum_declared_once(source, header_name, "inline-attribute")
+            {
+                violations.push(violation);
+                continue;
+            }
+            if !declares_inline_always(code, &header) {
+                violations.push(Violation::new(
+                    RULE,
+                    ADAPTER,
+                    format!(
+                        "`{header_name}` in {INTEGRITY_CHECK_PATH} is not declared \
+                         `#[inline(always)]` immediately before its `fn` — ADR 0053's table \
+                         is only a lookup table because both `{}` and `{}` are force-inlined \
+                         into each arm before LLVM's switch-to-lookup-table pass runs",
+                        table.helper, table.function
+                    ),
+                ));
+            }
+        }
+    }
+
+    violations.extend(check_integrity_check_routing(source, code));
+    violations
+}
+
+/// Whether `code` carries `#[inline(always)]` as an attribute of the item declared by
+/// `header` — read backward from `header`'s own position rather than forward from it, which
+/// is the direction every other pin in this module reads in.
+///
+/// [`braced_body`] starts at `header` and reads only what follows; an attribute is what
+/// precedes it, so nothing else here would notice one downgraded to a soft `#[inline]` or
+/// removed outright. The search window is bounded by the previous item's own closing brace,
+/// so an `#[inline(always)]` on some earlier, unrelated function does not vouch for this one.
+///
+/// Codex's finding: bounding the window by the previous `}` still let anything *inside* the
+/// window vouch for the attribute, including a macro invocation's own arguments — `ignore!(
+/// #[inline(always)]);` contains the exact attribute text while attaching it to nothing, and
+/// a plain `.contains` cannot tell that from the real thing. The occurrence now has to sit
+/// at bracket depth zero *within the window* — balanced against everything since the
+/// previous item's closing brace — which a macro call's own unclosed `(` rules out, while a
+/// real attribute stacked above another attribute (ADR 0053's own `#[allow(clippy::
+/// inline_always, reason = "...")]`, spanning several lines) stays at depth zero the whole
+/// way through, since every bracket it opens is closed before the next line.
+#[must_use]
+fn declares_inline_always(code: &str, header: &str) -> bool {
+    const ATTRIBUTE: &str = "#[inline(always)]";
+    let continues = |character: char| character.is_alphanumeric() || character == '_';
+
+    let Some(index) = code.match_indices(header).find_map(|(index, _)| {
+        let before_is_boundary = code
+            .get(..index)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|character| !continues(character));
+        let after_is_boundary = code
+            .get(index + header.len()..)
+            .and_then(|rest| rest.chars().next())
+            .is_none_or(|character| !continues(character));
+        (before_is_boundary && after_is_boundary).then_some(index)
+    }) else {
+        return false;
+    };
+
+    let preceding = code.get(..index).unwrap_or_default();
+    let scope_start = preceding.rfind('}').map_or(0, |at| at + 1);
+    let Some(window) = preceding.get(scope_start..) else {
+        return false;
+    };
+    window.match_indices(ATTRIBUTE).any(|(offset, _)| {
+        let Some(before) = window.get(..offset) else {
+            return false;
+        };
+        let opened = before.matches(['{', '(', '[']).count();
+        let closed = before.matches(['}', ')', ']']).count();
+        opened == closed
+    })
+}
+
+/// [`INTEGRITY_CHECK_ROUTING`]'s half of `check_integrity_check_tables`, factored out to
+/// keep that function under clippy's line count: for each routed checksum, verifies its
+/// `function` body is exactly the one [`expected_route_body`] builds from the pin — not a
+/// body that merely contains the right pieces somewhere.
+fn check_integrity_check_routing(source: &crate::size::LayerSource, code: &str) -> Vec<Violation> {
+    const RULE: &str = "integrity-check";
+    const ADAPTER: &str = "waymaker-flash";
+
+    let mut violations = Vec::new();
+    for route in INTEGRITY_CHECK_ROUTING {
+        let header = format!("fn {}", route.function);
+        if let Some(violation) = checksum_declared_once(source, route.function, "routing") {
+            violations.push(violation);
+            continue;
+        }
+        let Some(body) = braced_body(code, &header) else {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "{INTEGRITY_CHECK_PATH} declares no `{header}`, so ADR 0053's routing \
+                     pin has nothing to check"
+                ),
+            ));
+            continue;
+        };
+        if squeezed(body) != squeezed(&expected_route_body(route)) {
+            violations.push(Violation::new(
+                RULE,
+                ADAPTER,
+                format!(
+                    "`{}` in {INTEGRITY_CHECK_PATH} is not exactly the body ADR 0053 pins. \
+                     Codex found that checking the pinned nibble updates by presence, count \
+                     and order still let them sit inside dead control flow — both fitting \
+                     inside `if false {{ .. }}`, in order, exactly once each — while a \
+                     different statement outside it computed the returned value; requiring \
+                     the whole loop body, the same way `INTEGRITY_CHECK_TABLES`'s own shape \
+                     is pinned by equality rather than by counting its calls, is what closes \
+                     that",
+                    route.function
+                ),
+            ));
+        }
+    }
+
+    violations
+}
+
+/// The exact body [`ChecksumRoute`] pins a routed checksum to: its prelude, then the byte
+/// loop's header, each nibble update in the order the loop performs them, the loop's own
+/// trailing statement, the loop's closing brace, and the function's return expression —
+/// built from the pin rather than duplicated by hand, so a route added to it is checked by
+/// construction.
+#[must_use]
+fn expected_route_body(route: &ChecksumRoute) -> String {
+    use std::fmt::Write as _;
+
+    let mut expected = String::new();
+    for statement in route.prelude {
+        let _ = write!(expected, "{statement} ");
+    }
+    let _ = write!(expected, "{} ", route.loop_header);
+    for update in route.updates {
+        let _ = write!(expected, "{update} ");
+    }
+    let _ = write!(expected, "{} }} {}", route.loop_trailer, route.returns);
+    expected
+}
+
+/// Whether `body` is exactly the dense match [`ChecksumTable`] pins: `match {selector} { 0
+/// => helper(0), 1 => helper(1), ..., _ => helper(arms - 1) }`, arm patterns in order, each
+/// mapped to the identically-numbered call.
+///
+/// Whitespace-normalised rather than a byte-for-byte comparison, so line breaks and
+/// indentation `cargo fmt` chooses do not matter — only the selector, the arm order, and
+/// each arm's own mapping to `helper` do. Codex found the gap this replaces: counting how
+/// many times `helper(0)` through `helper(arms - 1)` each appear anywhere in the body
+/// proves none of them is missing or repeated, but not that arm `0`'s pattern is what calls
+/// `helper(0)` — two swapped arm patterns, or the whole match replaced by an equivalent
+/// chain of `if` statements calling the same functions, would still satisfy a pure count.
+#[must_use]
+fn table_body_matches_pinned_shape(body: &str, table: &ChecksumTable) -> bool {
+    use std::fmt::Write as _;
+
+    let mut expected = format!("match {} {{", table.selector);
+    for arm in 0..table.arms {
+        if arm + 1 == table.arms {
+            let _ = write!(expected, " _ => {}({arm}),", table.helper);
+        } else {
+            let _ = write!(expected, " {arm} => {}({arm}),", table.helper);
+        }
+    }
+    expected.push_str(" }");
+
+    // Equality rather than `contains`: Codex found that a substring check lets the pinned
+    // match survive as a discarded sub-expression — `let _ = match ...;` — beside a second,
+    // different match that actually produces the return value. The real function's body is
+    // this match and nothing else, so nothing is lost by requiring the whole of it.
+    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalize(body) == normalize(&expected)
+}
+
+/// The minimum number of arms a `match` needs before [`has_dense_arm_patterns`] will call it
+/// table-shaped.
+///
+/// [`INTEGRITY_CHECK_TABLES`]'s one entry has sixteen. This module's own doc comment says
+/// it owns "two functions... and the per-nibble helpers each is built from" and nothing
+/// else, so any dense integer match here is suspect; three explicit arms plus a wildcard is
+/// low enough to catch a small proof-of-concept table without also flagging a two-arm match
+/// that happens to have integer patterns for an unrelated reason.
+const MINIMUM_DENSE_TABLE_ARMS: usize = 4;
+
+/// `values` laid out against `slots` consecutive offsets from `base`, under wrapping
+/// (modulo 2^128) arithmetic: `Some` of the coverage bitmap when every value lands on its
+/// own distinct offset in `0..slots`, `None` the moment one lands out of range or repeats
+/// one another value already claimed.
+///
+/// Wrapping rather than checked arithmetic is what lets this answer the same question
+/// whether `base` truly is the window's lowest value (the ordinary case, where wrapping and
+/// checked subtraction agree because nothing overflows) or the window straddles the point
+/// where [`lit_value`]'s own two's-complement reinterpretation of a `u128` literal at or
+/// above `2^127` turns an ascending run into one that wraps through `i128::MIN` — there,
+/// `value.wrapping_sub(base)`'s own bit pattern, read as `u128`, is exactly the forward
+/// circular distance from `base` to `value`, agreeing with the unsigned domain the literal
+/// came from regardless of which half of it `lit_value` had to reinterpret as negative.
+fn try_window_layout(values: &[i128], slots: usize, base: i128) -> Option<Vec<bool>> {
+    let mut covered = vec![false; slots];
+    for &value in values {
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "wrapping_sub's own two's-complement bit pattern, reinterpreted as an \
+                      unsigned circular offset from `base` rather than converted as a value"
+        )]
+        let offset_bits = value.wrapping_sub(base) as u128;
+        let offset = usize::try_from(offset_bits).ok()?;
+        let slot = covered.get_mut(offset)?;
+        if *slot {
+            return None;
+        }
+        *slot = true;
+    }
+    Some(covered)
+}
+
+/// `values` laid out as a window of `slots` consecutive integers, together with the base
+/// that window starts at — tried first at the plain signed minimum, which is the window's
+/// true base and the only candidate needed whenever nothing straddles the u128-reinterpretation
+/// wrap point [`try_window_layout`]'s own doc comment describes.
+///
+/// Codex's forty-second-round finding: the plain signed minimum is not always the window's
+/// true base once `lit_value` can answer for a `u128` literal at or above `2^127` — a
+/// consecutive run of such literals spanning that boundary has its *smallest* values (just
+/// below `2^127`) reinterpreted as large *positive* `i128`s and its *largest* values (at or
+/// above `2^127`) reinterpreted as very *negative* ones, so the plain signed minimum lands
+/// in the middle of the window rather than at its start, and subtracting it from the large
+/// positive end overflows `i128` outright — which `missing_value`'s own prior `checked_sub`
+/// read as an unresolvable arm and skipped the whole match rather than recognising the
+/// window it still is. Every value is tried as a candidate base in turn, under
+/// [`try_window_layout`]'s wrapping arithmetic, so the search finds whichever one is the
+/// window's true circular start without needing to know in advance which half of `i128`'s
+/// range it sits in.
+///
+/// Codex's next-round finding: trying every value as a candidate base is sound only when
+/// wrapping past `i128::MIN` really does mean something — the fact that a `u128` literal at
+/// or above `2^127` came from, per [`try_window_layout`]'s own doc comment. A match whose
+/// patterns are genuinely signed and merely happen to sit near both ends of `i128`
+/// (`i128::MIN`, a constant just under `i128::MAX`, and `i128::MAX` itself) has no such
+/// fact behind it: nothing wraps, and treating those three as three of four consecutive
+/// circular slots reads a match `rustc` still lowers to ordinary comparisons as a table.
+/// `unsigned_domain` — every contributing arm's own [`crate::parse::FoundArm::unsigned`] —
+/// is what tells the two apart; the plain-minimum attempt above needs no such gate, because
+/// [`try_window_layout`]'s wrapping and a genuinely signed span's checked arithmetic already
+/// agree there, so it stays open to every match this scan resolves a value from.
+fn window_layout(
+    values: &[i128],
+    slots: usize,
+    unsigned_domain: bool,
+) -> Option<(i128, Vec<bool>)> {
+    if let Some(&base) = values.iter().min() {
+        if let Some(covered) = try_window_layout(values, slots, base) {
+            return Some((base, covered));
+        }
+    }
+    if unsigned_domain {
+        for &base in values {
+            if let Some(covered) = try_window_layout(values, slots, base) {
+                return Some((base, covered));
+            }
+        }
+    }
+    None
+}
+
+/// The single value in the window starting at the numbered arms' own lowest covered value
+/// and as wide as the number of values they cover *plus one*, that no numbered
+/// (non-wildcard) arm's pattern names — the value a dense table's own wildcard arm covers.
+///
+/// Codex's finding: the earlier version fixed the window at the literal range
+/// `0..found.arms.len()`, on the assumption a dense table always starts at `0` — true of
+/// every nibble mask this crate writes, but not of the shape LLVM will still lower to an
+/// indexed table: `rustc` builds the identical switch table for `16..=31` with a base
+/// subtracted from the scrutinee first. The window's own base is now the lowest value a
+/// numbered arm actually names, so a table offset by any amount is still recognised.
+///
+/// This still folds two source orders into one answer, the way the fixed-at-`0` window
+/// already did: a table whose numbered arms spell `1..=15` and whose `_` covers `0`, and
+/// one whose numbered arms spell `0..=14` and whose `_` covers `15`, both compile to the
+/// identical lookup table, and windowing from the lowest numbered value reads the second
+/// order directly and the first as an equally valid window one step higher — either
+/// reading agrees that the match is dense, which is the only thing this function's caller
+/// needs from it. Returns `None` when a numbered arm's pattern is missing, is repeated, or
+/// when more than one value in the window is left uncovered — a real gap rather than one
+/// arm's worth of slack for the wildcard.
+///
+/// Codex's finding: every resolved pattern is an `i128` — signed, since a dense match's
+/// own patterns can themselves be negative (an `i8`'s own `-8..=6`, say) — but this used
+/// to narrow straight to `usize` before ever computing the window's base, so a negative
+/// pattern failed that conversion and the whole match read as unresolved before the base
+/// (which the negative value might even be) was ever found. Values now stay `i128`
+/// throughout; only the *offset* from the window's own base — never negative once `base`
+/// is truly the minimum — is narrowed to a `usize` to index `covered`.
+///
+/// Codex's finding, again: an arm can be an or-pattern (`0 | 1 => ..`) covering more than
+/// one value, so the window's own width was never `numbered.len() + 1` — it is the *total
+/// number of values the numbered arms cover*, plus one for the wildcard. Every arm's own
+/// `pattern` list is flattened into one list of values before the window is built, rather
+/// than treating one arm as one value.
+fn missing_value(numbered: &[crate::parse::FoundArm]) -> Option<i128> {
+    let mut values = Vec::new();
+    let mut unsigned_domain = true;
+    for arm in numbered {
+        if arm.pattern.is_empty() {
+            return None;
+        }
+        unsigned_domain &= arm.unsigned;
+        values.extend(arm.pattern.iter().copied());
+    }
+    let total = values.len().checked_add(1)?;
+    let (base, covered) = window_layout(&values, total, unsigned_domain)?;
+    let mut gaps = covered.iter().enumerate().filter(|(_, seen)| !**seen);
+    let (gap, _) = gaps.next()?;
+    if gaps.next().is_some() {
+        return None;
+    }
+    Some(base.wrapping_add(i128::try_from(gap).ok()?))
+}
+
+/// The widest ratio of window width to named-value count [`compact_window_with_gaps`]
+/// still treats as compact enough to be a real lookup table, rather than a coincidentally
+/// evenly-spaced but genuinely sparse set of arms. Codex's own report is the concrete
+/// evidence this is sized against — eight explicit values spanning a fifteen-slot window,
+/// ratio `15 / 8 = 1.875` — not a figure read off LLVM's own undocumented density
+/// heuristic, which is neither stable across versions nor targets. Chosen with headroom
+/// above that report rather than pared to it exactly, the same reason every bound in this
+/// scan is a round, documented number rather than the tightest one the evidence in hand
+/// would allow.
+const SPARSE_WINDOW_SLOTS_PER_VALUE: usize = 3;
+
+/// Whether `numbered`'s own patterns, together with a trailing wildcard, span a window
+/// LLVM still compiles to an indexed table even though more than one value inside it is
+/// left for the wildcard — [`missing_value`]'s own single-gap window, generalised.
+///
+/// Codex's next-round finding: `missing_value` requires the window it finds to have
+/// *exactly* one slot the numbered arms leave uncovered, because it is built to answer a
+/// second question this function does not need — *which* value the wildcard covers, for
+/// [`call_shaped_uniformly`] to compare against [`INTEGRITY_CHECK_TABLES`]'s own pinned
+/// shape. But `0, 2, 4, .., 14` explicit with `_` covering every odd value in between is a
+/// nine-arm match spanning the identical `0..=14` window with *seven* slots uncovered
+/// rather than one, and `rustc` still lowers it to the same indexed `.rodata` table — the
+/// wildcard still names exactly one body, whatever share of the window it ends up
+/// answering for. This asks only whether the window is dense enough to be worth flagging,
+/// never which value the wildcard covers, so — unlike `missing_value` — it has no reason to
+/// insist on exactly one gap.
+///
+/// The window here is the exact span the arms' own values imply — `max` minus `min`, plus
+/// one — not a count fixed by the arm total the way `missing_value`'s is. Fixing the width
+/// at the numbered-arm count plus one is what `missing_value` needs in order to name a
+/// single covered gap, but this function only needs to know the values fit without
+/// colliding, which the true span always answers by construction: every offset from the
+/// minimum is inside the span by definition once nothing repeats. So no window-*search* for
+/// which gap the wildcard covers is needed — a repeated value is refused by a
+/// straightforward duplicate check — and `SPARSE_WINDOW_SLOTS_PER_VALUE` bounds how much
+/// wider than the value count the resulting span may be before this declines it. That bound
+/// serves two purposes at once: it is the density floor a real table needs, and it guards
+/// against reasoning about a window as wide as two arbitrarily far-apart values would imply,
+/// for a spread `rustc` would never compile into a table either.
+///
+/// Codex's next-round finding: the span itself was computed as a plain `max.checked_sub(min)`
+/// over the values sorted as ordinary signed `i128`s, which is only the window's true span
+/// when nothing straddles the point where [`lit_value`]'s own two's-complement
+/// reinterpretation of a `u128` literal at or above `2^127` turns an ascending run into one
+/// that wraps through `i128::MIN` — eight even values spanning `2^127 - 4` through
+/// `2^127 + 10` sort with the four values at or above `2^127` (each reinterpreted negative)
+/// *before* the two below it (still positive), so the plain `min`/`max` are nowhere near each
+/// other in the true circular order and `checked_sub` overflows outright, declining a window
+/// whose real span is fourteen. [`compact_span`] is the same wrapping candidate-base search
+/// [`window_layout`] already runs to answer the identical question there, reused here for a
+/// span rather than a full coverage bitmap.
+fn compact_window_with_gaps(numbered: &[crate::parse::FoundArm]) -> bool {
+    let mut values = Vec::new();
+    let mut unsigned_domain = true;
+    for arm in numbered {
+        if arm.pattern.is_empty() {
+            return false;
+        }
+        unsigned_domain &= arm.unsigned;
+        values.extend(arm.pattern.iter().copied());
+    }
+    if values.len() < 2 {
+        return false;
+    }
+    let mut sorted = values.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != values.len() {
+        return false;
+    }
+    let Some(slots) = compact_span(&values, unsigned_domain) else {
+        return false;
+    };
+    let Some(bound) = values.len().checked_mul(SPARSE_WINDOW_SLOTS_PER_VALUE) else {
+        return false;
+    };
+    slots <= bound
+}
+
+/// Whether `values`, sorted and deduplicated, form an exact arithmetic progression whose
+/// stride is a power of two greater than one — the shape LLVM's own switch-table lowering
+/// normalizes by rotating the scrutinee before ever consulting the raw span
+/// [`compact_window_with_gaps`] measures, so a table that check alone would call too sparse
+/// to flag can still be the identical value lookup table once the scrutinee is divided by
+/// that stride.
+///
+/// Codex's finding: `match n { 0 => 9, 4 => 3, 8 => 27, 12 => 1, _ => 0 }` spans thirteen raw
+/// slots for four values — over `compact_window_with_gaps`'s own bound of twelve — but
+/// `rustc` 1.95 with `-O` still emits a four-entry `.Lswitch.table`, confirmed by disassembly:
+/// `roll $30, %edi` rotates a 32-bit value right by two bits, exactly a division by four for
+/// values whose low two bits are already zero (stride eight was checked the same way, at a
+/// span of twenty-five, and rotates by three bits).
+///
+/// Scoped to a power-of-two stride specifically, not any uniform stride at all, because the
+/// two are not the same threat. A *non*-power-of-two stride wide enough to miss the existing
+/// bound (`0, 5, 10, 15`, stride five) was checked by disassembly too, and compiles to an
+/// ordinary jump table instead — a dispatch mechanism practically every match with more than
+/// a handful of arms already uses, and not the value-array-replacing-computation shape this
+/// whole check exists to catch. A *narrow* non-power-of-two stride (`0, 3, 6, 9`, stride
+/// three) needs no help from this function at all: `compact_window_with_gaps`'s own raw span
+/// already accepts it directly.
+fn values_form_a_power_of_two_stride(values: &[i128]) -> bool {
+    if values.len() < 2 {
+        return false;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != values.len() {
+        return false;
+    }
+    let (Some(&first), Some(&second)) = (sorted.first(), sorted.get(1)) else {
+        return false;
+    };
+    let Some(stride) = second.checked_sub(first) else {
+        return false;
+    };
+    if stride < 2 {
+        return false;
+    }
+    let Ok(stride_bits) = u128::try_from(stride) else {
+        return false;
+    };
+    if !stride_bits.is_power_of_two() {
+        return false;
+    }
+    sorted.windows(2).all(|pair| {
+        let [a, b] = pair else {
+            return false;
+        };
+        b.checked_sub(*a) == Some(stride)
+    })
+}
+
+/// [`values_form_a_power_of_two_stride`]'s own arm-pattern-flattening wrapper —
+/// [`compact_window_with_gaps`]'s identical extraction, reused here so the stride check
+/// declines the same way that one does on an unresolved arm's own empty pattern.
+fn dense_power_of_two_stride(numbered: &[crate::parse::FoundArm]) -> bool {
+    let mut values = Vec::new();
+    for arm in numbered {
+        if arm.pattern.is_empty() {
+            return false;
+        }
+        values.extend(arm.pattern.iter().copied());
+    }
+    values_form_a_power_of_two_stride(&values)
+}
+
+/// The narrowest circular span (modulo `2^128`) `values` fit within — every value tried in
+/// turn as the candidate starting point, the identical search [`window_layout`] runs, since
+/// only the window's true circular start gives the tightest span and any other candidate
+/// reports one inflated by wrapping past it before reaching every value. `values` is assumed
+/// already deduplicated by its caller, the same precondition [`try_window_layout`]'s own
+/// duplicate-offset refusal exists for there.
+///
+/// Codex's next-round finding: [`window_layout`]'s own `unsigned_domain` gate holds here
+/// too, for the identical reason — trying every value as a candidate base means treating a
+/// wrap past `i128::MIN` as real, which is only true of the unsigned domain a `u128`
+/// literal at or above `2^127` came from. When `unsigned_domain` is `false` the plain
+/// signed span — `max` minus `min`, checked rather than wrapped — is both the narrowest
+/// span and the only one this scan has any reason to believe in; declining rather than
+/// searching further bases is what a genuinely signed span spanning close to all of `i128`
+/// needs, the same standing [`window_layout`]'s own plain-minimum attempt already has.
+fn compact_span(values: &[i128], unsigned_domain: bool) -> Option<usize> {
+    if !unsigned_domain {
+        let min = *values.iter().min()?;
+        let max = *values.iter().max()?;
+        let span = u128::try_from(max.checked_sub(min)?).ok()?;
+        return usize::try_from(span.checked_add(1)?).ok();
+    }
+    let mut narrowest: Option<u128> = None;
+    for &base in values {
+        let mut widest_offset: u128 = 0;
+        for &value in values {
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "wrapping_sub's own two's-complement bit pattern, reinterpreted as \
+                          an unsigned circular offset from `base` rather than converted as a \
+                          value — the same reasoning try_window_layout's own cast carries"
+            )]
+            let offset = value.wrapping_sub(base) as u128;
+            widest_offset = widest_offset.max(offset);
+        }
+        narrowest = Some(narrowest.map_or(widest_offset, |current| current.min(widest_offset)));
+    }
+    let slots = narrowest?.checked_add(1)?;
+    usize::try_from(slots).ok()
+}
+
+/// Whether `found`'s patterns are dense in the shape ADR 0053 permits a `match` to compile
+/// into a lookup table: every value of some window of consecutive integers, as wide as
+/// the number of values the numbered arms cover plus one for the wildcard, named exactly
+/// once — whatever base the window sits at, whatever suffix each pattern was spelled
+/// with, in whatever order the arms were written, and whether one arm names one value or
+/// several (an or-pattern) — except one left for a final wildcard arm, with at least
+/// [`MINIMUM_DENSE_TABLE_ARMS`] arms in total.
+///
+/// `found` comes from `crate::parse::match_expressions`, which parses the real grammar —
+/// [ADR 0053]'s own history on pull request #154 is why that matters: a hand-rolled
+/// brace-and-comma scan over the same question accumulated eight distinct bypasses in as
+/// many review rounds (a comma-less block arm, a block scrutinee, a postfixed block value,
+/// a cast, an `else`, a scrutinee with its own nested `match`, one with its own `if`/`else`,
+/// and a comma inside a turbofish), each one a shape `rustc`'s grammar disambiguates for
+/// free. Reading `syn`'s own parsed patterns and values, rather than re-deriving arm
+/// boundaries from text, closes all eight at once and needs no ninth rule for the next one.
+///
+/// Independent of what each arm's own *value* is — a call, a bare literal, anything else —
+/// because a lookup table is exactly as much of one whichever shape backs it, and it is the
+/// pattern half this checks; [`call_shaped_uniformly`] is the value half.
+///
+/// [ADR 0053]: https://github.com/madmax983/waymaker/blob/main/docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md
+#[must_use]
+fn has_dense_arm_patterns(found: &crate::parse::FoundMatch) -> bool {
+    let total = found.arms.len();
+    if total < MINIMUM_DENSE_TABLE_ARMS {
+        return false;
+    }
+    if let Some(last) = total.checked_sub(1) {
+        if let Some(wildcard) = found.arms.get(last) {
+            if wildcard.is_wild {
+                if let Some(numbered) = found.arms.get(..last) {
+                    // Codex's finding: `x if x == index(0) => .., x if x == index(1) => ..,
+                    // .. _ => ..` binds a plain identifier in every numbered arm and
+                    // dispatches entirely through a guard equality against a call this scan
+                    // does not evaluate. Every such arm's own `pattern` is empty — the
+                    // identical shape one barrier arm's guarded, unconstrained binding
+                    // already produces — but here *every* numbered arm is shaped this way,
+                    // so `missing_value`, `compact_window_with_gaps` and
+                    // `dense_power_of_two_stride` below all bail on the first arm they meet
+                    // and no contiguous sub-slice is ever found dense, whatever `rustc`
+                    // itself folds `index(0)` through `index(14)` into at compile time. The
+                    // same refusal `const_call_initializer_uses` already gives a call
+                    // inside a `const` initializer applies here: reasoning about which
+                    // calls are safe to fold is not attempted, and a match built from arms
+                    // shaped this way is reported outright rather than read as unresolved.
+                    //
+                    // Codex's next-round finding: `(0, 0)` through `(3, 3)` over a
+                    // two-field tuple scrutinee has two non-catch-all fields in every
+                    // arm, so `pattern_literal` resolves no value from any of them and
+                    // the same three checks below all bail the same way, whatever
+                    // `rustc` itself folds the Cartesian product into at compile time.
+                    // The identical refusal applies: which field (or combination) a
+                    // table would be keyed on is not decoded, and a match built from
+                    // arms shaped this way is reported outright. Both findings are one
+                    // check now, over `FoundArm::unresolved_cause`, since
+                    // `struct_excessive_bools` refused a fourth field alongside
+                    // `is_wild` and `unsigned`.
+                    if numbered
+                        .iter()
+                        .any(|arm| arm.unresolved_cause != crate::parse::UnresolvedArmCause::None)
+                    {
+                        return true;
+                    }
+                    // Codex's next-round finding: `_x if flag => 999, 0 => .., 1 => .., 2
+                    // => .., 3 => .., _ => ..` names a first arm whose *pattern* (`_x`)
+                    // matches every input outright, guarded by a condition this scan
+                    // cannot resolve — so `pattern_literal` answers it with no values at
+                    // all, and `missing_value`/`compact_window_with_gaps` each bail the
+                    // moment they meet that empty pattern, whatever position it sits at.
+                    // But `rustc` does not stop compiling a switch table there: reaching
+                    // arm 0's own guard and finding it false is exactly how execution
+                    // *reaches* arm 1, so the numbered arms after it still lower to the
+                    // identical indexed table they would if arm 0 were not written at
+                    // all, and a real device runs it every time `flag` is false.
+                    //
+                    // Codex's next-round finding: trying only a *suffix* at every start
+                    // still missed `0 => .., 1 => .., .., 14 => .., _ if flag => .., _ =>
+                    // ..` — the dense run here is a *prefix* of `numbered`, ending before
+                    // the barrier arm rather than beginning after one, and every suffix
+                    // this used to try still carried that barrier arm along with it
+                    // (it sits at the very end of `numbered`, so no suffix ever excludes
+                    // it short of the empty one). `rustc` does not need the barrier to
+                    // have been reached first either way: `0` through `14` are literal
+                    // patterns tried by value before any guard is evaluated at all, so the
+                    // dense run they form is a real table candidate on its own, wherever a
+                    // barrier arm sits relative to it. Tried at every contiguous sub-slice
+                    // now, not only every suffix, which subsumes the suffix search above
+                    // as the case where the sub-slice happens to run to the end.
+                    let min_len = MINIMUM_DENSE_TABLE_ARMS.saturating_sub(1);
+                    if any_dense_sub_slice(numbered, min_len, |slice| {
+                        missing_value(slice).is_some()
+                            || compact_window_with_gaps(slice)
+                            || dense_power_of_two_stride(slice)
+                    }) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // Codex's finding: a match over a `#[repr(_)]` enum that names every variant
+    // explicitly — a real, common shape once `visit_item_enum` resolves the
+    // discriminants at all — has no wildcard, but `rustc` still lowers a fully dense,
+    // gap-free set of arms to the identical indexed table a `numbered` set plus a
+    // wildcard gets. `wildcard.is_wild` required a final catch-all unconditionally,
+    // which is a spelling requirement `rustc`'s own exhaustiveness check does not share
+    // — the same shape of gap issue #44's `has_dense_arm_patterns` closed for "does the
+    // last arm have to be `_`" answered for one axis and not the other.
+    fully_dense_arm_patterns(&found.arms)
+}
+
+/// Whether any contiguous sub-slice of `arms` at least `min_len` elements wide satisfies
+/// `check` — the sub-slice search both [`has_dense_arm_patterns`]'s own numbered scan and
+/// [`fully_dense_arm_patterns`] need, factored out so the nested search is written once.
+/// Tried at every `(start, end)` pair rather than only every suffix (`end` fixed at the
+/// slice's own length): a dense run can end *before* a barrier arm — one whose own pattern
+/// carries no values, the identical shape an unresolvable guard produces — just as much as
+/// it can begin after one, and the two are independent: a barrier can sit on either side of
+/// the run, or on both. `start`'s own upper bound shrinks as `min_len` cannot fit before
+/// the slice's own end, so the search stops rather than trying a `start` no `end` could
+/// ever reach `min_len` from.
+fn any_dense_sub_slice(
+    arms: &[crate::parse::FoundArm],
+    min_len: usize,
+    mut check: impl FnMut(&[crate::parse::FoundArm]) -> bool,
+) -> bool {
+    for start in 0..arms.len() {
+        let Some(first_end) = start.checked_add(min_len) else {
+            break;
+        };
+        if first_end > arms.len() {
+            break;
+        }
+        for end in first_end..=arms.len() {
+            let Some(slice) = arms.get(start..end) else {
+                continue;
+            };
+            if check(slice) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether every one of `arms`' patterns resolves, together covering a run of
+/// consecutive integers with no gap at all — the wildcard-free twin of the single-gap
+/// window [`missing_value`] looks for, for a match that names every value explicitly
+/// (an exhaustive enum match, most often) rather than leaving one for a catch-all.
+///
+/// Codex's next-round finding: the identical gap `has_dense_arm_patterns`'s own
+/// `numbered` scan had — an unresolvable guard on an early arm answers `pattern_literal`
+/// with no values, and the single top-to-bottom pass below used to bail at the first one
+/// regardless of where it sat, even though every arm after it can still be the dense,
+/// gap-free run `rustc` compiles into a table once that arm's own guard is false. Tried
+/// at every contiguous sub-slice now, through [`any_dense_sub_slice`], the identical way
+/// and for the identical reason `has_dense_arm_patterns`'s own scan is.
+fn fully_dense_arm_patterns(arms: &[crate::parse::FoundArm]) -> bool {
+    any_dense_sub_slice(
+        arms,
+        MINIMUM_DENSE_TABLE_ARMS,
+        fully_dense_arm_patterns_from,
+    )
+}
+
+/// [`fully_dense_arm_patterns`]'s own single-pass check over exactly the slice it is
+/// handed — factored out so the suffix search above can retry it at every start without
+/// duplicating the window arithmetic.
+fn fully_dense_arm_patterns_from(arms: &[crate::parse::FoundArm]) -> bool {
+    let mut values = Vec::new();
+    let mut unsigned_domain = true;
+    for arm in arms {
+        if arm.pattern.is_empty() {
+            return false;
+        }
+        unsigned_domain &= arm.unsigned;
+        values.extend(arm.pattern.iter().copied());
+    }
+    if values.is_empty() {
+        return false;
+    }
+    let Some((_, covered)) = window_layout(&values, values.len(), unsigned_domain) else {
+        return false;
+    };
+    covered.iter().all(|seen| *seen)
+}
+
+/// Whether every one of `found`'s arms calls one consistent callee with its own pattern's
+/// value as the sole argument — the exact value shape [`INTEGRITY_CHECK_TABLES`] pins,
+/// checked only once [`has_dense_arm_patterns`] has already said the patterns are dense.
+/// Returns the callee when it is, so a caller can compare it and the arm count against
+/// [`INTEGRITY_CHECK_TABLES`] without caring which function, or which selector, the match
+/// happens to sit under.
+///
+/// Each arm's expected argument is read from *that arm's own pattern* — the wildcard arm's
+/// from [`missing_value`], since [`has_dense_arm_patterns`] already requires it to be the
+/// one value the numbered patterns leave uncovered, wherever in the range that value falls
+/// — rather than from the arm's position in `found.arms`, so a match whose arms are written
+/// out of order is still read correctly.
+#[must_use]
+fn call_shaped_uniformly(found: &crate::parse::FoundMatch) -> Option<&str> {
+    let total = found.arms.len();
+    let last = total.checked_sub(1)?;
+    let numbered = found.arms.get(..last)?;
+    let wildcard_value = missing_value(numbered)?;
+    let mut callee: Option<&str> = None;
+    for (index, arm) in found.arms.iter().enumerate() {
+        let (this_callee, argument) = arm.call.as_ref()?;
+        match callee {
+            None => callee = Some(this_callee.as_str()),
+            Some(expected) if expected != this_callee.as_str() => return None,
+            Some(_) => {}
+        }
+        let expected = if index == last {
+            wildcard_value
+        } else {
+            // Codex's finding: an or-pattern arm covers more than one value, which the
+            // one permitted table (a single literal-to-literal mapping per arm) never
+            // does — such an arm cannot match the pinned shape, so this fails the
+            // comparison rather than guessing which of several values the call's own
+            // argument ought to equal.
+            let [value] = arm.pattern.as_slice() else {
+                return None;
+            };
+            *value
+        };
+        if *argument != Some(expected) {
+            return None;
+        }
+    }
+    callee
 }
 
 /// The checksum module, every file its module tree reaches, and every source under a
@@ -9494,6 +11010,107 @@ fn module_tree(
         .cloned()
         .collect();
     Ok((production_reachable, test_only))
+}
+
+/// [`INTEGRITY_CHECK_PATH`]'s own module name within `waymaker-flash` — the last path
+/// segment before `.rs`, which is what `mod crc;` in that crate's own root names it as by
+/// the ordinary convention a file with no `#[path = "..."]` attribute follows. Not read
+/// from `waymaker-flash`'s own crate root, which is outside the tree this rule scans at
+/// all — a stated assumption rather than a certainty, the same standing every heuristic in
+/// this module already has for the tree it *does* read.
+fn root_module_name() -> String {
+    INTEGRITY_CHECK_PATH
+        .trim_end_matches(".rs")
+        .rsplit('/')
+        .next()
+        .unwrap_or(INTEGRITY_CHECK_PATH)
+        .to_owned()
+}
+
+/// Every file reachable from `root` through an out-of-line `mod` declaration, paired with
+/// the module-path segments that declaration chain gives it — [`root_module_name`] alone
+/// for `root` itself.
+///
+/// Codex's finding: `qualified_constants` only ever sees one file, so a `mod indices;`
+/// pointing at a sibling file is never added to that file's own `qualified` map at
+/// all — `visit_item_mod` only records a module's constants when it can see that
+/// module's *content*, and an out-of-line declaration's content lives in a file this
+/// walk has not visited yet. This is the missing half: for each out-of-line child, the
+/// declaring file names it and this walk resolves which scanned file that is, so the
+/// child's own file can be scanned with the declaration's name seeded as its module-path
+/// prefix rather than as an empty one.
+///
+/// An out-of-line module nested inside an *inline* one used to lose that inline module's
+/// own name from the chain, since `crate::parse::child_modules` reported only the
+/// out-of-line leaf's bare name for such a case — Codex's next finding, closed by giving
+/// `ChildModule` its own `inline_ancestors` field and extending the chain with it here
+/// rather than pushing only `child.name`.
+///
+/// `root` itself is seeded with [`root_module_name`] rather than an empty prefix — Codex's
+/// finding after *that*: every prefix here used to be relative to `root`'s own file as if
+/// it were the crate's root module, when it is really one submodule of `waymaker-flash`
+/// named after its own file stem. A `crate::`-absolute reference has to cross that module
+/// too, so `crate::crc::outer::indices::P0` is the real path to something `outer::indices`
+/// records here — and without the seed, this tree recorded it one segment short, under a
+/// key no absolute reference could ever name.
+///
+/// Paths use `/` separators, the way the scan compares them.
+///
+/// `root_prefix` is what seeds `root`'s own entry — [`root_module_name`] for
+/// `waymaker-flash`'s own tree, and a dependency crate's own name
+/// ([`collect_dependency_qualified_constants`]) for the one other tree this scan ever
+/// walks: the same seeding rule, parameterised rather than hard-coded, because a
+/// dependency's own crate-root module is named after the crate rather than after a file
+/// stem one directory short of it.
+///
+/// Codex's finding: `visited` used to be keyed on the physical path alone, so two legal
+/// `#[path = "shared.rs"] mod ...;` declarations naming the same file under two different
+/// module names visited it once and recorded one of the two prefixes — never both. A
+/// constant this scan can only see through the *discarded* alias stays unqualified under
+/// that name, and an unqualified name is exactly what lets a dense-table arm's own pattern
+/// resolution come back empty, the shape the whole `integrity-check` scan exists to catch.
+/// Keying on `(path, prefix)` instead visits the shared file once per distinct module path
+/// that reaches it, so every namespace it is legally reachable under gets its own scan.
+fn module_path_prefixes(
+    sources: &[crate::size::LayerSource],
+    root: &crate::size::LayerSource,
+    root_prefix: Vec<String>,
+) -> Result<Vec<(String, Vec<String>)>, ModuleTreeError> {
+    let mut prefixes = Vec::new();
+    let mut visited: BTreeSet<(String, Vec<String>)> = BTreeSet::new();
+    let mut stack = vec![(root.path.replace('\\', "/"), root_prefix)];
+    while let Some((path, prefix)) = stack.pop() {
+        if !visited.insert((path.clone(), prefix.clone())) {
+            continue;
+        }
+        let Some(contents) = sources
+            .iter()
+            .find(|source| source.path.replace('\\', "/") == path)
+            .map(|source| source.contents.as_str())
+        else {
+            prefixes.push((path, prefix));
+            continue;
+        };
+        for child in crate::parse::child_modules(&path, contents)? {
+            let mut child_prefix = prefix.clone();
+            // Codex's finding: `child.name` alone is the out-of-line leaf, but a `mod
+            // outer { mod inner; }` puts `inner`'s own module path at `outer::inner`, not
+            // `inner` — `inline_ancestors` is `child_modules`'s own record of every inline
+            // `mod` this declaration sits inside, so the whole chain is carried forward
+            // rather than just its last link.
+            child_prefix.extend(child.inline_ancestors.iter().cloned());
+            child_prefix.push(child.name.clone());
+            // `resolve_child` answers one resolved path per candidate *group* — a
+            // natural `name.rs`/`name/mod.rs` pair and every `cfg_attr`-nested `path`
+            // can each legally resolve for a different build, so every one of them
+            // gets this same prefix seeded rather than only the first.
+            for resolved in resolve_child(sources, &path, &child)? {
+                stack.push((resolved, child_prefix.clone()));
+            }
+        }
+        prefixes.push((path, prefix));
+    }
+    Ok(prefixes)
 }
 
 /// How many times `code` contains `token` as a whole token.
@@ -20322,6 +21939,4167 @@ mod deferred_answer_pins {
     }
 
     #[test]
+    fn a_checksum_that_stops_routing_into_its_helper_is_reported() {
+        // Codex, on review of the pull request that introduced `crc16_nibble`/
+        // `crc32_nibble`: pinning the helper's own body proves the helper still computes
+        // with the right polynomial, but nothing tied the top-level function to it. A
+        // `crc32` rewritten to call something else for one of its two nibbles, leaving
+        // `crc32_nibble_table` sitting unused for that half, has to be reported even
+        // though `crc32_nibble_table` itself is untouched and still matches its own pin.
+        // `some_other_function` rather than a literal, so this is only ever the routing
+        // pin's finding and not also a changed literal count.
+        let source = tests_support::clean_checksum_module().replacen(
+            "crc32_nibble_table(",
+            "some_other_function(",
+            1,
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("is not exactly the body")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_argument_across_both_nibble_updates_is_reported() {
+        // Codex's third-round finding: the routing pin used to end each pinned statement
+        // at the call's opening parenthesis, so `crc32_nibble_table(0)` for both the high
+        // and the low nibble called the helper the pinned number of times, updated `crc`
+        // with it, and left the function's tail untouched — while reading the wrong
+        // nibble for one half of every byte, since the real fold extracts a distinct `lo`
+        // or `hi` argument from the byte and the running checksum rather than a constant.
+        // Pinning the complete extraction and its argument is what catches a body that
+        // routes into the helper correctly but folds the wrong nibble into it.
+        let source = tests_support::clean_checksum_module()
+            .replace(
+                "let lo = (crc ^ (*byte as u32)) & 0xF; crc = (crc >> 4) ^ \
+                 crc32_nibble_table(lo as u8);",
+                "crc = (crc >> 4) ^ crc32_nibble_table(0);",
+            )
+            .replace(
+                "let hi = (crc ^ ((*byte >> 4) as u32)) & 0xF; crc = (crc >> 4) ^ \
+                 crc32_nibble_table(hi as u8);",
+                "crc = (crc >> 4) ^ crc32_nibble_table(0);",
+            );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("is not exactly the body")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn two_swapped_table_arms_are_reported_even_though_every_call_still_appears_once() {
+        // Codex's sharper finding on the same review: counting how many times
+        // `crc32_nibble(0)` through `crc32_nibble(15)` each appear anywhere in the body
+        // proves none is missing or doubled, but not that arm `0`'s pattern is the one
+        // that calls `crc32_nibble(0)`. Swapping two arms' patterns changes the table
+        // `crc32_nibble_table` computes while leaving every call present exactly once.
+        let source = tests_support::clean_checksum_module()
+            .replace("0 => crc32_nibble(0),", "0 => crc32_nibble(1),")
+            .replace("1 => crc32_nibble(1),", "1 => crc32_nibble(0),");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("exact `match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_discarded_routing_call_is_reported_even_though_the_tail_is_unchanged() {
+        // Codex's sharper version of the routing finding, on the revision that first
+        // added `INTEGRITY_CHECK_ROUTING` as a bare call count: discarding the
+        // low-nibble update into `let _ = crc32_nibble_table(lo as u8);` still calls the
+        // helper the pinned number of times and leaves the function's tail expression
+        // untouched, so a check that only counted calls and checked the tail would miss
+        // it. Pinning the whole assignment statement is what catches it: the discarded
+        // update no longer contains the pinned nibble update at all.
+        let source = tests_support::clean_checksum_module().replace(
+            "crc = (crc >> 4) ^ crc32_nibble_table(lo as u8);",
+            "let _ = crc32_nibble_table(lo as u8);",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("is not exactly the body")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_nibble_update_hidden_inside_dead_control_flow_is_reported() {
+        // Codex's fourth-round finding: both pinned updates fit inside `if false { .. }`,
+        // in order, exactly once each, while a different statement outside that dead
+        // block computes the returned value — so a check built only from presence, count
+        // and order still passes. Requiring the whole loop body to match by equality is
+        // what catches it: a body with an extra `if false { }` around the updates is no
+        // longer the one body this checksum is pinned to, whether or not the wrapped
+        // statements ever run.
+        let source = tests_support::clean_checksum_module().replace(
+            "let lo = (crc ^ (*byte as u32)) & 0xF; crc = (crc >> 4) ^ \
+             crc32_nibble_table(lo as u8); let hi = (crc ^ ((*byte >> 4) as u32)) & 0xF; \
+             crc = (crc >> 4) ^ crc32_nibble_table(hi as u8);",
+            "if false { let lo = (crc ^ (*byte as u32)) & 0xF; crc = (crc >> 4) ^ \
+             crc32_nibble_table(lo as u8); let hi = (crc ^ ((*byte >> 4) as u32)) & 0xF; \
+             crc = (crc >> 4) ^ crc32_nibble_table(hi as u8); }",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("is not exactly the body")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_dense_match_table_outside_the_allowlist_is_reported() {
+        // Codex's third-round finding: the table check only ever looks inside the one
+        // function name `INTEGRITY_CHECK_TABLES` pins, so a second dense match calling
+        // the same helper from a function of its own — a different shape from the pinned
+        // sixteen-arm one, so it cannot be mistaken for a duplicate of it — passed every
+        // rule here.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn extra_nibble_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => crc32_nibble(0),\n        1 => crc32_nibble(1),\n        2 => crc32_nibble(2),\n        \
+             3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_comma_less_block_arms_is_reported() {
+        // Codex's sixth-round finding: Rust lets a block-valued arm — `0 => { VALUE }` —
+        // omit its trailing comma, because the block already delimits it. A whole match
+        // spelled that way, arm after arm, has no top-level comma anywhere in it, so
+        // `split_top_level(arms, ',')` alone read it as one single segment — not the
+        // `pattern => expression` shape `parse_dense_arms` expects, so it was not dense and
+        // the scan skipped it rather than reporting it. A synthetic separator after every
+        // top-level `}` is what recovers the arm boundaries a comma-less match never wrote.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn block_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => { 0x0000_0000 }\n        1 => { 0x7707_3096 }\n        \
+             2 => { 0xEE0E_612C }\n        3 => { 0x9909_57BA }\n        \
+             _ => { 0x0000_0000 }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_behind_a_block_scrutinee_is_reported() {
+        // Codex's seventh-round finding: a match's scrutinee can itself be a block
+        // expression — `match { let key = nibble & 0xF; key } { 0 => .., .. }` is legal
+        // Rust — and the first `{` found then belongs to the scrutinee rather than the
+        // arms. A block with no `=>` in it at all is taken as the scrutinee and skipped,
+        // and the next brace-balanced block that follows is tried as the arms instead.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn scrutinee_table(nibble: u8) -> u32 {\n    match { let key = nibble & 0xF; key } \
+             {\n        0 => crc32_nibble(0),\n        1 => crc32_nibble(1),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_behind_a_scrutinee_with_its_own_nested_match_is_reported() {
+        // Codex's tenth-round finding: the fix above told a scrutinee block from an arm
+        // block by whether the block contained `=>` at all, and a scrutinee can itself
+        // hold a nested `match` with arms of its own — `match { match nibble { value =>
+        // value & 0xF } } { 0 => .., .. }`'s scrutinee block carries a `=>`, one `match`
+        // deeper, and a plain `.contains` read that as "this is the arm list": it
+        // accepted the scrutinee, found it not dense (one non-arm segment), and the real
+        // arms that follow were never examined at all — the table hid behind them with
+        // the gate green. The arrow now has to be at the candidate block's own bracket
+        // depth zero, which the nested match's own braces rule out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn nested_scrutinee_table(nibble: u8) -> u32 {\n    match { match nibble \
+             { value => value & 0xF } } {\n        0 => crc32_nibble(0),\n        \
+             1 => crc32_nibble(1),\n        2 => crc32_nibble(2),\n        \
+             3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_behind_a_conditional_scrutinee_is_reported() {
+        // Codex's eleventh-round finding: the block-scrutinee fix advanced to the "next"
+        // candidate block only when the text right after the first one started with
+        // another `{`. `match (if true { nibble } else { 0 }) { 0 => .., .. }`'s first
+        // candidate is the `if`'s own block; what follows it is `else { 0 }`, not a bare
+        // `{`, so the scan gave up on the whole match rather than trying the real arm
+        // block that follows the conditional. `crate::parse::match_expressions` closes
+        // this the way it closes every scrutinee shape at once: it reads the real match
+        // arms `syn` itself parsed, so no scrutinee expression — conditional, nested
+        // match, or anything else — can be mistaken for the arm list in the first place.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn conditional_scrutinee_table(nibble: u8) -> u32 {\n    match (if true \
+             { nibble } else { 0 }) {\n        0 => crc32_nibble(0),\n        \
+             1 => crc32_nibble(1),\n        2 => crc32_nibble(2),\n        \
+             3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_generic_argument_commas_is_reported() {
+        // Codex's eleventh-round finding: the module-wide scan split an arm's value text
+        // at every top-level comma, and a turbofish's own commas — `entry::<1, 2>()` —
+        // are exactly as "top-level" to a bracket-depth counter that does not know angle
+        // brackets are a delimiter here, so the arm was cut in half and the whole match
+        // refused as unparseable. `crate::parse::match_expressions` reads `syn`'s own
+        // parsed call expression, whose single argument list is never in doubt regardless
+        // of what its callee's turbofish contains.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn generic_argument_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0 => entry::<0, 2>(),\n        1 => entry::<1, 2>(),\n        \
+             2 => entry::<2, 2>(),\n        3 => entry::<3, 2>(),\n        \
+             _ => entry::<4, 2>(),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_constant_patterns_is_reported() {
+        // Codex's eleventh-round finding: a dense table can spell its singleton patterns
+        // through named constants — `const P0: u8 = 0;` and so on — rather than bare
+        // literals, and `parse_integer_literal` had no way to resolve an identifier to a
+        // value, so the match read as not dense and slipped through unclassified.
+        // `crate::parse::match_expressions` resolves a pattern that is a plain identifier
+        // (or a call argument that is one) against every `const` the file declares with a
+        // literal initializer, the same way it reads a bare literal — a constant pattern
+        // is exactly as much a value as its literal spelling.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = 3;\n\
+             const fn constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => crc32_nibble(0),\n        P1 => crc32_nibble(1),\n        \
+             P2 => crc32_nibble(2),\n        P3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_function_local_constant_patterns_is_reported() {
+        // Codex's twelfth-round finding: the constant-collecting visitor overrode
+        // `visit_item` and `visit_impl_item` but never descended into a function's own
+        // block, so `const P0: u8 = 0;` declared *inside* the very function that matches
+        // on it was invisible to the resolver — every pattern resolves fine for `rustc`,
+        // but this scan recorded each as unresolved and read the match as not dense.
+        // `syn::visit::Visit`'s own default traversal already walks into a function's
+        // block and every local item statement in it, so nothing but not fighting that
+        // default was needed to close it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn local_constant_pattern_table(nibble: u8) -> u32 {\n    const P0: u8 \
+             = 0;\n    const P1: u8 = 1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n    \
+             match nibble & 0xF {\n        P0 => crc32_nibble(0),\n        \
+             P1 => crc32_nibble(1),\n        P2 => crc32_nibble(2),\n        \
+             P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_scoped_constant_table_survives_an_unrelated_function_reusing_its_names() {
+        // Codex's thirteenth-round finding: the constant resolver kept one file-wide map
+        // keyed only by name, so a later function's own `const P0 = 99;` silently
+        // overwrote an earlier function's unrelated `const P0 = 0;` — `rustc` resolves
+        // each function's own `P0`, `P1`, .. against its own declarations, but a flat map
+        // has the second function's values win everywhere, and the first function's
+        // genuinely dense table then resolves to non-dense values and is missed entirely.
+        // Constants are now collected per lexical scope (a `syn::Block` — a function body
+        // among them — or a module) and resolution searches that scope's own stack
+        // outward, so one function's declarations never leak into another's.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_via_scoped_constants(nibble: u8) -> u32 {\n    const P0: u8 = \
+             0;\n    const P1: u8 = 1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n    \
+             match nibble & 0xF {\n        P0 => crc32_nibble(0),\n        \
+             P1 => crc32_nibble(1),\n        P2 => crc32_nibble(2),\n        \
+             P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n\nfn \
+             unrelated_shadowing_function() -> u8 {\n    const P0: u8 = 99;\n    const P1: \
+             u8 = 100;\n    const P2: u8 = 101;\n    const P3: u8 = 102;\n    P0 + P1 + P2 + \
+             P3\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_qualified_constant_patterns_is_reported() {
+        // Codex's fourteenth-round finding: `Pat::Path`/`Expr::Path` resolution used
+        // `path.get_ident()`, which answers `None` for anything but a single, unqualified
+        // segment — so `indices::P0` through `indices::P3` (constants declared inside a
+        // `mod indices`) resolved to nothing at all, even though `rustc` treats a
+        // qualified constant pattern exactly like the literal it names. Every module's
+        // own constants are now recorded once under that module's file-root-relative
+        // path as the walk resolves it, and a qualified pattern or call argument is
+        // looked up there when a bare-name search cannot answer it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: u8 \
+             = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = 3;\n}\n\n\
+             const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        indices::P0 => crc32_nibble(0),\n        \
+             indices::P1 => crc32_nibble(1),\n        indices::P2 => crc32_nibble(2),\n        \
+             indices::P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_before_the_module_it_qualifies_its_patterns_against_is_reported() {
+        // Codex's fifteenth-round finding, first half: `qualified` used to start empty
+        // and grow only as `match_expressions`'s single left-to-right walk *reached* each
+        // inline module, so a match sitting textually before the `mod indices { ... }` it
+        // names had none of `indices::P0` through `indices::P3` resolved yet, even though
+        // Rust's own item lookup does not care about declaration order at all. The walk is
+        // two-pass now — the first pass exists only to finish `qualified` before the
+        // second, real pass runs — so a table's own position relative to the module it
+        // qualifies against no longer matters. Same fixture as
+        // `a_dense_match_with_qualified_constant_patterns_is_reported`, with the `match`
+        // and the `mod` swapped.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        indices::P0 => crc32_nibble(0),\n        \
+             indices::P1 => crc32_nibble(1),\n        indices::P2 => crc32_nibble(2),\n        \
+             indices::P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }\n}\n\n\
+             mod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: u8 \
+             = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = 3;\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_against_an_out_of_line_module_is_reported() {
+        // Codex's fifteenth-round finding, second half: "an external `mod indices;` is
+        // never added to this per-file map at all" — `qualified_constants` only ever
+        // walked one file, so a `mod indices;` with no `{ ... }` body of its own left the
+        // constants that body actually declares, in a sibling file, entirely unrecorded.
+        // `module_path_prefixes` walks the same out-of-line `mod` declarations
+        // `checksum_sources` already follows to find the file, and seeds that file's own
+        // scan with the declaration's name as its module-path prefix, so `indices.rs`'s
+        // top-level constants are recorded under `indices::` even though no `mod { ... }`
+        // node anywhere names them.
+        let parent = format!(
+            "{}\nmod indices;\n\nconst fn qualified_constant_pattern_table(nibble: u8) -> \
+             u32 {{\n    match nibble & 0xF {{\n        indices::P0 => crc32_nibble(0),\n        \
+             indices::P1 => crc32_nibble(1),\n        indices::P2 => crc32_nibble(2),\n        \
+             indices::P3 => crc32_nibble(3),\n        _ => crc32_nibble(4),\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "//! Table indices.\npub(crate) const P0: u8 = 0;\npub(crate) const P1: \
+                     u8 = 1;\npub(crate) const P2: u8 = 2;\npub(crate) const P3: u8 = 3;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/indices.rs", child),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_relative_to_its_own_enclosing_module_is_reported() {
+        // Codex's sixteenth-round finding: `resolve_qualified_path` only ever looked up a
+        // stripped chain against the file root (or, failing that, its own last two
+        // segments), never against the match's own enclosing module. `indices::P0` written
+        // inside `mod outer` resolves in Rust against `outer`'s own scope — `outer::P0`'s
+        // sibling `outer::indices` — not against a top-level `mod indices` of the same
+        // name, so a table nested one module deep had every arm read as unresolved and the
+        // whole match skipped. `indices` is declared *inside* `outer` here, with no
+        // same-named module at the file root to be confused with by the old fallback.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = 0;\n        \
+             pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = 2;\n        \
+             pub(crate) const P3: u8 = 3;\n    }\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            indices::P0 => super::crc32_nibble(0),\n            \
+             indices::P1 => super::crc32_nibble(1),\n            indices::P2 => \
+             super::crc32_nibble(2),\n            indices::P3 => super::crc32_nibble(3),\n            \
+             _ => super::crc32_nibble(4),\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_file_shared_by_two_module_paths_is_reported() {
+        // Codex's finding: `#[path = "shared.rs"] mod x;` and `#[path = "shared.rs"] mod
+        // y;` are two legal declarations naming the *same* physical file under two
+        // different module paths — both `x::P0` and `y::P0` are real, valid references to
+        // the identical constant. `module_path_prefixes`'s own `visited` set used to be
+        // keyed on the physical path alone, so the second declaration's own prefix — `y`
+        // here — was discarded the moment the first — `x` — had already visited
+        // `shared.rs`, and every constant this scan could only reach through `y::` stayed
+        // unqualified. This match's own arms alternate between the two aliases (`x::P0`,
+        // `y::P1`, `x::P2`, ...), so whichever alias the old code happened to keep, roughly
+        // half the arms were unresolved and `fully_dense_arm_patterns` refused the whole
+        // match — the shape this test catches regardless of which alias survived.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[path = \"shared.rs\"]\nmod x;\n#[path = \"shared.rs\"]\nmod y;\n\nconst fn \
+             dense_table_over_a_file_shared_by_two_module_paths(nibble: u32) -> u32 {\n    \
+             match nibble {\n        x::P0 => 0,\n        y::P1 => 1,\n        x::P2 => 2,\n        \
+             y::P3 => 3,\n        x::P4 => 4,\n        y::P5 => 5,\n        x::P6 => 6,\n        \
+             y::P7 => 7,\n        x::P8 => 8,\n        y::P9 => 9,\n        x::P10 => 10,\n        \
+             y::P11 => 11,\n        x::P12 => 12,\n        y::P13 => 13,\n        x::P14 => 14,\n        \
+             _ => 15,\n    }\n}\n",
+        );
+        let mut shared = String::from("//! Shared table indices.\n");
+        for n in 0..=14u8 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut shared,
+                format_args!("pub const P{n}: u8 = {n};\n"),
+            );
+        }
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &source),
+            layer("waymaker-flash/src/shared.rs", &shared),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_whose_catchall_covers_the_lowest_value_is_reported() {
+        // Codex's sixteenth-round finding: the missing value the wildcard arm covers was
+        // fixed at `arms.len() - 1`, on the assumption a dense table's catch-all always
+        // sits at the top of the range. A table whose numbered arms spell `1..=15` and
+        // whose `_` covers `0` folds into the identical 16-entry lookup table LLVM builds
+        // for the other order, over the same nibble mask — `missing_value` now finds
+        // whichever single value in `0..arms.len()` the numbered arms leave uncovered,
+        // wherever it falls, rather than assuming it is always the last one. The helper is
+        // named differently from the pinned table's own `crc32_nibble` so this is judged
+        // purely on arm-count-versus-pin, not folded into "a second copy of the one
+        // permitted table" by also matching its helper and selector.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 1..16 {
+            let _ = writeln!(arms, "        {value} => low_catchall_helper({value}),");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn low_catchall_helper(nibble: u32) -> u32 {{\n    nibble\n}}\n\nconst \
+             fn low_catchall_table(nibble: u8) -> u32 {{\n    match nibble & 0xF {{\n{arms}        \
+             _ => low_catchall_helper(0),\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_offset_from_zero_is_reported() {
+        // Codex's twenty-ninth-round finding: `missing_value` fixed its window at the
+        // literal range `0..found.arms.len()`, so a table whose numbered arms spell a
+        // nonzero range — `16` through `31` here — indexed `covered` out of bounds on the
+        // very first value and `missing_value` returned `None`, reading the whole match as
+        // not dense. `rustc` still lowers this to an indexed switch table by subtracting
+        // the range's own base first, the same way it does for `0..=15`, so the window's
+        // base is now the numbered arms' own lowest value rather than a literal `0`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 16..32 {
+            let _ = writeln!(arms, "        {value} => offset_table_helper({value}),");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn offset_table_helper(value: u32) -> u32 {{\n    value\n}}\n\nconst \
+             fn offset_table(value: u8) -> u32 {{\n    match value as u32 {{\n{arms}        \
+             _ => offset_table_helper(0),\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 17-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_negative_values_is_reported() {
+        // Codex's thirty-first-round finding: every resolved pattern was a `u128`, so a
+        // negative pattern or a negative-valued constant had no representation at all —
+        // a dense `i8` match with explicit arms `-8` through `6` and a final wildcard
+        // still lowers to an offset-indexed switch table exactly like an unsigned range
+        // does, but every negative arm read as unresolved and the match as not dense.
+        // Patterns now resolve to `i128`, and `missing_value`'s own window base can
+        // itself be negative.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in -8..7 {
+            let _ = writeln!(arms, "        {value} => signed_table_helper({value}),");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn signed_table_helper(value: i32) -> u32 {{\n    value as u32\n}}\n\n\
+             const fn signed_table(value: i8) -> u32 {{\n    match value as i32 {{\n{arms}        \
+             _ => signed_table_helper(0),\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_via_cast_constants_is_reported() {
+        // Codex's thirty-second-round finding: `literal_or_const_value` discarded a
+        // cast's own destination type and passed the operand straight through, so a
+        // `const` initializer spelled as `248u8 as i8` read as `248` instead of `-8` — a
+        // table whose negative range is built this way, rather than from literal
+        // negative integers, read as `248..=255` beside `0..=6` (two disjoint ranges)
+        // instead of the one contiguous `-8..=6` it really is.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut consts = String::new();
+        let mut arms = String::new();
+        for (index, raw) in (248_u16..256).enumerate() {
+            let _ = writeln!(consts, "const N{index}: i8 = {raw}u8 as i8;");
+            let _ = writeln!(arms, "        N{index} => {index},");
+        }
+        for value in 0..7 {
+            let _ = writeln!(arms, "        {value} => {value},");
+        }
+        let _ = write!(
+            source,
+            "\n{consts}\nconst fn cast_table(value: i8) -> u32 {{\n    match value {{\n{arms}        \
+             _ => 0,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_an_or_pattern_arm_is_reported() {
+        // Codex's thirty-second-round finding: `0 | 1 => VALUE` covers two values in one
+        // arm, and `rustc` still lowers the whole match to the identical indexed table a
+        // one-value-per-arm spelling gets — `Pat::Or` fell to `pattern_literal`'s
+        // catch-all and read as unresolved, so the arm's own two values (and the whole
+        // match) went uncounted. `missing_value` now sums the number of *values* the
+        // numbered arms cover rather than the number of *arms*, so an or-pattern arm's
+        // extra value correctly narrows the wildcard's own window by one.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 2..15 {
+            let _ = writeln!(arms, "        {value} => {value},");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn or_pattern_table(value: u8) -> u32 {{\n    match value {{\n        \
+             0 | 1 => 10,\n{arms}        _ => 0,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 15-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_non_singleton_range_arm_is_reported() {
+        // Codex's thirty-fourth-round finding: `0..=1` covers two values in one arm, and
+        // `rustc` still lowers the whole match to the identical indexed table a
+        // one-value-per-arm spelling gets — `pattern_literal`'s range case only ever
+        // accepted a *singleton* closed range (`start == end`) and returned nothing for
+        // any wider one, so the arm's own two values went uncounted the same way an
+        // or-pattern's did before the thirty-second round's fix.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut arms = String::new();
+        for value in 2..15 {
+            let _ = writeln!(arms, "        {value} => {value},");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn range_pattern_table(value: u8) -> u32 {{\n    match value {{\n        \
+             0..=1 => 10,\n{arms}        _ => 0,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 15-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_enum_variants_is_reported() {
+        // Codex's thirtieth-round finding: `Indices::P0` names a fieldless enum variant
+        // exactly the way `Pat::Path` spells a module-qualified constant, and `rustc`
+        // compiles a dense match over sequential variant discriminants into the identical
+        // indexed table — but nothing here had ever read an `enum`'s own variants, so
+        // every numbered arm of such a table resolved to `None` and the match read as not
+        // dense.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[repr(u8)]\nenum Indices {\n    P0,\n    P1,\n    P2,\n    P3,\n}\n\nconst \
+             fn enum_variant_pattern_table(index: Indices) -> u32 {\n    match index {\n        \
+             Indices::P0 => 0,\n        Indices::P1 => 1,\n        Indices::P2 => 2,\n        \
+             Indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_explicit_enum_discriminants_is_reported() {
+        // The explicit-discriminant half of the same finding: a variant's own value can be
+        // written out (`P2 = 2`) rather than left implicit, and `literal_or_const_value`
+        // is what resolves it — the same constant folding a `const`'s own initializer
+        // already gets, reused here rather than duplicated.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[repr(u8)]\nenum Indices {\n    P0 = 0,\n    P1 = 1,\n    P2 = 2,\n    P3 = \
+             3,\n}\n\nconst fn explicit_enum_variant_pattern_table(index: Indices) -> u32 {\n    \
+             match index {\n        Indices::P0 => 0,\n        Indices::P1 => 1,\n        \
+             Indices::P2 => 2,\n        Indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_exhaustive_dense_match_with_no_wildcard_is_reported() {
+        // Codex's thirty-third-round finding: `has_dense_arm_patterns` required the
+        // final arm to be a wildcard unconditionally, but a match over a `#[repr(u8)]`
+        // enum that names every variant explicitly — legal, ordinary Rust, and the more
+        // common shape for an exhaustive enum match — has no wildcard at all, and
+        // `rustc` still lowers a fully dense, gap-free set of arms to the identical
+        // indexed table a `numbered`-plus-wildcard spelling gets. `fully_dense_arm_patterns`
+        // is the wildcard-free twin of `missing_value`'s own window: every arm resolves,
+        // and together they cover a run of consecutive integers with no gap anywhere.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[repr(u8)]\nenum Indices {\n    P0,\n    P1,\n    P2,\n    P3,\n}\n\nconst \
+             fn exhaustive_enum_pattern_table(index: Indices) -> u32 {\n    match index {\n        \
+             Indices::P0 => 0,\n        Indices::P1 => 1,\n        Indices::P2 => 2,\n        \
+             Indices::P3 => 3,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_local_match_in_an_ordinary_function_is_not_reported() {
+        // Codex's thirtieth-round finding: `syn::visit::visit_block`'s default walk
+        // descends into every statement unconditionally, so a `#[cfg(test)] let expected =
+        // match ...;` local inside an otherwise ordinary (non-test) function — a statement
+        // `rustc` strips from shipped code entirely — was still walked and its match
+        // reported as a second production table. Only items and `impl` members were ever
+        // checked for `#[cfg(test)]`; a local statement's own attributes were never read.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    let _expected = \
+             match nibble & 0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        \
+             3 => 3,\n        _ => 4,\n    };\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_expression_statement_match_is_not_reported() {
+        // Codex's thirty-first-round finding: the previous round's fix only checked a
+        // `Stmt::Local`'s own attributes, so a *bare expression statement* carrying its
+        // own `#[cfg(test)]` — `#[cfg(test)] match nibble { .. };`, with no `let` at all
+        // — was still walked and read as a second production table, even though `rustc`
+        // strips the whole statement from shipped code the same way it does a gated
+        // local. `stmt_is_cfg_test` now reads a `Stmt::Expr`'s own attributes too, via
+        // `expr_attrs`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    match nibble & \
+             0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        3 => 3,\n        \
+             _ => 4,\n    };\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_raw_address_expression_statement_is_not_reported() {
+        // Codex's finding: `syn::Expr::RawAddr` — `&raw const place` / `&raw mut place` —
+        // has an `attrs` field like every other named variant `expr_attrs` reads, and the
+        // fallback arm dropped it anyway, so a `#[cfg(test)] &raw const array[match ..];`
+        // expression statement — legal, safe Rust, and stripped from shipped code the
+        // identical way the plain `match` statement above is — was still read as
+        // production: `stmt_is_cfg_test` saw no attributes on it at all and the visitor
+        // walked straight into the nested `match`, reporting its dense table as though
+        // `rustc` had shipped it. Verified against real rustc: this statement compiles with
+        // no `unsafe` needed, since taking a raw reference performs no dereference.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nfn ordinary_function(nibble: u8) {\n    #[cfg(test)]\n    &raw const \
+             array[match nibble & 0xF {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        \
+             3 => 3,\n        _ => 4,\n    } as usize];\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_against_the_current_module_wins_over_a_same_named_root_one() {
+        // Codex's seventeenth-round finding: the fix for the sixteenth round's relative-path
+        // gap tried the plain, file-root chain *first* and only fell back to the
+        // current-module-prefixed one when that missed — so a root `mod indices` with the
+        // same names, declaring non-dense values, would answer first and hide a real dense
+        // table nested one module deeper that Rust itself resolves the reference to. Here
+        // the root `mod indices` deliberately holds scattered, non-dense values (100..103)
+        // that `has_dense_arm_patterns` cannot cover, while `outer::indices` holds the real
+        // 0..3 range the match actually resolves to; the fix has to try the current-module
+        // form first for this to be caught.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 100;\n    pub(crate) const P1: \
+             u8 = 101;\n    pub(crate) const P2: u8 = 102;\n    pub(crate) const P3: u8 = \
+             103;\n}\n\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = \
+             0;\n        pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = \
+             2;\n        pub(crate) const P3: u8 = 3;\n    }\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            indices::P0 => super::crc32_nibble(0),\n            \
+             indices::P1 => super::crc32_nibble(1),\n            indices::P2 => \
+             super::crc32_nibble(2),\n            indices::P3 => super::crc32_nibble(3),\n            \
+             _ => super::crc32_nibble(4),\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_resolves_against_the_parent_module() {
+        // Codex's eighteenth-round finding: a leading `super` was left in the chain rather
+        // than resolved against `current_module`, so it never matched the plain module-name
+        // stack the relative lookup compares against and fell straight to the
+        // last-two-segments heuristic — silently right only when that heuristic's guess
+        // happened to land on the same entry `super` really names. The match here sits in
+        // `outer::inner` and uses `super::indices::P0`, which Rust resolves to
+        // `outer::indices::P0` — one level up from `inner`, not the file root, and not
+        // `inner`'s own (nonexistent) `indices`. A root `mod indices` deliberately holds
+        // scattered, non-dense values so a wrong resolution (falling through to the
+        // heuristic's guess at the file root) reads as non-dense and is missed.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 200;\n    pub(crate) const P1: \
+             u8 = 201;\n    pub(crate) const P2: u8 = 202;\n    pub(crate) const P3: u8 = \
+             203;\n}\n\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = \
+             0;\n        pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = \
+             2;\n        pub(crate) const P3: u8 = 3;\n    }\n\n    mod inner {\n        \
+             const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n            \
+             match nibble & 0xF {\n                super::indices::P0 => 0,\n                \
+             super::indices::P1 => 1,\n                super::indices::P2 => 2,\n                \
+             super::indices::P3 => 3,\n                _ => 4,\n            }\n        }\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_against_a_generic_associated_constant_is_reported() {
+        // Codex's twenty-second-round finding: `impl<T> Indices<T> { const P0 = 0; .. }`
+        // was excluded entirely because the fix for the last round required the `Self`
+        // type's one segment to carry no generic arguments at all — even though a caller
+        // referencing `Indices::<u8>::P0` names the base type `Indices` exactly the way a
+        // non-generic one would, since `ident_name` reads a segment's identifier and never
+        // its arguments on either side. The generics requirement is gone; only the shape
+        // (inherent, single-segment `Self`) still gates it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Indices<T>(T);\n\nimpl<T> Indices<T> {\n    pub(crate) const P0: u8 \
+             = 0;\n    pub(crate) const P1: u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    \
+             pub(crate) const P3: u8 = 3;\n}\n\nconst fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        Indices::<u8>::P0 => 0,\n        Indices::<u8>::P1 => 1,\n        \
+             Indices::<u8>::P2 => 2,\n        Indices::<u8>::P3 => 3,\n        _ => 4,\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_byte_literal_patterns_is_reported() {
+        // Codex's twenty-second-round finding: `b'\0'`, `b'\x01'`, .. are numeric
+        // singletons with the same semantics `0`, `1`, .. have and LLVM lowers a dense
+        // table spelled either way to the same indexed rodata. `lit_value` — shared by
+        // `literal_or_const_value` and `pattern_literal` — now reads `syn::Lit::Byte`
+        // alongside `syn::Lit::Int`, so this is dense rather than five unresolved patterns.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn byte_literal_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        b'\\0' => crc32_nibble(0),\n        b'\\x01' => crc32_nibble(1),\n        \
+             b'\\x02' => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_char_literal_patterns_is_reported() {
+        // Codex's twenty-sixth-round finding: a `char` literal's own scalar value is
+        // exactly as numeric a singleton as a byte literal's, and `rustc` lowers a dense
+        // `char` match to the same indexed rodata a `u8` one gets. `lit_value` now reads
+        // `syn::Lit::Char` alongside `syn::Lit::Int` and `syn::Lit::Byte`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn char_literal_table(nibble: char) -> u32 {\n    match nibble {\n        \
+             '\\0' => crc32_nibble(0),\n        '\\u{1}' => crc32_nibble(1),\n        \
+             '\\u{2}' => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_arithmetic_constant_patterns_is_reported() {
+        // Codex's twenty-sixth-round finding: a `const` initializer that is real,
+        // MSRV-legal arithmetic (`BASE + 1`) is evaluated by `rustc` before the match it
+        // feeds ever lowers, and compiles to the identical table a literal initializer
+        // would. `literal_or_const_value` now folds `Expr::Binary` over already-resolved
+        // operands instead of refusing every arithmetic initializer as unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst BASE: u8 = 0;\nconst P0: u8 = BASE;\nconst P1: u8 = BASE + 1;\nconst \
+             P2: u8 = BASE + 2;\nconst P3: u8 = 1 * 3;\n\nconst fn \
+             arithmetic_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => crc32_nibble(0),\n        P1 => crc32_nibble(1),\n        \
+             P2 => crc32_nibble(2),\n        P3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_at_binding_patterns_is_reported() {
+        // Codex's twenty-third-round finding: `_p0 @ 0` is exactly as singleton a pattern
+        // as `0` alone — the binding name is incidental to the value the arm matches, and
+        // the form is legal, unwarned Rust at the project's MSRV. `pattern_literal`'s
+        // `Pat::Ident` arm required `subpat.is_none()`, so every at-bound numbered pattern
+        // read as unresolved; it now recurses into the subpattern instead of refusing one.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             _p0 @ 0 => crc32_nibble(0),\n        _p1 @ 1 => crc32_nibble(1),\n        \
+             _p2 @ 2 => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_reference_patterns_is_reported() {
+        // Codex's twenty-fourth-round finding: over a reference scrutinee, `&0` is exactly
+        // as singleton a pattern as `0` itself, and `rustc` lowers a dense table spelled
+        // either way to the same indexed rodata. `pattern_literal` had no arm for
+        // `Pat::Reference` at all, so every referenced numbered pattern read as unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn reference_pattern_table(nibble: &u8) -> u32 {\n    match nibble {\n        \
+             &0 => crc32_nibble(0),\n        &1 => crc32_nibble(1),\n        \
+             &2 => crc32_nibble(2),\n        _ => crc32_nibble(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_to_a_constant_declared_in_another_file_of_the_tree() {
+        // Codex's twenty-fourth-round finding: seeding a file's own module-path prefix
+        // (round 19) fixed the module-qualified case (`super::indices::P0`) but not the
+        // single-segment one — `resolve_ancestor_single_segment`'s local branch only ever
+        // covers modules *this file's own walk entered*, and going further up than that
+        // used to clamp straight to this file's own root, never consulting `qualified` for
+        // an ancestor declared in a *different* file of the same out-of-line tree. Here
+        // `crc.rs` declares `mod outer;`, `outer.rs` declares four plain top-level consts
+        // and `mod inner;`, and `inner.rs`'s own match reads `super::P0`..`super::P3` —
+        // naming `outer.rs`'s own constants, which `inner.rs`'s local scope stack never
+        // held at all.
+        let parent = format!("{}\nmod outer;\n", tests_support::clean_checksum_module());
+        let outer = "const P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+                     3;\n\nmod inner;\n";
+        let inner = "const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    \
+                     match nibble & 0xF {\n        super::P0 => 0,\n        super::P1 => \
+                     1,\n        super::P2 => 2,\n        super::P3 => 3,\n        \
+                     _ => 4,\n    }\n}\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer.rs", outer),
+            layer("waymaker-flash/src/crc/outer/inner.rs", inner),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_past_an_inline_ancestor_of_an_out_of_line_file() {
+        // Codex's twenty-fifth-round finding: `child_modules` reports only the bare name
+        // of an out-of-line `mod`, so `crc.rs`'s `mod outer { mod inner; }` used to give
+        // `inner.rs` the prefix `["inner"]` rather than `["outer", "inner"]` —
+        // `module_path_prefixes` lost `outer`'s own name entirely. `inner.rs`'s own match
+        // reads `super::indices::P0`, which needs `outer`'s own inline `mod indices` to be
+        // reachable as `outer::indices::P0` in the merged qualified map; without `outer`
+        // in the prefix, `super` had nothing correct to step up from.
+        let parent = format!(
+            "{}\nmod outer {{\n    mod indices {{\n        pub(crate) const P0: u8 = 0;\n        \
+             pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = 2;\n        \
+             pub(crate) const P3: u8 = 3;\n    }}\n\n    mod inner;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let inner = "const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    \
+                     match nibble & 0xF {\n        super::indices::P0 => 0,\n        \
+                     super::indices::P1 => 1,\n        super::indices::P2 => 2,\n        \
+                     super::indices::P3 => 3,\n        _ => 4,\n    }\n}\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer/inner.rs", inner),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_crate_and_one_segment_does_not_resolve_locally() {
+        // Codex's thirty-third-round finding: `crate::P0` was resolved against the
+        // *scanned file's* own root (depth 1), on the reasoning that this scan cannot
+        // see the crate's real root anyway — true, but the fallback it used was still
+        // wrong, since `crc.rs` is itself one submodule (`crate::crc`), never the
+        // crate's own root (`crate`). A dense-looking match written as `crate::P0`
+        // through `crate::P3` plus a wildcard, even where this file *also* happens to
+        // declare identically-named, identically-dense local constants of its own, must
+        // not be reported by coincidentally resolving against the wrong module's
+        // constants — `crate::NAME` now always fails closed to unresolved, since the
+        // module it really names (`waymaker-flash`'s own `lib.rs`) is outside the tree
+        // this scan reads at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+             3;\n\nconst fn crate_qualified_pattern_table(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        crate::P0 => 0,\n        crate::P1 => 1,\n        \
+             crate::P2 => 2,\n        crate::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_pattern_naming_the_crate_root_is_reported_even_though_it_is_never_recognised_as_dense()
+     {
+        // Codex's thirty-fifth-round finding: the previous test correctly made
+        // `crate::NAME` always fail closed to unresolved, rather than answering it by
+        // coincidence against the wrong module. But `missing_value` and
+        // `fully_dense_arm_patterns` both fail a match's *entire* dense-table check the
+        // moment any single arm is unresolved, which turns "unresolved" into
+        // "invisible": a table built from `crate::P0` through `crate::P3`, naming real
+        // constants this scan's own tree cannot see the value of, is never recognised
+        // as dense and so is never reported by the dense-match check at all — the
+        // previous test's own fixture is exactly this shape, and asserted only that the
+        // *dense-match* violation was absent, which is still true and still correct on
+        // its own terms. What was missing is a check that does not need to resolve the
+        // pattern to distrust it: a bare `crate::NAME` pattern is refused outright,
+        // regardless of whether the match around it turns out to look dense.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn crate_qualified_pattern_table_again(nibble: u8) -> u32 {\n    match \
+             nibble & 0xF {\n        crate::P0 => 0,\n        crate::P1 => 1,\n        \
+             crate::P2 => 2,\n        crate::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("matches the pattern `crate::P0`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_crate_never_resolves_relative_to_the_current_module() {
+        // Codex's twenty-fifth-round finding: stripping `crate` the same way `self` is
+        // stripped lost the one fact that made it worth reading — `crate::crc::indices::P0`
+        // names the crate root exclusively in real Rust, never the current module. The old
+        // code still tried the current-module-relative form *first*, so a same-named
+        // `outer::indices` with non-dense values answered before the root ever got a
+        // chance, hiding a dense table at the root. `indices` at the file root is dense
+        // (0..3); `outer::indices`, deliberately non-dense (200..203), is what a wrong
+        // resolution would find instead. The reference names `crc` explicitly — round 26's
+        // finding — because `crc.rs` is itself one submodule of `waymaker-flash`, not the
+        // crate's own root, so the real absolute path has to cross it too.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = \
+             200;\n        pub(crate) const P1: u8 = 201;\n        pub(crate) const P2: \
+             u8 = 202;\n        pub(crate) const P3: u8 = 203;\n    }\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            crate::crc::indices::P0 => 0,\n            \
+             crate::crc::indices::P1 => 1,\n            crate::crc::indices::P2 => 2,\n            \
+             crate::crc::indices::P3 => 3,\n            _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_crate_reaches_a_nested_module_through_crc() {
+        // Codex's twenty-sixth-round finding: constants inside `mod outer { mod indices
+        // {..} }` are recorded as `outer::indices::P0`, but the *real* absolute path to
+        // them is `crate::crc::outer::indices::P0` — `crc.rs` is one submodule of
+        // `waymaker-flash`, not the crate's own root. Seeding the checksum module tree's
+        // root with its own module name (`root_module_name`, derived from
+        // `INTEGRITY_CHECK_PATH`'s file stem) is what makes this resolve: every
+        // module-qualified key in the tree, this one included, now carries a leading
+        // `crc::` the way the real crate does.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod outer {\n    mod indices {\n        pub(crate) const P0: u8 = 0;\n        \
+             pub(crate) const P1: u8 = 1;\n        pub(crate) const P2: u8 = 2;\n        \
+             pub(crate) const P3: u8 = 3;\n    }\n}\n\nconst fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        crate::crc::outer::indices::P0 => 0,\n        \
+             crate::crc::outer::indices::P1 => 1,\n        crate::crc::outer::indices::P2 \
+             => 2,\n        crate::crc::outer::indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_reading_an_imported_constant_bare_is_reported() {
+        // Codex's twenty-seventh-round finding: `use indices::{P0, P1, P2, P3};` brings
+        // each constant into scope under its bare name, and Rust resolves a pattern
+        // spelled `P0` exactly as if `indices::P0` had been written out — but the old
+        // `resolve` closure only ever consulted locally declared constants (`ConstScopes`),
+        // never a `use` import, so a match written entirely in terms of imported bare
+        // names read every arm as an unresolved binding and the table was invisible.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nuse indices::{P0, P1, P2, P3};\n\nconst fn \
+             imported_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        \
+             _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_reading_a_glob_imported_constant_bare_is_reported() {
+        // Codex's twenty-eighth-round finding: `use indices::*;` was recorded nowhere at
+        // all — the prior fix only ever read a named `use` (`use indices::{P0, ...};`),
+        // and a glob import was explicitly documented as unresolved. A match built
+        // entirely of bare names reached only through a glob is exactly as invisible to
+        // the dense-match scan as one reached through no `use` at all, and Rust resolves
+        // both the same way.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nuse indices::*;\n\nconst fn \
+             glob_imported_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & \
+             0xF {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        \
+             _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_through_a_module_alias_is_reported() {
+        // Codex's thirty-first-round finding: `use indices as idx;` binds `idx` to
+        // `indices` exactly the way `use indices::P0;` binds `P0` to `indices::P0` —
+        // but only the single-segment branch of pattern resolution ever consulted
+        // `use_scopes`. A multi-segment pattern headed by the alias (`idx::P0`) went
+        // straight to the anchored and qualified lookups, which know the real module by
+        // its own name and nothing by the alias, so every numbered arm read as
+        // unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const P1: \
+             u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: u8 = \
+             3;\n}\n\nuse indices as idx;\n\nconst fn \
+             aliased_module_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        idx::P0 => 0,\n        idx::P1 => 1,\n        idx::P2 => 2,\n        \
+             idx::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_declared_in_the_checksum_module_is_reported() {
+        // Codex's twenty-seventh-round finding: the dense-match scan and the array ban
+        // both read the syntax a macro invocation *is*, never what it expands to — `syn`
+        // does not expand a macro, and this module's own contract says so — so a
+        // `macro_rules!` definition shaped like a lookup table is invisible to both. This
+        // fixture never even invokes the macro it defines: the point is that declaring one
+        // in the checksum module's own tree is refused outright, not that a particular
+        // expansion is caught.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmacro_rules! dense_table {\n    () => {\n        match 0_u8 & 0xF {\n            \
+             0 => 0,\n            1 => 1,\n            2 => 2,\n            3 => 3,\n            \
+             _ => 4,\n        }\n    };\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro `macro_rules`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_invocation_in_the_checksum_module_is_reported() {
+        // The invocation half of the same finding: a checksum module that calls a macro
+        // declared elsewhere — a helper macro imported from a sibling module, say — never
+        // declares `macro_rules!` itself, so the fixture above alone would leave every
+        // *invocation* uncovered. `env!` is a real, always-available macro so this fixture
+        // needs no companion definition to be valid Rust.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nconst CARGO_PKG_NAME: &str = env!(\"CARGO_PKG_NAME\");\n");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro `env`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn codexs_extra_table_macro_reproduction_is_reported() {
+        // Codex's own round-27 reproduction, reproduced exactly: a `macro_rules!
+        // extra_table` carrying the same five-arm mapping the existing regression tests
+        // use, invoked as `extra_table!(nibble)` — which rustc compiles into an indexed
+        // lookup table the same way ADR 0053's own pinned `crc32_nibble_table` is, and
+        // which neither `has_dense_arm_patterns` nor the array ban could ever see, because
+        // both the definition's body and the invocation's arguments are opaque token
+        // streams to `syn`. Both halves are reported (the definition once, as
+        // `macro_rules`, and the invocation once, as `extra_table`), so this only checks
+        // that at least one violation exists — the two single-purpose tests above already
+        // pin each half's own wording.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmacro_rules! extra_table {\n    ($nibble:expr) => {\n        match $nibble & \
+             0xF {\n            0 => 0,\n            1 => 1,\n            2 => 2,\n            \
+             3 => 3,\n            _ => 4,\n        }\n    };\n}\n\nconst fn \
+             uses_extra_table(nibble: u8) -> u32 {\n    extra_table!(nibble)\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_macro_used_only_under_cfg_test_is_not_reported() {
+        // The exclusion half: `assert_eq!` and friends are how the checksum module's own
+        // tests already work (`crates/waymaker-flash/src/crc.rs`'s `#[cfg(test)] mod
+        // tests`), and a scan that refused those would fail the real workspace's own file
+        // outright rather than catching a bypass.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a_check() {\n        \
+             assert_eq!(1, 1);\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_local_macro_statement_is_not_reported() {
+        // Codex's thirty-first-round finding: `macro_uses`'s own item and `impl`-member
+        // exclusions say nothing about a *local* statement, so a `#[cfg(test)]
+        // assert_eq!(...)` inside an otherwise ordinary (non-test) function — a statement
+        // `rustc` strips from shipped code — was still walked and its macro reported as a
+        // second production one. `macro_uses`'s `Macros` visitor now overrides
+        // `visit_block` with the same `stmt_is_cfg_test` check `MatchVisitor` uses.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nfn ordinary_function() {\n    #[cfg(test)]\n    assert_eq!(1, 1);\n}\n");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("names the macro")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_reading_super_does_not_find_a_shadowing_child_value() {
+        // Codex's twenty-second-round finding: `super::P0` was resolved with a plain,
+        // unrestricted `ConstScopes::resolve`, which searches the *entire* live scope
+        // stack rather than only the ancestor `super` actually names. A child module that
+        // shadows its parent's `P0` with a non-dense value of its own — declared in the
+        // very module the match sits in — used to have `super::P0` find the child's own
+        // shadowing value first, since the child's scope is innermost. `P0` is dense
+        // (0..3) in the parent and deliberately non-dense (200..203) in the child, so the
+        // match is reported only if `super::P0` resolves against the parent, truncating
+        // the search before it ever reaches the child's own scope.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+             3;\n\nmod child {\n    const P0: u8 = 200;\n    const P1: u8 = 201;\n    \
+             const P2: u8 = 202;\n    const P3: u8 = 203;\n\n    const fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n        match nibble & \
+             0xF {\n            super::P0 => 0,\n            super::P1 => 1,\n            \
+             super::P2 => 2,\n            super::P3 => 3,\n            _ => 4,\n        }\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_across_out_of_line_files_resolves_against_the_tree() {
+        // Codex's nineteenth-round finding: `module_path_prefixes` computes each scanned
+        // file's own position in the tree for constant *collection*, but
+        // `match_expressions` — the other reader of the same file, the one that resolves a
+        // match's own patterns — always started its visitor's module path at `[]`
+        // regardless of where in the tree the file actually sits. A match in an
+        // out-of-line `crc/outer/inner.rs` using `super::indices::P0` therefore popped
+        // `super` from an empty path and searched only `indices::P0`, rather than
+        // `outer::indices::P0` — the entry `outer.rs`'s own inline `mod indices` recorded.
+        // The parent (`crc.rs`) declares a same-named but non-dense root `mod indices`, so
+        // the old bug (falling through to that root entry) would read as non-dense and
+        // miss the real table two directories deep.
+        let parent = format!(
+            "{}\nmod indices {{\n    pub(crate) const P0: u8 = 200;\n    pub(crate) const \
+             P1: u8 = 201;\n    pub(crate) const P2: u8 = 202;\n    pub(crate) const P3: u8 \
+             = 203;\n}}\n\nmod outer;\n",
+            tests_support::clean_checksum_module()
+        );
+        let outer = "mod indices {\n    pub(crate) const P0: u8 = 0;\n    pub(crate) const \
+                     P1: u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    pub(crate) const P3: \
+                     u8 = 3;\n}\n\nmod inner;\n";
+        let inner = "const fn qualified_constant_pattern_table(nibble: u8) -> u32 {\n    \
+                     match nibble & 0xF {\n        super::indices::P0 => 0,\n        \
+                     super::indices::P1 => 1,\n        super::indices::P2 => 2,\n        \
+                     super::indices::P3 => 3,\n        _ => 4,\n    }\n}\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer.rs", outer),
+            layer("waymaker-flash/src/crc/outer/inner.rs", inner),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_super_to_a_single_ancestor_constant_is_reported() {
+        // Codex's twentieth-round finding: `resolve_qualified_path` refused any chain whose
+        // segments, after removing leading `super`s, numbered fewer than two — right for a
+        // module-qualified reference (`super::indices::P0`), and wrong for `super::P0`
+        // itself, which names a plain constant declared directly in the ancestor module
+        // rather than inside a further-named module of its own. `resolve_qualified_path`'s
+        // map has no entry for such a constant at all, since only a module's *own* consts
+        // get a qualified key when `visit_item_mod` records them — a bare `const P0` at the
+        // file root is never inserted into `qualified` under any name. The fix resolves a
+        // single trailing segment after `super` the same way a bare identifier is: against
+        // the live scope stack, which already holds it regardless of how many `super`s it
+        // took to name.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = 0;\nconst P1: u8 = 1;\nconst P2: u8 = 2;\nconst P3: u8 = \
+             3;\n\nmod child {\n    const fn qualified_constant_pattern_table(nibble: u8) \
+             -> u32 {\n        match nibble & 0xF {\n            super::P0 => 0,\n            \
+             super::P1 => 1,\n            super::P2 => 2,\n            super::P3 => 3,\n            \
+             _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_against_an_associated_constant_is_reported() {
+        // Codex's twenty-first-round finding: `Indices::P0` is spelled exactly like a
+        // module-qualified constant and resolves the same way in Rust, but nothing here
+        // had ever looked at a `syn::ImplItem::Const` — only free `syn::Item::Const`
+        // declarations, and a module's own inline consts, ever entered `qualified`. An
+        // inherent `impl Indices { const P0 = 0; .. }`'s own associated constants are now
+        // collected under `Indices::P0` the same way a module's are collected under
+        // `module::P0`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Indices;\n\nimpl Indices {\n    pub(crate) const P0: u8 = 0;\n    \
+             pub(crate) const P1: u8 = 1;\n    pub(crate) const P2: u8 = 2;\n    \
+             pub(crate) const P3: u8 = 3;\n}\n\nconst fn \
+             qualified_constant_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        Indices::P0 => 0,\n        Indices::P1 => 1,\n        Indices::P2 \
+             => 2,\n        Indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_associated_constant_is_reported() {
+        // Codex's thirty-fourth-round finding: `<u8 as Indices>::P0` is a
+        // trait-associated constant, spelled with the qualified-self syntax `syn` gives
+        // a `Pat::Path` its own `qself` field for — but `pattern_literal` only ever
+        // asked `resolve` about `path.path` (`Indices::P0`, the *trait's* own path plus
+        // the member), never looking at `qself` (the `<u8 as ..>` half) at all, and
+        // `visit_item_impl` skipped a *trait* impl's own constants outright. A `u8`
+        // implementing `Indices` and declaring `P0` through `P6` directly is now indexed
+        // under `u8::P0` the way an inherent impl's constants already were, and a
+        // `<u8 as Indices>::P0` pattern resolves against that same key.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\ntrait Indices {\n    const P0: u8;\n    const P1: u8;\n    const P2: u8;\n    \
+             const P3: u8;\n    const P4: u8;\n    const P5: u8;\n    const P6: u8;\n}\n\nimpl \
+             Indices for u8 {\n    const P0: u8 = 0;\n    const P1: u8 = 1;\n    const P2: u8 \
+             = 2;\n    const P3: u8 = 3;\n    const P4: u8 = 4;\n    const P5: u8 = 5;\n    \
+             const P6: u8 = 6;\n}\n\nconst fn qself_pattern_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        <u8 as Indices>::P0 => 0,\n        \
+             <u8 as Indices>::P1 => 1,\n        <u8 as Indices>::P2 => 2,\n        \
+             <u8 as Indices>::P3 => 3,\n        <u8 as Indices>::P4 => 4,\n        \
+             <u8 as Indices>::P5 => 5,\n        <u8 as Indices>::P6 => 6,\n        _ => \
+             7,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 8-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_in_one_function_is_not_hidden_by_a_same_named_local_module_in_another() {
+        // Codex's thirty-fifth-round finding: two different functions each declaring
+        // their own local `mod indices { .. }` recorded their constants under one
+        // identical key — `module_path::indices::P0` — because nothing distinguished
+        // which function a function-local module sat inside. The later-visited
+        // function's own values silently overwrote the earlier one's, so a match inside
+        // the *first* function read the *second* function's values instead of its own.
+        //
+        // `helper_b` is nested directly inside `helper_a`, between `helper_a`'s own
+        // `mod indices` and `helper_a`'s own match, so the corrupting insert lands
+        // exactly between the two: `helper_b`'s local `indices` gives all four constants
+        // the identical value `0`, which is not what makes this reproduction observable
+        // (a corrupted-but-still-contiguous read would still be flagged as dense) — it
+        // is chosen non-dense on purpose, so that reading it by mistake collapses
+        // `helper_a`'s four distinct arm patterns into one repeated value and the dense
+        // table search finds no contiguous window to point a wildcard at. Read
+        // correctly, `helper_a`'s own match is `0..=3` over its own `indices` and is
+        // exactly the kind of table this gate exists to catch; read from `helper_b`'s
+        // leftover values it would instead look like four duplicate arms and slip past
+        // undetected — the dangerous direction, a real table the gate silently stopped
+        // seeing rather than a table it wrongly flagged.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn helper_a(nibble: u8) -> u32 {\n    mod indices {\n        \
+             pub(crate) const P0: u8 = 0;\n        pub(crate) const P1: u8 = 1;\n        \
+             pub(crate) const P2: u8 = 2;\n        pub(crate) const P3: u8 = 3;\n    \
+             }\n\n    const fn helper_b(inner: u8) -> u32 {\n        mod indices {\n            \
+             pub(crate) const P0: u8 = 0;\n            pub(crate) const P1: u8 = 0;\n            \
+             pub(crate) const P2: u8 = 0;\n            pub(crate) const P3: u8 = \
+             0;\n        }\n        match inner & 0xF {\n            indices::P0 => 0,\n            \
+             _ => 1,\n        }\n    }\n\n    let _ = helper_b(nibble);\n    match nibble & 0xF \
+             {\n        indices::P0 => collision_helper(0),\n        indices::P1 => \
+             collision_helper(1),\n        indices::P2 => collision_helper(2),\n        \
+             indices::P3 => collision_helper(3),\n        _ => collision_helper(4),\n    \
+             }\n}\n\nconst fn collision_helper(value: u32) -> u32 {\n    value\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_singleton_range_patterns_is_reported() {
+        // Codex's seventeenth-round finding: `pattern_literal` answered `None` for every
+        // `Pat::Range`, including an inclusive range whose two ends are the same integer —
+        // `0..=0` names exactly the value `0` and nothing else, so a table spelled that way
+        // folds into the identical lookup table a bare `0` would, and was read as "not one
+        // of a dense table's shapes" rather than as the single value it singles out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn singleton_range_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn singleton_range_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0..=0 => singleton_range_helper(0),\n        \
+             1..=1 => singleton_range_helper(1),\n        2..=2 => \
+             singleton_range_helper(2),\n        _ => singleton_range_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_wide_half_open_range_patterns_is_reported() {
+        // Codex's thirty-fifth-round finding: a *closed* range (`0..=1`) widens to every
+        // value it covers, but a half-open one (`0..2`, naming the identical two values)
+        // still fell through every arm of `pattern_literal`'s `Pat::Range` case and read
+        // as unresolved — the same shape of gap the singleton test just above this one
+        // closed for a range's own single-value form, left open for any half-open range
+        // wider than that. `rustc` lowers `0..2 | 2..4 | ...` to the identical indexed
+        // table a fully-spelled `0 | 1 | 2 | 3 | ...` gets, so a table spelled with
+        // half-open pairs is exactly as dense and needs no different treatment: each of
+        // the three numbered arms here covers two values — `0..2`, `2..4` and `4..6` —
+        // with a wildcard for the one value (`6`) none of them leaves covered, and four
+        // arms in total to clear `MINIMUM_DENSE_TABLE_ARMS`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn half_open_pair_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn half_open_pair_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0..2 => half_open_pair_helper(0),\n        \
+             2..4 => half_open_pair_helper(1),\n        4..6 => half_open_pair_helper(2),\n        \
+             _ => half_open_pair_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_ref_at_bindings_is_reported() {
+        // Codex's thirty-sixth-round finding: an at-binding's recursion into its own
+        // subpattern was gated on `named.by_ref.is_none()` for the *whole* arm, so an
+        // at-binding with an explicit binding mode (`ref _p0 @ 0`) fell to
+        // `_ => Vec::new()` instead of resolving through its subpattern the way an
+        // unmoded at-binding already did — but `ref`, `mut` and `ref mut` change only
+        // how the match binds the value, never which value the pattern matches, and
+        // MSRV Rust accepts the form with no warning.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn ref_at_binding_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn ref_at_binding_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        ref _p0 @ 0 => ref_at_binding_helper(0),\n        \
+             ref _p1 @ 1 => ref_at_binding_helper(1),\n        ref _p2 @ 2 => \
+             ref_at_binding_helper(2),\n        _ => ref_at_binding_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_self_inside_its_own_impl_is_reported() {
+        // Codex's thirty-sixth-round finding: `Self::P0`, written inside the very impl
+        // that declares `const P0 = 0;`, is indexed under the concrete implementing
+        // type's own name (`Indices::P0`) exactly like any other associated constant —
+        // but nothing recorded that `Self` currently *means* `Indices` while that
+        // impl's own body was being walked, so `resolve_pattern_path` searched for a
+        // literal path segment spelled `Self`, which `qualified` never indexes anything
+        // under, and every arm read as unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Indices;\n\nimpl Indices {\n    const P0: u8 = 0;\n    \
+             const P1: u8 = 1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n\n    \
+             const fn self_qualified_pattern_table(nibble: u8) -> u32 {\n        \
+             match nibble & 0xF {\n            Self::P0 => 0,\n            \
+             Self::P1 => 1,\n            Self::P2 => 2,\n            Self::P3 => 3,\n            \
+             _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_single_field_tuple_struct_patterns_is_reported() {
+        // Codex's thirty-sixth-round finding: `Some(0)` through `Some(14)` over an
+        // `Option<u8>` scrutinee lowers to the identical indexed table a bare-integer
+        // version gets, but every numbered arm is a `Pat::TupleStruct`, which fell to
+        // the wildcard `_ => Vec::new()` case regardless of which single-field
+        // constructor it named.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_struct_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn tuple_struct_table(nibble: Option<u8>) -> u32 {\n    match nibble \
+             {\n        Some(0) => tuple_struct_helper(0),\n        \
+             Some(1) => tuple_struct_helper(1),\n        Some(2) => \
+             tuple_struct_helper(2),\n        _ => tuple_struct_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_in_one_block_is_not_hidden_by_a_same_named_local_module_in_a_sibling_block() {
+        // Codex's thirty-sixth-round finding: the fix for two *functions* colliding
+        // under one same-named local module left the identical shape open one level
+        // finer — two *sibling blocks of one function*, two bare `{ .. }` expressions
+        // among them, each declaring their own local `mod indices`, still collided
+        // under `function_path` alone, since nothing recorded which *block* a
+        // function-local module sat in.
+        //
+        // The first block's own match is written *before* its own `mod indices`
+        // declaration — legal Rust, since items in a block are visible throughout the
+        // whole block regardless of where they sit — which is what makes the
+        // collision observable rather than merely present: `match_expressions_with_prefix`
+        // makes two full passes over the file, and by the end of the first pass
+        // (which exists only to populate `qualified` completely) the *second*, later
+        // block's own colliding `mod indices` — giving all four constants the
+        // identical value `0` — was the last thing to write that shared key. On the
+        // second pass, the first block's match is reached and resolved *before* that
+        // pass has re-inserted its own block's correct values, so — pre-fix — it read
+        // the first pass's leftover, poisoned state instead: four duplicate patterns
+        // rather than four distinct ones, hiding a real 5-arm dense table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn block_identity_helper(value: u32) -> u32 {\n    value\n}\n\n\
+             const fn block_identity_table(nibble: u8) -> u32 {\n    let first = {\n        \
+             let value = match nibble & 0xF {\n            \
+             indices::P0 => block_identity_helper(0),\n            indices::P1 => \
+             block_identity_helper(1),\n            indices::P2 => \
+             block_identity_helper(2),\n            indices::P3 => \
+             block_identity_helper(3),\n            _ => block_identity_helper(4),\n        \
+             };\n        mod indices {\n            pub(crate) const P0: u8 = 0;\n            \
+             pub(crate) const P1: u8 = 1;\n            pub(crate) const P2: u8 = 2;\n            \
+             pub(crate) const P3: u8 = 3;\n        }\n        value\n    \
+             };\n    let second = {\n        mod indices {\n            \
+             pub(crate) const P0: u8 = 0;\n            pub(crate) const P1: u8 = 0;\n            \
+             pub(crate) const P2: u8 = 0;\n            pub(crate) const P3: u8 = 0;\n        \
+             }\n        0u32\n    };\n    first + second\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_range_pattern_wider_than_the_cap_is_refused_rather_than_expanded() {
+        // Codex's thirty-sixth-round finding: the `usize`-fit check bounded only
+        // representability, not size — `0..=1_000_000_000u64` fits a `usize` on a
+        // 64-bit host and was then eagerly collected into roughly a billion `i128`
+        // values before the match around it was even checked for its arm count or its
+        // density, an out-of-memory failure one added line could trigger.
+        // `MAX_RANGE_PATTERN_VALUES` refuses to expand a span this wide at all, so the
+        // arm reads as unresolved and the match is never reported as dense — the
+        // opposite of the pre-fix behaviour, which resolved this exact fixture (a
+        // smaller, safely-allocatable 8192-value span rather than the billion-value one
+        // that motivated the fix, since a regression test earns nothing by risking the
+        // failure mode it exists to catch) and reported it.
+        //
+        // Codex's next-round finding gave `has_dense_arm_patterns` its own suffix scan,
+        // so a consecutive run of numbered arms *after* the unresolved range would now
+        // be found and correctly reported — this fixture's three residual arms are kept
+        // far apart on purpose, so this test still exercises only the refused-expansion
+        // half and does not accidentally assert against a real dense sub-table the
+        // suffix scan is right to find.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn huge_range_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn huge_range_table(nibble: u32) -> u32 {\n    match nibble \
+             {\n        0..=8191 => huge_range_helper(0),\n        \
+             20000 => huge_range_helper(1),\n        40000 => huge_range_helper(2),\n        \
+             60000 => huge_range_helper(3),\n        _ => huge_range_helper(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_single_field_tuple_patterns_is_reported() {
+        // Codex's thirty-seventh-round finding: a plain one-tuple pattern (`(0,)`
+        // through `(14,)`) is `Pat::Tuple` rather than `Pat::TupleStruct` — no
+        // constructor name, just a single parenthesized, comma-terminated field — and
+        // fell to the wildcard `_ => Vec::new()` case exactly the way the tuple-struct
+        // form did before the previous round's fix, even though `rustc` lowers it to
+        // the identical indexed table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn one_tuple_helper(nibble: u32) -> u32 {\n    nibble\n}\n\n\
+             const fn one_tuple_table(nibble: (u8,)) -> u32 {\n    match nibble \
+             {\n        (0,) => one_tuple_helper(0),\n        (1,) => \
+             one_tuple_helper(1),\n        (2,) => one_tuple_helper(2),\n        \
+             _ => one_tuple_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_default_associated_constant_is_reported() {
+        // Codex's thirty-seventh-round finding: `impl Indices for u8 {}`, implementing
+        // a trait every one of whose constants already carries a default, redeclares
+        // none of them — legal Rust — but `impl_const_exprs` only ever read what the
+        // impl's own item list redeclared, so `<u8 as Indices>::P0` stayed unresolved
+        // even though it still names the trait's own default value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\ntrait Indices {\n    const P0: u8 = 0;\n    const P1: u8 = 1;\n    \
+             const P2: u8 = 2;\n    const P3: u8 = 3;\n}\n\nimpl Indices for u8 \
+             {}\n\nconst fn trait_default_pattern_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        <u8 as Indices>::P0 => 0,\n        \
+             <u8 as Indices>::P1 => 1,\n        <u8 as Indices>::P2 => 2,\n        \
+             <u8 as Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_pattern_naming_a_multi_segment_crate_root_path_is_reported() {
+        // Codex's thirty-seventh-round finding: the crate-root-pattern scan only ever
+        // caught the shortest spelling, `crate::NAME` — a longer chain
+        // (`crate::indices::P0`) is anchored at the crate root exactly as much, and is
+        // just as capable of naming a constant outside this scan's own tree, but was
+        // not recognised as a crate-anchored pattern at all and stayed silently
+        // unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn multi_segment_crate_pattern_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        crate::indices::P0 => 0,\n        \
+             crate::indices::P1 => 1,\n        crate::indices::P2 => 2,\n        \
+             crate::indices::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("matches the pattern `crate::indices::P0`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_block_valued_constant_initializer_is_reported() {
+        // Codex's thirty-eighth-round finding: `const P0: u8 = { const N: u8 = 0; N };`
+        // is `Expr::Block` — a block used as an expression, most often to give an
+        // initializer a scope of its own — and `literal_or_const_value` never unwrapped
+        // one at all, so a table whose numbered arms are spelled with block-valued
+        // initializers this way read as unresolved on every arm.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst P0: u8 = {\n    const N: u8 = 0;\n    N\n};\nconst P1: u8 = \
+             {\n    const N: u8 = 1;\n    N\n};\nconst P2: u8 = {\n    const N: u8 \
+             = 2;\n    N\n};\nconst P3: u8 = {\n    const N: u8 = 3;\n    N\n};\n\n\
+             const fn block_valued_pattern_table(nibble: u8) -> u32 {\n    match nibble \
+             & 0xF {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_multi_field_tuple_patterns_with_one_discriminating_field_is_reported() {
+        // Codex's thirty-eighth-round finding: `(0, _)` through `(14, _)` over a
+        // `(u8, bool)` scrutinee is exactly as dense as the single-field tuple form —
+        // `rustc` still indexes on the one field that varies and ignores the field
+        // that is always a catch-all — but the previous round's fix required the tuple
+        // to contain exactly one field, so a second, irrelevant field defeated it
+        // entirely.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn two_field_tuple_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn two_field_tuple_table(nibble: (u8, bool)) -> u32 \
+             {\n    match nibble {\n        (0, _) => two_field_tuple_helper(0),\n        \
+             (1, _) => two_field_tuple_helper(1),\n        (2, _) => \
+             two_field_tuple_helper(2),\n        _ => two_field_tuple_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_named_struct_patterns_with_one_discriminating_field_is_reported() {
+        // Codex's thirty-ninth-round finding: `Key { n: 0, ignored: _ }` through
+        // `Key { n: 14, ignored: _ }` is exactly as dense once more, since `rustc`
+        // indexes on the one named field that varies and ignores a field that is
+        // always a catch-all — a named-field struct pattern is a third shape the
+        // discriminating-field reasoning applies to, alongside tuples and tuple
+        // structs, and fell to the wildcard case since `Pat::Struct` had no handling
+        // at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Key {\n    n: u8,\n    ignored: bool,\n}\n\nconst fn \
+             struct_field_helper(nibble: u32) -> u32 {\n    nibble\n}\n\nconst fn \
+             struct_field_table(key: Key) -> u32 {\n    match key {\n        \
+             Key { n: 0, ignored: _ } => struct_field_helper(0),\n        \
+             Key { n: 1, ignored: _ } => struct_field_helper(1),\n        \
+             Key { n: 2, ignored: _ } => struct_field_helper(2),\n        \
+             _ => struct_field_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_const_call_initializer_is_reported() {
+        // Codex's thirty-ninth-round finding: `const P0: u8 = identity(0);` through
+        // `P3` is `Expr::Call`, which `literal_or_const_value` does not evaluate on
+        // purpose — doing so in general means interpreting an arbitrary function
+        // body — so every such constant stayed unresolved and a table built entirely
+        // from them was never recognised as dense at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn identity(value: u8) -> u8 {\n    value\n}\n\nconst P0: u8 \
+             = identity(0);\nconst P1: u8 = identity(1);\nconst P2: u8 = \
+             identity(2);\nconst P3: u8 = identity(3);\n\nconst fn \
+             const_call_pattern_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 \
+             => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `P0` with a call as its own initializer")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn trait_defaults_do_not_collide_across_two_same_named_traits_in_different_modules() {
+        // Codex's thirty-ninth-round finding: `trait_defaults` was keyed by the
+        // trait's bare name alone, so two *different* traits named `Indices`,
+        // declared in two different modules, collided under one key — the
+        // later-visited trait's own defaults silently overwrote the earlier one's,
+        // and an impl of the *first* trait could read the *second* trait's values
+        // instead of its own. `poison`'s own `Indices` sits textually between
+        // `outer`'s own `Indices` and the impl that uses it, so the corruption — if
+        // present — lands exactly where the impl looks: read correctly, the match
+        // below is `0..=3`; read from `poison`'s leftover values it would instead
+        // see four identical `0`s and hide a real 5-arm dense table. Real Rust
+        // itself is unambiguous here — `poison::Indices` is not in scope at
+        // `impl Indices for u8 {}`'s own position without an explicit `use` or
+        // qualification — so this is a scanner-only collision, not a genuine
+        // ambiguity.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod outer {\n    trait Indices {\n        const P0: u8 = 0;\n        \
+             const P1: u8 = 1;\n        const P2: u8 = 2;\n        const P3: u8 = \
+             3;\n    }\n\n    mod poison {\n        trait Indices {\n            \
+             const P0: u8 = 0;\n            const P1: u8 = 0;\n            const P2: \
+             u8 = 0;\n            const P3: u8 = 0;\n        }\n    }\n\n    impl \
+             Indices for u8 {}\n\n    const fn trait_scope_pattern_table(nibble: u8) \
+             -> u32 {\n        match nibble & 0xF {\n            <u8 as \
+             Indices>::P0 => 0,\n            <u8 as Indices>::P1 => 1,\n            \
+             <u8 as Indices>::P2 => 2,\n            <u8 as Indices>::P3 => 3,\n            \
+             _ => 4,\n        }\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_ref_binding_catchall_is_reported() {
+        // Codex's fortieth-round finding: `ref other => 199` is exactly as
+        // irrefutable as `other` itself — `ref` changes only how the match binds the
+        // value, never whether the pattern matches — but the whole arm was gated on
+        // `named.by_ref.is_none()`, so a catch-all spelled this way was not
+        // recognised as one, and a table ending in it failed both density checks
+        // instead of being reported.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn ref_binding_catchall_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn ref_binding_catchall_table(nibble: u8) -> u32 \
+             {\n    match nibble & 0xF {\n        0 => \
+             ref_binding_catchall_helper(0),\n        1 => \
+             ref_binding_catchall_helper(1),\n        2 => \
+             ref_binding_catchall_helper(2),\n        ref other => \
+             ref_binding_catchall_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_const_call_nested_inside_a_block_initializer_is_reported() {
+        // Codex's fortieth-round finding: the first version of the const-call scan
+        // only looked for a call at an initializer's own top level, seen through a
+        // `Paren` or a `Group` — but `const P0: u8 = { let value = identity(0);
+        // value };` buries the call one level deeper, inside a `let` statement
+        // `literal_or_const_value`'s own block handling does not understand either
+        // (it only follows a block whose every leading statement is a local `const`
+        // item), so the constant stayed silently unresolved and unflagged. The
+        // initializer's whole expression tree is now searched for a call wherever it
+        // sits.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn identity(value: u8) -> u8 {\n    value\n}\n\nconst P0: u8 \
+             = {\n    let value = identity(0);\n    value\n};\nconst P1: u8 = {\n    \
+             let value = identity(1);\n    value\n};\nconst P2: u8 = {\n    let \
+             value = identity(2);\n    value\n};\nconst P3: u8 = {\n    let value = \
+             identity(3);\n    value\n};\n\nconst fn nested_call_pattern_table(nibble: \
+             u8) -> u32 {\n    match nibble & 0xF {\n        P0 => 0,\n        P1 => \
+             1,\n        P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `P0` with a call as its own initializer")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_match_arm_is_not_counted_toward_density() {
+        // Codex's fortieth-round finding: an individual match arm can carry its own
+        // `#[cfg(test)]`, and `rustc` strips such an arm from a production build
+        // exactly as it does a gated item — but nothing here had ever read an arm's
+        // own attributes, so three test-gated numbered arms plus one production
+        // wildcard were read as a four-arm dense table, even though the shipped
+        // match holds only the wildcard, and reported as a violation the real code
+        // does not commit.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn cfg_gated_arm_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn cfg_gated_arm_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        #[cfg(test)]\n        0 => \
+             cfg_gated_arm_helper(0),\n        #[cfg(test)]\n        1 => \
+             cfg_gated_arm_helper(1),\n        #[cfg(test)]\n        2 => \
+             cfg_gated_arm_helper(2),\n        _ => cfg_gated_arm_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_in_a_nested_module_is_reported() {
+        // Codex's forty-first-round finding: `resolve_qself_associated_const` built
+        // its lookup key from the qself's own type and the member alone, discarding
+        // the trait path's own leading segments entirely — so
+        // `<u8 as defs::Indices>::P0`, naming a trait (and its impl) declared inside
+        // `mod defs`, looked up the bare `u8::P0` while `visit_item_impl` had indexed
+        // it as `defs::u8::P0`. Every numbered arm stayed unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod defs {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n\n    \
+             impl Indices for u8 {\n        const P0: u8 = 0;\n        const P1: u8 = \
+             1;\n        const P2: u8 = 2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             const fn nested_trait_pattern_table(nibble: u8) -> u32 {\n    match nibble \
+             & 0xF {\n        <u8 as defs::Indices>::P0 => 0,\n        \
+             <u8 as defs::Indices>::P1 => 1,\n        <u8 as defs::Indices>::P2 => \
+             2,\n        <u8 as defs::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_single_field_slice_patterns_is_reported() {
+        // Codex's forty-first-round finding: `[0]` through `[14]` over a `[u8; 1]`
+        // scrutinee is exactly as dense as the tuple, tuple-struct and named-struct
+        // forms already handled — a slice pattern is a fourth shape the
+        // discriminating-field reasoning applies to — but `Pat::Slice` had no
+        // handling at all and fell to the wildcard case.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn slice_pattern_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn slice_pattern_table(nibble: [u8; 1]) -> u32 \
+             {\n    match nibble {\n        [0] => slice_pattern_helper(0),\n        \
+             [1] => slice_pattern_helper(1),\n        [2] => \
+             slice_pattern_helper(2),\n        _ => slice_pattern_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_u128_literals_above_i128_max_is_reported() {
+        // Codex's forty-first-round finding: a `u128` literal at or above `2^127` —
+        // half of that type's own range — has no representation in this scan's own
+        // `i128`, so `base10_parse::<i128>()` fails and every arm of a table spelled
+        // with such literals stayed unresolved. `2^127`, `2^127 + 1` and `2^127 + 2`
+        // are each above `i128::MAX` (`2^127 - 1`) and are now reinterpreted as their
+        // own two's-complement bit pattern instead of rejected outright.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn u128_upper_half_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn u128_upper_half_table(nibble: u128) -> u32 \
+             {\n    match nibble {\n        \
+             170141183460469231731687303715884105728 => \
+             u128_upper_half_helper(0),\n        \
+             170141183460469231731687303715884105729 => \
+             u128_upper_half_helper(1),\n        \
+             170141183460469231731687303715884105730 => \
+             u128_upper_half_helper(2),\n        _ => u128_upper_half_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_spanning_the_u128_sign_boundary_is_reported() {
+        // Codex's forty-second-round finding: reinterpreting a `u128` literal at or above
+        // `2^127` as its own two's-complement `i128` bit pattern (the prior round's fix)
+        // breaks plain signed ordering for a window that straddles the boundary — the
+        // values just below `2^127` stay near `i128::MAX`, while the values at or above
+        // it wrap to near `i128::MIN`. `missing_value`'s own plain signed minimum then
+        // picks a value from the *middle* of the true window as its base, and subtracting
+        // it from the far end overflows `i128` outright, which `checked_sub` read as an
+        // unresolvable arm — skipping a match that is still exactly the dense window it
+        // was written as. `2^127-2`, `2^127-1`, `2^127+1` and `2^127+2` cover four of a
+        // five-value window; the wildcard covers the fifth, `2^127`, sitting exactly on
+        // the boundary the four explicit arms straddle.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn u128_boundary_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn u128_boundary_table(nibble: u128) -> u32 \
+             {\n    match nibble {\n        \
+             170141183460469231731687303715884105726 => \
+             u128_boundary_helper(0),\n        \
+             170141183460469231731687303715884105727 => \
+             u128_boundary_helper(1),\n        \
+             170141183460469231731687303715884105729 => \
+             u128_boundary_helper(2),\n        \
+             170141183460469231731687303715884105730 => \
+             u128_boundary_helper(3),\n        _ => u128_boundary_helper(4),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_slice_patterns_with_a_rest_element_is_reported() {
+        // Codex's forty-second-round finding: `[0, ..]` through `[14, ..]` over a wider
+        // slice still evaded the slice handling the prior round added — `..` is
+        // `Pat::Rest`, which `is_catchall_pattern` did not recognise, so
+        // `single_discriminating_field` saw *two* fields it could not rule out (the
+        // literal and the rest element) for every arm and answered `None` throughout.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn slice_rest_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn slice_rest_table(nibble: [u8; 2]) -> u32 \
+             {\n    match nibble {\n        [0, ..] => slice_rest_helper(0),\n        \
+             [1, ..] => slice_rest_helper(1),\n        [2, ..] => \
+             slice_rest_helper(2),\n        _ => slice_rest_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_implemented_in_a_sibling_module_is_reported() {
+        // Codex's forty-second-round finding: the trait's own declared module is not
+        // necessarily the impl's module at all. `traits::Indices` is declared in `mod
+        // traits`, but `impl traits::Indices for u8` sits in the sibling `mod
+        // implementations` — so `visit_item_impl` indexes the constants under
+        // `implementations::u8::P0`, while the prior round's fix built its lookup key
+        // from the *trait's* own path segments (`traits`), asking for `traits::u8::P0`
+        // instead. Neither that candidate nor the bare `u8::P0` fallback matches, and
+        // every numbered arm stayed unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod implementations {\n    impl super::traits::Indices for u8 {\n        \
+             const P0: u8 = 0;\n        const P1: u8 = 1;\n        const P2: u8 = \
+             2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             const fn sibling_module_trait_table(nibble: u8) -> u32 {\n    match nibble \
+             & 0xF {\n        <u8 as traits::Indices>::P0 => 0,\n        \
+             <u8 as traits::Indices>::P1 => 1,\n        <u8 as traits::Indices>::P2 => \
+             2,\n        <u8 as traits::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_qualified_initializers_is_reported() {
+        // Codex's forty-second-round finding: `const P0: u8 = base::BASE + 0;` names a
+        // qualified path already recorded in the qualified-constants map by an
+        // earlier-visited sibling module, but `resolve_scope_consts`'s own `resolve`
+        // closure only ever accepted `path.get_ident()` — a single bare segment — so a
+        // multi-segment initializer answered `None` regardless of whether `base::BASE`
+        // was already known, and every one of `P0` through `P3` stayed unresolved.
+        // Closing that alone was not enough: `base` sits beside `crc` (the whole file's
+        // own root), not beside `qualified_initializer_table` (the function `P0` is
+        // declared in), so a search fixed at exactly
+        // `module_path + function_path + block_path` still missed it, and
+        // `resolve_scope_consts` needed the same full most-specific-first search a match
+        // arm's own qualified pattern already gets, rather than one fixed combination.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod base {\n    pub const BASE: u8 = 10;\n}\n\n\
+             const fn qualified_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = base::BASE + 0;\n    const P1: u8 = base::BASE + 1;\n    \
+             const P2: u8 = base::BASE + 2;\n    const P3: u8 = base::BASE + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_range_spanning_the_u128_sign_boundary_is_reported() {
+        // Codex's forty-third-round finding: preserving individual `u128` literals above
+        // `2^127` was not enough — a *range* pattern whose own `start` and `end` straddle
+        // the boundary (`2^127-1..=2^127+1`) has `start` reinterpreted as a large positive
+        // `i128` and `end` reinterpreted as a small negative one, so the old
+        // `checked_sub`-based span computation overflowed and the whole range answered no
+        // values at all, which emptied the arm's pattern and skipped the match outright.
+        // The range is now expanded with the identical wrapping (mod 2^128) reasoning
+        // `window_layout` already uses for the values it lays out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn range_boundary_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn range_boundary_table(nibble: u128) -> u32 \
+             {\n    match nibble {\n        \
+             170141183460469231731687303715884105726 => \
+             range_boundary_helper(0),\n        \
+             170141183460469231731687303715884105727..=\
+             170141183460469231731687303715884105729 => \
+             range_boundary_helper(1),\n        \
+             170141183460469231731687303715884105730 => \
+             range_boundary_helper(2),\n        _ => range_boundary_helper(3),\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_one_of_two_traits_implemented_for_one_type_is_reported() {
+        // Codex's forty-third-round finding: the sibling-module suffix search the prior
+        // round added searches for a key ending in `type_name::member` alone, which is
+        // ambiguous the moment *two* different traits are each implemented for the same
+        // type in two different modules — `traits::Dense` and `traits::Noise`, both for
+        // `u8`, each declaring `P0` through `P3` — because both impls' constants end in
+        // the identical `u8::P0` suffix, even though the pattern's own trait path
+        // (`<u8 as traits::Dense>::P0`) names the intended impl exactly.
+        // `visit_item_impl` now also indexes a trait impl's constants with the trait's own
+        // bare name ahead of the type, and the search tries that shape first.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits {\n    pub trait Dense {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n\n    \
+             pub trait Noise {\n        const P0: u8;\n        const P1: u8;\n        \
+             const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod dense_impl {\n    impl super::traits::Dense for u8 {\n        \
+             const P0: u8 = 0;\n        const P1: u8 = 1;\n        const P2: u8 = \
+             2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             mod noise_impl {\n    impl super::traits::Noise for u8 {\n        \
+             const P0: u8 = 99;\n        const P1: u8 = 100;\n        const P2: u8 = \
+             101;\n        const P3: u8 = 102;\n    }\n}\n\n\
+             const fn trait_identity_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        <u8 as traits::Dense>::P0 => 0,\n        \
+             <u8 as traits::Dense>::P1 => 1,\n        <u8 as traits::Dense>::P2 => \
+             2,\n        <u8 as traits::Dense>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_bitwise_not_initializers_is_reported() {
+        // Codex's forty-third-round finding: `const P0: u8 = !255u8;` through `P3` is
+        // `Expr::Unary(Not, ..)`, which fell to the wildcard `_ => None` case and left
+        // every numbered constant unresolved. `!` flips every bit within the operand's
+        // own width, which this scan can only know from a literal's own suffix — computed
+        // as a full-width `i128` NOT truncated down to that width, the same masking
+        // `apply_integer_cast` already does for a cast.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn bitwise_not_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = !255u8;\n    const P1: u8 = !254u8;\n    \
+             const P2: u8 = !253u8;\n    const P3: u8 = !252u8;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_parenthesized_patterns_is_reported() {
+        // Codex's forty-fourth-round finding: `(0)` through `(2)` — a pattern wrapped in
+        // parentheses, legal and warning-free — is `Pat::Paren`, which fell to the
+        // wildcard `_ => Vec::new()` case in `pattern_literal` and left every such arm
+        // unresolved, even though a parenthesized pattern names exactly the value its own
+        // interior does.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn parenthesized_pattern_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn parenthesized_pattern_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        (0) => parenthesized_pattern_helper(0),\n        \
+             (1) => parenthesized_pattern_helper(1),\n        (2) => \
+             parenthesized_pattern_helper(2),\n        _ => \
+             parenthesized_pattern_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_resolves_a_constant_that_references_a_sibling_out_of_line_file_is_reported() {
+        // Codex's forty-fourth-round finding: `qualified_constants_with_prefix` used to
+        // scan each file of the tree in complete isolation, seeded from nothing, so a
+        // constant whose own initializer names a module declared in a *different*
+        // out-of-line file — `pub(crate) const P0: u8 = super::base::BASE + 0;` in
+        // `indices.rs`, naming the sibling out-of-line `base` module — never resolved
+        // regardless of which order the tree's files were scanned in: `indices.rs`'s own
+        // isolated pass had no way to see `base.rs`'s constant, and no later pass ever
+        // came back to retry it. The collection now runs to a fixed point, each file's
+        // scan seeded with everything the tree has accumulated so far.
+        let parent = format!(
+            "{}\nmod base;\nmod indices;\n\nconst fn qualified_constant_pattern_table(nibble: \
+             u8) -> u32 {{\n    match nibble & 0xF {{\n        indices::P0 => \
+             crc32_nibble(0),\n        indices::P1 => crc32_nibble(1),\n        \
+             indices::P2 => crc32_nibble(2),\n        indices::P3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let base = "//! Base value.\npub(crate) const BASE: u8 = 10;\n";
+        let indices = "//! Table indices.\npub(crate) const P0: u8 = super::base::BASE + \
+                       0;\npub(crate) const P1: u8 = super::base::BASE + \
+                       1;\npub(crate) const P2: u8 = super::base::BASE + \
+                       2;\npub(crate) const P3: u8 = super::base::BASE + 3;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/base.rs", base),
+            layer("waymaker-flash/src/crc/indices.rs", indices),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_conditional_initializers_is_reported() {
+        // Codex's forty-fifth-round finding: `const P0: u8 = if SELECT_FIRST { 0 } else {
+        // 100 };` is `Expr::If`, which fell to the wildcard `_ => None` case in
+        // `literal_or_const_value` and left every such arm unresolved — and the
+        // const-call backstop (`const_call_initializer_uses`) does not catch it either,
+        // since an `if` is not a call. A `bool` is the only type Rust permits an `if`'s
+        // own condition to be, so evaluating it through the same `i128` pipeline (`0`
+        // for `false`, `1` for `true`) and then evaluating the chosen branch — reusing
+        // `Expr::Block`'s own local-`const` handling, since the `then` branch is the
+        // identical shape — resolves it exactly as directly as `rustc`'s own constant
+        // folding does.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst SELECT_FIRST: bool = true;\n\n\
+             const fn conditional_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = if SELECT_FIRST { 0 } else { 100 };\n    \
+             const P1: u8 = if SELECT_FIRST { 1 } else { 101 };\n    \
+             const P2: u8 = if SELECT_FIRST { 2 } else { 102 };\n    \
+             const P3: u8 = if SELECT_FIRST { 3 } else { 103 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_against_an_impl_with_a_qualified_self_type_is_reported() {
+        // Codex's forty-sixth-round finding: `impl defs::Key { .. }` — an inherent impl
+        // whose own self type is qualified rather than bare — was excluded outright by a
+        // guard requiring exactly one path segment, so every constant it declared was
+        // dropped. A qualifying prefix (`self`, `defs`, or anything else) changes nothing
+        // about the key a reference to these constants resolves against: it is still the
+        // type's own last segment, the identical bare name a single-segment `Self` type
+        // already indexes under, and `resolve_qualified_path`'s own last-two-segments
+        // fallback is what a fully qualified reference like `defs::Key::P0` already
+        // reaches it through.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod defs {\n    pub struct Key;\n}\n\n\
+             impl defs::Key {\n    pub const P0: u8 = 0;\n    pub const P1: u8 = \
+             1;\n    pub const P2: u8 = 2;\n    pub const P3: u8 = 3;\n}\n\n\
+             const fn qualified_self_type_table(nibble: u8) -> u32 {\n    match nibble & \
+             0xF {\n        defs::Key::P0 => 0,\n        defs::Key::P1 => 1,\n        \
+             defs::Key::P2 => 2,\n        defs::Key::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_provably_dead_guarded_arm_is_still_reported() {
+        // Codex's forty-sixth-round finding: `_ if false => 999`, sitting between the
+        // numbered arms and the real wildcard, is dead code `rustc` eliminates outright —
+        // but this scan recorded it as an ordinary arm with an empty pattern (a guarded
+        // `Pat::Wild` is neither the wildcard, since `is_catchall_pattern` refuses every
+        // guarded arm, nor a value-bearing one, since a bare `_` names no value), and
+        // `missing_value` requires every arm in its own numbered prefix to have a
+        // non-empty pattern — so one dead arm anywhere in that prefix silently
+        // disqualified an otherwise dense match. A guard this scan can prove is always
+        // `false` is now dropped before the arm is ever recorded, the same way `rustc`'s
+        // own dead-code elimination drops it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dead_guarded_arm_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn dead_guarded_arm_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => dead_guarded_arm_helper(0),\n        \
+             1 => dead_guarded_arm_helper(1),\n        2 => dead_guarded_arm_helper(2),\n        \
+             _ if false => 999,\n        _ => dead_guarded_arm_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_if_else_chain_is_reported() {
+        // Codex's forty-seventh-round finding: this scan only ever looked at `match`
+        // expressions, but a hand-written `if x == 0 { .. } else if x == 1 { .. } else {
+        // .. }` chain over one consistent scrutinee compiles to the identical indexed
+        // table a `match` over the same arms would. `extract_if_chain` now recognises the
+        // shape and answers in the same `FoundMatch` form a real match already produces,
+        // so the existing density check runs over it unchanged.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn if_chain_table(nibble: u8) -> u32 {\n    \
+             if nibble == 0 {\n        if_chain_helper(0)\n    } else if nibble == 1 \
+             {\n        if_chain_helper(1)\n    } else if nibble == 2 {\n        \
+             if_chain_helper(2)\n    } else {\n        if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_match_valued_initializers_is_reported() {
+        // Codex's forty-seventh-round finding: `const P0: u8 = match true { true => 0,
+        // false => 100 };` is `Expr::Match`, which fell to the wildcard `_ => None` case
+        // in `literal_or_const_value` and left every such constant unresolved — and the
+        // const-call backstop does not catch it either, since a `match` is not a call.
+        // `evaluate_match` resolves the scrutinee and evaluates whichever arm's pattern
+        // names that value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn match_valued_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match true {\n        true => 0,\n        false => 100,\n    \
+             };\n    const P1: u8 = match true {\n        true => 1,\n        false => \
+             101,\n    };\n    const P2: u8 = match true {\n        true => 2,\n        \
+             false => 102,\n    };\n    const P3: u8 = match true {\n        true => \
+             3,\n        false => 103,\n    };\n    match nibble {\n        P0 => 0,\n        \
+             P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_initialized_by_a_match_with_a_cfg_test_arm_is_reported() {
+        // Codex's forty-eighth-round finding: `evaluate_match` read every arm of a
+        // constant-valued initializer regardless of its own `#[cfg(test)]`, unlike
+        // `visit_expr_match`'s own scan of a top-level match, which has filtered such an
+        // arm out since round forty-six. Each `const P0` here is initialized by
+        // `match true { #[cfg(test)] true => 99, true => 0, false => 200 }`: a test build
+        // never reaches the first arm at all, and the real, shipped value is `0` — but an
+        // unfiltered scan matches the `#[cfg(test)]` arm first (its pattern is `true`,
+        // identical to the production arm's own), resolving `P0` to the sparse, test-only
+        // `99` instead. Filtering the arm the same way `visit_expr_match` already does
+        // makes `P0` through `P3` resolve to `0..3`, the dense sequence the outer match's
+        // patterns actually are in the shipped binary.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nconst fn cfg_test_arm_initializer_table(nibble: u8) -> u32 {\n");
+        source.push_str("    const P0: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 99,\n        true => 0,\n        false => 200,\n    };\n");
+        source.push_str("    const P1: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 199,\n        true => 1,\n        false => 201,\n    };\n");
+        source.push_str("    const P2: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 299,\n        true => 2,\n        false => 202,\n    };\n");
+        source.push_str("    const P3: u8 = match true {\n");
+        source.push_str("        #[cfg(test)]\n        true => 399,\n        true => 3,\n        false => 203,\n    };\n");
+        source.push_str("    match nibble {\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_nested_inside_an_if_chain_condition_is_reported() {
+        // Codex's forty-eighth-round finding: a recognised `if`/`else if` chain's manual
+        // traversal visited only each link's *body*, never its *condition* — so a dense
+        // match embedded inside a condition, as in `(match nibble & 3 { .. }) == 0`, was
+        // never handed to `self.visit_expr` and so never reached `visit_expr_match` at
+        // all. The outer chain here is not itself dense (two numbered arms and an else,
+        // one short of `MINIMUM_DENSE_TABLE_ARMS`), so the only violation this source can
+        // produce is the nested match inside its own two conditions — which is identical
+        // text in both, keeping the chain's scrutinee consistent the way
+        // `extract_if_chain` requires, and is exactly what visiting each condition finds.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn condition_nested_table(nibble: u8) -> u32 {\n    \
+             if (match nibble & 3 {\n        0 => 10,\n        1 => 11,\n        2 => \
+             12,\n        _ => 13,\n    }) == 0 {\n        0\n    } else if (match nibble \
+             & 3 {\n        0 => 10,\n        1 => 11,\n        2 => 12,\n        _ => \
+             13,\n    }) == 1 {\n        1\n    } else {\n        2\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_tuple_field_initializers_is_reported() {
+        // Codex's forty-ninth-round finding: `const P0: u8 = (0u8,).0;` is `Expr::Field` —
+        // a field projection on a tuple literal — which fell to the wildcard `_ => None`
+        // case in `literal_or_const_value` and left every such constant unresolved, the
+        // const-call and array backstops included, since a field projection is neither a
+        // call nor an array index. The new `Expr::Field` case evaluates the tuple's own
+        // element at the projected index through this same pipeline, so `P0` through `P3`
+        // resolve to `0..3`, the dense sequence the outer match's patterns actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_field_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = (0u8,).0;\n    const P1: u8 = (1u8,).0;\n    \
+             const P2: u8 = (2u8,).0;\n    const P3: u8 = (3u8,).0;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_method_call_initializer_is_reported() {
+        // Codex's next-round finding: `syn` gives a dot-call its own node kind rather than
+        // lowering it to `Expr::Call`, so `const P0: u8 = 0u8.wrapping_add(0);` walked
+        // straight past `const_call_initializer_uses`'s original `visit_expr_call`-only
+        // override — a real, `const`-evaluable method call this scan does not interpret,
+        // exactly like the free-function call the const-call backstop already refuses, but
+        // silently unrecognised as either a call or a resolved value. `contains_call` now
+        // also overrides `visit_expr_method_call`, so a method-call initializer is refused
+        // outright the same way a free-function-call one already is.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str("\nconst P0: u8 = 0u8.wrapping_add(0);\n");
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `P0` with a call as its own initializer")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_boolean_negated_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if !true => ..` is still retained after the
+        // provably-dead-guard fix, because that fix's `Unary(Not)` case requires a
+        // *suffixed integer literal* (`as_suffixed_int_literal`) — the width it needs for a
+        // bitwise flip — and `true` is a `Lit::Bool`, which carries no width and no suffix
+        // at all, so `!true` resolved to `None` rather than the `0` the dead-guard filter
+        // in `visit_expr_match` needs to prove the arm unreachable. `as_bool_literal` is
+        // now tried first, so a boolean operand is read as logical negation (`!true` is
+        // `false`, `0`) and only a non-boolean operand falls through to the width-aware
+        // bitwise path.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn bool_negated_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn bool_negated_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => bool_negated_dead_guard_helper(0),\n        \
+             1 => bool_negated_dead_guard_helper(1),\n        2 => bool_negated_dead_guard_helper(2),\n        \
+             _ if !true => 999,\n        _ => bool_negated_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_let_bound_block_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let value = 0; value };` is
+        // exactly as resolvable as a local `const` block `evaluate_block` already folds,
+        // but a `let` is `syn::Stmt::Local`, a different statement kind from the local
+        // `const` items `block_const_exprs` recognised — and the const-call backstop does
+        // not catch it either, since a bare `let` names no call. `block_let_exprs` now
+        // reads a plain `let NAME = EXPR;` the same narrow way a local `const` already is,
+        // so `P0` through `P3` resolve to `0..3`, the dense sequence the outer match's
+        // patterns actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn let_bound_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = { let value = 0; value };\n    \
+             const P1: u8 = { let value = 1; value };\n    \
+             const P2: u8 = { let value = 2; value };\n    \
+             const P3: u8 = { let value = 3; value };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_provably_true_guarded_wildcard_is_reported() {
+        // Codex's next-round finding: `_ if true => ..`, followed by the
+        // exhaustiveness-required `_ => ..`, unconditionally matches every remaining input
+        // exactly as an unguarded `_` would — but `is_catchall_pattern` was handed
+        // `arm.guard.is_some()` unconditionally, so this arm read as an ordinary guarded,
+        // non-wild arm, and the *real* trailing wildcard after it (dead code `rustc`
+        // eliminates, since the guarded arm already claims everything) was the one
+        // `has_dense_arm_patterns` looked at — leaving the numbered prefix in front of it
+        // carrying the guarded arm's own empty pattern, exactly the shape the forty-sixth
+        // round's false-guard fix already refuses. A guard this scan resolves to anything
+        // but `0` is now treated as absent, so the guarded arm reads as the real wildcard
+        // and the scan stops there, dropping the truly unreachable arm after it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn true_guarded_wildcard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn true_guarded_wildcard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => true_guarded_wildcard_helper(0),\n        \
+             1 => true_guarded_wildcard_helper(1),\n        2 => true_guarded_wildcard_helper(2),\n        \
+             _ if true => true_guarded_wildcard_helper(3),\n        \
+             _ => true_guarded_wildcard_helper(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_named_struct_field_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = Cell { value: 0 }.value;` is
+        // `Expr::Field` over `Expr::Struct` — a *named*-field projection, a different node
+        // kind from the tuple literal the forty-ninth round's `Expr::Field` case first
+        // handled — and fell straight through to that case's own tuple-only refusal, the
+        // const-call and array backstops included, since a field projection is neither a
+        // call nor an array index. `Expr::Field`'s struct-literal arm evaluates the named
+        // field's own initializer expression, refusing outright when the literal carries a
+        // `..rest` base a named field might otherwise come from.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nstruct Cell {\n    value: u8,\n}\n\nconst fn struct_field_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = Cell { value: 0 }.value;\n    \
+             const P1: u8 = Cell { value: 1 }.value;\n    \
+             const P2: u8 = Cell { value: 2 }.value;\n    \
+             const P3: u8 = Cell { value: 3 }.value;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_trait_default_implemented_in_a_sibling_module_is_reported() {
+        // Codex's next-round finding: an empty impl of a *qualified* trait reference in a
+        // sibling module — `mod traits { pub trait Indices { const P0: u8 = 0; .. } }`
+        // beside `mod implementations { impl super::traits::Indices for u8 {} }` — indexes
+        // the trait's defaults under `"traits::Indices"` (`visit_item_trait`'s own full
+        // declaration scope), but `visit_item_impl` looked them up only by the trait's
+        // *bare* name, searched against the impl's own lexical scope
+        // (`"implementations::Indices"`) — never against the qualified path
+        // (`super::traits::Indices`) the impl itself wrote, which names the trait's real
+        // declaration. `resolve_qualified_trait_defaults_at_any_depth` now tries that
+        // qualified path first, the same way a qualified constant reference already
+        // resolves.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits {\n    pub trait Indices {\n        const P0: u8 = 0;\n        \
+             const P1: u8 = 1;\n        const P2: u8 = 2;\n        const P3: u8 = \
+             3;\n    }\n}\n\nmod implementations {\n    impl super::traits::Indices for u8 \
+             {}\n}\n\nconst fn sibling_module_trait_default_table(nibble: u8) -> u32 {\n    \
+             match nibble & 0xF {\n        <u8 as traits::Indices>::P0 => 0,\n        \
+             <u8 as traits::Indices>::P1 => 1,\n        <u8 as traits::Indices>::P2 => \
+             2,\n        <u8 as traits::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_inline_const_block_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = const { 0u8 };` is `Expr::Const` — an
+        // inline const block, MSRV-legal and evaluated by `rustc` before the match it feeds
+        // ever lowers — which fell to the wildcard `_ => None` case in
+        // `literal_or_const_value` and left every such constant unresolved, the const-call
+        // and array backstops included, since an inline const block is neither a call nor
+        // an array index. The new `Expr::Const` case routes the block's own body to
+        // `evaluate_block`, the identical function `Expr::Block`'s own case already uses.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn const_block_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = const { 0u8 };\n    const P1: u8 = const { 1u8 };\n    \
+             const P2: u8 = const { 2u8 };\n    const P3: u8 = const { 3u8 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_two_same_named_traits_implemented_for_one_type_is_reported() {
+        // Codex's next-round finding: explicit impl constants were still keyed, and looked
+        // up, by the trait's bare *last segment* alone — the exact collision the
+        // forty-third round's fix closed for two *differently*-named traits reappears the
+        // moment two traits sharing one bare name (`Indices`, declared once in
+        // `traits_a` and once in `traits_b`) are each implemented for the same type in
+        // their own sibling module: both impls' constants ended in the identical
+        // `Indices::u8::P0` suffix, so the trait-aware suffix search found two candidates
+        // and answered neither, even though `<u8 as traits_a::Indices>::P0` names the
+        // intended impl exactly. `visit_item_impl` now keys a trait impl's constants under
+        // the trait's *full resolved* scope path (`traits_a::Indices`, not bare
+        // `Indices`), and `resolve_qself_associated_const`'s own suffix search is widened
+        // to match — built from every segment of the pattern's own trait path rather than
+        // only the one immediately before the member — so `traits_a::Indices::u8::P0` and
+        // `traits_b::Indices::u8::P0` no longer share a candidate.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod traits_a {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod traits_b {\n    pub trait Indices {\n        const P0: u8;\n        \
+             const P1: u8;\n        const P2: u8;\n        const P3: u8;\n    }\n}\n\n\
+             mod impl_a {\n    impl super::traits_a::Indices for u8 {\n        \
+             const P0: u8 = 0;\n        const P1: u8 = 1;\n        const P2: u8 = \
+             2;\n        const P3: u8 = 3;\n    }\n}\n\n\
+             mod impl_b {\n    impl super::traits_b::Indices for u8 {\n        \
+             const P0: u8 = 99;\n        const P1: u8 = 100;\n        const P2: u8 = \
+             101;\n        const P3: u8 = 102;\n    }\n}\n\n\
+             const fn same_named_trait_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        <u8 as traits_a::Indices>::P0 => 0,\n        \
+             <u8 as traits_a::Indices>::P1 => 1,\n        <u8 as traits_a::Indices>::P2 => \
+             2,\n        <u8 as traits_a::Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_dereferenced_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = *&0u8;` — dereferencing a reference
+        // taken in the same expression — is `Expr::Unary(Deref, Expr::Reference(..))`,
+        // which fell to the wildcard `_ => None` case in `literal_or_const_value` and left
+        // every such constant unresolved, the const-call and array backstops included,
+        // since a dereference is neither a call nor an array index. `*&X` is definitionally
+        // `X`, so the new case recurses into the reference's own inner expression through
+        // the identical pipeline.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dereferenced_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = *&0u8;\n    const P1: u8 = *&1u8;\n    \
+             const P2: u8 = *&2u8;\n    const P3: u8 = *&3u8;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_indexed_array_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = [0u8][0];` is `Expr::Index` over an
+        // array *literal*, built solely so the indexing yields a constant — which fell to
+        // the wildcard `_ => None` case in `literal_or_const_value` and left every such
+        // constant unresolved. Neither backstop catches it: the const-call scan finds no
+        // call, and the array-vocabulary ban reads a *declared type* (`const P0: [u8; N]`),
+        // never an initializer's own shape — each of these constants is still plainly typed
+        // `u8`. The new `Expr::Index` case evaluates the array literal's own element at the
+        // resolved index through this same pipeline.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn indexed_array_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = [0u8][0];\n    const P1: u8 = [1u8][0];\n    \
+             const P2: u8 = [2u8][0];\n    const P3: u8 = [3u8][0];\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_cast_into_the_upper_half_of_u128_is_reported() {
+        // Codex's next-round finding: `apply_integer_cast`'s own `u128`-destination branch
+        // at full width used `i128::try_from(bits).ok()`, which fails closed the moment
+        // `bits` exceeds `i128::MAX` — exactly the upper half of `u128`'s own range, and
+        // exactly the domain `lit_value`'s `Lit::Int` case already stores as a wrapped,
+        // negative `i128` for an *oversized u128 literal* too wide for `i128` to parse.
+        // `(-4i128) as u128` through `(-1i128) as u128` *land* in that same upper half —
+        // each cast's own 128-bit pattern is a large positive `u128` no `i128` can hold as
+        // a positive value — and was refused instead of reinterpreted the identical way.
+        // Both destinations now share the one 128-bit reinterpretation, so `P0` through
+        // `P3` resolve to four wrapping-consecutive values near `u128::MAX`, the dense
+        // window `window_layout`'s own mod-2^128 arithmetic already lays out.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn u128_cast_upper_half_table(nibble: u128) -> u32 {\n    \
+             const P0: u128 = (-4i128) as u128;\n    const P1: u128 = (-3i128) as u128;\n    \
+             const P2: u128 = (-2i128) as u128;\n    const P3: u128 = (-1i128) as u128;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_indexed_into_a_repeat_array_literal_is_reported() {
+        // Codex's next-round finding: `[0u8; 1][0]` is `syn`'s `Expr::Repeat` — the
+        // `[value; count]` grammar, a different node kind from the bracketed-list
+        // `Expr::Array` the previous round's `Expr::Index` case first handled — and fell
+        // straight through that case's own refusal, for the same reason the tuple/struct
+        // split needed a second match arm two rounds earlier. Every element of a repeat
+        // literal is definitionally the same expression, so the new arm bounds-checks the
+        // index against the (separately resolved) repeat count and evaluates that one
+        // shared element expression rather than looking anything up positionally.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn repeat_array_indexed_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = [0u8; 1][0];\n    const P1: u8 = [1u8; 1][0];\n    \
+             const P2: u8 = [2u8; 1][0];\n    const P3: u8 = [3u8; 1][0];\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_comparison_valued_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if 1 == 0 => ..`, sitting between the numbered
+        // arms and the real wildcard, is exactly the dead code the forty-sixth round's
+        // `false`-guard fix and the forty-eighth round's `!true`-guard fix already prune —
+        // but `Expr::Binary`'s own `match` on `binary.op` had no arm at all for a
+        // comparison operator, so `1 == 0` fell to the wildcard `_ => None` and the guard
+        // stayed unresolved rather than provably `0`. `evaluate_binary_op` now folds every
+        // comparison operator the same way it already folds arithmetic, so the guard
+        // resolves to `0` and the arm is dropped the way `rustc`'s own dead-code
+        // elimination would drop it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn comparison_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn comparison_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => comparison_dead_guard_helper(0),\n        \
+             1 => comparison_dead_guard_helper(1),\n        2 => comparison_dead_guard_helper(2),\n        \
+             _ if 1 == 0 => 999,\n        _ => comparison_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_with_a_multi_segment_qself_type_is_reported() {
+        // Codex's next-round finding: `<defs::Key as Indices>::P0` still failed after the
+        // impl-path indexing fix, because `resolve_qself_associated_const` read its own
+        // `Type` (`qself.ty`) through `single_segment_type_name`, which refuses outright
+        // the moment the self type carries more than one segment — `defs::Key` is two —
+        // and returns before ever consulting the impl-constant index at all, even though
+        // `visit_item_impl` already indexes exactly this spelling (`defs::Key::P0`) under
+        // its own third key, for the identical reason a qualified constant reference
+        // needs one. `type_path_name` replaces it: the type name this function builds its
+        // synthetic paths and suffixes from can itself be multi-segment now, and the
+        // existing qualified-path machinery finds that third key directly.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod defs {\n    pub struct Key;\n}\n\ntrait Indices {\n    const P0: u8;\n    \
+             const P1: u8;\n    const P2: u8;\n    const P3: u8;\n}\n\n\
+             impl Indices for defs::Key {\n    const P0: u8 = 0;\n    const P1: u8 = \
+             1;\n    const P2: u8 = 2;\n    const P3: u8 = 3;\n}\n\n\
+             const fn qualified_qself_type_table(nibble: u8) -> u32 {\n    match nibble & \
+             0xF {\n        <defs::Key as Indices>::P0 => 0,\n        \
+             <defs::Key as Indices>::P1 => 1,\n        <defs::Key as Indices>::P2 => \
+             2,\n        <defs::Key as Indices>::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_loop_valued_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = loop { break 0 };` is `Expr::Loop`,
+        // which fell to the wildcard `_ => None` case in `literal_or_const_value` and left
+        // every such constant unresolved — the const-call, array and macro backstops all
+        // included, since a loop is none of those. Scoped to the one shape that is
+        // knowably total without interpreting control flow: the body must hold exactly one
+        // statement, an unlabelled `break` carrying a value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn loop_valued_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = loop { break 0 };\n    const P1: u8 = loop { break 1 };\n    \
+             const P2: u8 = loop { break 2 };\n    const P3: u8 = loop { break 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_logically_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if OFF && ON => ..`, sitting between the numbered
+        // arms and the real wildcard, is exactly the dead code the comparison-guard fix
+        // this same round already prunes — but `evaluate_binary_op`'s own `match` had no
+        // arm for the logical operators `&&`/`||`, so `OFF && ON` fell to the wildcard
+        // `_ => None` and the guard stayed unresolved rather than provably `0`.
+        // `evaluate_binary_op` now folds both, over the same two already-resolved operand
+        // values every other operator here folds.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn logical_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst OFF: bool = false;\nconst ON: bool = true;\n\n\
+             const fn logical_dead_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => logical_dead_guard_helper(0),\n        \
+             1 => logical_dead_guard_helper(1),\n        2 => logical_dead_guard_helper(2),\n        \
+             _ if OFF && ON => 999,\n        _ => logical_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_indexed_into_a_byte_string_literal_is_reported() {
+        // Codex's next-round finding: `b"\x00"[0]` indexes a byte-string literal
+        // (`Expr::Lit` wrapping `syn::Lit::ByteStr`), a third indexable shape beside the
+        // array and repeat literals the two previous rounds already handled — which fell
+        // to the wildcard `_ => None` case in `literal_or_const_value` and left every such
+        // constant unresolved, the array-vocabulary ban included, since each declared
+        // constant's own type is a plain `u8`. The new arm reads the byte string's own
+        // bytes and bounds-checks the index against that length directly.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn byte_string_indexed_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = b\"\\x00\"[0];\n    const P1: u8 = b\"\\x01\"[0];\n    \
+             const P2: u8 = b\"\\x02\"[0];\n    const P3: u8 = b\"\\x03\"[0];\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_short_circuited_dead_guarded_arm_is_still_reported() {
+        // Codex's next-round finding: `_ if false && opaque() => ..` stayed unresolved
+        // under the round-before-this fix for logical operators, because that fix
+        // resolved *both* operands eagerly before folding `&&` — and `opaque()` is a
+        // call, which this scan never evaluates, so the whole guard answered `None`
+        // instead of the `0` a decisive `false` left operand should have given on its
+        // own, exactly the way `rustc` itself never evaluates `opaque()` once `false` has
+        // already decided `&&`'s answer. `evaluate_short_circuit_op` now resolves only
+        // the left operand first, and returns a decisive answer directly without ever
+        // asking the right operand — the call included — to resolve at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn short_circuit_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn opaque() -> bool {\n    true\n}\n\n\
+             const fn short_circuit_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => short_circuit_dead_guard_helper(0),\n        \
+             1 => short_circuit_dead_guard_helper(1),\n        2 => short_circuit_dead_guard_helper(2),\n        \
+             _ if false && opaque() => 999,\n        _ => short_circuit_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_platform_sized_cast_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: usize = 0u8 as usize;` was refused by
+        // `apply_integer_cast`'s blanket "platform-width, no target to measure against"
+        // rule, even though nothing about *this* cast's answer depends on which target it
+        // runs on — Rust's own reference guarantees `usize`/`isize` are at least 16 bits
+        // wide everywhere, so a value already inside that guaranteed range (`0` here)
+        // casts to the identical value on every target. `apply_integer_cast` now answers
+        // such a cast directly, scoped to exactly that 16-bit-guaranteed width.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn platform_sized_cast_table(nibble: usize) -> u32 {\n    \
+             const P0: usize = 0u8 as usize;\n    const P1: usize = 1u8 as usize;\n    \
+             const P2: usize = 2u8 as usize;\n    const P3: usize = 3u8 as usize;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_if_chain_with_a_parenthesised_scrutinee_link_is_reported() {
+        // Codex's next-round finding: `if_chain_condition_value` read a link's scrutinee
+        // as raw token text with no normalisation of its *own* shape, so `if nibble == 0
+        // { .. } else if (nibble) == 1 { .. }` compared "nibble" against "(nibble)" —
+        // different token strings for the identical scrutinee `rustc` sees straight
+        // through parentheses — and `extract_if_chain` refused the whole chain as
+        // inconsistent, even though every link names the same value. `strip_parens` is
+        // now applied to the unresolved side before its token text is taken, the same
+        // normalisation this scan already applies before looking at most other
+        // expressions' own shape.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn mixed_paren_if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn mixed_paren_if_chain_table(nibble: u8) -> u32 {\n    \
+             if nibble == 0 {\n        mixed_paren_if_chain_helper(0)\n    } else if \
+             (nibble) == 1 {\n        mixed_paren_if_chain_helper(1)\n    } else if \
+             nibble == 2 {\n        mixed_paren_if_chain_helper(2)\n    } else {\n        \
+             mixed_paren_if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_if_chain_with_xor_equals_zero_links_is_reported() {
+        // Codex's finding: `if (n ^ 0) == 0 { .. } else if (n ^ 1) == 0 { .. } else { .. }`
+        // names an equality ladder whose every link's own unresolved side is `(n ^ k)` for a
+        // different `k` — `if_chain_condition_value`'s own token-text comparison across
+        // links never matched, since each link's own "scrutinee" read as `n ^ 0`, `n ^ 1`,
+        // and so on, never twice the same text, even though every link tests the identical
+        // `n` against a different value and `(n ^ k) == 0` is bit-for-bit equivalent to `n
+        // == k`. `xor_equals_zero_scrutinee` now recognises this shape: the real scrutinee
+        // is the XOR's own unresolved operand, and the value each link tests against is the
+        // XOR's own resolved operand rather than the zero the outer `==` names. Verified
+        // against real rustc, warning-free, and by disassembly that a fifteen-case `u8`
+        // ladder of this exact shape still emits a sixty-byte `.Lswitch.table`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn xor_equals_zero_if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn xor_equals_zero_if_chain_table(nibble: u8) -> u32 {\n    \
+             if (nibble ^ 0) == 0 {\n        xor_equals_zero_if_chain_helper(0)\n    } else \
+             if (nibble ^ 1) == 0 {\n        xor_equals_zero_if_chain_helper(1)\n    } else \
+             if (nibble ^ 2) == 0 {\n        xor_equals_zero_if_chain_helper(2)\n    } else \
+             {\n        xor_equals_zero_if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_if_chain_with_wrapping_sub_equals_zero_links_is_reported() {
+        // Codex's finding: `if n.wrapping_sub(0) == 0 { .. } else if n.wrapping_sub(1) == 0
+        // { .. } else { .. }` names an equality ladder whose every link's own unresolved
+        // side is `n.wrapping_sub(k)` for a different `k` — the identical shape
+        // `xor_equals_zero_scrutinee` already closed one operator over, since `a - b == 0`
+        // if and only if `a == b` regardless of which side names the scrutinee.
+        // `wrapping_sub_equals_zero_scrutinee` now recognises this shape the same way.
+        // Verified against real rustc, warning-free, and by disassembly that a fifteen-case
+        // `u8` ladder of this exact shape still emits a sixty-byte `.Lswitch.table`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn wrapping_sub_equals_zero_if_chain_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn wrapping_sub_equals_zero_if_chain_table(nibble: u8) -> u32 \
+             {\n    if nibble.wrapping_sub(0) == 0 {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(0)\n    } else if \
+             nibble.wrapping_sub(1) == 0 {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(1)\n    } else if \
+             nibble.wrapping_sub(2) == 0 {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(2)\n    } else {\n        \
+             wrapping_sub_equals_zero_if_chain_helper(3)\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_guard_ordering_an_upper_half_u128_value_does_not_wrongly_prune_a_live_arm() {
+        // Codex's next-round finding: an upper-half `u128` value (above `i128::MAX`) is
+        // stored here as its own two's-complement bit pattern reinterpreted as a
+        // *negative* `i128` — the identical storage a genuinely negative signed value
+        // already uses — so `evaluate_binary_op`'s old plain signed `Lt`/`Gt`/... folded
+        // `2^127u128 > 0` as `false`, where `rustc` evaluates it `true`. A guard spelled
+        // that way is not provably dead in real Rust, but the old signed fold made this
+        // scan's own dead-guard filter treat it as exactly that and drop the arm outright
+        // — losing the `1` arm from the numbered sequence below and leaving only a
+        // *3*-arm dense window (`0`, `2` present, `1` a tolerated single-value gap).
+        // `evaluate_binary_op` now declines to fold an ordering comparison whenever
+        // either operand is negative, since this domain cannot tell "really negative"
+        // apart from "a large unsigned value wrapped around" — so the guard stays
+        // unresolved, the arm is kept with its own literal pattern intact (unaffected by
+        // an unresolved guard), and the real, full *4*-arm dense window is what this scan
+        // reports.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn upper_half_u128_ordering_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn upper_half_u128_ordering_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => upper_half_u128_ordering_helper(0),\n        \
+             1 if 170141183460469231731687303715884105728u128 > 0 => \
+             upper_half_u128_ordering_helper(1),\n        \
+             2 => upper_half_u128_ordering_helper(2),\n        \
+             _ => upper_half_u128_ordering_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_guard_ordering_two_explicitly_typed_u128_operands_is_still_pruned_as_dead() {
+        // Codex's next-round finding: the round-before-this fix declined to fold an
+        // ordering comparison whenever *either* operand was negative in this scan's own
+        // domain, with no exception — sound, but overbroad: `2^127u128 < 0u128` is written
+        // with an explicit `u128` suffix on *both* sides, so nothing about which domain it
+        // means is actually ambiguous, and `rustc` folds it to `false` outright. The same
+        // signed-only rule left this guard unresolved too, so the arm it sits on was kept
+        // rather than pruned as the dead code it really is, leaving an empty-pattern arm
+        // in the numbered prefix and no violation reported at all.
+        // `evaluate_ordering_op` now reinterprets a negative operand's bit pattern as
+        // `u128` once `is_definitely_unsigned` confirms that is what it means, so this
+        // guard folds to `0` and the arm is dropped, restoring the real 4-arm dense window.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_upper_half_u128_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn typed_upper_half_u128_dead_guard_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => typed_upper_half_u128_dead_guard_helper(0),\n        \
+             1 => typed_upper_half_u128_dead_guard_helper(1),\n        2 => typed_upper_half_u128_dead_guard_helper(2),\n        \
+             _ if 170141183460469231731687303715884105728u128 < 0u128 => 999,\n        \
+             _ => typed_upper_half_u128_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_well_known_integer_bound_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = u8::MIN;` names a real, well-known
+        // associated constant of a language primitive — not anything the scanned source
+        // tree ever declares — so no amount of collecting local, qualified or
+        // trait-default constants would ever find it, and every such initializer read as
+        // unresolved. `well_known_integer_bound` answers `TypeName::MIN`/`MAX` directly
+        // for the ten fixed-width integer types this scan already knows, checked in
+        // `resolve_pattern_path` before any of the scope-dependent lookups.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn well_known_bound_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = u8::MIN;\n    const P1: u8 = u8::MIN + 1;\n    \
+             const P2: u8 = u8::MIN + 2;\n    const P3: u8 = u8::MIN + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_typed_local_constants_is_pruned_as_dead() {
+        // Codex's next-round finding: `is_definitely_unsigned` recognised a suffixed
+        // literal or a cast, but not a bare `Expr::Path` referring to an already-typed
+        // constant — `const HI: u128 = 1u128 << 127; const ZERO: u128 = 0; _ if HI < ZERO
+        // => ..` resolves both operands to values, and `HI`'s value is negative in this
+        // scan's own `i128` storage, but neither operand expression is itself a literal or
+        // a cast for that function's existing cases to read, so the guard stayed
+        // unresolved and the arm it guards was kept rather than pruned as the dead code it
+        // really is — undercounting an otherwise dense `0..=3` window by one arm.
+        // `path_is_definitely_unsigned` now answers a bare name from
+        // `UnsignedConstScopes`, the mirror of `ConstScopes` this round adds for exactly
+        // that fact, so the guard folds to `0` and the real four-arm window is restored.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_constant_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn typed_constant_dead_guard_table(nibble: u8) -> u32 {\n    \
+             const HI: u128 = 1u128 << 127;\n    const ZERO: u128 = 0;\n    \
+             match nibble {\n        0 => typed_constant_dead_guard_helper(0),\n        \
+             1 => typed_constant_dead_guard_helper(1),\n        \
+             2 => typed_constant_dead_guard_helper(2),\n        \
+             _ if HI < ZERO => 999,\n        \
+             _ => typed_constant_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_module_shadowing_a_primitive_type_name_is_respected() {
+        // Codex's next-round finding: `well_known_integer_bound` was checked before this
+        // scan ever consulted a locally declared module's own constants, so a local
+        // `mod u8 { pub const MIN: u8 = 0; pub const MAX: u8 = 2; }` — legal Rust, and
+        // resolved by `rustc` to the module's own constants rather than the primitive's —
+        // was shadowed the other way around here: the primitive's own `MIN`/`MAX` answered
+        // first regardless of what the module actually declared. A table whose numbered
+        // arms alternate `u8::MIN + n` and `u8::MAX + n` under that shadowing module reads
+        // as two widely separated sequences (based on `0` and `255`) rather than the
+        // single consecutive `0..=3` window `rustc` itself sees, and stayed undercounted.
+        // Both `resolve_pattern_path` and `resolve_qualified_path` now try every
+        // scope-dependent lookup first and fall back to the primitive's own bound only once
+        // none of them found a real declaration, so a real module always wins.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod u8 {\n    pub const MIN: u8 = 0;\n    pub const MAX: u8 = 2;\n}\n\n\
+             const fn shadowed_primitive_bound_table(nibble: u32) -> u32 {\n    \
+             const P0: u32 = u8::MIN as u32;\n    const P1: u32 = u8::MAX as u32 - 1;\n    \
+             const P2: u32 = u8::MAX as u32;\n    const P3: u32 = u8::MAX as u32 + 1;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_labelled_loop_pattern_constants_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = 'done: loop { break 'done 0 };` labels
+        // both the loop and its own break with the identical name — the break targets this
+        // loop and no other, so it is exactly as resolvable as the unlabelled `loop { break
+        // 0 }` this scan already folds — but the prior round's fix refused every labelled
+        // break unconditionally, so every one of `P0` through `P3`'s initializers stayed
+        // unresolved and the dense `0..=3` window they pattern-match went undetected.
+        // `evaluate_loop` now compares the break's own label against the loop's, refusing
+        // only a break that targets a *different* (outer) loop.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn labelled_loop_pattern_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = 'done: loop { break 'done 0 };\n    \
+             const P1: u8 = 'done: loop { break 'done 1 };\n    \
+             const P2: u8 = 'done: loop { break 'done 2 };\n    \
+             const P3: u8 = 'done: loop { break 'done 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_qualified_typed_constant_comparison_is_pruned_as_dead() {
+        // Codex's next-round finding: the prior round's fix answered a *bare* typed
+        // constant's own unsignedness from `UnsignedConstScopes`, but a *qualified*
+        // reference to one — `bounds::HI`, `bounds` an inline `mod` this file itself
+        // declares — still answered `false` unconditionally, because `qualified` carried no
+        // unsignedness counterpart of its own. `_ if bounds::HI < bounds::ZERO => ..` — with
+        // `HI = 1u128 << 127` and `ZERO = 0`, both declared `u128` — stayed unresolved, and
+        // the dense `0..=2` window it guards went undetected. `MatchVisitor::qualified_unsigned`
+        // is `qualified`'s own mirror now, so `path_is_definitely_unsigned` can answer the
+        // same question for a qualified name that `UnsignedConstScopes` already answers for
+        // a bare one.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod bounds {\n    pub const HI: u128 = 1u128 << 127;\n    \
+             pub const ZERO: u128 = 0;\n}\n\n\
+             const fn qualified_typed_constant_dead_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        _ if bounds::HI < bounds::ZERO => 999,\n        \
+             _ => 3,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_canonical_primitive_bound_initializers_is_reported() {
+        // Codex's next-round finding: `core::primitive::u8::MIN` names the identical
+        // constant `u8::MIN` does — `core::primitive` (and `std::primitive`) are real
+        // modules that re-export every primitive type under its own name — but
+        // `resolve_qualified_path_at_any_depth`'s own well-known fallback matched only the
+        // bare two-segment shape, so `P0` through `P3`'s initializers spelled this way
+        // stayed unresolved on every arm. `well_known_bound_segments` now reads the
+        // `(type_name, member)` pair out of either shape: `TypeName::MIN` directly, or
+        // `core::primitive::TypeName::MIN` spelled out in full.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn canonical_primitive_bound_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = core::primitive::u8::MIN;\n    \
+             const P1: u8 = core::primitive::u8::MIN + 1;\n    \
+             const P2: u8 = core::primitive::u8::MIN + 2;\n    \
+             const P3: u8 = core::primitive::u8::MIN + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_blocks_holding_a_cfg_test_statement_is_reported() {
+        // Codex's next-round finding: `block_const_exprs`, `block_let_exprs` and
+        // `block_ignored_let_count` each already skip a `#[cfg(test)]`-gated statement, the
+        // same way `MatchVisitor::visit_block`'s own production walk does — but
+        // `evaluate_block`'s own statement-count check compared their filtered total
+        // against `block.stmts`'s own *raw* length, so a block holding one of those
+        // alongside an otherwise-complete set of local declarations counted one statement
+        // more than the filtered collectors ever could, and every one of `P0` through
+        // `P3`'s initializers stayed unresolved. The count is now taken over the identical
+        // filtered statement list the tail is split from, so a `#[cfg(test)]` statement
+        // costs the block nothing — matching what a real, shipped build of it looks like.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn cfg_gated_statement_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = { #[cfg(test)] let _ = (); let value = 0; value };\n    \
+             const P1: u8 = { #[cfg(test)] let _ = (); let value = 1; value };\n    \
+             const P2: u8 = { #[cfg(test)] let _ = (); let value = 2; value };\n    \
+             const P3: u8 = { #[cfg(test)] let _ = (); let value = 3; value };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_unsigned_u128_division_is_reported() {
+        // Codex's next-round finding: `evaluate_binary_op` divided the shared 128-bit
+        // storage as a plain signed `i128`, which is not sound for the identical reason
+        // ordering comparisons are not — `0xffffffffffffffffffffffffffffffffu128 / 2` is a
+        // real `u128` division `rustc` performs unsigned, but the dividend's own stored
+        // `i128` bit pattern is negative (`-1`), and `i128::checked_div` divides that
+        // negative value as itself, landing on a wrong, much smaller quotient. A constant
+        // built from that division therefore stayed unresolved, and a match over
+        // constants derived from it went undetected. `evaluate_division_op` folds `Div`
+        // and `Rem` the same way `evaluate_ordering_op` folds the four comparisons: an
+        // operand negative in this domain is reinterpreted as `u128` once its own
+        // declaration confirms that is what it means.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn unsigned_division_pattern_table(nibble: u32) -> u32 {\n    \
+             const Q: u128 = 0xffffffffffffffffffffffffffffffffu128 / 2;\n    \
+             const P0: u128 = (Q / Q) * 0;\n    const P1: u128 = (Q / Q) * 1;\n    \
+             const P2: u128 = (Q / Q) * 2;\n    const P3: u128 = (Q / Q) * 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_blocks_with_an_ignored_let_binding_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let _ =
+        // core::marker::PhantomData::<()>; 0 };` holds a statement `block_let_exprs`
+        // correctly leaves unresolved — its pattern is `_`, binding no name a later
+        // expression could reference — but `evaluate_block`'s own statement-count check
+        // could not tell that apart from a statement it genuinely could not fold, so the
+        // whole block was refused rather than only what the wildcard binding actually
+        // costs it: nothing, since a real `let _ = EXPR;` never reads `EXPR`'s value again.
+        // `block_ignored_let_count` counts such statements instead of trying to resolve
+        // them, so the statement-count check no longer conflates "unresolvable" with
+        // "resolves to nothing on purpose".
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn ignored_let_binding_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = { let _ = core::marker::PhantomData::<()>; 0 };\n    \
+             const P1: u8 = { let _ = core::marker::PhantomData::<()>; 1 };\n    \
+             const P2: u8 = { let _ = core::marker::PhantomData::<()>; 2 };\n    \
+             const P3: u8 = { let _ = core::marker::PhantomData::<()>; 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_labelled_block_pattern_constants_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = 'value: { break 'value 0 };` is a
+        // *labelled block* (stable since Rust 1.65) — the other construct, beside a loop, a
+        // labelled `break` can exit — and it targets this block itself, not some other one
+        // this scan would have to interpret control flow to find, so it is exactly as
+        // resolvable as `'done: loop { break 'done 0 }` already is. But the labelled-loop
+        // fix only ever touched `Expr::Loop`; `Expr::Block`'s own guard
+        // (`block_expr.label.is_none()`) refuses every labelled block unconditionally, so
+        // every one of `P0` through `P3`'s initializers stayed unresolved and the dense
+        // `0..=3` window they pattern-match went undetected. `evaluate_labelled_block` is
+        // the same self-targeted-break reasoning `evaluate_loop` already has, applied here.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn labelled_block_pattern_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = 'value: { break 'value 0 };\n    \
+             const P1: u8 = 'value: { break 'value 1 };\n    \
+             const P2: u8 = 'value: { break 'value 2 };\n    \
+             const P3: u8 = 'value: { break 'value 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_sparse_but_compact_window_with_several_wildcard_covered_gaps_is_reported() {
+        // Codex's next-round finding: `missing_value` requires the numbered arms to leave
+        // *exactly* one slot uncovered for the wildcard, but `0, 2, 4, .., 14` explicit —
+        // eight arms, every even value from 0 to 14 — with `_` covering every odd value in
+        // between is a nine-arm match spanning the identical `0..=14` window with seven
+        // slots left for the wildcard rather than one, and a warning-free optimized Rust
+        // build still lowers it to the same indexed `.rodata` table `missing_value`'s own
+        // single-gap shape is pinned against — `has_dense_arm_patterns` read it as not
+        // dense and let it through undetected. `compact_window_with_gaps` is the
+        // generalisation: the window is the exact span the values imply, and any number of
+        // gaps inside it — not just one — still means the wildcard is one body covering
+        // everything the numbered arms did not name.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn sparse_even_pattern_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        2 => 1,\n        4 => 2,\n        \
+             6 => 3,\n        8 => 4,\n        10 => 5,\n        12 => 6,\n        \
+             14 => 7,\n        _ => 8,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_a_binding_catchall_is_reported() {
+        // Codex's twelfth-round finding: an ordinary, unguarded binding — `other => ..`
+        // rather than `_ => ..` — is exactly as irrefutable as a wildcard and compiles to
+        // the identical lookup table, since it matches every value a wildcard would.
+        // `is_catchall_pattern` now treats any unguarded binding that names no known
+        // constant as the catch-all, alongside `_` itself, rather than requiring the one
+        // spelling.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn binding_catchall_table(nibble: u8) -> u32 {\n    match nibble & 0xF \
+             {\n        0 => crc32_nibble(0),\n        1 => crc32_nibble(1),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        \
+             other => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_postfixed_block_values_is_reported() {
+        // Codex's seventh-round finding, the sharper half: the synthetic-separator fix for
+        // comma-less block arms used to insert a separator after *every* top-level `}`,
+        // which would cut `{ VALUE }.wrapping_add(0)` in two and make the whole match
+        // unparseable — failing closed on recognising a table that really is dense, rather
+        // than reporting it as a decision. A block followed by a postfix operator is left
+        // alone now, so this match is still recognised as dense and — since its values are
+        // not the one permitted call shape — reported as an unauthorised table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn postfix_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => { 0x0000_0000_u32 }.wrapping_add(0),\n        \
+             1 => { 0x0000_0000_u32 }.wrapping_add(1),\n        \
+             2 => { 0x0000_0000_u32 }.wrapping_add(2),\n        \
+             3 => { 0x0000_0000_u32 }.wrapping_add(3),\n        \
+             _ => { 0x0000_0000_u32 }.wrapping_add(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_cast_block_values_is_reported() {
+        // Codex's ninth-round finding was against a hand-rolled brace-and-comma scan that
+        // has since been replaced entirely by `crate::parse::match_expressions`, which
+        // parses the real grammar (round 11). `{ VALUE } as TYPE` turns out not to be
+        // legal Rust without its own parentheses — `rustc` itself asks for
+        // `({ VALUE }) as TYPE` — so this keeps the parenthesized, buildable form: a cast
+        // applied to a block operand as an arm's value. Dense patterns, values that are
+        // casts rather than the one permitted call shape, so reported as an unauthorised
+        // table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn cast_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => ({ 0x0000_0000 }) as u32,\n        1 => ({ 0x7707_3096 }) as u32,\n        \
+             2 => ({ 0xEE0E_612C }) as u32,\n        3 => ({ 0x9909_57BA }) as u32,\n        \
+             _ => ({ 0x0000_0000 }) as u32,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_if_else_block_values_is_reported() {
+        // Codex's tenth-round finding: neither continuation check recognised the keyword
+        // `else`, so `0 => if COND { A } else { B },` — a legal arm value, an `if`
+        // expression with a block operand of its own — had a synthetic comma inserted
+        // between `{ A }` and `else { B }` exactly as an unrecognised cast once did
+        // between a block and `as`. `parse_dense_arms` then met an `else { B }` segment
+        // with no `=>` in it and refused the whole match, even though a constant
+        // condition still lets this fold into the same lookup-table shape. `else` is
+        // recognised now, alongside `as`, so this is reported as an unauthorised table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn if_else_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => if true { 0x0000_0000 } else { 0x0000_0000 },\n        \
+             1 => if true { 0x7707_3096 } else { 0x0000_0000 },\n        \
+             2 => if true { 0xEE0E_612C } else { 0x0000_0000 },\n        \
+             3 => if true { 0x9909_57BA } else { 0x0000_0000 },\n        \
+             _ => if true { 0x0000_0000 } else { 0x0000_0000 },\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_literal_valued_arms_is_reported() {
+        // Codex's fourth-round finding: the shape scan required every arm's value to be a
+        // call, so a table spelled as `0 => 0x0000_0000, 1 => 0x7707_3096, ..` — the most
+        // direct way to spell a lookup table, and invisible to the array ban since it is a
+        // `match` rather than a `[u32; N]` — passed every rule here. The pattern half of
+        // the shape (dense, zero-based, wildcard-terminated) is now checked independently
+        // of what each arm's value looks like.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn literal_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => 0x0000_0000,\n        1 => 0x7707_3096,\n        2 => 0xEE0E_612C,\n        \
+             3 => 0x9909_57BA,\n        _ => 0x0000_0000,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_hex_spelled_patterns_is_reported() {
+        // Codex's fifth-round finding: the pattern comparison matched a pattern's
+        // *spelling* against `index.to_string()`, so a table whose patterns were written
+        // in hex (`0x0` through `0xE`) rather than decimal was not recognised as dense at
+        // all and the scan skipped it in silence, rather than reporting it as an
+        // unauthorised table. `parse_integer_literal` compares values now, not spelling.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn hex_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0x0 => crc32_nibble(0),\n        0x1 => crc32_nibble(1),\n        \
+             0x2 => crc32_nibble(2),\n        0x3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_arms_out_of_source_order_is_reported() {
+        // Codex's eighth-round finding: `has_dense_arm_patterns` compared each arm's
+        // pattern against its own *position* in the source — arm 0 had to read `0`, arm
+        // 1 had to read `1`, and so on — so a match listing the same complete, singleton
+        // set of patterns in a different order, such as `1 => .., 0 => .., 2 => ..`,
+        // failed that comparison at the very first arm and was silently treated as not
+        // dense at all: no violation, and no count toward the pinned table's own tally
+        // either. LLVM's switch-to-lookup-table pass does not care what order a
+        // `match`'s arms are written in, only that the patterns are dense, so a second
+        // real lookup table could have hidden here by nothing more than reordering its
+        // arms. The patterns are now normalised to a set and checked for complete,
+        // gap-free, duplicate-free coverage independent of where each is written.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn reordered_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             1 => crc32_nibble(1),\n        0 => crc32_nibble(0),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_with_swapped_out_of_order_call_arguments_is_reported() {
+        // The sharper half of the same finding: an arm's expected call argument used to
+        // be read from its *position* too, so two arms that swapped both their pattern
+        // and their call argument together — `1 => crc32_nibble(1), 0 =>
+        // crc32_nibble(0), ..` written as `0 => crc32_nibble(1), 1 => crc32_nibble(0),
+        // ..` — would have satisfied a positional comparison by coincidence while
+        // calling the wrong helper index for each pattern. Reading each arm's expected
+        // argument from that arm's own pattern, rather than from its position, is what
+        // this reports on now: this match is dense but not uniform, and it is not the
+        // pinned table.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn swapped_table(nibble: u8) -> u32 {\n    match nibble & 0xF {\n        \
+             0 => crc32_nibble(1),\n        1 => crc32_nibble(0),\n        \
+             2 => crc32_nibble(2),\n        3 => crc32_nibble(3),\n        \
+             _ => crc32_nibble(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_checksum_declared_in_a_nested_module_is_reported() {
+        // Codex's eighth-round finding: a private nested module placed before the real
+        // checksum, declaring an exact copy of it under the same name — with the helper
+        // imported from `super` — lets `braced_body`'s first-match search pin the decoy
+        // while the shipped `Catalogued` binding still resolves the module-scope
+        // function of the same name. Every check in this module stays green while the
+        // function that actually ships computes something else entirely. Counting
+        // declarations before `braced_body` is asked which one to read closes it, the
+        // same way `check_boundary_type` already guards a pinned type against a decoy.
+        const DECOY: &str = "mod decoy {\n    use super::crc32_nibble;\n    pub(crate) const \
+             fn crc32(bytes: &[u8]) -> u32 {\n        let mut crc: u32 = 0xFFFF_FFFF;\n        \
+             let _ = crc32_nibble(0);\n        crc ^ 0xFFFF_FFFF\n    }\n}\n\n";
+        // The fixture's own leading line is an inner doc comment (`//! Two checksums.`),
+        // which Rust requires to precede every other item in its enclosing scope — so the
+        // decoy is spliced in right after that line rather than prepended ahead of it,
+        // keeping "declared before the real checksum" (what `braced_body`'s first-match
+        // search would read) without producing a file `syn` itself refuses to parse.
+        let clean = tests_support::clean_checksum_module();
+        let split_at = clean.find('\n').map_or(0, |at| at + 1);
+        let mut source = String::new();
+        source.push_str(clean.get(..split_at).unwrap_or_default());
+        source.push_str(DECOY);
+        source.push_str(clean.get(split_at..).unwrap_or_default());
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `fn crc32` 2 times, not once")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_decoy_spelled_past_a_raw_identifier_rename_is_reported() {
+        // Codex's ninth-round finding: a purely textual `fn crc32` search does not see
+        // that `fn r#crc32` names the same item — Rust's raw-identifier marker exists
+        // precisely so a keyword or a reserved word can be used as a name, and it changes
+        // nothing about which item the plain spelling resolves to. A private nested
+        // module can therefore keep an exact, plain-spelled decoy under the pinned name
+        // while the real, module-scope function is renamed to its raw form and altered:
+        // a textual count sees exactly one `fn crc32` (the decoy) and waves every pin
+        // through to check it, while the unqualified `crc32` the shipped `Catalogued`
+        // binding calls still resolves the altered `r#crc32`. Counting structurally with
+        // `crate::parse::fns_named`, which un-raws identifiers before comparing, is what
+        // catches the pair as two declarations of the same name.
+        const DECOY: &str = "mod decoy {\n    use super::crc32_nibble;\n    pub(crate) const \
+             fn crc32(bytes: &[u8]) -> u32 {\n        let mut crc: u32 = 0xFFFF_FFFF;\n        \
+             let _ = crc32_nibble(0);\n        crc ^ 0xFFFF_FFFF\n    }\n}\n\n";
+        let clean = tests_support::clean_checksum_module().replace(
+            "pub(crate) const fn crc32(bytes",
+            "pub(crate) const fn r#crc32(bytes",
+        );
+        let split_at = clean.find('\n').map_or(0, |at| at + 1);
+        let mut source = String::new();
+        source.push_str(clean.get(..split_at).unwrap_or_default());
+        source.push_str(DECOY);
+        source.push_str(clean.get(split_at..).unwrap_or_default());
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("declares `fn crc32` 2 times, not once")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_test_only_reference_of_a_pinned_name_is_not_a_second_declaration() {
+        // Codex's tenth-round finding: the structural count the raw-identifier fix above
+        // added did not skip `#[cfg(test)]` items, even though every other check in this
+        // rule works from `without_test_modules`-stripped text for exactly that reason. A
+        // `#[cfg(test)] mod tests { fn crc32(..) { .. } }` — an unrelated reference
+        // implementation used only by a test, sharing a pinned name by coincidence — was
+        // therefore counted as a second shipped declaration and failed every checksum
+        // pin, over code that never ships. `checksum_declared_once` now counts through
+        // `crate::parse::fns_named`, which already skips `#[cfg(test)]` the same way the
+        // rest of this rule does, so this passes clean.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\n#[cfg(test)]\nmod tests {\n    fn crc32(_bytes: &[u8]) -> u32 {\n        0\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("fn crc32")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_downgraded_inline_always_is_reported() {
+        // Codex's fifth-round finding: `braced_body` starts reading at a function's `fn`
+        // header and never looks at what precedes it, so removing `#[inline(always)]`
+        // from `crc32_nibble_table` passed every check above even though ADR 0053's whole
+        // shape argument depends on it — a soft `#[inline]` here measured as a real
+        // function call per nibble rather than the table LLVM otherwise builds.
+        let source = tests_support::clean_checksum_module().replace(
+            "#[inline(always)]\nconst fn crc32_nibble_table",
+            "const fn crc32_nibble_table",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("is not declared `#[inline(always)]`")
+                && violation.detail.contains("crc32_nibble_table")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_always_swallowed_by_a_macro_call_is_not_credited() {
+        // Codex's ninth-round finding: bounding the search window by the previous item's
+        // `}` still let anything *inside* that window vouch for the attribute, including a
+        // macro invocation's own arguments. `ignore!(#[inline(always)]);` contains the
+        // exact attribute text immediately before `crc32_nibble_table`'s real declaration
+        // while attaching the attribute to nothing — the compiler receives no
+        // force-inlining directive at all, so ADR 0053's measured 5-21% regression can
+        // return even though the old `.contains` scan read this as satisfied. The
+        // occurrence now has to sit at bracket depth zero within the window, which an
+        // unclosed macro-call paren rules out.
+        let source = tests_support::clean_checksum_module().replace(
+            "#[inline(always)]\nconst fn crc32_nibble_table",
+            "ignore!(#[inline(always)]);\nconst fn crc32_nibble_table",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("is not declared `#[inline(always)]`")
+                && violation.detail.contains("crc32_nibble_table")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_byte_identical_second_copy_of_the_pinned_table_is_reported() {
+        // The sharper case beside the one above: a second table that reuses the pinned
+        // table's own selector, helper and arm count under a different function name is
+        // still a second 64 B table, and the tuple-based check alone would wave it
+        // through as "the one table `INTEGRITY_CHECK_TABLES` names" a second time.
+        // Counting occurrences of the pinned shape, rather than merely permitting it, is
+        // what catches a duplicate.
+        let mut source = tests_support::clean_checksum_module();
+        let copy = source
+            .find("const fn crc32_nibble_table")
+            .map(|start| source[start..].to_string())
+            .unwrap_or_default();
+        source.push('\n');
+        source.push_str(&copy.replace("crc32_nibble_table", "second_nibble_table"));
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares 2 dense match(es)")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_match_discarded_into_a_dead_binding_is_reported() {
+        // Codex's sharper version of the arm-mapping finding, on the revision that first
+        // tightened counting to a substring `contains`: the exact pinned match survives
+        // as `let _ = match ...;` beside a second, different tail expression that is what
+        // the function actually returns. Equality rather than `contains` is what catches
+        // it, since the body then holds more than just the pinned match.
+        let source = tests_support::clean_checksum_module()
+            .replacen("match nibble & 0xF {", "let _ = match nibble & 0xF {", 1)
+            .replace(
+                "_ => crc32_nibble(15), }\n}\n",
+                "_ => crc32_nibble(15), }; 0\n}\n",
+            );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("exact `match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
     fn a_path_attribute_test_module_is_excluded_from_the_table_scan() {
         // Issue #59: `#[cfg(test)] #[path = "crc/tbl.rs"] mod table;` — the stem guesser
         // looked for `table.rs` and never found `tbl.rs`, so the test-only file's arrays
@@ -20361,6 +26139,102 @@ mod deferred_answer_pins {
         assert!(
             violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
             "a production table outside crc/ was not scanned: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_inside_an_inline_module_resolves_against_its_own_directory() {
+        // Codex's thirtieth-round finding: a `#[path]` attribute on a `mod` declared
+        // inside an inline `mod outer { ... }` resolves against `outer`'s own directory
+        // (`crc/outer/`) — the same one an unattributed `mod table;` there would use —
+        // not against the declaring file's directory (`src/`) the way a top-level
+        // `#[path]` does. The two only coincide when there is no inline nesting, which is
+        // why `parent_dir` was ever the right answer for the top-level case above.
+        let parent = format!(
+            "{}\nmod outer {{\n    #[path = \"table.rs\"]\n    mod table;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/outer/table.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a #[path] module inside an inline mod was not resolved against its own \
+             directory: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_inside_a_function_body_is_traversed() {
+        // Codex's thirty-first-round finding: module discovery started and stayed at
+        // `file.items`, so a `mod` declared inside a *function body* — legal Rust, and
+        // the one shape `rustc` requires a `#[path]` attribute for, since a block has no
+        // directory of its own to fall back to — was never seen at all. Its own directory
+        // context is inherited from its enclosing item-level scope (the file's own
+        // directory here, since the function is not itself nested in an inline module).
+        let parent = format!(
+            "{}\nfn declares_a_module() {{\n    #[path = \"table.rs\"]\n    mod table;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/table.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a #[path] module inside a function body was not traversed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_attribute_inside_a_nested_block_is_traversed() {
+        // Codex's thirty-second-round finding: the previous round's fix only scanned a
+        // function body's own *top-level* statements, so a `mod` declared inside a
+        // further-nested block within that body — here, an `if` block — was still
+        // unseen. `ChildModuleCollector` is now a `syn::visit::Visit` walk whose default
+        // recursion already reaches every nested block the grammar allows, so no
+        // separate handling is needed for this shape at all.
+        let parent = format!(
+            "{}\nfn declares_a_module() {{\n    if true {{\n        #[path = \"table.rs\"]\n        \
+             mod table;\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/table.rs", child),
+        ]);
+        assert!(
+            violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a #[path] module inside a nested block was not traversed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_module_inside_a_cfg_test_function_is_test_gated() {
+        // Codex's thirty-second-round finding: a `mod` declared inside a
+        // `#[cfg(test)] fn fixture() { .. }` was still walked with the enclosing
+        // *production* gating state, so `rustc` removing the whole function (and the
+        // module inside it) from a non-test build was not reflected — the module's own
+        // arrays or dense matches were scanned as shipping code. `ChildModuleCollector`'s
+        // `visit_item` now folds every item's own `#[cfg(test)]` into the gating state
+        // before recursing, `Item::Fn` included, not only `Item::Mod`.
+        let parent = format!(
+            "{}\n#[cfg(test)]\nfn fixture() {{\n    #[path = \"table.rs\"]\n    mod table;\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let child = "static NIBBLE_TABLE: [u8; 16] = [0; 16];\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/table.rs", child),
+        ]);
+        assert!(
+            !violations.iter().any(|v| v.detail.contains("NIBBLE_TABLE")),
+            "a module inside a #[cfg(test)] function was scanned as production code: \
+             {violations:?}"
         );
     }
 
@@ -20617,9 +26491,16 @@ mod deferred_answer_pins {
     fn a_const_fn_and_a_const_generic_are_not_lookup_tables() {
         // The real module is all `pub(crate) const fn`. A rule that read those as tables
         // would fail the workspace it is supposed to pass.
+        //
+        // This fixture used to also carry `const _: () = assert!(true);`, to prove an
+        // anonymous const's initializer is not a table either — round 27's macro ban
+        // means that line is now refused on its own terms (`assert!` is a macro, and the
+        // ban does not carve out an exception for one from the standard library, the same
+        // way the array ban carves out none for a `const` array), so the anonymous-const
+        // shape is exercised here with no macro in it instead.
         let source = format!(
             "{}pub(crate) const fn f() -> u32 {{ 0 }}\n\
-             const _: () = assert!(true);\n\
+             const _: () = ();\n\
              fn g<const N: usize>() -> usize {{ N }}\n",
             tests_support::clean_checksum_module()
         );
@@ -20662,8 +26543,10 @@ mod deferred_answer_pins {
     #[test]
     fn a_longer_literal_does_not_vouch_for_a_shorter_one() {
         // The specific shape of the bug above, stated on its own so a future rewrite of the
-        // matcher has to keep it: `0xFFFF` must not be found inside `0xFFFF_FFFF`.
-        let source = tests_support::clean_checksum_module().replace(" 0xFFFF ", " 0x0000 ");
+        // matcher has to keep it: `0xFFFF` must not be found inside `0xFFFF_FFFF`. The
+        // trailing `;` rather than a space is what disambiguates the two here: `crc16`'s own
+        // initial value is a `let` statement's literal now, not a bare standalone one.
+        let source = tests_support::clean_checksum_module().replace(" 0xFFFF;", " 0x0000;");
         assert!(
             source.contains("0xFFFF_FFFF"),
             "the longer literal has to survive, or the test proves nothing"
@@ -20921,7 +26804,7 @@ mod deferred_answer_pins {
         // nothing, and that has to be loud rather than green.
         let violations = check_integrity_check(&[layer(
             INTEGRITY_CHECK_PATH,
-            "//! Nothing here.\npub(crate) const fn crc16(b: &[u8]) -> u16 { 0x1021 0xFFFF }\n",
+            "//! Nothing here.\npub(crate) const fn crc16(b: &[u8]) -> u16 { 0x1021; 0xFFFF }\n",
         )]);
         assert!(
             violations.iter().any(|v| v.detail.contains("fn crc32")),
@@ -21083,6 +26966,2622 @@ mod deferred_answer_pins {
             "a table in a checksum submodule went unseen: {violations:?}"
         );
     }
+
+    #[test]
+    fn a_dense_match_guarded_by_an_unsigned_right_shift_is_reported() {
+        // Codex's next-round finding: `evaluate_binary_op` folded `Shr` the same way it
+        // folded every other binary operator — as a plain signed `i128::checked_shr` over
+        // the shared 128-bit storage — which is not sound for a `u128` shift the way an
+        // ordinary bitwise operator's storage-agnostic bit pattern is. `u128::MAX >> 127`
+        // is a real, unsigned, zero-filling shift `rustc` performs, landing on `1`; the
+        // same bits reinterpreted as the stored `i128` (`-1`) shift arithmetically and
+        // sign-extend, landing on `-1` again. A constant built from that shift therefore
+        // resolved to the wrong value rather than merely staying unresolved, and a match
+        // over constants derived from it went undetected. `evaluate_shift_op` now
+        // reinterprets the left operand as `u128` before shifting, once
+        // `is_definitely_unsigned` — recursing into the shifted expression itself, not
+        // only into a literal, a cast or a bare path — confirms that is what its bits
+        // mean.
+        //
+        // Writing this test surfaced a second, narrower gap in the same family:
+        // `resolve_scope_consts`'s own local `resolve_unsigned` closure — used while
+        // resolving `Q`'s own initializer, before any pattern is ever reached — answered
+        // only for a bare name, never for a qualified reference or a well-known primitive
+        // bound, on the reasoning (now stale) that this was the identical scope
+        // `path_is_definitely_unsigned` itself declines beyond. `u128::MAX` is exactly a
+        // qualified, well-known-bound reference, so `is_definitely_unsigned(u128::MAX)`
+        // answered `false` inside `evaluate_shift_op` regardless of that function's own
+        // fix, and `Q` stayed unresolved rather than merely wrong. Threaded to match
+        // `path_is_definitely_unsigned`'s own two-step fallback instead. `40 / Q` through
+        // `43 / Q`, rather than `Q * 0` through `Q * 3`, is deliberate: a wrongly-signed
+        // `Q` still multiplies or adds into *some* contiguous window, just one shifted by
+        // a constant amount, which this scan's own density check cannot tell apart from a
+        // correct one — dividing a distinct dividend by the reinterpreted-as-`u128::MAX`
+        // wrong answer collapses all four to `0` instead, which is not a window at all.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn unsigned_shift_pattern_table(nibble: u32) -> u32 {\n    \
+             const Q: u128 = u128::MAX >> 127;\n    const P0: u128 = 40 / Q;\n    \
+             const P1: u128 = 41 / Q;\n    const P2: u128 = 42 / Q;\n    const P3: u128 = 43 / Q;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_u128_sum_crossing_the_i128_boundary_is_reported() {
+        // Codex's next-round finding: `evaluate_binary_op` added two `u128` operands as
+        // plain `i128::checked_add`, which refuses a sum that is a valid `u128` value but
+        // exceeds `i128::MAX` — `(1u128 << 126) + (1u128 << 126)` is `2u128.pow(127)`, well
+        // inside `u128`'s range and exactly what `rustc` computes, but one past what a
+        // *signed* 128-bit addition can hold. The constant therefore stayed unresolved
+        // rather than resolving to the wrong thing, and a match over constants derived
+        // from it went undetected — the same shape of gap `evaluate_ordering_op` and
+        // `evaluate_division_op` already closed for comparison and division, met here for
+        // addition, subtraction and multiplication. `evaluate_additive_op` now retries as
+        // `u128` once the signed attempt overflows and at least one operand is confirmed
+        // unsigned, reinterpreting the result back into the shared storage.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn additive_overflow_pattern_table(nibble: u32) -> u32 {\n    \
+             const BASE: u128 = (1u128 << 126) + (1u128 << 126);\n    \
+             const P0: u128 = (BASE / BASE) * 0;\n    const P1: u128 = (BASE / BASE) * 1;\n    \
+             const P2: u128 = (BASE / BASE) * 2;\n    const P3: u128 = (BASE / BASE) * 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_cross_file_qualified_typed_constant_is_pruned_as_dead() {
+        // Codex's next-round finding: an earlier round already gave `MatchVisitor` its own
+        // `qualified_unsigned` mirror of `qualified`, so a guard qualified against an
+        // *inline* `mod bounds { .. }` this same file declares already folds — but
+        // `check_integrity_check_module_tree`'s own tree-wide `qualified` map, collected
+        // from every file of the checksum module tree before any file is checked for a
+        // dense match, had no unsignedness counterpart at all: `match_expressions_with_prefix`
+        // was still seeded with an empty map regardless of what `qualified_unsigned` the
+        // visitor itself would have produced. `bounds::HI` declared in a sibling
+        // *out-of-line* `bounds.rs` therefore answered `false` for its own unsignedness no
+        // matter how it was declared, because the file that would answer honestly was never
+        // the file being checked. `qualified_constants_with_prefix` now returns its own
+        // `qualified_unsigned` alongside `qualified`, collected across the tree the same
+        // fixed-point pass already collects `qualified` with, and threaded through to
+        // `match_expressions_with_prefix` instead of an empty map.
+        let parent = format!(
+            "{}\nmod bounds;\n\nconst fn cross_file_qualified_dead_guard_table(nibble: u8) -> \
+             u32 {{\n    match nibble {{\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        _ if bounds::HI < bounds::ZERO => 999,\n        \
+             _ => 3,\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let bounds = "//! Bounds.\npub(crate) const HI: u128 = 1u128 << 127;\n\
+                       pub(crate) const ZERO: u128 = 0;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/bounds.rs", bounds),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_bitwise_negated_unsigned_shift_is_reported() {
+        // Codex's next-round finding: `is_definitely_unsigned` recognised a suffixed
+        // literal, a cast, a bare path and a handful of binary operators, but not
+        // `Expr::Unary(Not)` — `!x` flips every bit of `x` without changing its type, so
+        // `(!0u128) >> 127` names an operand this function fell through to `false` for even
+        // though nothing about its type is ambiguous: it is exactly `0u128`'s own type.
+        // `evaluate_shift_op` therefore declined to reinterpret the shift's own left
+        // operand as `u128`, and `(!0u128) >> 127` — which is `1`, the same top bit
+        // `u128::MAX >> 127` already tests via a different route to the same all-ones
+        // pattern — stayed unresolved. `is_definitely_unsigned` now recurses through `!`
+        // the same way it already does through a binary operator's own operands.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn negated_unsigned_shift_pattern_table(nibble: u32) -> u32 {\n    \
+             const Q: u128 = (!0u128) >> 127;\n    const P0: u128 = 40 / Q;\n    \
+             const P1: u128 = 41 / Q;\n    const P2: u128 = 42 / Q;\n    const P3: u128 = 43 / Q;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_crate_root_path_inside_a_const_initializer_is_reported() {
+        // Codex's next-round finding: `crate_root_pattern_uses`'s own `CrateRootPatterns`
+        // visitor only ever overrode `visit_pat`, so a crate-anchored path used in *pattern*
+        // position (`crate::R0 => ..`) was refused outright, but the identical path used as
+        // a `const`'s own *initializer* (`const P0: u8 = crate::R0;`) was invisible to it —
+        // `literal_or_const_value` already declines to resolve such a path on purpose
+        // (`resolve_anchored_single_segment` answers `crate::NAME` as always-unresolved),
+        // so the constant simply stayed silently unresolved, and `missing_value`/
+        // `fully_dense_arm_patterns` fail a match's *entire* dense-table check the moment
+        // any one arm is unresolved — the same shape of gap `const_call_initializer_uses`
+        // already closes for a call initializer. Every `const` item's own initializer is
+        // now searched for a crate-anchored path too, independent of whether it is ever
+        // pattern-matched on.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn crate_root_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = crate::R0;\n    const P1: u8 = crate::R1;\n    \
+             const P2: u8 = crate::R2;\n    const P3: u8 = crate::R3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("crate::R0")
+                    && violation
+                        .detail
+                        .contains("anchored at the crate's own root")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_qualified_through_a_grouped_self_renamed_import_is_reported() {
+        // Codex's next-round finding: `use indices::{self as idx};` binds `idx` to
+        // `indices` itself — Rust's own grammar for renaming a module import — but
+        // `flatten_use_tree`'s `Rename` arm treated `self` as an ordinary path segment,
+        // appending it literally and recording the target as `indices::self` rather than
+        // `indices`. A pattern spelled `idx::P0` through `idx::P3` therefore searched
+        // `UseScopes` for a target Rust itself would never produce, and stayed unresolved
+        // on every arm. `self` in this position now contributes no segment of its own,
+        // matching the plain, unrenamed `use indices::{self};` (`Pat::Name`) that already
+        // needed the identical fix.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod indices {\n    pub const P0: u8 = 0;\n    pub const P1: u8 = 1;\n    \
+             pub const P2: u8 = 2;\n    pub const P3: u8 = 3;\n}\n\n\
+             use indices::{self as idx};\n\n\
+             const fn grouped_self_renamed_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        idx::P0 => 0,\n        idx::P1 => 1,\n        \
+             idx::P2 => 2,\n        idx::P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_negated_typed_constant_paths_is_reported() {
+        // Codex's next-round finding: `const Q0: u8 = 255; const P0: u8 = !Q0;` names an
+        // operand `is_definitely_unsigned` already confirms is unsigned — `Q0`'s own
+        // declaration is `u8` — but the `!` case in `literal_or_const_value` still required
+        // a *suffixed literal* to learn a width to mask against, and a bare path to an
+        // already-typed sibling constant has no suffix of its own to read, so it stayed
+        // unresolved. `evaluate_bitwise_not` now also reads a bare path's own declared
+        // width through `resolve.width`, a new narrow, bare-name-only resolver mirroring
+        // `resolve.unsigned`'s own scope, so `!Q0` masks to `u8`'s eight bits (`!255u8 ==
+        // 0`) exactly as a width-aware NOT would.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn negated_typed_constant_table(nibble: u8) -> u32 {\n    \
+             const Q0: u8 = 255;\n    const P0: u8 = !Q0;\n    const P1: u8 = !Q0 + 1;\n    \
+             const P2: u8 = !Q0 + 2;\n    const P3: u8 = !Q0 + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_range_pattern_matched_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = match 0u8 { 0..=14 => 0, _ => 100 };`
+        // nests a range pattern inside the match that initializes a numbered constant —
+        // `match_arm_matches_constant`, the function `evaluate_match` asks whether an arm's
+        // own pattern matches the scrutinee, recognised a literal, a binding, an or-pattern
+        // and parentheses, but fell to its own `_ => None` for anything else, a range
+        // included, which stops `evaluate_match`'s whole search rather than trying a later
+        // arm. Every one of a table's numbered arms nesting a range-pattern match this way
+        // stayed unresolved. `pattern_literal`'s own `Pat::Range` case already answers the
+        // wider question of every value a range names, bounded so it cannot enumerate an
+        // unreasonably wide one; this only needs whether one value is inside, which is the
+        // same forward-distance-from-`start` arithmetic without enumerating anything.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn range_pattern_matched_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match 0u8 { 0..=14 => 0, _ => 100 };\n    \
+             const P1: u8 = match 1u8 { 0..=14 => 1, _ => 100 };\n    \
+             const P2: u8 = match 2u8 { 0..=14 => 2, _ => 100 };\n    \
+             const P3: u8 = match 3u8 { 0..=14 => 3, _ => 100 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_dead_guarded_match_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = match 0u8 { _ if false => 100, _ =>
+        // 0 };` nests a guarded arm inside the match that initializes a numbered constant —
+        // `evaluate_match` bailed out with `None` the moment it saw *any* guard at all,
+        // even one this scan can already prove always false, the identical pruning
+        // `MatchVisitor::visit_expr_match` already applies to a numbered table's own outer
+        // arms. Every one of a table's numbered arms nesting a dead-guarded match this way
+        // stayed unresolved. `evaluate_match` now folds a guard through the same
+        // `literal_or_const_value` pipeline every other constant expression here uses: an
+        // arm whose guard resolves to `0` is skipped in favour of a later one, exactly as
+        // `rustc`'s own dead-code elimination would drop it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dead_guarded_match_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match 0u8 { _ if false => 100, _ => 0 };\n    \
+             const P1: u8 = match 0u8 { _ if false => 100, _ => 1 };\n    \
+             const P2: u8 = match 0u8 { _ if false => 100, _ => 2 };\n    \
+             const P3: u8 = match 0u8 { _ if false => 100, _ => 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_at_binding_matched_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = match 0u8 { _x @ 0 => 0, _ => 100 };`
+        // nests an at-binding pattern inside the match that initializes a numbered
+        // constant. `match_arm_matches_constant`'s `Pat::Ident` case required
+        // `subpat.is_none()`, so an at-binding fell straight through its guard to the
+        // wildcard `_ => None` case and stopped the whole search — even though
+        // `pattern_literal`'s own at-binding case already answers the identical question
+        // for a numbered table's own *outer* patterns: the binding name is incidental to
+        // the value the arm matches. A second `Pat::Ident` arm now recurses into the
+        // subpattern the same way, so an at-binding inside a nested match resolves exactly
+        // as one written directly as an outer pattern already did.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_matched_initializer_table(nibble: u8) -> u32 {\n    \
+             const P0: u8 = match 0u8 { _x @ 0 => 0, _ => 100 };\n    \
+             const P1: u8 = match 1u8 { _x @ 1 => 1, _ => 100 };\n    \
+             const P2: u8 = match 2u8 { _x @ 2 => 2, _ => 100 };\n    \
+             const P3: u8 = match 3u8 { _x @ 3 => 3, _ => 100 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_negated_boolean_constant_path_is_reported() {
+        // Codex's next-round finding: `const OFF: bool = false; .. _ if !OFF => .., _ =>
+        // ..` negates a *bare path* to a boolean constant, not a literal — `evaluate_bitwise_not`
+        // already handled `!true`/`!false` written directly, but a match arm's own guard was
+        // always resolved with a `resolve.width` stub answering `None` unconditionally, on
+        // the reasoning that only a `const`'s own initializer ever needed a referenced
+        // constant's declared width. That reasoning held for an *integer* width, where a
+        // value alone cannot say how many bits to mask to, but excluded `bool`, which this
+        // scan already represents unambiguously as `0` or `1` either way — the only fact
+        // missing was that `OFF` is a `bool` at all. `MatchVisitor` now carries its own
+        // `scopes_types` (the same stack `scopes_unsigned` already is, mirrored), and every
+        // match arm's own guard or pattern answers `resolve.width` through it, so `!OFF`
+        // folds to `true` and the guarded arm reads as the real wildcard — the identical
+        // dead-code elimination a `_ if true => ..` guard already gets.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst OFF: bool = false;\n\n\
+             const fn negated_boolean_constant_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        2 => 2,\n        \
+             _ if !OFF => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_typed_let_negated_initializer_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let q: u8 = 255; !q };` names an
+        // operand `evaluate_bitwise_not` cannot fold — `evaluate_block`'s own
+        // `local_resolve_width`/`block_resolve_width` closures declined unconditionally for
+        // any name already resolved as one of the block's own locals, on the reasoning that
+        // this function never read a declared type for one. True before `block_let_exprs`'s
+        // own `binding_name` was joined by a mirror that keeps the type ascription rather
+        // than discarding it: `stmt_let_type` reads `q`'s own `u8` the same way
+        // `block_const_types` already reads a local `const`'s.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_let_negated_initializer_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let q: u8 = 255; !q };\n    \
+             const P1: u8 = { let q: u8 = 255; !q + 1 };\n    \
+             const P2: u8 = { let q: u8 = 255; !q + 2 };\n    \
+             const P3: u8 = { let q: u8 = 255; !q + 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_sparse_but_compact_window_straddling_the_u128_sign_boundary_is_reported() {
+        // Codex's next-round finding: `compact_window_with_gaps`'s own span was
+        // `max.checked_sub(min)` over the values sorted as ordinary signed `i128`s, which is
+        // only the window's true span when nothing straddles the point where `lit_value`'s
+        // own two's-complement reinterpretation of a `u128` literal at or above `2^127` turns
+        // an ascending run into one that wraps through `i128::MIN` — eight even values
+        // spanning `2^127 - 4` through `2^127 + 10` sort with the four values at or above
+        // `2^127` (each reinterpreted negative) *before* the two below it (still positive),
+        // so the plain `min`/`max` are nowhere near each other in the true circular order and
+        // `checked_sub` overflowed outright, declining a window whose real span is fourteen.
+        // `compact_span` is the same wrapping candidate-base search `window_layout` already
+        // runs, reused here for a span rather than a full coverage bitmap.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn wrapping_compact_window_table(nibble: u128) -> u32 {\n    \
+             match nibble {\n        \
+             170141183460469231731687303715884105724u128 => 0,\n        \
+             170141183460469231731687303715884105726u128 => 1,\n        \
+             170141183460469231731687303715884105728u128 => 2,\n        \
+             170141183460469231731687303715884105730u128 => 3,\n        \
+             170141183460469231731687303715884105732u128 => 4,\n        \
+             170141183460469231731687303715884105734u128 => 5,\n        \
+             170141183460469231731687303715884105736u128 => 6,\n        \
+             170141183460469231731687303715884105738u128 => 7,\n        \
+             _ => 8,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_typed_block_locals_unsigned_shift_is_reported() {
+        // Codex's next-round finding: `evaluate_block`'s own `local_resolve_unsigned` and
+        // `block_resolve_unsigned` closures declined unconditionally for any name already
+        // resolved as one of the block's own locals, even after `local_types` was added to
+        // answer the parallel `width` question — so `{ let hi: u128 = u128::MAX; (hi >>
+        // 127) as u32 }` could resolve `hi`'s own value (`-1` in this scan's shared `i128`
+        // storage) but never its unsignedness, and `evaluate_shift_op` refuses a negative
+        // left operand unless `is_definitely_unsigned` says otherwise. Both closures now
+        // answer from `local_types` the same way `*_resolve_width` already does, so a
+        // block-local declared `u128` reinterprets its own top bit as `1` rather than
+        // leaving the shift — and every constant built from it — unresolved.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn typed_block_local_unsigned_shift_table(nibble: u32) -> u32 {\n    \
+             const P0: u32 = { let hi: u128 = u128::MAX; (hi >> 127) as u32 };\n    \
+             const P1: u32 = P0 + 1;\n    const P2: u32 = P0 + 2;\n    const P3: u32 = P0 + 3;\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_one_element_tuple_scrutinees_is_reported() {
+        // Codex's next-round finding: `literal_or_const_value` had no `Expr::Tuple` case at
+        // all, so a one-element tuple scrutinee (`match (0u8,) { .. }`) could never resolve
+        // to a value in the first place — `evaluate_match`'s own search never even began,
+        // whatever the arms inside it matched against. A one-element tuple names exactly its
+        // own element's value with no ambiguity, the same as a parenthesized expression, so
+        // it is folded the identical way; `match_arm_matches_constant` gained the pattern-side
+        // twin, `Pat::Tuple` with exactly one element, for the arms themselves (`(0,) => ..`).
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_scrutinee_match_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = match (0u8,) { (0,) => 0, _ => 100 };\n    \
+             const P1: u8 = match (0u8,) { (0,) => 1, _ => 100 };\n    \
+             const P2: u8 = match (0u8,) { (0,) => 2, _ => 100 };\n    \
+             const P3: u8 = match (0u8,) { (0,) => 3, _ => 100 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_over_genuinely_signed_values_near_both_ends_of_i128_is_not_reported() {
+        // Codex's next-round finding: `window_layout`'s own wrapping search tries every
+        // value as a candidate base, which is sound only because a `u128` literal at or
+        // above `2^127` really does wrap through `i128::MIN` back to the unsigned domain
+        // it came from — but `i128::MIN`, a plain `i128` constant just under `i128::MAX`,
+        // and `i128::MAX` itself are genuinely signed values with no such fact behind
+        // them: nothing about those three is adjacent, and `rustc` lowers a match over
+        // them to ordinary comparisons rather than any lookup table. Treating them as
+        // three of four consecutive circular slots read a match that is not dense as one
+        // that is. `FoundArm::unsigned` — folded in from the match's own scrutinee type
+        // here, since `i128` is signed and neither `i128::MIN` nor `i128::MAX` is confirmed
+        // unsigned — is what keeps the wrapping search closed for a domain with no wrap in
+        // it, so this table is correctly left unreported rather than flagged as a second
+        // one outside `INTEGRITY_CHECK_TABLES`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn signed_boundary_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst NEAR_MAX: i128 = i128::MAX - 1;\n\
+             const fn signed_boundary_table(nibble: i128) -> u32 {\n    \
+             match nibble {\n        \
+             i128::MIN => signed_boundary_helper(0),\n        \
+             NEAR_MAX => signed_boundary_helper(1),\n        \
+             i128::MAX => signed_boundary_helper(2),\n        \
+             _ => signed_boundary_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .all(|violation| !violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_one_element_tuple_destructuring_lets_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let (x,) = (0u8,); x };` names a
+        // `let` whose pattern is a one-element tuple rather than a bare identifier —
+        // `block_let_exprs`'s own `binding_name` fell through to `_ => None` for it, which
+        // did not merely decline to fold the initializer, it dropped the statement from the
+        // map entirely while `evaluate_block`'s own statement count still expected it
+        // accounted for, so the whole block read as unresolved. `destructured_binding` now
+        // recurses through a one-element tuple pattern over a one-element tuple initializer
+        // the same way a scrutinee and an arm pattern already do.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn tuple_destructuring_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let (x,) = (0u8,); x };\n    \
+             const P1: u8 = { let (x,) = (1u8,); x };\n    \
+             const P2: u8 = { let (x,) = (2u8,); x };\n    \
+             const P3: u8 = { let (x,) = (3u8,); x };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_crate_root_path_inside_a_match_guard_is_reported() {
+        // Codex's next-round finding: `_ if crate::ALWAYS => value, _ => fallback` names a
+        // crate-root path in a match *guard*, which `CrateRootPatterns` had never reached —
+        // its own `crate_anchored_paths` was called only from a `const` item's initializer
+        // and from `visit_pat`'s own pattern-position check, neither of which is a guard.
+        // The guard's own path resolves to nothing (`resolve_anchored_single_segment`
+        // declines `crate::NAME` on purpose), so the arm it guards is neither provably dead
+        // nor the real wildcard and the outer match reads as not dense — but the hidden
+        // path itself went unreported, unlike the identical shape in a `const` initializer
+        // or a pattern. `visit_expr_match` now searches every arm's own guard the same way.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn crate_root_guard_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        _ if crate::ALWAYS => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations.iter().any(|violation| violation
+                .detail
+                .contains("matches the pattern `crate::ALWAYS`")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_an_inline_const_blocks_unsigned_shift_is_reported() {
+        // Codex's next-round finding: `(const { u128::MAX }) >> 127` names an inline
+        // const block as the shift's own left operand — `is_definitely_unsigned` had no
+        // case for `Expr::Const` at all, even though `literal_or_const_value` already
+        // evaluates the identical shape as a *value* by recursing into `evaluate_block`.
+        // Without it, `evaluate_shift_op` refuses to reinterpret `u128::MAX`'s own negative
+        // `i128` bit pattern as unsigned, so `(const { u128::MAX }) >> 127 == 0` stays
+        // unresolved — not provably false, so the guarded arm is neither dropped as dead
+        // code nor read as the real wildcard, and the trailing `_` that would otherwise
+        // complete a dense table is never reached. `is_definitely_unsigned` now recurses
+        // into a const block's own bare tail expression the same way.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dead_guard_inline_const_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn dead_guard_inline_const_table(nibble: u8) -> u32 \
+             {\n    match nibble {\n        0 => dead_guard_inline_const_helper(0),\n        \
+             1 => dead_guard_inline_const_helper(1),\n        \
+             2 => dead_guard_inline_const_helper(2),\n        \
+             _ if ((const { u128::MAX }) >> 127) == 0 => 999,\n        \
+             _ => dead_guard_inline_const_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_qualified_primitive_typed_constant_is_pruned_as_dead() {
+        // Codex's next-round finding: `declared_type_is_unsigned` reads a `const`'s own
+        // type ascription through `single_segment_type_name`, which only ever accepted a
+        // bare, unqualified single-segment path — `const HI: core::primitive::u128 = ...`
+        // names the identical type, spelled the canonical fully-qualified way
+        // `well_known_bound_segments` already recognises for a *bound path* rather than a
+        // type, but this function answered `None` for it regardless. `HI` therefore never
+        // recorded as unsigned, so `HI < ZERO` stayed unresolved and the arm it guards was
+        // kept rather than pruned as dead code. `single_segment_type_name` now recognises
+        // the three-segment `core::primitive::TYPE` / `std::primitive::TYPE` spelling too.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn qualified_primitive_dead_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn qualified_primitive_dead_guard_table(nibble: u8) -> u32 {\n    \
+             const HI: core::primitive::u128 = 1u128 << 127;\n    const ZERO: u128 = 0;\n    \
+             match nibble {\n        0 => qualified_primitive_dead_guard_helper(0),\n        \
+             1 => qualified_primitive_dead_guard_helper(1),\n        \
+             2 => qualified_primitive_dead_guard_helper(2),\n        \
+             _ if HI < ZERO => 999,\n        \
+             _ => qualified_primitive_dead_guard_helper(3),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_at_binding_tuple_destructuring_lets_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = { let _whole @ (x,) = (0u8,); x };`
+        // names a `let` whose pattern is `Pat::Ident` carrying a `subpat` — an irrefutable
+        // `@` binding, where `_whole` and `(x,)` both bind against the same value.
+        // `destructured_binding`'s own `Pat::Ident` arm was guarded to fire only when
+        // `subpat.is_none()`, so this shape fell through to `_ => None` the same way an
+        // unhandled `Pat::Tuple` used to — not merely leaving `x` unresolved, but dropping
+        // the whole statement from `block_let_exprs`'s map while `block_ignored_let_count`
+        // does not count it either, since `_whole` is a real identifier rather than the
+        // wildcard `_` that function looks for. The statement therefore went uncounted
+        // anywhere and the whole block read as unresolved. `destructured_binding` now
+        // recurses into the sub-pattern of an `@` binding against the same initializer the
+        // outer name would have bound to, the same way it already recurses through a
+        // one-element tuple pattern.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_tuple_destructuring_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let _whole @ (x,) = (0u8,); x };\n    \
+             const P1: u8 = { let _whole @ (x,) = (1u8,); x };\n    \
+             const P2: u8 = { let _whole @ (x,) = (2u8,); x };\n    \
+             const P3: u8 = { let _whole @ (x,) = (3u8,); x };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_negated_cast_expressions_is_reported() {
+        // Codex's next-round finding: `!(255 as u8)` carries its width in `Expr::Cast`
+        // rather than in a literal's own suffix, which `as_suffixed_int_literal` — reading
+        // only a `Lit::Int` through parentheses or a brace group — had no way to find,
+        // falling straight through to the path-only case and declining. `evaluate_bitwise_not`
+        // now recognises a cast operand directly: `literal_or_const_value` already evaluates
+        // the cast for real (recursing into the operand and truncating to the destination
+        // type), and negating that truncated value within the identical destination width is
+        // the same masked answer the suffixed-literal case above already gives.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn negated_cast_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = !(255 as u8);\n    const P1: u8 = !(254 as u8);\n    \
+             const P2: u8 = !(253 as u8);\n    const P3: u8 = !(252 as u8);\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_qualified_declared_bool_constant_is_the_effective_catchall() {
+        // Codex's next-round finding: `path_declared_type` answered `None` for every
+        // *qualified* reference unconditionally, because `qualified` — `MatchVisitor`'s own
+        // tree of module-qualified constant values — carried no declared-type counterpart at
+        // all; only `ConstTypeScopes` did, for the bare-name case. `const OFF: bool = false;`
+        // in an inline `mod bounds { .. }`, referenced as `!bounds::OFF` in a guard, stayed
+        // unresolved the identical way a qualified `bounds::HI`'s own unsignedness once did
+        // before `qualified_unsigned` existed — so the guard never resolved to the provably
+        // `true` value `a_dense_match_with_a_provably_true_guarded_wildcard_is_reported`
+        // already covers for an unqualified condition, and never became the effective
+        // catch-all that lets the numbered prefix in front of it read as dense.
+        // `MatchVisitor::qualified_types` is `qualified`'s own type-name mirror now, inserted
+        // at the identical key everywhere `qualified` itself gains one, and
+        // `path_declared_type` consults it through `resolve_qualified_type_at_any_depth` the
+        // same most-specific-first way `path_is_definitely_unsigned` already consults
+        // `qualified_unsigned`.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nmod bounds {\n    pub(crate) const OFF: bool = false;\n}\n\n\
+             const fn qualified_bool_catchall_guard_helper(nibble: u32) -> u32 {\n    \
+             nibble\n}\n\nconst fn qualified_bool_catchall_guard_table(nibble: u8) -> u32 {\n    \
+             match nibble {\n        0 => qualified_bool_catchall_guard_helper(0),\n        \
+             1 => qualified_bool_catchall_guard_helper(1),\n        \
+             2 => qualified_bool_catchall_guard_helper(2),\n        \
+             _ if !bounds::OFF => qualified_bool_catchall_guard_helper(3),\n        \
+             _ => qualified_bool_catchall_guard_helper(4),\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_cross_file_qualified_declared_bool_constant_is_the_effective_catchall()
+     {
+        // Codex's next-round finding: the inline-module fix above still left
+        // `check_integrity_check_module_tree`'s own tree-wide `qualified_types` seeded
+        // empty at every `match_expressions_with_prefix` call, the identical gap
+        // `a_dense_match_guarded_by_a_cross_file_qualified_typed_constant_is_pruned_as_dead`
+        // already closed for `qualified_unsigned` — `bounds::OFF` declared in a sibling
+        // *out-of-line* `bounds.rs`, referenced as `!bounds::OFF` in a guard written in a
+        // different file, answered `None` for its own declared type no matter how it was
+        // declared, because the file that would answer honestly (`bounds.rs`) was never the
+        // file whose guard needed it. `qualified_constants_with_prefix` now returns its own
+        // `qualified_types` alongside `qualified` and `qualified_unsigned`, collected across
+        // the tree the same fixed-point pass already collects both with, and threaded
+        // through to `match_expressions_with_prefix` instead of an empty map.
+        let parent = format!(
+            "{}\nmod bounds;\n\nconst fn cross_file_qualified_bool_catchall_helper(nibble: \
+             u32) -> u32 {{\n    nibble\n}}\n\nconst fn \
+             cross_file_qualified_bool_catchall_table(nibble: u8) -> u32 {{\n    match \
+             nibble {{\n        0 => cross_file_qualified_bool_catchall_helper(0),\n        \
+             1 => cross_file_qualified_bool_catchall_helper(1),\n        \
+             2 => cross_file_qualified_bool_catchall_helper(2),\n        \
+             _ if !bounds::OFF => cross_file_qualified_bool_catchall_helper(3),\n        \
+             _ => cross_file_qualified_bool_catchall_helper(4),\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let bounds = "//! Bounds.\npub(crate) const OFF: bool = false;\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &parent),
+            layer("waymaker-flash/src/crc/bounds.rs", bounds),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_at_binding_outer_name_lets_is_reported() {
+        // Codex's next-round finding: the earlier `@`-binding fix recursed only into the
+        // sub-pattern of `let _whole @ (x,) = ...;`, discarding the *outer* name — sound for
+        // that reproduction, where the tail referenced `x` rather than `_whole`, but wrong in
+        // general: `let whole @ _ignored = 0u8; whole` references the *outer* binding, which
+        // `destructured_binding` never recorded, so the constant stayed unresolved and the
+        // whole block read as unresolved with it. `destructured_binding` now returns every
+        // name a pattern legally binds — the outer name of an `@` pattern and whatever its
+        // sub-pattern binds — rather than one, and `block_let_exprs` flattens all of them
+        // into its map; `block_let_statement_count` is the statement-counted twin
+        // `evaluate_block`'s own `rest.len()` check now reads, since one statement can bind
+        // more than one name.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn at_binding_outer_name_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let whole @ _ignored = 0u8; whole };\n    \
+             const P1: u8 = { let whole @ _ignored = 1u8; whole };\n    \
+             const P2: u8 = { let whole @ _ignored = 2u8; whole };\n    \
+             const P3: u8 = { let whole @ _ignored = 3u8; whole };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_if_let_conditioned_initializers_is_reported() {
+        // Codex's next-round finding: `const P0: u8 = if let 0 = 0u8 { 0 } else { 100 };`
+        // names an `if` whose own condition is `Expr::Let` — Rust's grammar permits a
+        // `let` only in an `if`'s or a `while`'s own condition position, never as a plain
+        // value expression, but `literal_or_const_value` had no case for the node kind
+        // regardless, so `if_expr.cond` stayed unresolved and every such constant did
+        // too. `literal_or_const_value` now evaluates an `Expr::Let` the same way a
+        // `match` arm's own pattern already is: the scrutinee resolved through this same
+        // pipeline, then `match_arm_matches_constant` answers whether the pattern
+        // matches it.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn if_let_condition_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = if let 0 = 0u8 { 0 } else { 100 };\n    \
+             const P1: u8 = if let 0 = 1u8 { 0 } else { 1 };\n    \
+             const P2: u8 = if let 0 = 2u8 { 0 } else { 2 };\n    \
+             const P3: u8 = if let 0 = 3u8 { 0 } else { 3 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_suffix_following_an_unresolved_guarded_arm_is_reported() {
+        // Codex's next-round finding: `_x if flag => 999, 0 => .., 1 => .., 2 => .., 3
+        // => .., _ => ..` names a first arm whose own *pattern* (`_x`) is a bare,
+        // unconstrained binding — `pattern_literal` answers it with no values at all,
+        // regardless of the guard — guarded by a condition (`flag`) this scan cannot
+        // resolve, so it is neither dropped as dead code nor treated as the real
+        // wildcard. `missing_value` and `compact_window_with_gaps` each used to bail
+        // the moment they met that empty pattern anywhere in the numbered prefix, so
+        // the whole match read as not dense even though `rustc` still lowers arms `0`
+        // through `3` to an indexed table whenever `flag` is false — reaching arm `1` is
+        // exactly what a false guard on arm `0` means. `has_dense_arm_patterns` now
+        // retries the numbered scan at every possible start, not only at position `0`,
+        // so a dense run beginning after one or more such barrier arms is still found.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn guarded_barrier_dense_suffix_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        _x if flag => 999,\n        0 => 0,\n        \
+             1 => 1,\n        2 => 2,\n        3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 6-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_guarded_by_a_width_truncated_left_shift_is_reported() {
+        // Codex's next-round finding: `128u8 << 1` is `0u8` in real Rust — the ninth bit a
+        // full-width shift would keep has nowhere to live in an eight-bit register — but
+        // `evaluate_binary_op`'s own `Shl` arm computed `left.checked_shl(shift)` over the
+        // shared `i128` storage with no truncation at all, answering `256` instead. Each of
+        // `P0` through `P3` picks between a dense branch (`n`) and a sparse one (`n`'s own
+        // decade, `100`/`110`/`120`/`130`) based on whether `(128u8 << 1) == 0`; the untruncated
+        // fold took the sparse branch every time, so this match never read as dense. `Shl`
+        // is now evaluated by `evaluate_shl_op`, which truncates the shifted value to the
+        // left operand's own declared width the same narrow way `evaluate_bitwise_not`
+        // already reads one — a literal's own suffix, a cast's destination type, or a
+        // path's declared type — so `(128u8 << 1) == 0` now folds to `true` and the dense
+        // branch is what every constant here resolves to.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn shl_truncation_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = if (128u8 << 1) == 0 { 0 } else { 100 };\n    \
+             const P1: u8 = if (128u8 << 1) == 0 { 1 } else { 110 };\n    \
+             const P2: u8 = if (128u8 << 1) == 0 { 2 } else { 120 };\n    \
+             const P3: u8 = if (128u8 << 1) == 0 { 3 } else { 130 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_multi_element_tuple_scrutinee_matches_is_reported() {
+        // Codex's next-round finding: `match (0u8, 1u8) { (0, 1) => 0, _ => 100 }` names a
+        // scrutinee this scan's own `i128` domain has no room for — `literal_or_const_value`'s
+        // own `Expr::Tuple` case only ever reduced a *one*-element tuple to its single inner
+        // value, so a genuinely multi-element tuple scrutinee fell through to the wildcard
+        // `_ => None` case and stayed unresolved, taking every constant built from it with
+        // it. `evaluate_match` now tries `evaluate_tuple_match` when the ordinary
+        // single-value path fails and the scrutinee is itself a multi-element tuple: each
+        // element is resolved on its own, then matched component-wise against the first arm
+        // whose own pattern is a tuple of the identical arity, reusing
+        // `match_arm_matches_constant` per element rather than needing the whole scrutinee
+        // named as one value.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn multi_element_tuple_match_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = match (0u8, 1u8) { (0, 1) => 0, _ => 100 };\n    \
+             const P1: u8 = match (0u8, 2u8) { (0, 2) => 1, _ => 101 };\n    \
+             const P2: u8 = match (0u8, 3u8) { (0, 3) => 2, _ => 102 };\n    \
+             const P3: u8 = match (0u8, 4u8) { (0, 4) => 3, _ => 103 };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_prefix_ending_before_a_trailing_unresolved_guarded_arm_is_reported() {
+        // Codex's next-round finding: the dense-suffix fix tried only a *suffix* at every
+        // start, which still missed `0 => .., 1 => .., 2 => .., 3 => .., _ if flag => ..,
+        // _ => ..` — the dense run here is a *prefix* of the numbered arms, ending before
+        // the barrier arm rather than beginning after one, and the barrier sits at the very
+        // end of the numbered prefix, so every suffix that used to be tried still carried it
+        // along (no suffix short of the empty one excludes an arm at the very end). `rustc`
+        // does not need the barrier reached first either way: `0` through `3` are literal
+        // patterns tried by value before any guard is evaluated at all, so the dense run
+        // they form is a real table candidate on its own regardless of what follows it.
+        // `has_dense_arm_patterns` now tries every contiguous sub-slice, not only every
+        // suffix, so a dense run ending before a barrier is found the same way one
+        // beginning after one already is.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_prefix_before_trailing_guard_table(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 0,\n        1 => 1,\n        \
+             2 => 2,\n        3 => 3,\n        _ if flag => 999,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 6-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_multi_element_tuple_destructuring_lets_is_reported() {
+        // Codex's next-round finding: `let (x, _) = (0u8, ()); x` names a *two*-element
+        // tuple pattern over a two-element tuple initializer, which `destructured_binding`'s
+        // own tuple case — scoped to exactly one element — fell through to `_ =>
+        // Vec::new()` for, the identical shape of gap the one-element case itself closed,
+        // one arity wider: the whole statement went uncounted, and the block it sat in read
+        // as unresolved. `destructured_binding`'s tuple case is now generalised to any
+        // arity: a tuple pattern and a tuple expression of the identical length are paired
+        // element-wise, each pair recursed through the identical way a one-element tuple's
+        // own single pair already was, and `_` contributes none of its own bindings the
+        // same way it already does outside a tuple.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn multi_element_tuple_destructuring_let_table(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let (x, _) = (0u8, ()); x };\n    \
+             const P1: u8 = { let (x, _) = (1u8, ()); x };\n    \
+             const P2: u8 = { let (x, _) = (2u8, ()); x };\n    \
+             const P3: u8 = { let (x, _) = (3u8, ()); x };\n    \
+             match nibble {\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        _ => 4,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_struct_pattern_destructuring_let_is_reported() {
+        // Codex's finding: `let S { x } = S { x: 0 }; x` names an irrefutable struct
+        // destructure — MSRV-legal, unwarned Rust, and no rarer a shape than the tuple
+        // pattern beside it — which `destructured_binding`'s own match fell through to `_
+        // => Vec::new()` for, exactly the way an unhandled `Pat::Tuple` once did: the whole
+        // statement went uncounted by every term that requires this function to answer at
+        // least one name, and the block it sat in read as unresolved. `destructured_binding`
+        // now matches each field pattern to its initializer by name (`Member`'s own
+        // `PartialEq`) rather than by position, since a struct's fields carry no positional
+        // order a pattern must respect the way a tuple's elements do. Verified against real
+        // rustc, warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ struct S {{ x: u8 }} let S {{ x }} = S {{ x: {n}u8 \
+                 }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_struct_pattern_destructuring_let(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_bound_by_their_own_selected_arm_is_reported() {
+        // Codex's finding: `const P0: u8 = match 0u8 { x @ 0 => x, _ => 100 };` returns a
+        // value bound by its own selected arm's pattern. `match_arm_matches_constant`
+        // confirms `x @ 0` matches `0u8`, but the body `x` was then evaluated through only
+        // the *outer* resolver, where the arm-local binding `x` does not exist — a bare
+        // path lookup that fails and takes the whole match down with it, `None`, exactly
+        // as if the arm's own pattern had never matched. Defining `P0` through `P14` this
+        // way left every outer pattern of the dense table below unresolved.
+        // `evaluate_match` and `evaluate_tuple_match` each now build a resolver, scoped to
+        // the selected arm, that answers for whatever name the arm's own pattern binds —
+        // an at-binding (`x @ ..`) or a bare irrefutable binding alike — before evaluating
+        // that arm's guard and body, so `x` resolves to the value the pattern just matched.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = match {n}u8 {{ x @ {n} => x, _ => 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_self_bound_arm_constants(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_harmless_local_item_in_their_block_is_reported() {
+        // Codex's finding: `const P0: u8 = { type Value = u8; let value: Value = 0; value };`
+        // names a local item — a type alias — alongside the `let` `evaluate_block` already
+        // resolves. `production_stmts` kept the type alias (every item statement but a
+        // `#[cfg(test)]`-gated one passes `stmt_is_cfg_test`), while neither
+        // `block_const_exprs` nor `block_let_exprs`/`block_let_statement_count` count a type
+        // alias at all — it binds no value either collector tracks — so `rest.len()` came
+        // out one higher than `const_item_count + block_let_statement_count(block) +
+        // ignored_lets`, and `evaluate_block` refused a block that was otherwise fully
+        // resolvable. Defining `P0` through `P14` this way left every outer pattern of the
+        // dense table below unresolved. `stmt_is_transparent_item` now filters a local item
+        // that is not a `const` — a type alias, a local `fn`, `struct`, `enum`, `trait`,
+        // `impl`, `use`, `mod` or `static` — out of `production_stmts` the same way a
+        // `#[cfg(test)]` statement already is, so the count it is compared against never
+        // counted it either.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ type Value = u8; let value: Value = {n}; value }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_with_a_local_type_alias(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_folding_a_negative_signed_right_shift_is_reported() {
+        // Codex's finding: `(-128i8 >> 7) + 1` evaluates to `0` in real Rust, since `>>` on
+        // a signed operand is an arithmetic shift — floor division by a power of two, which
+        // `i128::checked_shr` already performs natively on the true, sign-extended value
+        // this scan stores for a negated literal. `evaluate_shift_op` used to refuse *every*
+        // negative left operand it could not confirm unsigned, so `BASE` through `BASE + 14`
+        // stayed unresolved and the dense table built from them went unrecognised.
+        // `is_definitely_signed` now confirms a suffixed, cast or declared-type-`i*` operand
+        // as signed, and a confirmed-signed negative operand folds through `checked_shr`
+        // directly instead of being refused.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14i8 {
+            let _ = writeln!(constants, "    const P{n}: i8 = (-128i8 >> 7) + 1 + {n};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_negative_signed_right_shift_constants(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_shifting_an_arm_bound_scrutinee_is_reported() {
+        // Codex's finding: `match u128::MAX { x @ u128::MAX => ((x >> 127) as u8) - 1 + n,
+        // _ => 100 }` resolves `x`'s own *value* through the earlier arm-binding fix, but
+        // the arm resolver's `unsigned`/`width` closures still asked only the *outer* scope
+        // for `x` — which has never heard of an arm-local name — so
+        // `is_definitely_unsigned(x, ..)` answered `false` and the shift `x >> 127` stayed
+        // unresolved regardless of what `x` was actually bound to. `evaluate_match` now
+        // derives an arm-bound name's own unsignedness and width from the *scrutinee
+        // expression* it was matched against — `u128::MAX`, confirmed unsigned by the
+        // identical well-known-bound recognition `path_is_definitely_unsigned` already
+        // gives it — so `x >> 127` folds as an unsigned (logical) shift, `1`, and
+        // `((x >> 127) as u8) - 1 + n` folds to `n`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = match u128::MAX {{ x @ u128::MAX => ((x >> 127) as u8) - 1 + {n}, _ => 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_arm_bound_scrutinee_shift(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_mutation_statement_in_their_block_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 0; x += 1; x - 1 };` names a
+        // compound-assignment statement `evaluate_block`'s own local-resolution loop has no
+        // way to represent — that loop resolves each local from one static initializer
+        // expression, and `rest` counted the mutation statement while neither collector
+        // behind the invariant counted it, so the block refused as unresolved even though it
+        // is arithmetically resolvable. Defining `P0` through `P14` this way left every
+        // outer pattern of the dense table below unresolved. `apply_block_mutations` now
+        // applies every compound-assignment statement in source order, once the block's own
+        // declarations have resolved, by folding a synthetic binary expression through the
+        // identical operator dispatch any other expression in this scan already goes
+        // through; `block_mutation_statement_count` is the matching half of the statement
+        // count `rest` is compared against.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = {n}; x += 1; x - 1 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_with_a_compound_assignment(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_folding_an_ordering_of_a_confirmed_signed_negative_is_reported()
+    {
+        // Codex's finding: `const BASE: i8 = -1; const P0: u8 = if BASE < 0 { 0 } else { 100 };`
+        // names a negative operand whose type is confirmed *signed* rather than unsigned, and
+        // `evaluate_ordering_op` used to refuse every negative operand it could not confirm
+        // unsigned — leaving `BASE < 0` unresolved even though `is_definitely_signed` already
+        // proves `BASE`'s stored `i128` bit pattern already is its true, negative value.
+        // Verified against real rustc: `BASE < 0` is `true`, so `P0` through `P14` fold to the
+        // dense `0..14` sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = if BASE < 0 {{ {n} }} else {{ 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_signed_negative_ordering(nibble: u32) -> u32 {{\n    \
+             const BASE: i8 = -1;\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_computed_by_a_while_loop_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 100; while x > 0 { x -= 1; } x };`
+        // names a block whose statements are a `let` and a `while` loop — `evaluate_block`'s
+        // own statement-count invariant had no term at all for the loop statement, so the
+        // block always looked one statement longer than `const_item_count +
+        // block_let_statement_count + block_mutation_statement_count + ignored_lets` could
+        // ever sum to, and every constant built this way refused as unresolved regardless of
+        // what the loop itself computed. Verified against real rustc: decrementing `x` from
+        // 100 while it exceeds `n` leaves `x == n`, so `P0` through `P14` fold to the dense
+        // `0..14` sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8; while x > {n} {{ x -= 1; }} x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_while_loop(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_whose_while_body_shadows_a_mutated_local_is_reported() {
+        // Codex's finding: `const Pn: u8 = { let mut x = 1u8; while x > 0 { x -= 1; let x =
+        // 1u8; let _ = x; } n };` shadows the outer, mutated `x` with a fresh `let x = 1u8;`
+        // *inside* the loop body — a name whose lexical scope ends at the body's own closing
+        // brace, so Rust decrements the outer `x` to 0 on the first iteration, evaluates the
+        // (unrelated) shadow, drops it, and finds the outer `x` still 0 on the next
+        // condition check: one iteration, result `n`. `evaluate_while_loop` used to share
+        // `resolved`/`local_types` across iterations with nothing undoing the body's own
+        // `let`s afterward, so the shadow's `1` permanently overwrote the outer `x`'s `0`,
+        // the condition stayed true forever, and the loop hit its own iteration cap and
+        // refused — hiding a dense `0..14` table behind an unresolved constant. Verified
+        // against real rustc: `make(n)` is the identity for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 1u8; while x > 0 {{ x -= 1; let x = \
+                 1u8; let _ = x; }} {n} }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_while_body_that_shadows_a_mutated_local(nibble: \
+             u32) -> u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        \
+             P1 => 1,\n        P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        \
+             P5 => 5,\n        P6 => 6,\n        P7 => 7,\n        P8 => 8,\n        \
+             P9 => 9,\n        P10 => 10,\n        P11 => 11,\n        P12 => 12,\n        \
+             P13 => 13,\n        P14 => 14,\n        _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_computed_by_a_nested_block_statement_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 100; { x -= 100; } x };` names a
+        // block whose statements are a `let` and a bare, unlabelled nested `{ .. }` block —
+        // the identical gap `block_while_statement_count` was added for, one syntax over:
+        // nothing on either side of `evaluate_block`'s own statement-count invariant ever
+        // counted the nested block statement, so a block holding one refused outright
+        // regardless of what running it would have computed. Verified against real rustc:
+        // `x -= 100 - n` inside the nested block leaves `x == n`, so `P0` through `P14`
+        // fold to the dense `0..14` sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8; {{ x -= 100 - {n}; }} x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_nested_block_statement(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_while_loop_whose_condition_never_folds_to_false_is_refused_rather_than_hung() {
+        // `evaluate_while_loop`'s own bound: an unbounded interpreter over arbitrary source
+        // would make a crate whose constant never terminates able to hang this gate, so a
+        // condition that stays true past `MAX_WHILE_LOOP_ITERATIONS` iterations has to refuse
+        // the block rather than loop forever computing it. This module never reports a
+        // violation over `P0` at all, because the whole constant refuses to resolve — the
+        // point of this test is that it *returns*, not that it flags anything.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn never_terminates(nibble: u32) -> u32 {\n    \
+             const P0: u8 = { let mut x = 0u8; while x < 255 { x += 0; } x };\n    \
+             match nibble {\n        P0 => 0,\n        _ => 1,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.detail.contains("dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_block_containing_an_unrecognised_statement_is_refused_rather_than_silently_skipped()
+    {
+        // The reproduction this test originally used, `{ let mut x: u8 = 30; { if true { x =
+        // 3; } } x }`, stopped being an example of an *unrecognised* statement once
+        // `evaluate_if_statement` was added — it now correctly resolves `P0` to `3`, and the
+        // test now uses `a_dense_match_over_constants_with_a_conditional_body_is_reported`
+        // below to check that. What this test still needs to hold is the general fallback:
+        // a `for` loop — recognised by `resolve_block_sequential` as neither a `while`, a
+        // nested block, an `if`/`else`, nor a mutation — sitting inside a bare nested block.
+        // The fallback refuses the whole call rather than silently treating an unrecognised
+        // statement as a no-op, so `P0` never resolves at all, whatever the `for` loop would
+        // really have done to `x`. Verified against real rustc: this shape compiles cleanly,
+        // warning-free.
+        // `qualified_constants_with_prefix` only populates `qualified` when `prefix` is
+        // non-empty — a module-qualified name is the whole point of that map — so a
+        // one-segment prefix is what makes `P0`'s own resolved (or refused) value visible
+        // here at all, under the key it would be reached by from another file of the tree.
+        let source = "const P0: u8 = { let mut x: u8 = 30; { for _ in 0..1 { x = 3; } } x };";
+        let (qualified, _, _) = crate::parse::qualified_constants_with_prefix(
+            source,
+            &["m".to_owned()],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .expect("valid Rust source parses");
+        assert!(
+            !qualified.contains_key("m::P0"),
+            "P0 resolved to {:?} instead of refusing to resolve at all",
+            qualified.get("m::P0")
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_an_unsuffixed_bitwise_not_is_reported() {
+        // Codex's finding: `const P0: u8 = !255;` names an operand with no suffix, no cast
+        // and no path — `evaluate_bitwise_not`'s three fallbacks all correctly decline it,
+        // because the width really is nowhere in `!255` itself, only in `P0`'s own
+        // declaration. Verified against real rustc: `!255` as `u8` is `0`, `!254` is `1`,
+        // and so on through `!241` at `14` — the dense `0..14` sequence the outer match's
+        // patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let operand = 255 - n;
+            let _ = writeln!(constants, "    const P{n}: u8 = !{operand};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_unsuffixed_bitwise_not(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_adding_an_unsuffixed_bitwise_not_to_a_path_is_reported() {
+        // Codex's finding: `const Pn: u8 = !255 + n;` names a bare, unsuffixed negation that
+        // is not the *whole* initializer but one operand of a binary expression — the
+        // previous fix's own check only fired when `expr` itself, after stripping
+        // parentheses, was `Expr::Unary`, so `!255 + n` (an `Expr::Binary`) declined
+        // regardless of the declared type sitting right there on `Pn`. Real Rust propagates
+        // the declaration's own expected type into both operands of an arithmetic binary the
+        // same way it does the initializer as a whole, so this operand is rewritten to
+        // `!(255 as u8) + n` — the shape `evaluate_bitwise_not` already resolves on its own
+        // — before being handed to the ordinary binary evaluator. Verified against real
+        // rustc: `!255 + n` for `n` in `0..=14` is the dense `0..14` sequence the outer
+        // match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(constants, "    const P{n}: u8 = !255 + {n};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_unsuffixed_bitwise_not_in_a_binary(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_bitwise_not_two_binary_levels_deep_is_reported() {
+        // Codex's finding: `const Pn: u8 = (!255 + n) + 0;` names a bare, unsuffixed negation
+        // two binary levels down from the declaration — the previous fix's own rewrite
+        // reached `expr` itself and its immediate two operands (`!255 + n` and `0`), neither
+        // of which is itself a bare negation, so both tries declined and the whole
+        // expression stayed unresolved. `propagate_declared_width` now recurses into a binary
+        // operand that is itself a binary, trying the identical rewrite one level further in,
+        // so `!255` is found and rewritten to `!(255 as u8)` regardless of how many
+        // arithmetic operators separate it from `Pn`'s own declaration. Verified against real
+        // rustc, warning-free: `(!255 + n) + 0` for `n` in `0..=14` is the dense `0..14`
+        // sequence the outer match's patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(constants, "    const P{n}: u8 = (!255 + {n}) + 0;");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_bitwise_not_two_binary_levels_deep(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_while_let_bound_body_is_reported() {
+        // Codex's finding: `while let x @ 1 = y { out = x - 1 + n; y = 0; }` binds `x`
+        // through the loop's own condition — but `evaluate_while_loop` reduced that
+        // condition to a plain boolean through `literal_or_const_value`'s existing
+        // `Expr::Let` case, which only ever answers "did it match," and then ran the body
+        // against the *outer* resolver alone, where `x` does not exist. `evaluate_if_let`'s
+        // own fix for the identical gap is reused here: the scrutinee and the match are
+        // decided through the same resolver the plain condition already uses (so `y`'s
+        // current, mutated value is what the pattern is checked against on every
+        // iteration), and the body runs with a resolver that answers for `x` and falls back
+        // to the outer one for everything else. Verified against real rustc, warning-free:
+        // `y` starts at `1`, the loop runs exactly once (`y` is reset to `0` inside the
+        // body), and the body's own `out = x - 1 + n;` makes the whole function the identity
+        // on `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut y = 1u8; let mut out = 100u8; while let \
+                 x @ 1 = y {{ out = x - 1 + {n}; y = 0; }} out }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_while_let_bound_body(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_conditional_body_is_reported() {
+        // Codex's finding: `{ let mut x: u8 = n * 10; if x > 0 { x /= 10; } x }` names a
+        // top-level `if` statement with no `else` and no trailing semicolon —
+        // `evaluate_block`'s own statement-count invariant had no term at all for it, unlike
+        // the `while` and nested-block statements beside it, so the block always looked one
+        // statement longer than its own name-counting terms could account for and every
+        // constant built this way refused as unresolved regardless of which branch running
+        // it would have taken. `evaluate_if_statement` now runs the chosen branch for real,
+        // as its own nested lexical scope. Verified against real rustc: dividing `x` by 10
+        // when it is nonzero leaves `x == n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = {n} * 10; if x > 0 {{ x /= 10; }} \
+                 x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_conditional_body(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_match_statement_body_is_reported() {
+        // Codex's finding: `{ let mut x: u8 = 100 + n; match x { 100 => x = 0, 101 => x = 1,
+        // _ => x -= 100 }; x }` names a top-level `match` statement whose own arms are
+        // mutations, not values — `resolve_block_sequential`'s per-statement dispatch named
+        // `While`, `Block` and `If`, but never `Match`, so the whole statement fell to
+        // `resolve_mutation_statement`, which declines a bare `match` outright (it names no
+        // assignment target) and refused the entire block regardless of which arm running it
+        // would have taken. `evaluate_match_statement` now runs the matching arm's own body
+        // for real, through the identical sequential dispatch a `while` body or an `if`
+        // branch already goes through. Verified against real rustc, warning-free: `x` is `n`
+        // for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = 100 + {n}; match x {{ 100 => x = \
+                 0, 101 => x = 1, _ => x -= 100 }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_match_statement_body(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_dispatched_entirely_through_unresolved_guard_calls_is_reported() {
+        // Codex's finding: `x if x == index(0) => .., x if x == index(1) => .., .. _ => ..`
+        // binds a plain identifier in every numbered arm and dispatches entirely through a
+        // guard equality against a call this scan does not evaluate (`index` a `const fn`).
+        // `pattern_literal` answers such a pattern with no values at all, so every numbered
+        // arm's own `pattern` is empty and `missing_value`/`compact_window_with_gaps`/
+        // `dense_power_of_two_stride` each bail on the first arm they meet — no contiguous
+        // sub-slice was ever found dense and `has_dense_arm_patterns` returned `false`,
+        // approving the table unseen. Verified against real rustc, warning-free: this exact
+        // 16-arm reproduction (with a permutation as each arm's own value, so the compiler
+        // cannot fold the whole thing into an identity clamp) compiles to a real
+        // `.Lswitch.table` in `.rodata`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let permutation = [5, 2, 9, 0, 14, 7, 1, 13, 4, 11, 8, 3, 12, 6, 10];
+        let mut arms = String::new();
+        for (n, value) in permutation.iter().enumerate() {
+            let _ = writeln!(arms, "        x if x as u32 == index({n}) => {value},");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn index(n: u32) -> u32 {{ n }}\n\n\
+             const fn guard_call_dispatch_table(nibble: u8) -> u32 {{\n    match nibble {{\n{arms}        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_loop_statement_body_is_reported() {
+        // Codex's finding: `{ let mut x = 100u8 + n; loop { x -= 100; break; } x }` names a
+        // top-level `loop` statement with no trailing semicolon, ending in a bare `break;`
+        // that carries no value — `evaluate_loop` answers a *value* a loop folds to (its own
+        // doc comment requires a break carrying one), so it declines this shape, and
+        // `resolve_statement_expr`'s own dispatch named `While`, `Block`, `If` and `Match`
+        // but never `Loop`, so the whole statement fell to `resolve_mutation_statement`,
+        // which declines a bare `loop` outright (it names no assignment target) and refused
+        // the entire block regardless of what running the body once would have computed.
+        // `evaluate_loop_statement` now runs the body's setup statements once and treats the
+        // trailing unconditional break as the loop's own exit, the identical sequential
+        // dispatch a `while` body, an `if` branch or a `match` arm already goes through.
+        // Verified against real rustc, warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8 + {n}; loop {{ x -= 100; break; \
+                 }} x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_loop_statement_body(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_tuple_struct_pattern_destructuring_let_is_reported() {
+        // Codex's finding: `struct S(u8); let S(x) = S(0); x` names an irrefutable
+        // tuple-struct destructure — the plain tuple pattern's own reasoning, met one
+        // syntax over — which `destructured_binding`'s own match fell through to `_ =>
+        // Vec::new()` for, exactly the way an unhandled `Pat::Struct` once did: the whole
+        // statement went uncounted by every term that requires this function to answer at
+        // least one name, and the block it sat in read as unresolved. `destructured_binding`
+        // now matches a tuple struct's constructor call the identical positional way a bare
+        // tuple literal's own elements are matched. Verified against real rustc,
+        // warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ struct S(u8); let S(x) = S({n}u8); x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_tuple_struct_pattern_destructuring_let(nibble: u32) \
+             -> u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_two_field_tuple_scrutinee_is_reported() {
+        // Codex's finding: `match (nibble & 3, (nibble >> 2) & 3) { (0, 0) => .., .. (3, 3)
+        // => .., _ => .. }` has two non-catch-all fields in every one of its sixteen
+        // numbered arms, so `single_discriminating_field` answers `None` for each of them
+        // — it refuses to guess which field a table would be keyed on — and
+        // `pattern_literal` resolves no value from any of them, the identical silence a
+        // guard-dispatched table already produces. Every one of `missing_value`,
+        // `compact_window_with_gaps` and `dense_power_of_two_stride` bails on the first
+        // arm they meet, so no contiguous sub-slice was ever found dense and
+        // `has_dense_arm_patterns` returned `false`, approving the table unseen — even
+        // though `rustc` still lowers the Cartesian product to a real indexed table.
+        // Verified against real rustc, warning-free (`rustc --edition 2021 -C
+        // opt-level=z`): this exact match compiles clean with no `unreachable_patterns`
+        // or dead-code warning, over every one of the sixteen `(hi, lo)` pairs `nibble &
+        // 15` can produce.
+        let source = format!(
+            "{}\nconst fn dense_table_over_a_two_field_tuple(nibble: u32) -> u32 {{\n    \
+             match (nibble & 3, (nibble >> 2) & 3) {{\n        (0, 0) => 0,\n        \
+             (0, 1) => 1,\n        (0, 2) => 2,\n        (0, 3) => 3,\n        \
+             (1, 0) => 4,\n        (1, 1) => 5,\n        (1, 2) => 6,\n        \
+             (1, 3) => 7,\n        (2, 0) => 8,\n        (2, 1) => 9,\n        \
+             (2, 2) => 10,\n        (2, 3) => 11,\n        (3, 0) => 12,\n        \
+             (3, 1) => 13,\n        (3, 2) => 14,\n        (3, 3) => 15,\n        \
+             _ => 15,\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 17-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_two_field_tuple_nested_in_a_one_tuple_is_reported() {
+        // Codex's finding: `((0, 0),)` through `((3, 3),)` — the same ambiguous
+        // two-field inner tuple wrapped in an outer one-tuple — has exactly *one*
+        // non-catch-all field at the outer level (the inner tuple as a whole), so the
+        // round-19 fix's own `has_multiple_discriminating_fields` answered `false` for
+        // the outer pattern and never looked inside that one field to see that *it* is
+        // ambiguous. `pattern_literal` does not stop there either: its own `Pat::Tuple`
+        // case recurses into the single field with a plain call to `pattern_literal`,
+        // which is exactly what finds the inner tuple's real, two-field ambiguity and
+        // returns nothing from it — so every arm's `pattern` was still empty and
+        // `unresolved_cause` stayed `None`. `compound_pattern_is_ambiguous` now recurses
+        // through `pattern_has_ambiguous_discriminating_fields` the identical way.
+        // Verified against real rustc, warning-free (`rustc --edition 2021 -C
+        // opt-level=z`): this exact nested match compiles clean with no
+        // `unreachable_patterns` or dead-code warning.
+        let source = format!(
+            "{}\nconst fn dense_table_over_a_nested_two_field_tuple(nibble: u32) -> u32 \
+             {{\n    match ((nibble & 3, (nibble >> 2) & 3),) {{\n        ((0, 0),) => 0,\n        \
+             ((0, 1),) => 1,\n        ((0, 2),) => 2,\n        ((0, 3),) => 3,\n        \
+             ((1, 0),) => 4,\n        ((1, 1),) => 5,\n        ((1, 2),) => 6,\n        \
+             ((1, 3),) => 7,\n        ((2, 0),) => 8,\n        ((2, 1),) => 9,\n        \
+             ((2, 2),) => 10,\n        ((2, 3),) => 11,\n        ((3, 0),) => 12,\n        \
+             ((3, 1),) => 13,\n        ((3, 2),) => 14,\n        ((3, 3),) => 15,\n        \
+             _ => 15,\n    }}\n}}\n",
+            tests_support::clean_checksum_module()
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 17-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_an_array_pattern_destructuring_let_is_reported() {
+        // Codex's finding: `let [x] = [0u8]; x` names an irrefutable array destructure —
+        // the plain tuple pattern's own reasoning, met one syntax over: a fixed-length
+        // array pattern over a fixed-length array literal binds its elements
+        // positionally the identical way a tuple pattern does, but the pattern is
+        // `Pat::Slice` and the initializer is `Expr::Array` — which
+        // `destructured_binding`'s own match fell through to `_ => Vec::new()` for,
+        // exactly the way an unhandled `Pat::TupleStruct` once did: the whole statement
+        // went uncounted by every term that requires this function to answer at least
+        // one name, and the block it sat in read as unresolved.
+        // `destructured_binding` now matches a fixed-length array pattern the identical
+        // positional way a bare tuple literal's own elements are matched. Verified
+        // against real rustc, warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let [x] = [{n}u8]; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_array_pattern_destructuring_let(nibble: u32) \
+             -> u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_abandoned_at_the_while_loop_iteration_cap_is_reported() {
+        // Codex's finding: `{ let mut x = 4097u16; while x > 0 { x -= 1; } n }` needs one
+        // more iteration than `MAX_WHILE_LOOP_ITERATIONS` allows, so `evaluate_while_loop`
+        // answers `None` — correctly, since guessing a value would be worse than
+        // refusing — but every numbered arm naming a constant built this way had its
+        // pattern read as empty exactly the way a genuine catch-all's is, and
+        // `has_dense_arm_patterns` approved the table unseen even though `rustc` still
+        // folds every one of these constants given enough iterations. Verified against
+        // real rustc, warning-free: this exact reproduction compiles clean, and `x` is
+        // `n` for every `n` in `0..=14` once the loop actually runs.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u32 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u32 = {{ let mut x = 4097u32; while x > 0 {{ x -= 1; }} \
+                 {n}u32 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_capped_loop_constants(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_assigning_an_unsuffixed_bitwise_not_to_a_typed_local_is_reported()
+     {
+        // Codex's finding: `{ let mut x: u8 = 99; let _old = x; x = !255 + n; x }` names a
+        // *plain assignment* whose right-hand side needs the target's own declared type to
+        // fold the bare negation inside it — but the mutation-handling code called
+        // `literal_or_const_value` directly for a plain `=`, discarding the same
+        // `declared_type` the compound-assignment arm beside it already threads through.
+        // Real Rust uses the assignment target's own declared type as the expected type for
+        // the right-hand side, the identical way it does for a typed `let`'s own initializer,
+        // so the plain-assignment arm now goes through `resolve_declared_initializer` too.
+        // Verified against real rustc: `!255 + n` assigned into a `u8` is `n`, for every `n`
+        // in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = 99; let _old = x; x = !255 + {n}; \
+                 x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_assignments_declared_target_type(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_successful_let_else_binding_is_reported() {
+        // Codex's finding: `let x @ 0..=254 = n else { loop {} }; x` names a `let`-`else`
+        // whose refutable pattern provably matches every `n` this test builds it with — but
+        // `resolve_block_sequential` unconditionally skipped any `Stmt::Local` with
+        // `init.diverge.is_some()`, leaving `x` unbound and the whole block unresolved
+        // regardless of whether the pattern matched. `resolve_let_else_binding` now checks
+        // the pattern against its scrutinee the same way an `if let`/`while let` condition
+        // already is, and binds the name(s) it finds into the *enclosing* scope — a
+        // let-else's own binding is visible from that point on in the surrounding block, not
+        // confined to a nested branch. Verified against real rustc, warning-free: `x` is `n`
+        // for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let x @ 0..=254 = {n}u8 else {{ loop {{}} }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_successful_let_else_binding(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_wildcard_let_initializer_mutation_is_reported() {
+        // Codex's finding: `destructured_binding` correctly returns no names for a wildcard
+        // pattern, but nothing evaluated `EXPR` at all in `let _ = EXPR;`, so a mutation
+        // written inside it never reached `resolved`. `{ let mut x: u8 = n * 10; let old = x;
+        // let _ = { x = n; old }; x }` mutates `x` back to `n` inside the wildcard's own
+        // initializer block before discarding the block's own value (`old`) — real Rust
+        // performs that assignment and the outer `x` reads `n` afterward, while a scanner
+        // that runs no side effect for a wildcard keeps `x` at `n * 10`, a sparse,
+        // non-monotonic set of sixteen values that would let a dense match past
+        // `integrity-check` undetected. `resolve_wildcard_let_side_effects` now walks the
+        // wildcard's own block initializer (minus its own discarded tail) through the same
+        // sequential interpreter every other nested scope uses. Verified against real rustc,
+        // warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = {n}u8 * 10; let old = x; let _ = {{ x \
+                 = {n}u8; old }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_wildcard_let_mutation(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_an_uninitialized_let_is_reported() {
+        // Codex's finding: `{ let x: u8; x = n; x }` names a declaration with no initializer
+        // at all — legal Rust as long as every read of `x` is preceded by an assignment to
+        // it — but `production_stmts` never excluded it while neither
+        // `block_let_statement_count` (which requires an initializer to destructure) nor
+        // `block_ignored_let_count` (which requires a wildcard pattern) ever counted it, so
+        // `evaluate_block`'s own statement-count invariant always came up one short and the
+        // whole block refused before the later assignment to `x` ever ran.
+        // `block_uninitialized_let_statement_count` now counts the declaration and
+        // `resolve_uninitialized_let` tracks its declared type until `x = n;` — now permitted
+        // to be `x`'s very first value, since a plain assignment no longer requires an
+        // existing `resolved` entry the way a compound assignment still does — supplies it.
+        // Verified against real rustc, warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let x: u8; x = {n}u8; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_uninitialized_let(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_an_if_let_bound_then_branch_is_reported() {
+        // Codex's finding: `if let x @ 0 = 0u8 { x } else { 100 }` selects the `then`
+        // branch, whose own body reads `x` — a name only the condition's own `Expr::Let`
+        // pattern binds — but the `Expr::If` case evaluated the chosen branch with only the
+        // outer resolver, where that binding does not exist, so `x` stayed unresolved.
+        // Verified against real rustc: `if let x @ 0 = 0u8 { x } else { 100 }` is `0`, `if
+        // let x @ 1 = 1u8 { x } else { 100 }` is `1`, and so on.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = if let x @ {n} = {n}u8 {{ x }} else {{ 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_an_if_let_bound_then_branch(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_binding_a_nested_at_pattern_name_is_reported() {
+        // Codex's finding: `match 0u8 { _outer @ inner => inner }` binds *two* names —
+        // `_outer` from the at-pattern itself, and `inner` from its sub-pattern, a bare
+        // identifier that is itself an irrefutable binding — and `pattern_binding` answered
+        // only the first, `Option`-shaped rather than list-shaped, so a body naming the
+        // *inner* binding (as this one does) stayed unresolved. Verified against real rustc:
+        // `match 0u8 { _outer @ inner => inner }` is `0`, `match 1u8 { .. }` is `1`, and so
+        // on, so every constant built this way should resolve to its own scrutinee.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = match {n}u8 {{ _outer @ inner => inner }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_nested_at_pattern_binding(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_shift_over_a_suffixed_but_unascribed_local_is_reported()
+    {
+        // Codex's finding: `let mut x = 128u8; x <<= 1; if x == 0 { n } else { n * 10 } }`
+        // names no type *ascription* at all — only a suffixed initializer — which
+        // `stmt_let_type` answered `None` for before this fix, so
+        // `apply_compound_assignment` folded the shift with no declared type at all. An
+        // unsuffixed synthetic literal has no width to truncate against, so `128 << 1`
+        // folded to the untruncated `256` rather than the real, 8-bit-truncated `0`, and
+        // `if x == 0` took the wrong branch for every constant built this way. `128u8`
+        // truncates to exactly `0` after one left shift regardless of `n`, so every
+        // constant should resolve to `n` — the dense `0..14` sequence the outer match's
+        // patterns actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u32 = {{ let mut x = 128u8; x <<= 1; if x == 0 {{ {n} }} \
+                 else {{ {n} * 10 }} }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_shift_over_a_suffixed_local(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_shift_before_a_shadowing_typed_let_is_reported() {
+        // Codex's finding: `let mut x: u8 = 128 + n; x <<= 1; let x: u16 = if x < 100 { n }
+        // else { 10 * n + 1 }; x` declares `x` twice with two different widths, and the
+        // previous flat, whole-block `local_types` map folded both into one entry keyed by
+        // name — whichever declaration `HashMap::collect` visited last (the second, `u16`)
+        // answered for the *first* statement's own shift too. Real Rust shifts an 8-bit `x`,
+        // which truncates `(128 + n) << 1` to `((128 + n) * 2) % 256`; every value of that
+        // for `n` in `0..=14` is under 100, so the `if` takes its `then` arm and every
+        // constant resolves to `n`. Crediting the shift to a 16-bit `x` instead skips the
+        // truncation, so `(128 + n) * 2` is never under 100, the `if` takes its `else` arm,
+        // and every constant resolves to the sparse `10 * n + 1` instead — masking the dense
+        // `0..14` sequence the real, compiled constants actually are.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u16 = {{ let mut x: u8 = 128 + {n}; x <<= 1; let x: u16 = \
+                 if x < 100 {{ {n} }} else {{ 10 * {n} + 1 }}; x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_shift_before_a_shadowing_typed_let(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_plain_assignment_statement_in_their_block_is_reported() {
+        // Codex's finding: `const P0: u8 = { let mut x = 100u8; x = x - 100; x };` names a
+        // plain `=` assignment — `syn::Expr::Assign`, a distinct shape from every one of the
+        // ten compound-assignment operators `mutation_target` used to recognise exclusively
+        // — so this block refused as unresolved the same way an unhandled compound
+        // assignment used to. `mutation_target` now recognises both shapes, and a plain
+        // assignment's own new value is its right-hand side evaluated against the scope as
+        // it stood before the write, with no synthetic binary needed.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x = 100u8; x = x - (100 - {n}); x }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_with_a_plain_assignment(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_whose_block_declares_a_let_after_a_mutation_is_reported() {
+        // Codex's finding: the previous fix for a compound-assignment statement resolved
+        // every `let` in a block first, against the block's own *declared* values, and only
+        // applied every mutation afterward in a second pass — sound for `let mut x = 0; x +=
+        // 1; x - 1`, where the mutated name is also the tail expression, but not for a `let`
+        // statement that reads a name *after* an earlier mutation to it: `{ let mut x: u8 = n
+        // * 10; x /= 10; let y = x; y }` evaluates to `n` in real Rust, since `y` binds to
+        // `x`'s value after the division, but the two-pass shape resolved `y` from `x`'s
+        // freshly declared value (`n * 10`) before the mutation pass ever ran. Using this
+        // shape for constants `P0` through `P14` therefore made the scanner see sparse,
+        // wrong-valued patterns and report success over a dense table it could not see.
+        // `resolve_block_sequential` now walks every `let` and every mutation together, in
+        // the single order they actually execute, so `y` sees exactly the mutations that
+        // precede it.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = {{ let mut x: u8 = {n} * 10; x /= 10; let y = x; y }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_constants_whose_block_lets_a_mutated_name(nibble: u32) -> u32 {{\n{constants}    \
+             match nibble {{\n        P0 => 0,\n        P1 => 1,\n        P2 => 2,\n        \
+             P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_qualified_dependency_enum_variants_is_reported() {
+        // Codex's finding: a dense match over a *dependency* crate's own enum variants —
+        // `waymaker_core::transition::Divergence`'s real `Sequence`, `Kind`, `Digest` and
+        // `BoundaryKind`, reachable without adding any dependency at all, since
+        // `waymaker-flash` already depends on `waymaker-core` — resolved every arm to
+        // nothing, because `collect_tree_qualified_constants` only ever walks the checksum
+        // module's own tree and had no way to see a variant declared one crate over. Four
+        // consecutive discriminants (0 through 3) with non-linear arm results, and no
+        // wildcard arm at all since the match already names every variant, is exactly the
+        // shape `fully_dense_arm_patterns` exists to catch when it *can* see the values —
+        // and the scan reported success over it while it could not.
+        // `collect_dependency_qualified_constants` now walks `waymaker-core`'s own reachable
+        // tree the identical way `collect_tree_qualified_constants` walks the checksum
+        // module's, keyed under the fully-qualified spelling a real external reference uses,
+        // and merges its findings into `qualified` before the density scan runs.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_a_dependency_enum() -> u32 {\n    \
+             match waymaker_core::transition::Divergence::Sequence {\n        \
+             waymaker_core::transition::Divergence::Sequence => 9,\n        \
+             waymaker_core::transition::Divergence::Kind => 3,\n        \
+             waymaker_core::transition::Divergence::Digest => 27,\n        \
+             waymaker_core::transition::Divergence::BoundaryKind => 1,\n    \
+             }\n}\n",
+        );
+        let core_lib = "pub mod transition;\n";
+        let core_transition = "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n\
+             pub enum Divergence {\n    \
+             Sequence,\n    \
+             Kind,\n    \
+             Digest,\n    \
+             BoundaryKind,\n\
+             }\n";
+        let violations = check_integrity_check(&[
+            layer(INTEGRITY_CHECK_PATH, &source),
+            layer("waymaker-core/src/lib.rs", core_lib),
+            layer("waymaker-core/src/transition.rs", core_transition),
+        ]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 4-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_well_known_std_enums_variants_is_reported() {
+        // Codex's finding: `core::sync::atomic::Ordering`'s five variants — a real,
+        // reachable enum with no dependency edge this scan could ever walk source for,
+        // since `core` is the toolchain rather than a workspace crate `sources` could ever
+        // list — resolved to nothing, so a match naming all five with a trailing wildcard
+        // sixth arm passed `has_dense_arm_patterns` unseen. `well_known_std_enum_variant`
+        // now answers for this enum (and its two nearest well-known siblings,
+        // `core::cmp::Ordering` and `core::task::Poll`) the identical "declaration order is
+        // the ordinal" rule `item_enum_variant_constants` already applies to a workspace
+        // enum one dependency edge away. Verified against real rustc, warning-free: this
+        // match compiles, and `Relaxed` through `SeqCst` resolve to the dense `0..5`
+        // sequence the outer table's patterns actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_a_well_known_std_enum() -> u32 {\n    \
+             match core::sync::atomic::Ordering::Relaxed {\n        \
+             core::sync::atomic::Ordering::Relaxed => 9,\n        \
+             core::sync::atomic::Ordering::Release => 3,\n        \
+             core::sync::atomic::Ordering::Acquire => 27,\n        \
+             core::sync::atomic::Ordering::AcqRel => 1,\n        \
+             core::sync::atomic::Ordering::SeqCst => 81,\n        \
+             _ => 0,\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 6-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_cmp_orderings_explicit_discriminant_is_reported() {
+        // Codex's finding: `core::cmp::Ordering` is declared `Less = -1, Equal = 0, Greater
+        // = 1` — real, explicit discriminants — but `well_known_std_enum_variant` used to
+        // number every entry by plain declaration-order position, giving `Less` the value
+        // `0` rather than `-1`. `if (core::cmp::Ordering::Less as i8) < 0 { n } else { 10 *
+        // n + 100 }` is `n` in real Rust (`-1 < 0` is `true`) but read as `10 * n + 100`
+        // here (`0 < 0` is `false`), turning a dense `0..14` sequence into a sparse one and
+        // letting the outer table pass `integrity-check` undetected. Every entry in the
+        // table now names its own explicit discriminant rather than a derived position.
+        // Verified against real rustc, warning-free: the guard is `n` for every `n` in
+        // `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = if (core::cmp::Ordering::Less as i8) < 0 {{ {n}u8 }} \
+                 else {{ 10 * {n}u8 + 100 }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_orderings_explicit_discriminant(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_reference_pattern_destructuring_let_is_reported() {
+        // Codex's finding: `let &x = &n; x` names an irrefutable reference destructure —
+        // after struct-pattern support was added, this fell through to `_ => Vec::new()`
+        // for the identical reason both earlier shapes did: the whole statement went
+        // uncounted by every term that requires `destructured_binding` to answer at least
+        // one name. `destructured_binding` now recurses into a `Pat::Reference` paired with
+        // a real, syntactic `Expr::Reference` initializer, the identical way it already
+        // recurses into a tuple or struct pattern. Verified against real rustc,
+        // warning-free: `x` is `n` for every `n` in `0..=14`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..=14u8 {
+            let _ = writeln!(constants, "    const P{n}: u8 = {{ let &x = &{n}u8; x }};");
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_reference_pattern_destructuring_let(nibble: u32) \
+             -> u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        P8 => 8,\n        P9 => 9,\n        P10 => 10,\n        \
+             P11 => 11,\n        P12 => 12,\n        P13 => 13,\n        P14 => 14,\n        \
+             _ => 15,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 16-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_a_power_of_two_strided_pattern_is_reported() {
+        // Codex's finding: `match n { 0 => 9, 4 => 3, 8 => 27, 12 => 1, _ => 0 }` — a stride
+        // of four — spans thirteen raw slots for four values, over
+        // `compact_window_with_gaps`'s own bound of twelve, but `rustc` 1.95 with `-O`
+        // still emits a four-entry `.Lswitch.table`, confirmed by disassembly: `roll $30,
+        // %edi` rotates the scrutinee right by two bits, exactly a division by the common
+        // stride. This test uses a wider stride of eight instead (`0, 8, 16, 24`, span
+        // twenty-five): the stride-four reproduction's own three-element runs (`0, 4, 8` and
+        // `4, 8, 12`) each already span nine slots for three values, exactly
+        // `compact_window_with_gaps`'s own bound at that length, so `any_dense_sub_slice`'s
+        // sub-slice search already flagged it *without* this fix — stride eight's own
+        // three-element runs span seventeen, over that bound too, so this genuinely
+        // exercises `dense_power_of_two_stride` rather than a pre-existing sub-slice match.
+        // Checked by disassembly the identical way: `roll $29, %edi` rotates right by three
+        // bits, a division by eight. `dense_power_of_two_stride` is the additional check:
+        // an exact arithmetic progression whose stride is a power of two greater than one is
+        // flagged regardless of the raw span, since LLVM normalizes it before the span this
+        // scan otherwise measures is ever reached.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_a_power_of_two_stride(nibble: u32) -> u32 {\n    \
+             match nibble {\n        0 => 9,\n        8 => 3,\n        16 => 27,\n        \
+             24 => 1,\n        _ => 0,\n    }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_loop_setup_statement_is_reported() {
+        // Codex's finding: `loop { let x = n; break x; }` is two statements rather than the
+        // one `evaluate_loop`'s own exact-one-statement match required — a `let` setting up
+        // the value a trailing, unconditional `break` then returns — so it declined
+        // outright even though nothing about a setup statement before a total break is any
+        // less knowable than the break alone. `evaluate_loop` now walks every statement
+        // before the break through `resolve_block_sequential`, the identical sequential
+        // interpreter every other nested scope in this scan already uses, before resolving
+        // the break expression against whatever that walk bound. Verified against real
+        // rustc, warning-free: `x` is `n` for every `n` in `0..8`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..8u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = loop {{ let x = {n}u8; break x; }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_loop_setup_statement(nibble: u32) -> u32 \
+             {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        _ => 8,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_constants_with_a_labelled_block_setup_statement_is_reported() {
+        // Codex's finding: `'value: { let x = n; break 'value x; }` is two statements rather
+        // than the one `evaluate_labelled_block`'s own exact-one-statement match required —
+        // the identical gap `evaluate_loop` had before its own setup-statement fix, one
+        // construct over. `evaluate_labelled_block` now walks every statement before the
+        // break through `resolve_block_sequential` the same way, before resolving the break
+        // expression against whatever that walk bound. Verified against real rustc,
+        // warning-free: `x` is `n` for every `n` in `0..8`.
+        use std::fmt::Write as _;
+        let mut source = tests_support::clean_checksum_module();
+        let mut constants = String::new();
+        for n in 0..8u8 {
+            let _ = writeln!(
+                constants,
+                "    const P{n}: u8 = 'value: {{ let x = {n}u8; break 'value x; }};"
+            );
+        }
+        let _ = write!(
+            source,
+            "\nconst fn dense_table_over_a_labelled_block_setup_statement(nibble: u32) -> \
+             u32 {{\n{constants}    match nibble {{\n        P0 => 0,\n        P1 => 1,\n        \
+             P2 => 2,\n        P3 => 3,\n        P4 => 4,\n        P5 => 5,\n        P6 => 6,\n        \
+             P7 => 7,\n        _ => 8,\n    }}\n}}\n"
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 9-arm dense match")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_match_over_fp_category_variants_is_reported() {
+        // Codex's finding: `core::num::FpCategory`'s five variants named the identical gap
+        // `core::sync::atomic::Ordering`'s own fix closed one enum over — resolved to
+        // nothing, so a match assigning non-linear results to all five (an exhaustive
+        // match, since `FpCategory` is not `#[non_exhaustive]` and needs no wildcard arm)
+        // passed `fully_dense_arm_patterns` unseen. `well_known_std_enum_variant` now
+        // answers for this enum too. Verified against real rustc, warning-free: `Nan`
+        // through `Normal` resolve to the dense `0..5` sequence the outer table's patterns
+        // actually are.
+        let mut source = tests_support::clean_checksum_module();
+        source.push_str(
+            "\nconst fn dense_table_over_fp_category(nibble: u32) -> u32 {\n    \
+             match core::num::FpCategory::Nan {\n        \
+             core::num::FpCategory::Nan => 9,\n        \
+             core::num::FpCategory::Infinite => 3,\n        \
+             core::num::FpCategory::Zero => 27,\n        \
+             core::num::FpCategory::Subnormal => 1,\n        \
+             core::num::FpCategory::Normal => 81,\n    \
+             }\n}\n",
+        );
+        let violations = check_integrity_check(&[layer(INTEGRITY_CHECK_PATH, &source)]);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.detail.contains("declares a 5-arm dense match")),
+            "{violations:?}"
+        );
+    }
 }
 
 /// Fixtures describing a replay module that does not exist on disk.
@@ -21099,14 +29598,15 @@ pub mod tests_support {
         CLOCK_KIND_CONSTANTS, CLOCK_SPEC_CONSTRUCTION, CLOCK_SURFACE, CTX_FUTURES,
         CTX_JOURNAL_SURFACE, CTX_PRIVATE_METHODS, CTX_SURFACE, CTX_TYPE, DIGEST_FUNCTION,
         DISPATCH_SURFACE, EFFECT_SCHEDULED_FIELDS, FRAME_LEN_STEP, HEADER_STEP,
-        INTEGRITY_CHECK_PARAMETERS, INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS,
-        RECOVERY_SURFACE, REPLAY_SURFACE, SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS,
-        STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL, SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS,
-        SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE, SWAP_TYPESTATE, TIMER_BRACED_STRUCTS,
-        TIMER_RECORD_FIELDS, TIMER_SURFACE, TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE,
-        VERSION_GATE_SURFACE, VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE,
-        VERSION_RANGE_METHODS, VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE,
-        WIRING_TYPE_FIELDS, WIRING_TYPE_METHODS,
+        INTEGRITY_CHECK_PARAMETERS, INTEGRITY_CHECK_ROUTING, INTEGRITY_CHECK_TABLES,
+        INTEGRITY_ROUTING_PATH, RECOVERY_ROUTING_STEPS, RECOVERY_SURFACE, REPLAY_SURFACE,
+        SCAN_STEP, SEAL_BINDINGS, SEALING_FUNCTIONS, STORAGE_CONTRACT_SURFACE, SWAP_BARRIER_CALL,
+        SWAP_COMMIT_STEP, SWAP_CONSTRUCTIONS, SWAP_ERASE_CALLS, SWAP_ROUTING_STEPS, SWAP_SURFACE,
+        SWAP_TYPESTATE, TIMER_BRACED_STRUCTS, TIMER_RECORD_FIELDS, TIMER_SURFACE,
+        TIMER_TYPE_METHODS, TIMER_TYPES, TRANSITION_SURFACE, VERSION_GATE_SURFACE,
+        VERSION_MARKER_FIELDS, VERSION_PREDICATE, VERSION_RANGE, VERSION_RANGE_METHODS,
+        VERSION_ROUTING_BODIES, WIRING_SELECTION_BODIES, WIRING_SURFACE, WIRING_TYPE_FIELDS,
+        WIRING_TYPE_METHODS, expected_route_body,
     };
 
     /// A module declaring exactly `pinned` and nothing else.
@@ -21711,25 +30211,71 @@ mod tests {
         // pin is now a count inside one body rather than a presence check over the file.
         // Literals are `;`-separated statements, not space-separated tokens: the module
         // tree walk parses this fixture (issues #51, #59), and `{ 0x1021 0xFFFF }` is not
-        // Rust. The leading space is kept — `replace(" 0xFFFF ", ...)` in the token-boundary
-        // tests below depends on it.
+        // Rust. A routed function (`crc16`, `crc32`) is skipped here and rendered by
+        // `expected_route_body` below instead, which already contains every literal this
+        // loop would otherwise add — `crc32`'s own initial value and final xor, both — as
+        // part of the one body `INTEGRITY_CHECK_ROUTING` now pins by equality.
         let mut bodies: BTreeMap<&str, String> = BTreeMap::new();
         for parameter in INTEGRITY_CHECK_PARAMETERS {
+            if INTEGRITY_CHECK_ROUTING
+                .iter()
+                .any(|route| route.function == parameter.function)
+            {
+                continue;
+            }
             let body = bodies.entry(parameter.function).or_default();
             for _ in 0..parameter.occurrences {
                 if !body.is_empty() {
                     body.push(';');
                 }
-                let _ = write!(body, " {}", parameter.literal);
+                let _ = write!(body, " {} ", parameter.literal);
             }
         }
+        // A routed function's whole body, rendered from the pin rather than assembled from
+        // a call count or a presence check — the same shape `check_integrity_check_routing`
+        // now checks it against by equality, so a route added here can never itself fail
+        // the pin it satisfies.
+        for route in INTEGRITY_CHECK_ROUTING {
+            bodies.insert(route.function, expected_route_body(route));
+        }
+
+        // `declares_inline_always` reads backward from a function's own `fn` header, so
+        // every function ADR 0053 pins that way — a table's own function and the helper
+        // every one of its arms calls — needs the attribute here too, or the clean fixture
+        // would fail the pin it is meant to satisfy.
+        let needs_inline_always = |name: &str| {
+            INTEGRITY_CHECK_TABLES
+                .iter()
+                .any(|table| table.function == name || table.helper == name)
+        };
 
         let mut source = String::from("//! Two checksums.\n");
         for (function, body) in bodies {
+            if needs_inline_always(function) {
+                source.push_str("#[inline(always)]\n");
+            }
             let _ = writeln!(
                 source,
                 "pub(crate) const fn {function}(bytes: &[u8]) -> u32 {{{body} }}"
             );
+        }
+        // One matching table per `INTEGRITY_CHECK_TABLES` entry, in the exact shape
+        // `table_body_matches_pinned_shape` checks for — the pinned selector, then every
+        // arm in order mapped to the identically-numbered call, nothing else — rendered
+        // from the pin so a table added to it arrives in this fixture too.
+        for table in INTEGRITY_CHECK_TABLES {
+            source.push_str("#[inline(always)]\n");
+            let _ = writeln!(source, "const fn {}(nibble: u8) -> u32 {{", table.function);
+            let _ = write!(source, "    match {} {{", table.selector);
+            for arm in 0..table.arms {
+                if arm + 1 == table.arms {
+                    let _ = write!(source, " _ => {}({arm}),", table.helper);
+                } else {
+                    let _ = write!(source, " {arm} => {}({arm}),", table.helper);
+                }
+            }
+            let _ = writeln!(source, " }}");
+            let _ = writeln!(source, "}}");
         }
         source
     }
