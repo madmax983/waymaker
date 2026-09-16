@@ -6184,3 +6184,32 @@ and its control, `a_cfg_gated_module_still_counts_with_no_competing_concrete_typ
 regression, the first confirmed RED against the pre-fix code (`total: 1` against an
 expected `0`) before this fix landed. No new ADR: nothing here moves a must-not-own cell, a
 dependency edge, or a rule id.
+
+Codex review of that same commit found a twentieth, on the opposite face of the nineteenth's
+own fix: `preferred_alias` picks one candidate, `chosen`, as the type-namespace winner for a
+name, and when `chosen` is a concrete type that yields no alias, the function had always
+returned `None` outright — discarding a genuinely live `use` of the same name in the
+*value* namespace, which real Rust lets coexist with a type-namespace declaration with no
+collision at all. Confirmed against real `rustc`: `use values::forbidden as allowed; mod
+allowed {}` compiles cleanly — a value import and a module never collide — and a call
+`allowed()` names the value import, never the module; but `preferred_alias` answering `None`
+left `resolve_segments_from` and `resolve_local_alias_chain` substituting nothing, so the
+call resolved to the bare, unaliased name `allowed` instead of `values::forbidden`, hiding
+whatever a caller (`resolved_path_uses`, `name_uses`, and every construction pin built on
+`struct_literal_counts`) was really looking for behind an alias. The fix cannot simply
+always fall back to a `use` candidate once the type-namespace winner yields nothing, though:
+real Rust's own grammar says a path segment followed by another can only ever name a module,
+a type, an enum or a trait — never a plain value — so `allowed::Marker` can only mean the
+module, and substituting the value alias there would trade a missed resolution for a wrong
+one. `preferred_alias` now takes a `terminal` flag — whether the segment it is resolving is
+the *whole* remaining path, computed by each caller from its own `segments.len() == 1` — and
+tries a `use` candidate as a fallback only when `terminal` is true, which is exactly the
+condition under which a value-namespace answer is ever the correct one syntactically, not a
+guess between two live possibilities the way this file's own parsing limits already refuse
+elsewhere. `a_value_namespace_alias_is_not_suppressed_by_a_same_named_module` and its
+control, `a_qualified_path_through_the_same_name_still_names_the_module`, are the
+regression, the first confirmed RED against the pre-fix code (resolving to the bare name
+`allowed` rather than `values::forbidden`) before this fix landed, the second confirmed
+green against both the pre-fix and the fixed code alike, since the multi-segment case was
+never broken. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.

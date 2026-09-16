@@ -1127,7 +1127,10 @@ fn resolve_local_alias_chain(
         // let that inner module's private alias shadow the outer, real one
         // (Codex review) — a bare `S {}` outside `mod hidden { type S =
         // Other; }` still means whatever `S` resolves to in the enclosing
-        // block, never `hidden`'s own.
+        // block, never `hidden`'s own. `terminal` is `preferred_alias`'s own
+        // value-namespace-fallback gate (Codex review of PR #204) — see its
+        // doc comment.
+        let terminal = segments.len() == 1;
         let Some((depth, alias)) = blocks
             .get(..visible)
             .unwrap_or(blocks)
@@ -1135,7 +1138,8 @@ fn resolve_local_alias_chain(
             .enumerate()
             .rev()
             .find_map(|(depth, items)| {
-                preferred_alias(items.iter().copied(), &first, true).map(|alias| (depth, alias))
+                preferred_alias(items.iter().copied(), &first, true, terminal)
+                    .map(|alias| (depth, alias))
             })
         else {
             break;
@@ -1593,8 +1597,12 @@ fn resolve_segments_from(
         // Prefers an unconditional declaration over a `#[cfg]`-gated
         // duplicate of the same name in this same scope, over the first
         // match by declaration order when none is unconditional (issue
-        // #197) — see `preferred_alias`.
-        if let Some(alias) = preferred_alias(items.iter(), &first, false) {
+        // #197) — see `preferred_alias`. `terminal` is whether `first` is
+        // the whole remaining path, which is what lets a value-namespace
+        // `use` fall back in only where doing so cannot be wrong (Codex
+        // review of PR #204) — see `preferred_alias`'s own doc.
+        let terminal = segments.len() == 1;
+        if let Some(alias) = preferred_alias(items.iter(), &first, false, terminal) {
             let mut resolved = alias.target.clone();
             resolved.extend(segments.drain(1..));
             segments = resolved;
@@ -5585,10 +5593,28 @@ const fn is_namespace_unambiguous(item: &syn::Item) -> bool {
 /// `cfg` this scanner cannot evaluate, or across a namespace it does not
 /// track, and left to `path_could_reach_target`'s own separate, fail-closed
 /// search to catch what this single pick still might miss.
+///
+/// `terminal` is whether `first` is the *whole* remaining path at the call
+/// site — no further segment follows it. Real Rust's own grammar is what
+/// makes the next step safe rather than a guess (Codex review of PR #204):
+/// a path segment followed by another can only ever name a module, a type,
+/// an enum or a trait — never a plain value — so when the namespace-
+/// unambiguous winner picked above is itself a `mod`/`struct`/`enum`/
+/// `union`/`trait` and so yields no alias, a `use` importing a *value* of
+/// the same name is a distinct, correct answer only when nothing follows
+/// it. `use values::forbidden as allowed; mod allowed {}; fn f() {
+/// allowed(); }` compiles — the call and the module occupy different
+/// namespaces, confirmed against real `rustc` — and the call names the
+/// value import, never the module; `allowed::Marker`, by contrast, can only
+/// ever name the module, since a value cannot be qualified with `::` at
+/// all, and substituting the `use`'s own target there would be wrong. So
+/// this fallback is tried only when `terminal` is `true`, never when a
+/// further segment remains.
 fn preferred_alias<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     first: &str,
     prefer_last: bool,
+    terminal: bool,
 ) -> Option<UseAlias> {
     let candidates: Vec<&'a syn::Item> = items
         .into_iter()
@@ -5606,9 +5632,29 @@ fn preferred_alias<'a>(
                 candidates.first().copied()
             }
         })?;
-    own_aliases(core::iter::once(chosen))
+    if let Some(alias) = own_aliases(core::iter::once(chosen))
         .into_iter()
         .find(|candidate| candidate.local == first)
+    {
+        return Some(alias);
+    }
+    if !terminal {
+        return None;
+    }
+    let uses: Vec<&&'a syn::Item> = candidates
+        .iter()
+        .filter(|item| !is_namespace_unambiguous(item))
+        .collect();
+    let picked = if prefer_last {
+        uses.last()
+    } else {
+        uses.first()
+    };
+    picked.and_then(|item| {
+        own_aliases(core::iter::once(**item))
+            .into_iter()
+            .find(|candidate| candidate.local == first)
+    })
 }
 
 /// The items of `items` — one scope: a module or a single block — that
@@ -25601,6 +25647,59 @@ mod alias_scope_tests {
         assert!(
             paths.iter().any(|path| path.segments == ["Marker", "x"]),
             "module b's own, unaliased path went missing: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_namespace_alias_is_not_suppressed_by_a_same_named_module() {
+        // Codex review of PR #204: `use values::forbidden as allowed;` and
+        // `mod allowed {}` compile together, confirmed against real `rustc`,
+        // because a value import and a module occupy different namespaces —
+        // but `preferred_alias` picked the module as the type-namespace
+        // winner and, since a module is never itself an alias, returned
+        // `None` outright rather than falling back to the value alias, so a
+        // call `allowed()` resolved to the bare, unaliased name instead of
+        // `values::forbidden`.
+        let code = "mod values {\n\
+             \x20   pub fn forbidden() {}\n\
+             }\n\
+             use values::forbidden as allowed;\n\
+             mod allowed {}\n\
+             fn f() {\n\
+             \x20   allowed();\n\
+             }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["values", "forbidden"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_path_through_the_same_name_still_names_the_module() {
+        // The control for the test above: once a further segment follows
+        // `allowed`, real Rust can only mean the module — a value cannot be
+        // qualified with `::` at all — so the value alias must never be
+        // substituted there, whatever the fallback above does for the bare,
+        // terminal case.
+        let code = "mod values {\n\
+             \x20   pub fn forbidden() {}\n\
+             }\n\
+             use values::forbidden as allowed;\n\
+             mod allowed {\n\
+             \x20   pub struct Marker;\n\
+             }\n\
+             fn f() {\n\
+             \x20   let _ = allowed::Marker;\n\
+             }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["allowed", "Marker"]),
+            "{paths:?}"
         );
     }
 
