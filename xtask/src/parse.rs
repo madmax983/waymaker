@@ -1042,8 +1042,11 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
                     self.found.push(name.clone());
                 }
                 // Issue #205: the walk above cannot see a block-local `mod`. Run
-                // the same fail-closed search `struct_literal_counts` uses, for
-                // each guarded name the walk above did not already find.
+                // the same fail-closed search `struct_literal_counts` uses. Do
+                // this for each guarded name that the walk above did not find.
+                // The outer `if !shadowed` gate changes nothing here:
+                // `path_could_reach_target` checks the same head segment
+                // against the same `shadow` list on its own.
                 for name in self.names {
                     if resolved.last().map(String::as_str) != Some(*name)
                         && path_could_reach_target(
@@ -5266,10 +5269,10 @@ impl<'a> AliasLookupCache<'a> {
     /// The live `use`/`type` aliases in `items` whose local name is `first` —
     /// see [`live_named_items_in_scope`] for what "live" excludes. `false`:
     /// this cache exists only for [`segments_could_reach_target`]'s own
-    /// search, whose sole caller ([`struct_literal_counts`]) is always
-    /// resolving a construction path, never a value (Codex review of PR
-    /// #204) — see [`live_named_items_in_scope`]'s own doc for why that
-    /// matters here.
+    /// search. Every caller ([`struct_literal_counts`], and since issue
+    /// #205, [`generic_assoc_type_bindings_naming`]) always resolves a
+    /// construction path, never a value (Codex review of PR #204) — see
+    /// [`live_named_items_in_scope`]'s own doc for why that matters here.
     fn live_aliases_of(&mut self, items: &'a [syn::Item], first: &str) -> std::rc::Rc<[UseAlias]> {
         self.aliases
             .entry((scope_key(items), first.to_owned()))
@@ -5992,9 +5995,10 @@ fn live_named_items_in_scope<'a>(
 /// `block_items` without ever finding an unconditional declaration.
 ///
 /// Passes `false` for [`live_named_items_in_scope`]'s own `value_position`:
-/// this function exists only for [`segments_could_reach_target`]'s search,
-/// whose sole caller ([`struct_literal_counts`]) always resolves a
-/// construction path, never a value (Codex review of PR #204).
+/// this function exists only for [`segments_could_reach_target`]'s search.
+/// Every caller ([`struct_literal_counts`], and since issue #205,
+/// [`generic_assoc_type_bindings_naming`]) always resolves a construction
+/// path, never a value (Codex review of PR #204).
 fn live_block_declarations<'a>(
     block_items: &[Vec<&'a syn::Item>],
     first: &str,
@@ -24136,8 +24140,10 @@ mod raw_identifier_tests {
     #[test]
     fn a_generic_bound_bound_through_a_deeper_blocks_alias_over_an_outer_items_own_struct_is_reported()
      {
-        // Issue #205, shape 1: the innermost declaration always wins. An outer
-        // block's own struct must not hide a real alias declared closer in.
+        // Issue #205, shape 1. The innermost declaration always wins. This
+        // case never reaches the new backstop above: the deterministic walk
+        // finds the real, inner alias first. This test pins that the outer
+        // block's own unrelated struct still cannot hide it.
         let found = generic_assoc_type_bindings_naming(
             "pub fn outer() {\n\
              \x20   struct Hidden;\n\
