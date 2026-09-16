@@ -273,6 +273,20 @@ impl Cfg {
     /// assignment where the guarantee does not hold, this answers `false`
     /// — assume no guarantee, so the outward search still runs.
     fn is_guaranteed_by(&self, site_cfg: &Self) -> bool {
+        // A formula always guarantees itself (`p && !p` is unsatisfiable
+        // whatever `p` names), so a candidate declared under the site's own
+        // exact `cfg` — a common shape, since a block-local declaration
+        // often repeats its enclosing item's own gate — never needs the
+        // enumeration below at all. `key()` is `could_coexist`'s own
+        // equality test for a `Cfg`, so this stays consistent with how the
+        // rest of this cache already treats two formulas as "the same"
+        // (Codex review of the fix, issue #206: nested functions each
+        // carrying the identical `cfg` repeat this exact shape once per
+        // level, and without this the enumeration below ran again, from
+        // scratch, at every depth).
+        if self.key() == site_cfg.key() {
+            return true;
+        }
         let mut atoms = Vec::new();
         self.atoms(&mut atoms);
         site_cfg.atoms(&mut atoms);
@@ -373,8 +387,30 @@ impl Cfg {
 
     /// [`Cfg::normalized`]'s helper: normalizes every child, splices in the
     /// children of any that normalized to the same kind of combinator
-    /// (`is_all` says which), and collapses the result to its own single
-    /// child when exactly one remains.
+    /// (`is_all` says which), deduplicates identical children (`all`/`any`
+    /// are idempotent — `all(a, a)` is exactly `a`), and collapses the
+    /// result to its own single child when exactly one remains.
+    ///
+    /// The dedup is by [`Cfg::key_raw`], the identical identity
+    /// [`Cfg::commutative_key`] already uses to dedup a *key string*'s own
+    /// rendered children — done here too, at the value level, so a
+    /// singleton left over after dedup collapses to its own bare child
+    /// rather than staying wrapped in a combinator of one. Skipping this
+    /// left the two forms different formulas by [`Cfg::key`], even though
+    /// they mean the same thing: `enclosing_cfg` conjoins one more copy of
+    /// an identical predicate per level of nesting (a function inside a
+    /// function, each carrying the same `#[cfg(..)]`), and `commutative_key`
+    /// alone dedups the *rendered strings* to one entry but still wraps
+    /// that entry in `all([..])`, so a formula with two or more accumulated
+    /// copies renders as `all(["p"])` where the accumulation stops after
+    /// exactly one copy — `all(EMPTY, p)` — renders as the bare `"p"`
+    /// [`Cfg::flattened`]'s own single-raw-child collapse already gives it.
+    /// [`Cfg::is_guaranteed_by`]'s own fast path for two structurally
+    /// identical formulas relies on `key()` agreeing between the two, and
+    /// missed exactly this case (Codex review of the fix, issue #206):
+    /// `is_guaranteed_by`'s enumeration ran again, from scratch, at every
+    /// nesting depth past the first, on a fixture already built to prove
+    /// one cache key is shared across every depth.
     fn flattened(children: &[Self], is_all: bool) -> Self {
         let mut flat = Vec::with_capacity(children.len());
         for child in children {
@@ -386,6 +422,10 @@ impl Cfg {
                 _ => flat.push(normalized_child),
             }
         }
+        let mut keyed: Vec<(String, Self)> = flat.into_iter().map(|c| (c.key_raw(), c)).collect();
+        keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        keyed.dedup_by(|(a, _), (b, _)| a == b);
+        let mut flat: Vec<Self> = keyed.into_iter().map(|(_, c)| c).collect();
         if flat.len() == 1 {
             return flat.remove(0);
         }
@@ -6264,17 +6304,31 @@ fn scope_key(items: &[syn::Item]) -> ScopeKey {
 /// address to key a cache entry on — [`live_block_declarations`] runs it uncached.
 ///
 /// One `use`/`type` alias, tagged with the `cfg` of the item that declared
-/// it — [`AliasLookupCache::live_aliases_of`]'s own cache entry, so a
-/// site's own `cfg` can be checked against each alias without re-expanding
-/// the item it came from.
-type TaggedAliases = std::rc::Rc<[(Cfg, UseAlias)]>;
+/// it and that item itself — [`AliasLookupCache::live_aliases_of`]'s own
+/// cache entry, so a site's own `cfg` can be checked against each alias
+/// without re-expanding the item it came from, and so the declaring item
+/// can be compared by identity against a
+/// [`guaranteed_unambiguous_winner`](AliasLookupCache::guaranteed_unambiguous_winner)
+/// (issue #206, Codex review of the fix).
+type TaggedAliases<'a> = std::rc::Rc<[(Cfg, UseAlias, &'a syn::Item)]>;
 
 #[derive(Default)]
 struct AliasLookupCache<'a> {
     candidates: std::collections::HashMap<(ScopeKey, String), std::rc::Rc<[&'a syn::Item]>>,
-    aliases: std::collections::HashMap<(ScopeKey, String), TaggedAliases>,
+    aliases: std::collections::HashMap<(ScopeKey, String), TaggedAliases<'a>>,
     coexistence: std::collections::HashMap<(String, String), bool>,
     guarantee: std::collections::HashMap<(String, String), bool>,
+    // `(scope, name, site_cfg.key())` — a further key than `coexistence`'s
+    // and `guarantee`'s own, since a winner depends on which candidates a
+    // scope and name name, not only on two `Cfg` values (issue #206, Codex
+    // review of the fix). Without this, `live_aliases_of` and
+    // `live_modules_of` each recomputed a fresh
+    // `coexisting_with_site` — an `O(candidates)` allocation, on top of the
+    // already-memoized per-pair checks inside it — on every call, reopening
+    // a narrower version of the per-site cost this whole cache exists to
+    // avoid: `many_distinctly_ordered_cfg_predicates_over_one_pair_resolve_quickly`
+    // and its own siblings nearly doubled before this was added.
+    winners: std::collections::HashMap<(ScopeKey, String, String), Option<&'a syn::Item>>,
 }
 
 impl<'a> AliasLookupCache<'a> {
@@ -6327,6 +6381,50 @@ impl<'a> AliasLookupCache<'a> {
             .clone()
     }
 
+    /// Among `items`' candidates named `first`, the one whose own `cfg`
+    /// coexists with `site_cfg`, is [namespace-unambiguous](is_namespace_unambiguous)
+    /// and is [guaranteed](Cfg::is_guaranteed_by) by `site_cfg` — the type-
+    /// namespace analogue of [`live_named_items_in_scope`]'s own
+    /// unconditional winner, one layer up: real Rust can declare `first`
+    /// this one way in *any* build that reaches a site with this `cfg`, not
+    /// only in the specific build the winner's own `cfg` selects (Codex
+    /// review of PR #209, issue #206). Two namespace-unambiguous
+    /// declarations of one name in one scope are always `E0428`/`E0255`,
+    /// so a *merely* coexisting namespace-unambiguous peer — one whose own
+    /// `cfg` is not itself guaranteed — can only ever exist alongside the
+    /// winner in a build that also satisfies the peer's own `cfg`, and that
+    /// build does not compile: `#[cfg(a)] type Alias = Decoy;` beside
+    /// `#[cfg(b)] type Alias = CheckedDispatch;`, referenced bare inside a
+    /// `#[cfg(a)]` function, only ever compiles as `Decoy` — a build with
+    /// `b` also enabled never compiles at all, so it is not a build this
+    /// site is ever really reached from. `None` when there is no such
+    /// single winner: zero, or more than one, coexisting namespace-
+    /// unambiguous candidates are guaranteed — the latter means the site
+    /// itself is unreachable in any compiling build, so nothing needs
+    /// excluding to stay sound. `use` is never a winner, for
+    /// [`is_namespace_unambiguous`]'s own reason: this scanner cannot prove
+    /// which namespace it occupies.
+    fn guaranteed_unambiguous_winner(
+        &mut self,
+        items: &'a [syn::Item],
+        first: &str,
+        site_cfg: &Cfg,
+    ) -> Option<&'a syn::Item> {
+        let key = (scope_key(items), first.to_owned(), site_cfg.key());
+        if let Some(winner) = self.winners.get(&key) {
+            return *winner;
+        }
+        let candidates = self.candidates_of(items, first);
+        let coexisting = coexisting_with_site(candidates.iter().copied(), site_cfg, self);
+        let mut winners = coexisting.into_iter().filter(|item| {
+            is_namespace_unambiguous(item)
+                && self.guaranteed_by(&attrs_cfg(item_attrs(item)), site_cfg)
+        });
+        let winner = winners.next().filter(|_| winners.next().is_none());
+        self.winners.insert(key, winner);
+        winner
+    }
+
     /// The live `use`/`type` aliases in `items` whose local name is `first`
     /// and whose own `cfg` can coexist with `site_cfg` (issue #206), each
     /// paired with that own `cfg` — see [`live_named_items_in_scope`] for
@@ -6348,6 +6446,18 @@ impl<'a> AliasLookupCache<'a> {
     /// fix: a first version called [`own_aliases`] fresh per site, over
     /// this already-small candidate list, which still reopened a narrower
     /// version of the per-site cost this whole cache exists to avoid).
+    ///
+    /// A [`guaranteed_unambiguous_winner`](Self::guaranteed_unambiguous_winner)
+    /// excludes every other namespace-unambiguous alias — a `type` item's,
+    /// never a `use`'s, since a `use` is never namespace-unambiguous —
+    /// sharing this scope and name, keeping only the winner's own (Codex
+    /// review of PR #209, issue #206). Compared by item identity
+    /// (`core::ptr::eq`) against the tagged alias's own declaring item,
+    /// rather than by `cfg` equality: two distinct namespace-unambiguous
+    /// items sharing one name in one scope always have distinct `cfg`s (or
+    /// neither compiles), so the two comparisons agree, but identity is
+    /// exact where a formula's own text rendering is not guaranteed to be
+    /// injective.
     fn live_aliases_of(
         &mut self,
         items: &'a [syn::Item],
@@ -6366,16 +6476,22 @@ impl<'a> AliasLookupCache<'a> {
                         own_aliases(core::iter::once(*item))
                             .into_iter()
                             .filter(|candidate| candidate.local == first)
-                            .map(move |alias| (cfg.clone(), alias))
+                            .map(move |alias| (cfg.clone(), alias, *item))
                     })
                     .collect::<Vec<_>>()
                     .into()
             })
             .clone();
+        let winner = self.guaranteed_unambiguous_winner(items, first, site_cfg);
         tagged
             .iter()
-            .filter(|(cfg, _)| self.could_coexist(site_cfg, cfg))
-            .cloned()
+            .filter(|(cfg, _, _)| self.could_coexist(site_cfg, cfg))
+            .filter(|(_, _, source)| {
+                winner.is_none_or(|winner| {
+                    !is_namespace_unambiguous(source) || core::ptr::eq(*source, winner)
+                })
+            })
+            .map(|(cfg, alias, _)| (cfg.clone(), alias.clone()))
             .collect()
     }
 
@@ -6390,6 +6506,13 @@ impl<'a> AliasLookupCache<'a> {
     /// (Codex review of PR #209, issue #206 — see
     /// [`try_alias_candidates`]'s own doc for why that matters for an
     /// alias hop; a module hop needs the identical treatment).
+    ///
+    /// A [`guaranteed_unambiguous_winner`](Self::guaranteed_unambiguous_winner)
+    /// that is not this module excludes it — a `mod` is always namespace-
+    /// unambiguous, so it can never coexist with a guaranteed `type` alias
+    /// of the same name in any build that compiles (Codex review of PR
+    /// #209, issue #206) — see [`live_aliases_of`](Self::live_aliases_of)'s
+    /// own doc for the identical rule stated for an alias.
     fn live_modules_of(
         &mut self,
         items: &'a [syn::Item],
@@ -6398,7 +6521,9 @@ impl<'a> AliasLookupCache<'a> {
     ) -> Vec<(Cfg, &'a [syn::Item])> {
         let candidates = self.candidates_of(items, first);
         let live = coexisting_with_site(candidates.iter().copied(), site_cfg, self);
+        let winner = self.guaranteed_unambiguous_winner(items, first, site_cfg);
         live.into_iter()
+            .filter(|item| winner.is_none_or(|winner| core::ptr::eq(*item, winner)))
             .filter_map(|item| match item {
                 syn::Item::Mod(module) => module
                     .content
@@ -27322,6 +27447,94 @@ mod cfg_alias_ambiguity_tests {
              \x20   #[cfg(feature = \"a\")]\n\
              \x20   const Unchecked: u8 = 0;\n\
              \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_site_guaranteed_module_scope_alias_excludes_a_merely_coexisting_peer() {
+        // Codex review of PR #209 (issue #206): `live_aliases_of` kept every
+        // module-scope alias whose own `cfg` merely *coexists* with the
+        // site's, with no regard for whether a different, *guaranteed*
+        // namespace-unambiguous declaration of the same name also exists.
+        // `#[cfg(feature = "a")] type Alias = Decoy;` beside
+        // `#[cfg(feature = "b")] type Alias = CheckedDispatch;`, referenced
+        // bare inside a `#[cfg(feature = "a")]` function, only ever compiles
+        // as `Decoy` — `feature = "a"` and `feature = "b"` can both be true
+        // as a raw satisfiability question, but a build where both hold
+        // never compiles at all (`E0428`, two declarations of `Alias`), so
+        // it is not a build this site is ever really reached from. The
+        // unrestricted coexistence check still counted `CheckedDispatch`
+        // anyway.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Alias = Decoy;\n\
+             #[cfg(feature = \"b\")]\n\
+             type Alias = CheckedDispatch;\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_site_guaranteed_module_scope_declaration_excludes_a_merely_coexisting_module_peer() {
+        // The module twin of the test above: a `mod` is always namespace-
+        // unambiguous, so it can never coexist with a guaranteed `type`
+        // alias of the same name in any build that compiles either — a
+        // `#[cfg(feature = "b")] mod Alias { .. }` beside the identical
+        // `#[cfg(feature = "a")] type Alias = Decoy;` and
+        // `#[cfg(feature = "a")]` site is excluded the same way. Qualified
+        // (`Alias::X { .. }`), not bare, on purpose: `live_modules_of` is
+        // only ever consulted for a path with a further segment to look up
+        // inside the module — a bare `Alias { .. }` never enters module
+        // descent at all, so it would not exercise this exclusion.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Alias = Decoy;\n\
+             #[cfg(feature = \"b\")]\n\
+             mod Alias {\n\
+             \x20   pub type X = super::CheckedDispatch;\n\
+             }\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias::X { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_merely_coexisting_module_scope_peer_still_counts_with_no_guaranteed_winner() {
+        // The control for both tests above: neither alias's own `cfg` is
+        // guaranteed by the site's own `not(feature = "a")` — `feature =
+        // "a"` and `feature = "b"` are genuinely independent flags this
+        // scanner cannot evaluate between, so both stay live candidates and
+        // the guarded one is still counted, under this scanner's own
+        // unevaluated-`cfg` residual (issue #185).
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Alias = Decoy;\n\
+             #[cfg(feature = \"b\")]\n\
+             type Alias = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
             "CheckedDispatch",

@@ -7196,3 +7196,57 @@ construction the outer alias reaches. `site_guaranteed` now requires
 is the regression, confirmed RED against the pre-fix code (`total: 0` against an expected `1`)
 before landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
 rule id.
+
+A fifth finding, on the same review round, closes the last gap
+`live_aliases_of`/`live_modules_of` left open. Two namespace-unambiguous declarations of one
+name in one scope are always `E0428`/`E0255` — never two live branches the way two
+`#[cfg]`-gated declarations under mutually exclusive flags are — so a merely *coexisting* peer
+beside a *guaranteed* one is dead code in every build that reaches the site: `#[cfg(a)] type
+Alias = Decoy;` beside `#[cfg(b)] type Alias = CheckedDispatch;`, referenced bare inside a
+`#[cfg(a)]` function, only ever compiles as `Decoy` — a build with `b` also enabled never
+compiles at all — but both scans kept every coexisting peer regardless, over-counting the
+construction. `AliasLookupCache::guaranteed_unambiguous_winner` is the fix: among a scope's
+namespace-unambiguous candidates coexisting with a site, the one — if there is exactly one —
+`is_guaranteed_by` that site excludes every other namespace-unambiguous peer sharing the name;
+`use` is never among the candidates, for `is_namespace_unambiguous`'s own reason. `TaggedAliases`
+widens to carry each alias's own declaring item, compared against the winner by identity
+(`core::ptr::eq`) rather than by `cfg` equality, since two distinct namespace-unambiguous items
+sharing one name in one scope always have distinct `cfg`s in a real, compiling build.
+
+Landing it exposed two more, both closed before landing rather than left as a regression. The
+first: `is_guaranteed_by`'s own enumeration is exactly as expensive as `could_coexist_with`'s,
+and `a_repeated_site_candidate_cfg_pair_is_not_recomputed`'s own fixture now paid two full
+worst-case enumerations where it used to pay one, roughly doubling that test's own runtime.
+`is_guaranteed_by` now short-circuits when a candidate's `cfg` and the site's are the identical
+formula (`self.key() == site_cfg.key()`) — `p && !p` is unsatisfiable for any `p`, so a
+candidate declared under the site's own exact `cfg`, a common shape once a block-local
+declaration repeats its enclosing item's own gate, never needs the enumeration at all.
+
+The second is a real gap in `Cfg::key()`'s own claim to be an equality test, and the fast path
+above still missed it at every nesting depth past the first:
+`a_predicate_repeated_across_nested_functions_shares_one_cache_key`'s own fixture is built to
+prove one cache key is shared across eight levels of identical, repeated `cfg`, and
+`enclosing_cfg` conjoins one more copy of that identical predicate per level of nesting.
+`commutative_key`'s own dedup (round 7) only ever collapses the *rendered strings* of an
+`All`/`Any`'s children to one entry — it still wraps that surviving entry in `all([..])`, where
+`Cfg::flattened`'s own single-*raw*-child collapse (round 8) renders the identical formula bare,
+with no wrapper, whenever accumulation stops after exactly one real copy. `all(p, p, p)` and `p`
+mean the same formula and rendered as two different keys, so `is_guaranteed_by`'s fast path, and
+every `AliasLookupCache` lookup keyed on `.key()`, missed the identical formula at every depth
+past the one where accumulation happened to collapse to a single raw child. `Cfg::flattened` now
+dedups by `key_raw` at the *value* level too — the identical identity `commutative_key` already
+uses for its own string-level dedup — so a singleton left over after dedup collapses to its own
+bare child the same way a genuinely single raw child already did. Measured directly: the nested
+fixture ran in 21.6s before this fix (worse than the pre-winner-exclusion baseline of 13.79s in
+this environment) and 6.88s after it, with `is_guaranteed_by`'s own fast path confirmed hitting
+at every depth once the two keys agreed.
+
+`a_site_guaranteed_module_scope_alias_excludes_a_merely_coexisting_peer`,
+`a_site_guaranteed_module_scope_declaration_excludes_a_merely_coexisting_module_peer` and
+`a_merely_coexisting_module_scope_peer_still_counts_with_no_guaranteed_winner` are the
+winner-exclusion regressions, the last a control confirming a scope with no guaranteed winner
+still counts every coexisting peer exactly as before. All 2088 tests, `cargo fmt --all --check`,
+`cargo clippy -p xtask --locked --all-targets -- -D warnings`,
+`RUSTDOCFLAGS="-D warnings" cargo doc --locked -p xtask --no-deps` and
+`cargo xtask check-layering` (57 rules) are clean. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
