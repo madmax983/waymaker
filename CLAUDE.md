@@ -6483,21 +6483,22 @@ old tie-break; `a_use_declared_first_still_resolves_past_a_later_value_only_decl
 the control, confirming the fix is not merely papering over one declaration order. No new
 ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
 
-Issue #202 closes a gap Codex found on review of PR #199. `shadow_generic_params!()`
-tracked the generic parameters of a function, an `impl`, and a `trait`. It did not track a
-struct's, an enum's, a union's, a type alias's, a trait alias's, or a generic associated
-type's own parameters. `AssocBindings` (`generic_assoc_type_bindings_naming`) already had
-these seven overrides, added on its own across issues #189 and #201. The macro's other
-three callers — `resolved_path_uses`, `struct_literal_counts`, and `name_uses` — did not,
-so a same-named module or alias could still shadow one of these parameters for them. Codex's
-own example: `struct S<CheckedDispatch: HasHidden, T: Alias<Dispatch =
-CheckedDispatch::Hidden>>` beside `mod CheckedDispatch { pub use DurableIntent as Hidden; }`
-resolved the bound through the module instead of the struct's own parameter. The fix moves
-all seven overrides into `shadow_generic_params!()` itself, so every caller shares one
-definition; `AssocBindings` keeps none of its own. Six regression tests, one per new item
-kind (a struct, an enum, a union, a type alias, a trait GAT, an impl GAT), confirm
-`resolved_path_uses`; one further test each confirms `struct_literal_counts` and `name_uses`
-still agree — the same, narrower coverage this file's own `generic_shadow_tests` module used
-for the original fn/impl/trait fix, since the three callers share one macro body with
-`AssocBindings`. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
-rule id.
+Issue #202 closes a gap Codex found on review of PR #199. That PR first wired
+`AssocBindings` into `shadow_generic_params!()`, to fix an unrelated compile break. At the
+time, the macro tracked only a function's, an `impl`'s, and a `trait`'s own generic
+parameters — not a struct's, an enum's, a union's, a type alias's, a trait alias's, or a
+generic associated type's own. PR #201 then gave `AssocBindings` its own, separate overrides
+for all seven of these shapes, found and added one at a time across several of that PR's own
+review rounds. The macro's other three callers — `resolved_path_uses`,
+`struct_literal_counts`, and `name_uses` — never gained them, so a same-named module or
+alias could still shadow one of these parameters for those three. Codex's own example:
+`struct S<CheckedDispatch: HasHidden, T: Alias<Dispatch = CheckedDispatch::Hidden>>` beside
+`mod CheckedDispatch { pub use DurableIntent as Hidden; }` resolved the bound through the
+module, not the struct's own parameter. The fix moves all seven overrides into
+`shadow_generic_params!()` itself, so every caller shares one definition; `AssocBindings`
+keeps none of its own. Six regression tests, one per new item kind (a struct, an enum, a
+union, a type alias, a trait GAT, an impl GAT), confirm `resolved_path_uses`; one further
+test each confirms `struct_literal_counts` and `name_uses` still agree — the same, narrower
+coverage this file's own `generic_shadow_tests` module used for the original fn/impl/trait
+fix, since the three callers share one macro body with `AssocBindings`. No new ADR: nothing
+here moves a must-not-own cell, a dependency edge, or a rule id.
