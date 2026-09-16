@@ -1053,8 +1053,8 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
             // same rule `struct_literal_counts` already relies on for a
             // struct literal.
             //
-            // But when `shadowed` and *no* block-local declaration of that
-            // name exists at all, the identifier can only ever mean the
+            // But when `shadowed` and no block-local item can actually win
+            // the type namespace, the identifier can only ever mean the
             // parameter — issue #189's own case, still true here. Calling
             // the backstop then would reintroduce it:
             // `path_could_reach_target`'s own "shadowed, no override" answer
@@ -1062,17 +1062,27 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
             // `struct_literal_counts`'s question (could this parameter be
             // instantiated with the guarded type) and wrong for this one
             // (does this identifier name the guarded type). So the backstop
-            // runs on a shadowed name only once some block-local declaration
-            // of it exists to actually decide between the two.
+            // runs on a shadowed name only once a namespace-unambiguous
+            // block-local item of it exists (`is_namespace_unambiguous`: a
+            // `mod`, `type`, `struct`, `enum`, `union`, `trait` or `extern
+            // crate`) to actually decide between the two — never a bare
+            // `use`, which can just as easily import a value of the same
+            // name (Codex review of PR #208, round 3: `fn
+            // outer<CheckedDispatch>() { use values::CheckedDispatch; let _:
+            // dyn Alias<Dispatch = CheckedDispatch>; }`, where the import is
+            // a function, still means the parameter — checked against real
+            // `rustc` — and treating the mere presence of that `use` as an
+            // override reported it anyway).
             let first = path
                 .segments
                 .first()
                 .map(|segment| ident_name(&segment.ident));
             let overridable = !shadowed
                 || first.is_some_and(|first| {
-                    !live_block_declarations(&self.block_items, &first)
+                    live_block_declarations(&self.block_items, &first)
                         .0
-                        .is_empty()
+                        .iter()
+                        .any(|declaration| is_namespace_unambiguous(declaration.item))
                 });
             if overridable {
                 for name in self.names {
@@ -24248,6 +24258,23 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_value_only_use_sharing_a_shadowed_generic_names_name_does_not_override_it() {
+        // Codex review of PR #208, round 3. A `use` can import a value, and a
+        // shadowed type parameter has nothing to do with the value
+        // namespace. Checked against real `rustc`: this compiles, and the
+        // bound still means the generic parameter, not the imported
+        // function — a `use` alone is not enough to run the backstop.
+        let found = generic_assoc_type_bindings_naming(
+            "fn outer<CheckedDispatch>() {\n\
+             \x20   use values::CheckedDispatch;\n\
+             \x20   let _: Box<dyn Alias<Dispatch = CheckedDispatch>>;\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

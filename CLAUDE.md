@@ -6507,5 +6507,16 @@ outer parameter of the same name (issue #181), so a binding in a *nested* item's
 already found the guarded type through the block-local module; a binding in the *same*
 item's body, naming that item's own parameter through a same-named sibling module, does not
 compile at all (`E0220`) — the parameter always wins there, and the backstop's own
-conservative answer in that dead case is an accepted over-count, not a miss. No new ADR:
-nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+conservative answer in that dead case is an accepted over-count, not a miss.
+
+A third round of the same review found "a real block-local declaration of it exists" was
+still too wide: `live_block_declarations` returns a bare `use` too, and a `use` can import a
+value. `fn outer<CheckedDispatch>() { use values::CheckedDispatch; let _: dyn
+Alias<Dispatch = CheckedDispatch>; }` compiles — the bound still means the parameter, not
+the imported function, checked against real `rustc` — but the backstop ran anyway and
+reported a match, since it will happily chase the `use`'s own path to a last segment that
+coincidentally spells the guarded name. That is issue #189's exact false positive again, one
+level removed. The gate now asks for a *namespace-unambiguous* block-local item —
+`is_namespace_unambiguous`: a `mod`, `type`, `struct`, `enum`, `union`, `trait` or `extern
+crate` — never a bare `use`, which this scanner can never show collides with the parameter
+at all. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
