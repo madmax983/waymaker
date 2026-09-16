@@ -1242,18 +1242,20 @@ Stated so that nobody mistakes silence for coverage:
   construction is counted when *any* live alias sharing its name could reach it, not only
   the one declaration `resolve_local_alias_chain`/`resolve_segments_from` would pick — for a
   bare construction path or a qualified one, and chased into a module a multi-segment alias
-  target names, mirroring `resolve_segments_from`'s own `own_modules` descent. What that
-  search still does not do is intersect a candidate's own `cfg` with the construction
-  *site's* own enclosing `cfg`: a candidate declared under `feature = "a"` is treated as a
-  live branch even when the function containing the literal is itself only compiled under
-  `not(feature = "a")`, so no build ever has both — a real, `rustc`-confirmed over-count
-  (Codex review of PR #204) that needs a general `cfg`-vs-`cfg` satisfiability check beside
-  `Cfg::requires_test`, enclosing-`cfg` accumulation in the visitor, and a wider
-  `AliasLookupCache` key than `(scope, name)` to stay sound, none of which exists yet. See
-  issue [#206](https://github.com/madmax983/waymaker/issues/206), filed rather than chased
-  under review-driven time pressure for the same reason issues #171/#186/#193 were: it needs
-  new machinery across several pieces, and getting one wrong in the exclude direction is a
-  missed count, the opposite failure mode from the one it would fix.
+  target names, mirroring `resolve_segments_from`'s own `own_modules` descent.
+  [Issue #206](https://github.com/madmax983/waymaker/issues/206) closes the next gap: a
+  candidate's own `cfg` is now checked against the construction site's own enclosing `cfg`
+  too. `Cfg::could_coexist_with` is the check — a satisfiability test between two `cfg`
+  formulas, capped at `MAX_CFG_ATOMS` like `Cfg::requires_test`, and it fails open past that
+  cap. `Literals` tracks `enclosing_cfg`: every enclosing item's and impl member's own `cfg`,
+  combined. A first version of this fix widened `AliasLookupCache`'s key to carry the
+  site's own `cfg`, and reopened issue #197's own cost along a different axis: many sites
+  with a different `cfg` sharing one scope each paid a full re-scan of it, measured over a
+  minute on an adversarial file (Codex review of the fix). The cache stays keyed on
+  `(scope, name)` alone; a site's own `cfg` is checked afterward, cheaply, over that small
+  cached answer, by `coexisting_with_site`. One residual stays open: the check reads a
+  candidate's own immediate `cfg` only, never an ancestor module's `cfg`. That can only
+  miss an exclusion, never make a wrong one, so it is stated rather than chased further here.
   `resolved_path_uses` and `future_trait_implementors` still have the wider residual, because
   they need `resolve_segments`'s and `resolve_segments_from`'s one deterministic answer for
   reasons of their own — see the Status section's own paragraph on issue #185 for why
@@ -6482,3 +6484,28 @@ landing, with the function declared first to match the shape that actually loses
 old tie-break; `a_use_declared_first_still_resolves_past_a_later_value_only_declaration` is
 the control, confirming the fix is not merely papering over one declaration order. No new
 ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #206 closes the gap Codex found on review of PR #204: `path_could_reach_target`'s
+fail-closed search checked a candidate's own `cfg` against nothing else. It never checked
+the construction site's own `cfg`. A candidate gated the wrong way could still be counted,
+even though no build could ever reach it from that site. Confirmed against real `rustc`:
+`#[cfg(not(feature = "a"))] fn forge() { self::Unchecked { .. } }`, beside two declarations
+of `Unchecked` gated on `feature = "a"` and its negation, can only ever build the negation's
+— `forge` itself does not exist in the other build. `Cfg::could_coexist_with` is the fix: a
+satisfiability check between two `cfg` formulas, over every value of `test` and every named
+atom, capped at `MAX_CFG_ATOMS` like `Cfg::requires_test`, and it fails open past that cap —
+a missed count is the one unacceptable answer here. `Literals` tracks `enclosing_cfg`: every
+enclosing item's and impl member's own `cfg`, combined, pushed and popped like `shadow`.
+`live_named_items_in_scope` keeps its old three-argument shape and its old, `(scope, name)`-
+only answer, so `AliasLookupCache` still caches across every site that shares a scope and a
+name; a new `coexisting_with_site` applies the check afterward, over that small cached
+answer. A first version applied the check inside `live_named_items_in_scope` and widened the
+cache key by the site's own `cfg` instead — sound, but it reopened issue #197's own cost
+along a different axis: many sites with a different `cfg` sharing one scope each paid a full
+re-scan, measured over a minute on an adversarial file, found on review of this fix and
+fixed before it landed. `many_distinctly_gated_construction_sites_over_one_ambiguous_scope_resolve_quickly`
+pins that this stays fast. What is owed: the check reads a candidate's own immediate `cfg`
+only, not an ancestor module's — stated in
+[what is not checked](#what-is-not-checked) rather than closed, since under-checking there
+can only miss an exclusion, never make a wrong one. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
