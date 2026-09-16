@@ -858,6 +858,15 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 /// associated type's own generic parameter could still be shadowed by a
 /// same-named module or alias.
 ///
+/// `visit_attribute` clears `self.shadow` for the span of one attribute, then
+/// restores it. Confirmed against real `rustc` (Codex review of PR #207): an
+/// item's own outer attribute resolves in the scope outside the item, before
+/// its own generics exist, so no generic parameter — the item's own or an
+/// enclosing one's — may ever shadow a module or an alias there. A generic
+/// type parameter is never a valid macro-path segment in the first place, at
+/// any nesting depth, so clearing `self.shadow` outright is correct rather
+/// than only reordering one item kind's own reset against its own attributes.
+///
 /// Defined here, above its first use in this file. A `macro_rules!` macro is
 /// visible only after its own definition.
 macro_rules! shadow_generic_params {
@@ -932,6 +941,12 @@ macro_rules! shadow_generic_params {
             let added = extend_generic_shadow(&mut self.shadow, &node.generics);
             syn::visit::visit_impl_item_type(self, node);
             self.shadow.truncate(self.shadow.len() - added);
+        }
+
+        fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+            let outer = core::mem::take(&mut self.shadow);
+            syn::visit::visit_attribute(self, node);
+            self.shadow = outer;
         }
     };
 }
@@ -26932,6 +26947,47 @@ mod generic_shadow_tests {
             names.paths
         );
         assert!(!names.names_decision("Disallowed"), "{:?}", names.paths);
+    }
+
+    // Codex review of PR #207: an item's own outer attributes resolve in the scope
+    // outside the item, before its own generics exist — confirmed against real
+    // `rustc`. A generic parameter must never shadow a module or an alias inside the
+    // item's own attribute, at any nesting depth, because a generic type parameter is
+    // never a valid macro-path segment in the first place.
+
+    #[test]
+    fn an_items_own_attribute_does_not_resolve_through_its_own_generic_parameter() {
+        let code = "mod Marker {\n    pub use Disallowed as guard;\n}\n#[Marker::guard]\nstruct \
+             S<Marker>(Marker);\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "an item's own generic parameter wrongly shadowed a module named from its own \
+             attribute: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_methods_own_attribute_does_not_resolve_through_an_enclosing_generic_parameter() {
+        // Confirmed against real `rustc`: the enclosing `impl`'s own generic parameter
+        // does not shadow the module either, for a method's own attribute.
+        let code = "mod Marker {\n    pub use Disallowed as guard;\n}\nstruct \
+             Holder<Marker>(Marker);\nimpl<Marker> Holder<Marker> {\n    #[Marker::guard]\n    \
+             fn f<T>(_x: T) {}\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "an enclosing impl's generic parameter wrongly shadowed a module named from a \
+             method's own attribute: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn name_uses_does_not_shadow_an_items_own_attribute_through_its_generic_parameter() {
+        let code = "mod Marker {\n    pub use Disallowed as guard;\n}\n#[Marker::guard]\nstruct \
+             S<Marker>(Marker);\n";
+        let names = name_uses(code).expect("the fixture parses");
+        assert!(names.names_decision("Disallowed"), "{:?}", names.paths);
     }
 }
 

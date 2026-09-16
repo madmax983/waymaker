@@ -6502,3 +6502,23 @@ test each confirms `struct_literal_counts` and `name_uses` still agree — the s
 coverage this file's own `generic_shadow_tests` module used for the original fn/impl/trait
 fix, since the three callers share one macro body with `AssocBindings`. No new ADR: nothing
 here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of PR #207 found a real gap in the fix above, and it turned out to be older
+than the PR: a same-named module or alias could still shadow a generic parameter inside the
+generics-bearing item's own outer attribute — `#[Marker::guard] struct S<Marker>(Marker);`
+beside `mod Marker { pub use Disallowed as guard; }` — because `syn`'s own default traversal
+visits an item's attributes before its generics, and every reset/extend override installs
+`self.shadow` before calling that default traversal. Confirmed against real `rustc`: an
+item's own outer attribute resolves in the scope outside the item, before its own generics
+exist, and this holds at any nesting depth — an enclosing `impl`'s own generic parameter
+does not shadow a method's attribute either. Reordering each of the twelve reset/extend
+overrides to visit attributes first would only fix item-level attributes on these twelve
+item kinds, missing the identical rule for an attribute on a field, a variant, or anything
+else. `shadow_generic_params!()` gains a thirteenth override instead, `visit_attribute`,
+clearing `self.shadow` for the span of one attribute and restoring it after: a generic type
+parameter is never a valid macro-path segment at all, so clearing it outright is correct
+rather than only reordering one item kind's own reset. Three regression tests cover an
+item's own attribute and an enclosing `impl`'s, against `resolved_path_uses` and `name_uses`
+— `struct_literal_counts` and `generic_assoc_type_bindings_naming` need none, because neither
+ever resolves a path from inside an attribute's own token stream. No new ADR: nothing here
+moves a must-not-own cell, a dependency edge, or a rule id.
