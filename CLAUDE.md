@@ -6161,3 +6161,26 @@ and its control, `a_relative_type_alias_target_still_chases_a_same_named_local_m
 are the regression, the first confirmed RED against the pre-fix code before this fix
 landed. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
 id.
+
+Codex review of that same commit found a nineteenth, back in module descent rather than in
+an alias: `preferred_alias` correctly answers `None` when the head name's unconditional
+winner is a concrete type — a `struct`, `enum`, `union` or `trait`, none of which
+`own_aliases` ever turns into an alias — but `resolve_segments_from`'s own caller read that
+`None` as "no matching alias" and fell straight through to `own_modules`, which finds a
+`#[cfg]`-gated `mod` of the same name with no regard for the unconditional type sitting in
+the same scope. Confirmed against real `rustc`: `use values::m;` (a value import, no
+collision) beside `enum m { Marker { x: u8 } }` compiles cleanly, but adding
+`#[cfg(feature = "a")] mod m { type Marker = super::CheckedDispatch; }` makes feature `a` a
+duplicate-definition error (`E0428`) — the module can never exist in any build that
+compiles — yet `m::Marker { x: 0 }` in the valid, feature-off build was resolved through
+that impossible module and counted as `CheckedDispatch`, an over-count in the same
+direction as the fourteenth, sixteenth and seventeenth rounds' own findings. The fix
+filters `own_modules`'s own candidates through `live_named_items_in_scope` first — the same
+primitive `AliasLookupCache::live_modules_of` already wraps for the fail-closed backstop
+search, now reused by the deterministic resolver's own module descent, so a `mod` an
+unconditional concrete type of the same name has already ruled out is never a live
+candidate to step into. `an_unconditional_concrete_type_excludes_a_cfg_gated_module_of_one_name`
+and its control, `a_cfg_gated_module_still_counts_with_no_competing_concrete_type`, are the
+regression, the first confirmed RED against the pre-fix code (`total: 1` against an
+expected `0`) before this fix landed. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.

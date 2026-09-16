@@ -1612,8 +1612,24 @@ fn resolve_segments_from(
         // A one-segment path names an item, not a module to step into
         // (Codex review, PR #176): `own_modules` is not even consulted
         // once `segments` has nothing left past the head.
+        //
+        // `own_modules` is filtered to this scope's own *live* declarations
+        // of `first` first (Codex review of PR #204): an unconditional
+        // concrete type — a `struct`, `enum`, `union` or `trait`, none of
+        // them an alias `preferred_alias` above could have matched — owns
+        // the type namespace exactly as an unconditional `mod`/`type` alias
+        // does, so a `#[cfg]`-gated `mod` of the same name can never coexist
+        // with it (`E0428`) and is never a real module to descend into. Confirmed
+        // against real `rustc`: `enum m { .. }` beside `#[cfg(feature = "a")]
+        // mod m { .. }` is a duplicate-definition error the moment feature
+        // `a` is enabled, so the module is dead in every build that
+        // compiles, and `m::Marker { .. }` in the valid, feature-off build
+        // is the enum's own variant rather than whatever the module would
+        // have named.
         if segments.len() > 1 {
-            if let Some((_, module_items)) = own_modules(items)
+            let (live_items, _) =
+                live_named_items_in_scope(items.iter(), |item| declares_name(item, &first));
+            if let Some((_, module_items)) = own_modules(live_items.iter().copied())
                 .into_iter()
                 .find(|(name, _)| *name == first)
             {
@@ -25440,6 +25456,62 @@ mod cfg_alias_ambiguity_tests {
              \x20       type Unchecked = Decoy;\n\
              \x20       let _ = Unchecked { intent: 0, bytes: 0 };\n\
              \x20   }\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_concrete_type_excludes_a_cfg_gated_module_of_one_name() {
+        // Codex review of PR #204: `preferred_alias` correctly answers `None`
+        // here, because the unconditional winner for `m` is `enum m` itself,
+        // not an alias — but the caller, `resolve_segments_from`, then fell
+        // through to `own_modules`, which finds the `#[cfg]`-gated `mod m`
+        // with no regard for the fact that `enum m` already owns the type
+        // namespace unconditionally. Confirmed against real `rustc`: feature
+        // `a` on is a duplicate-definition error (`E0428`), so the module can
+        // never exist in any build that compiles, and `m::Marker { .. }` in
+        // the valid, feature-off build is the enum's own variant, never
+        // `CheckedDispatch`.
+        let counts = struct_literal_counts(
+            "mod values {\n\
+             \x20   pub fn m() -> u8 { 0 }\n\
+             }\n\
+             use values::m;\n\
+             enum m {\n\
+             \x20   Marker { x: u8 },\n\
+             }\n\
+             #[cfg(feature = \"a\")]\n\
+             mod m {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = m::Marker { x: 0 };\n\
+             \x20   m()\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_cfg_gated_module_still_counts_with_no_competing_concrete_type() {
+        // The control for the test above: with no unconditional `enum m` to
+        // collide with, the `#[cfg]`-gated module is a real, reachable
+        // branch and its construction still counts.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             mod m {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = m::Marker { x: 0 };\n\
              \x20   0\n\
              }",
             "CheckedDispatch",
