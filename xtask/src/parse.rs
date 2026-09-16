@@ -5526,6 +5526,11 @@ struct LiveDeclaration<'a> {
 /// CheckedDispatch; }` left both cfg'd aliases counted as live branches, even
 /// though enabling either feature collides with the unconditional struct
 /// (`E0428`) and can never compile at all — confirmed against real `rustc`.
+/// An `extern crate` declaration is the same shape once more (Codex review
+/// of PR #204): it binds a name — its own crate name, or its `as` rename —
+/// in the type namespace exactly as a `mod` does, so `extern crate self as
+/// m;` beside a `#[cfg]`-gated `mod m { .. }` collides the moment the
+/// feature is enabled, confirmed against real `rustc`.
 fn declares_name(item: &syn::Item, first: &str) -> bool {
     match item {
         syn::Item::Mod(module) => ident_name(&module.ident) == first,
@@ -5533,6 +5538,13 @@ fn declares_name(item: &syn::Item, first: &str) -> bool {
         syn::Item::Enum(item) => ident_name(&item.ident) == first,
         syn::Item::Union(item) => ident_name(&item.ident) == first,
         syn::Item::Trait(item) => ident_name(&item.ident) == first,
+        syn::Item::ExternCrate(item) => {
+            let name = item
+                .rename
+                .as_ref()
+                .map_or_else(|| ident_name(&item.ident), |(_, rename)| ident_name(rename));
+            name == first
+        }
         _ => own_aliases(core::iter::once(item))
             .iter()
             .any(|alias| alias.local == first),
@@ -5556,7 +5568,9 @@ fn declares_name(item: &syn::Item, first: &str) -> bool {
 /// `use` is therefore always kept as an independently live candidate rather
 /// than guessed about, the same residual
 /// [what is not checked](../../CLAUDE.md#what-is-not-checked) already states
-/// for a same-spelled alias across namespaces.
+/// for a same-spelled alias across namespaces. An `extern crate` binding is
+/// unambiguously type-namespace too, the same as a `mod` (Codex review of
+/// PR #204) — see `declares_name`'s own doc for the confirmed collision.
 const fn is_namespace_unambiguous(item: &syn::Item) -> bool {
     matches!(
         item,
@@ -5566,6 +5580,7 @@ const fn is_namespace_unambiguous(item: &syn::Item) -> bool {
             | syn::Item::Enum(_)
             | syn::Item::Union(_)
             | syn::Item::Trait(_)
+            | syn::Item::ExternCrate(_)
     )
 }
 
@@ -25558,6 +25573,56 @@ mod cfg_alias_ambiguity_tests {
              }\n\
              fn forge() -> u8 {\n\
              \x20   let _ = m::Marker { x: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_extern_crate_alias_excludes_a_cfg_gated_module_of_one_name() {
+        // Codex review of PR #204: `extern crate self as m;` is an
+        // unconditional binding of `m` in the type namespace exactly as a
+        // `mod m` or a `type m` already is, but neither `declares_name` nor
+        // `is_namespace_unambiguous` recognized `Item::ExternCrate` at all,
+        // so it was invisible when deciding whether a `#[cfg]`-gated `mod m`
+        // of the same name could ever coexist with it. Confirmed against
+        // real `rustc`: `extern crate self as m;` beside `#[cfg(feature =
+        // "a")] mod m { .. }` is a duplicate-definition error the moment
+        // feature `a` is enabled, so the module can never exist in any
+        // build that compiles.
+        let counts = struct_literal_counts(
+            "extern crate self as m;\n\
+             #[cfg(feature = \"a\")]\n\
+             mod m {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = m::Marker { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_cfg_gated_module_still_counts_with_no_competing_extern_crate_alias() {
+        // The control for the test above: with no unconditional `extern
+        // crate` binding to collide with, the `#[cfg]`-gated module is a
+        // real, reachable branch and its construction still counts.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             mod m {\n\
+             \x20   pub type Marker = CheckedDispatch;\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = m::Marker { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
             "CheckedDispatch",

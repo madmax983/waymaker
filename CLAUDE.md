@@ -6213,3 +6213,23 @@ regression, the first confirmed RED against the pre-fix code (resolving to the b
 green against both the pre-fix and the fixed code alike, since the multi-segment case was
 never broken. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
 rule id.
+
+Codex review of that same commit found a twenty-first, in the same shape as the seventeenth
+and nineteenth: `extern crate self as m;` binds `m` in the type namespace exactly as a `mod`
+or a `type` alias does, but `declares_name` and `is_namespace_unambiguous` never recognized
+`Item::ExternCrate` at all, so it was invisible when deciding whether a `#[cfg]`-gated `mod
+m` of the same name could ever coexist with it. Confirmed against real `rustc`:
+`extern crate self as m;` beside `#[cfg(feature = "a")] mod m { .. }` is a duplicate-
+definition error the moment feature `a` is enabled, so the module can never exist in any
+build that compiles, yet it was still treated as a live branch and its construction
+counted. `declares_name` now reads an `extern crate`'s own bound name — its `as` rename when
+one is written, its crate name otherwise — and `is_namespace_unambiguous` now recognizes it
+too, the same way both already recognize a `struct`/`enum`/`union`/`trait`. Since neither
+`own_aliases` nor `own_modules` ever produces an entry for an `extern crate`, becoming the
+scope's one live declaration this way correctly excludes a conflicting `#[cfg]`-gated module
+without itself ever being chased into.
+`an_unconditional_extern_crate_alias_excludes_a_cfg_gated_module_of_one_name` and its
+control, `a_cfg_gated_module_still_counts_with_no_competing_extern_crate_alias`, are the
+regression, the first confirmed RED against the pre-fix code (`total: 1` against an expected
+`0`) before this fix landed. No new ADR: nothing here moves a must-not-own cell, a dependency
+edge, or a rule id.
