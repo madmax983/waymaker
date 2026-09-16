@@ -6081,3 +6081,28 @@ already reviewed on its own: `cargo test -p xtask --locked --lib` (1984 passed),
 `cargo clippy -p xtask --locked --all-targets -- -D warnings`, `cargo fmt --all --check`
 and `cargo xtask check-layering` (57 rules) are all clean on the merged tree. No new ADR:
 nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of the merge commit found a sixteenth: the `shadowed` fast path's own
+fallback ignored a block-local search that had already run and failed. Confirmed against
+real `rustc`: `struct T; struct Decoy; fn forge<T>() { type T = Decoy; let _ = T {}; }`
+constructs `Decoy`, because an unconditional block-local `type T = Decoy;` shadows the
+generic parameter `T` completely — the same way an unconditional block-local declaration
+already shadows module scope — but `segments_could_reach_target`'s `if shadowed { return
+segments.last() == target; }` compared the untouched, pre-resolution text and never
+consulted `resolved_elsewhere` or `module_scope_shadowed`, so it counted a construction
+the block-local search directly above it had just shown reaches `Decoy`, never the
+guarded type — an over-count, the same direction the fourteenth round's own finding was.
+The fix gates the fallback on `!module_scope_shadowed` rather than on `resolved_elsewhere`
+directly: `module_scope_shadowed` is already the fact that the closest live block-local
+declaration is unconditional, so the generic-parameter reading is dead code in every
+build, not only the one a conditional block-local alias happens to resolve under — a
+`resolved_elsewhere` gate alone would have made a merely `#[cfg]`-conditional shadow
+suppress the generic-parameter branch too, a missed count under whichever build the
+conditional alias is absent from, which
+`a_block_local_alias_still_resolves_when_its_name_shadows_a_generic_parameter`'s own
+conditional fixture already requires to keep counting.
+`an_unconditional_block_local_alias_shadows_a_generic_parameter_away_from_the_target` and
+its control, `an_unconditional_block_local_alias_that_really_reaches_the_target_still_counts`,
+are the regression, the first confirmed RED against the pre-fix code (`total: 1` against
+an expected `0`) before this fix landed. No new ADR: nothing here moves a must-not-own
+cell, a dependency edge, or a rule id.

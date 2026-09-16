@@ -5876,8 +5876,26 @@ fn segments_could_reach_target<'a>(
         }
     }
 
+    // The generic-parameter reading itself is a live branch only while
+    // nothing block-local unconditionally shadows it (Codex review of PR
+    // #204: `struct T; struct Decoy; fn forge<T>() { type T = Decoy; let _
+    // = T {}; }` constructs `Decoy` — the unconditional block-local `type
+    // T = Decoy;` shadows the generic parameter completely, the same way
+    // `live_block_declarations`'s own docs already say it shadows module
+    // scope — but this fallback compared the untouched, pre-resolution
+    // text and ignored that the block-local search above had already run
+    // and failed, counting a construction the block-local alias had just
+    // shown reaches `Decoy`, never `target`). `module_scope_shadowed` is
+    // exactly that fact, already computed above for module scope's own
+    // sake: while it is `false`, a competing block-local declaration is
+    // absent or merely `#[cfg]`-conditional, so the generic parameter is
+    // still live under some build and the conservative "assume it could be
+    // `target`" answer must still stand — see
+    // `a_block_local_alias_still_resolves_when_its_name_shadows_a_generic_parameter`,
+    // whose alias is conditional and must still count.
     if shadowed {
-        return segments.last().is_some_and(|last| last.as_str() == target);
+        return !module_scope_shadowed
+            && segments.last().is_some_and(|last| last.as_str() == target);
     }
 
     // An unconditional block-local declaration of `first` shadows module
@@ -24315,6 +24333,52 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_block_local_alias_shadows_a_generic_parameter_away_from_the_target() {
+        // Codex review of PR #204: `struct T; struct Decoy; fn forge<T>() { type T
+        // = Decoy; let _ = T {}; }` constructs `Decoy`, confirmed against real
+        // `rustc` — the unconditional block-local `type T = Decoy;` shadows the
+        // generic parameter `T` completely, the same way an unconditional
+        // block-local declaration already shadows module scope. The `shadowed`
+        // fallback compared the untouched, pre-resolution text and ignored that
+        // the block-local search just above it had already run and shown `T`
+        // resolves to `Decoy`, never to the guarded type — a false count.
+        let counts = struct_literal_counts(
+            "struct Decoy;\n\
+             fn forge<CheckedDispatch>() -> u8 {\n\
+             \x20   type CheckedDispatch = Decoy;\n\
+             \x20   let _ = CheckedDispatch {};\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_unconditional_block_local_alias_that_really_reaches_the_target_still_counts() {
+        // The control: the same shape as the finding above, but the
+        // unconditional block-local alias's own target genuinely names the
+        // guarded type through a sibling module (issue #169's own descent),
+        // so it must still be counted.
+        let counts = struct_literal_counts(
+            "mod inner {\n\
+             \x20   pub struct CheckedDispatch;\n\
+             }\n\
+             fn forge<CheckedDispatch>() -> u8 {\n\
+             \x20   type CheckedDispatch = inner::CheckedDispatch;\n\
+             \x20   let _ = CheckedDispatch { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 
     #[test]
