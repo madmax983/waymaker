@@ -5683,27 +5683,43 @@ const fn is_unit_or_tuple_struct(item: &syn::Item) -> bool {
     )
 }
 
-/// Whether `item` unconditionally binds `first`'s value-namespace meaning —
-/// a unit or tuple struct's own implicit constructor
-/// ([`is_unit_or_tuple_struct`]), a free function, a `const`, or a `static`.
-/// Confirmed against real `rustc` (Codex review of PR #204): `fn allowed()
-/// {}` beside a `#[cfg]`-gated `use values::forbidden as allowed;` compiles
-/// only feature-off, where `allowed()` calls the local function; enabling
-/// the feature collides in the value namespace (E0255), so the `use` can
-/// never be live wherever the function, `const` or `static` is unconditional
-/// — the identical shape [`is_unit_or_tuple_struct`] already covers for a
-/// struct's own constructor, met here for every other item kind whose name
-/// is unconditionally a value. A foreign function or `static` declared
-/// inside an `extern` block is the same shape once more but is not
-/// recognized here: [`declares_name`] compares one item against one name,
-/// and a `syn::Item::ForeignMod` names none of its own — it holds a list of
-/// `ForeignItem`s, each with a name of its own — which needs machinery this
-/// function does not attempt, left as a residual.
-const fn is_unconditional_value_declaration(item: &syn::Item) -> bool {
+/// Whether `item`'s own name is bound *only* in the value namespace — a free
+/// function, a `const`, or a `static` — with no type-namespace meaning at
+/// all, unlike a unit/tuple struct's implicit constructor
+/// ([`is_unit_or_tuple_struct`]), whose own type-namespace meaning survives
+/// wherever its value-namespace one is irrelevant. Confirmed against real
+/// `rustc` (Codex review of PR #204): `fn Allowed() {}` beside `use
+/// traits::Future as Allowed;`, referenced as `impl Allowed for Real {}` —
+/// a position that can only ever name a trait — refers to `traits::Future`
+/// alone; the function is not merely a losing candidate there, it names
+/// nothing a trait path could ever mean, so [`preferred_alias`] excludes it
+/// from `candidates` outright rather than letting it win an arbitrary
+/// tie-break in a position it is categorically irrelevant to.
+const fn is_value_only_declaration(item: &syn::Item) -> bool {
     matches!(
         item,
         syn::Item::Fn(_) | syn::Item::Const(_) | syn::Item::Static(_)
-    ) || is_unit_or_tuple_struct(item)
+    )
+}
+
+/// Whether `item` unconditionally binds `first`'s value-namespace meaning —
+/// a unit or tuple struct's own implicit constructor
+/// ([`is_unit_or_tuple_struct`]), or one of [`is_value_only_declaration`]'s
+/// three shapes. Confirmed against real `rustc` (Codex review of PR #204):
+/// `fn allowed() {}` beside a `#[cfg]`-gated `use values::forbidden as
+/// allowed;` compiles only feature-off, where `allowed()` calls the local
+/// function; enabling the feature collides in the value namespace (E0255),
+/// so the `use` can never be live wherever the function, `const` or
+/// `static` is unconditional — the identical shape [`is_unit_or_tuple_struct`]
+/// already covers for a struct's own constructor, met here for every other
+/// item kind whose name is unconditionally a value. A foreign function or
+/// `static` declared inside an `extern` block is the same shape once more
+/// but is not recognized here: [`declares_name`] compares one item against
+/// one name, and a `syn::Item::ForeignMod` names none of its own — it holds
+/// a list of `ForeignItem`s, each with a name of its own — which needs
+/// machinery this function does not attempt, left as a residual.
+const fn is_unconditional_value_declaration(item: &syn::Item) -> bool {
+    is_value_only_declaration(item) || is_unit_or_tuple_struct(item)
 }
 
 /// Picks which of `items`' own `use`/`type` aliases named `first` is the
@@ -5779,6 +5795,20 @@ const fn is_unconditional_value_declaration(item: &syn::Item) -> bool {
 /// Allowed() {}` compiles — different namespaces — and a trait bound `T:
 /// Allowed` still names `core::fmt::Debug`, never the function, confirmed
 /// against real `rustc`.
+///
+/// A value-*only* declaration ([`is_value_only_declaration`]: a free
+/// function, a `const` or a `static`, never a unit/tuple struct) is dropped
+/// from `candidates` outright when `!terminal` (Codex review of PR #204, yet
+/// one round further): such an item names nothing a non-value position
+/// could ever mean, so leaving it in a pool the arbitrary `prefer_last`/
+/// `first` tie-break can still pick from — when no namespace-unambiguous
+/// item exists to win outright — let it silently out-vote a genuine
+/// `use`/`type` alias whenever it happened to sort first. `fn Allowed() {}`
+/// beside `use traits::Future as Allowed;`, referenced as `impl Allowed for
+/// Real {}`, compiles and always means `traits::Future` — confirmed against
+/// real `rustc` — but with the function declared first the old tie-break
+/// picked it, found no alias, and (being outside a terminal position)
+/// returned `None` immediately, missing `Real` as an implementor entirely.
 fn preferred_alias<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     first: &str,
@@ -5789,6 +5819,7 @@ fn preferred_alias<'a>(
         .into_iter()
         .filter(|item| !has_cfg_test(item_attrs(item)))
         .filter(|item| declares_name(item, first))
+        .filter(|item| terminal || !is_value_only_declaration(item))
         .collect();
     let unconditional_winner = candidates
         .iter()
@@ -26165,6 +26196,43 @@ mod alias_scope_tests {
                 .any(|path| path.segments == ["core", "fmt", "Debug"]),
             "{paths:?}"
         );
+    }
+
+    #[test]
+    fn a_value_only_declaration_does_not_win_a_type_only_tie_break() {
+        // Codex review of PR #204, round 27: `future_trait_implementors`
+        // resolves a trait path with `value_position = false`, so `terminal`
+        // is always `false` there — but round 24's own widening of
+        // `declares_name` still put an unrelated `fn` into `candidates`, and
+        // with no namespace-unambiguous winner to prefer, the arbitrary
+        // `prefer_last`/`first` tie-break could land on it instead of the
+        // genuine `use` alias, find no alias on it, and (being outside a
+        // terminal position) return `None` immediately — never falling
+        // through to the `use` at all. `fn Allowed() {}` beside `use
+        // core::future::Future as Allowed;`, referenced as `impl Allowed for
+        // Real {}`, compiles and always means `core::future::Future`,
+        // confirmed against real `rustc` — declared in this order
+        // specifically so the old tie-break's `.first()` picked the
+        // function.
+        let code = "fn Allowed() {}\n\
+             use core::future::Future as Allowed;\n\
+             struct Real;\n\
+             impl Allowed for Real {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Real"], "{implementors:?}");
+    }
+
+    #[test]
+    fn a_use_declared_first_still_resolves_past_a_later_value_only_declaration() {
+        // Control for the fix above: reversing the declaration order must
+        // not change the answer, since real Rust does not care which one is
+        // written first.
+        let code = "use core::future::Future as Allowed;\n\
+             fn Allowed() {}\n\
+             struct Real;\n\
+             impl Allowed for Real {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert_eq!(implementors, ["Real"], "{implementors:?}");
     }
 
     #[test]

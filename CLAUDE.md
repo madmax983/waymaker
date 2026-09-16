@@ -6419,3 +6419,34 @@ rather than `["core", "fmt", "Debug"]`) before landing; the twenty-fourth round'
 tests were re-run alongside it and stayed green, confirming the narrower suppression still
 fires exactly where that round's own repro needs it to. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a twenty-seventh, and it is a different dimension
+from the twenty-fourth's and twenty-sixth's own: not whether a value declaration should
+*suppress* a competing `use` in a value (terminal) position, but whether a value-*only*
+declaration should be in the candidate pool at all in a position that can never be a value
+in the first place. `future_trait_implementors` resolves a trait path with
+`value_position = false` always, so `terminal` is `false` at every call
+`preferred_alias` ever makes from it — but the twenty-fourth round's own widening of
+`declares_name` to recognize `fn`/`const`/`static` at all put a plain, unrelated function
+into `candidates` regardless of position, and with no namespace-unambiguous winner among
+the candidates to prefer, the arbitrary `prefer_last`/`first` tie-break could still land
+on it: `own_aliases` never produces an alias for a function, so the pick found none,
+and — being outside a terminal position — `preferred_alias` returned `None` immediately,
+never trying the genuine `use`/`type` candidate the fallback exists to find. Confirmed
+against real `rustc`: `fn Allowed() {}` beside `use core::future::Future as Allowed;`,
+referenced as `impl Allowed for Real {}`, compiles and always means
+`core::future::Future` — a function and a trait import occupy different namespaces, with
+nothing conditional about either — and before the twenty-fourth round even existed this
+resolved correctly, because a plain `fn` was invisible to `declares_name` and the `use`
+was the only candidate. The fix is a fourth filter on `candidates` itself, ahead of every
+other check: a value-only declaration (a free function, a `const` or a `static`, via a new
+`is_value_only_declaration` — narrower than `is_unconditional_value_declaration`, since a
+unit/tuple struct's own constructor is still a value the terminal fallback can legitimately
+answer with) is dropped from the pool outright whenever `!terminal`, rather than left in it
+to win an ordering-dependent tie-break in a position it is categorically irrelevant to.
+`a_value_only_declaration_does_not_win_a_type_only_tie_break` is the regression, confirmed
+RED against the pre-fix code (`implementors: []` against an expected `["Real"]`) before
+landing, with the function declared first to match the shape that actually loses under the
+old tie-break; `a_use_declared_first_still_resolves_past_a_later_value_only_declaration` is
+the control, confirming the fix is not merely papering over one declaration order. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
