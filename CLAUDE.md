@@ -6489,7 +6489,23 @@ So a binding qualified through one was never checked. Real `rustc` reads `mod tr
 use CheckedDispatch as Marker; } fn forge<T: Alias<Dispatch = traits::Marker>>() {}` as a
 live use of the guarded type. The old code missed it. A missed count is the dangerous
 direction. The fix runs the same `path_could_reach_target` search `struct_literal_counts`
-already uses. It runs that search for each guarded name the deterministic walk did not find.
-`struct_literal_counts` itself needed no change: its own backstop already covers every shape
-issue #205 named. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or
-a rule id.
+already uses, for each guarded name the deterministic walk did not find. `struct_literal_counts`
+itself needed no change: its own backstop already covers every shape issue #205 named.
+
+Codex review of PR #208 found the fix's own first version wrong in the direction issue #189
+already guards against. The backstop ran even when the binding's head segment named an
+in-scope generic parameter. `path_could_reach_target`'s own "shadowed, no override" answer
+conservatively assumes reachable — right for `struct_literal_counts`'s question (could this
+parameter be instantiated with the guarded type), wrong for this one (does this identifier
+name the guarded type as written). So `pub fn forge<CheckedDispatch, T: Alias<Dispatch =
+CheckedDispatch>>() {}` — issue #189's own case, a sibling parameter that merely shares the
+guarded name — started reporting a match again. The backstop now runs on a shadowed name
+only when a real block-local declaration of it exists to decide between the two readings;
+with none, the identifier can only ever mean the parameter, exactly as issue #189 settled.
+Checked against real `rustc` both ways: a nested item's own generics reset away from an
+outer parameter of the same name (issue #181), so a binding in a *nested* item's own bound
+already found the guarded type through the block-local module; a binding in the *same*
+item's body, naming that item's own parameter through a same-named sibling module, does not
+compile at all (`E0220`) — the parameter always wins there, and the backstop's own
+conservative answer in that dead case is an accepted over-count, not a miss. No new ADR:
+nothing here moves a must-not-own cell, a dependency edge, or a rule id.

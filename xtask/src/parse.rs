@@ -1006,49 +1006,82 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
     // shape `Iterator<Item = u8>`'s syntax can take.
     fn visit_assoc_type(&mut self, node: &'ast syn::AssocType) {
         if let Some(path) = type_alias_path(&node.ty) {
-            // Codex review of #189: `resolve_segments`/`resolve_segments_from` leave
-            // a shadowed head segment as written, so the answer is the bare
-            // parameter name — not the real type it happens to share a spelling
-            // with. `T: Alias<Dispatch = CheckedDispatch>` where `CheckedDispatch`
-            // is a sibling generic parameter names that parameter, not the guarded
-            // struct, so a shadowed head segment is excluded before the comparison
-            // below rather than matched on the string alone.
+            // Codex review of #189: a bound naming its own item's generic
+            // parameter always means that parameter, never a same-named type
+            // (`T: Alias<Dispatch = CheckedDispatch>` where `CheckedDispatch`
+            // is a sibling parameter). `resolve_segments`/`resolve_segments_from`
+            // leave a shadowed head segment as written, so a bare, coincidental
+            // name match would otherwise pass the check below unchanged. This
+            // gate stops that, for the deterministic walk only.
             let shadowed = path.segments.first().is_some_and(|segment| {
                 self.shadow
                     .iter()
                     .any(|name| *name == ident_name(&segment.ident))
             });
-            if !shadowed {
-                // `false`: an associated-type binding's value is always
-                // type-namespace, never a value — real Rust's own grammar
-                // decides that, not a segment count (Codex review of PR
-                // #204).
+            // `false`: an associated-type binding's value is always
+            // type-namespace, never a value — real Rust's own grammar
+            // decides that, not a segment count (Codex review of PR
+            // #204).
+            let resolved = if shadowed {
+                None
+            } else {
                 let local = (path.leading_colon.is_none() && path.segments.len() == 1)
                     .then(|| path.segments.first())
                     .flatten()
                     .map(|segment| ident_name(&segment.ident))
                     .and_then(|first| resolve_local_alias_chain(&self.block_items, &first, false));
-                let resolved = match local {
+                Some(match local {
                     Some((segments, true)) => segments,
                     Some((segments, false)) => {
                         resolve_segments_from(segments, &self.stack, &self.shadow, false)
                     }
                     None => resolve_segments(path, &self.stack, &self.shadow, false),
-                };
-                if let Some(name) = resolved
-                    .last()
-                    .filter(|last| self.names.contains(&last.as_str()))
-                {
-                    self.found.push(name.clone());
-                }
-                // Issue #205: the walk above cannot see a block-local `mod`. Run
-                // the same fail-closed search `struct_literal_counts` uses. Do
-                // this for each guarded name that the walk above did not find.
-                // The outer `if !shadowed` gate changes nothing here:
-                // `path_could_reach_target` checks the same head segment
-                // against the same `shadow` list on its own.
+                })
+            };
+            if let Some(name) = resolved
+                .as_ref()
+                .and_then(|segments| segments.last())
+                .filter(|last| self.names.contains(&last.as_str()))
+            {
+                self.found.push(name.clone());
+            }
+            // Issue #205, round 2 (Codex): this must run even when `shadowed`.
+            // A block-local declaration can shadow an outer generic parameter
+            // for a binding used in that item's own body — real Rust reads
+            // `fn outer<Traits>() { mod Traits { .. } let _: dyn Alias<Dispatch
+            // = Traits::Marker>; }` that way (checked against `rustc`), the
+            // same rule `struct_literal_counts` already relies on for a
+            // struct literal.
+            //
+            // But when `shadowed` and *no* block-local declaration of that
+            // name exists at all, the identifier can only ever mean the
+            // parameter — issue #189's own case, still true here. Calling
+            // the backstop then would reintroduce it:
+            // `path_could_reach_target`'s own "shadowed, no override" answer
+            // conservatively assumes reachable, which is right for
+            // `struct_literal_counts`'s question (could this parameter be
+            // instantiated with the guarded type) and wrong for this one
+            // (does this identifier name the guarded type). So the backstop
+            // runs on a shadowed name only once some block-local declaration
+            // of it exists to actually decide between the two.
+            let first = path
+                .segments
+                .first()
+                .map(|segment| ident_name(&segment.ident));
+            let overridable = !shadowed
+                || first.is_some_and(|first| {
+                    !live_block_declarations(&self.block_items, &first)
+                        .0
+                        .is_empty()
+                });
+            if overridable {
                 for name in self.names {
-                    if resolved.last().map(String::as_str) != Some(*name)
+                    let already = resolved
+                        .as_ref()
+                        .and_then(|segments| segments.last())
+                        .map(String::as_str)
+                        == Some(*name);
+                    if !already
                         && path_could_reach_target(
                             path,
                             &self.stack,
@@ -24160,19 +24193,57 @@ mod raw_identifier_tests {
     #[test]
     fn a_generic_bound_bound_through_a_block_local_module_sharing_an_outer_generic_name_is_reported()
      {
-        // Codex review of PR #208, issue #205. A nested item's own generic
-        // parameter always resets `shadow` (issue #181). So `forge`'s own
+        // Codex review of PR #208, issue #205, round 1. A nested item's own
+        // generic parameter resets `shadow` (issue #181). So `forge`'s own
         // `T` replaces the outer `Traits` before its bound is checked. The
-        // outer `Traits` is gone. The backstop runs and finds the module.
-        // Checked against real `rustc`. It confirms this compiles. A second
-        // check confirms the opposite case: a bound naming its *own* item's
-        // generic parameter through a same-named sibling module does not
-        // compile at all (`E0220`). The parameter always wins there. That is
-        // what the outer `shadowed` gate above assumes.
+        // backstop runs and finds the module. Checked against real `rustc`:
+        // this compiles.
         let found = generic_assoc_type_bindings_naming(
             "pub fn outer<Traits>() {\n\
              \x20   mod Traits { pub use CheckedDispatch as Marker; }\n\
              \x20   fn forge<T: Alias<Dispatch = Traits::Marker>>() {}\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_in_a_body_through_a_module_that_shadows_an_outer_generic_is_reported() {
+        // Codex review of PR #208, issue #205, round 2. Here the binding sits
+        // in `outer`'s own body, not in a nested item's own generics, so
+        // `shadow` still holds `outer`'s `Traits` when the bound is checked.
+        // Checked against real `rustc`: this compiles, and the block-local
+        // `mod Traits` wins over the outer parameter — the same rule
+        // `struct_literal_counts` already relies on for a struct literal
+        // (`Codex review of PR #204`'s own `type T = Decoy; let _ = T {};`).
+        // The backstop must run even though `shadowed` is true here, or this
+        // binding is missed.
+        let found = generic_assoc_type_bindings_naming(
+            "fn outer<Traits>() {\n\
+             \x20   mod Traits { pub type Marker = CheckedDispatch; }\n\
+             \x20   let _: Box<dyn Alias<Dispatch = Traits::Marker>>;\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_naming_its_own_items_parameter_through_a_sibling_module_is_not_a_miss() {
+        // The complementary case: a bound naming its *own* item's generic
+        // parameter through a same-named sibling module never compiles at
+        // all (checked against real `rustc`: `E0220`, associated type not
+        // found). Running the backstop unconditionally can still report a
+        // match here — the search only sees a block-local `mod Traits` and a
+        // shadowed head segment, and returns `true` before ever asking
+        // whether the surrounding code compiles. That is an over-count, the
+        // safe direction: no real construction exists to miss. This test
+        // pins the actual behavior so a future change is not surprised by it.
+        let found = generic_assoc_type_bindings_naming(
+            "fn outer() {\n\
+             \x20   mod Traits { pub type Marker = CheckedDispatch; }\n\
+             \x20   struct Wrapper<Traits: Alias<Dispatch = Traits::Marker>>(Traits);\n}",
             &["CheckedDispatch"],
         )
         .expect("the fixture parses");
