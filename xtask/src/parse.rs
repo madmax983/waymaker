@@ -1015,17 +1015,21 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
                     .any(|name| *name == ident_name(&segment.ident))
             });
             if !shadowed {
+                // `false`: an associated-type binding's value is always
+                // type-namespace, never a value — real Rust's own grammar
+                // decides that, not a segment count (Codex review of PR
+                // #204).
                 let local = (path.leading_colon.is_none() && path.segments.len() == 1)
                     .then(|| path.segments.first())
                     .flatten()
                     .map(|segment| ident_name(&segment.ident))
-                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first));
+                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first, false));
                 let resolved = match local {
                     Some((segments, true)) => segments,
                     Some((segments, false)) => {
-                        resolve_segments_from(segments, &self.stack, &self.shadow)
+                        resolve_segments_from(segments, &self.stack, &self.shadow, false)
                     }
-                    None => resolve_segments(path, &self.stack, &self.shadow),
+                    None => resolve_segments(path, &self.stack, &self.shadow, false),
                 };
                 if let Some(name) = resolved
                     .last()
@@ -1099,6 +1103,7 @@ pub fn generic_assoc_type_bindings_naming(
 fn resolve_local_alias_chain(
     blocks: &[Vec<&syn::Item>],
     name: &str,
+    value_position: bool,
 ) -> Option<(Vec<String>, bool)> {
     let mut segments = vec![name.to_owned()];
     let mut resolved_any = false;
@@ -1129,8 +1134,13 @@ fn resolve_local_alias_chain(
         // Other; }` still means whatever `S` resolves to in the enclosing
         // block, never `hidden`'s own. `terminal` is `preferred_alias`'s own
         // value-namespace-fallback gate (Codex review of PR #204) — see its
-        // doc comment.
-        let terminal = segments.len() == 1;
+        // doc comment. Gated on `value_position` too (Codex's own review,
+        // one round later): a bare segment count cannot tell a value
+        // reference (a call) from one that can never be one (a struct-
+        // literal head, an associated-type binding, a trait path) — that is
+        // a fact about the caller's own syntactic position, so each entry
+        // point states it rather than this loop guessing it from shape.
+        let terminal = value_position && segments.len() == 1;
         let Some((depth, alias)) = blocks
             .get(..visible)
             .unwrap_or(blocks)
@@ -1471,8 +1481,14 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
         }
 
         fn visit_path(&mut self, path: &'ast syn::Path) {
+            // `true`: this visits every path in the file, type-position and
+            // value-position alike, so a same-spelled alias across
+            // namespaces is the documented residual this scan already
+            // carries (Codex review of PR #204) — `true` is what lets a
+            // call's own callee resolve through a value-namespace alias,
+            // which is the case this fallback exists for.
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(path, &self.stack, &self.shadow),
+                segments: resolve_segments(path, &self.stack, &self.shadow, true),
             });
             syn::visit::visit_path(self, path);
         }
@@ -1521,7 +1537,22 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 /// `shadow` is every generic type-parameter name currently in scope (issue
 /// #181): a bare head segment it names is never looked up, because a real
 /// generic parameter shadows a same-named module or alias outright.
-fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]], shadow: &[String]) -> Vec<String> {
+///
+/// `value_position` is whether `path`, as the caller's own syntax placed it,
+/// could ever denote a value rather than a type, a module, an enum variant
+/// or a trait (Codex review of PR #204): a call's own callee can, but a
+/// struct-literal head, an associated-type binding's value, and a trait
+/// path in `impl Trait for T` never can, whatever a bare segment count says
+/// — real Rust's own grammar decides that from where the path sits, not
+/// from how many segments it has, so each caller states it once rather than
+/// this function guessing it from `path` alone. See [`preferred_alias`]'s
+/// own doc for what it gates.
+fn resolve_segments(
+    path: &syn::Path,
+    stack: &[&[syn::Item]],
+    shadow: &[String],
+    value_position: bool,
+) -> Vec<String> {
     let segments: Vec<String> = path
         .segments
         .iter()
@@ -1530,7 +1561,7 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]], shadow: &[String])
     if path.leading_colon.is_some() {
         return segments;
     }
-    resolve_segments_from(segments, stack, shadow)
+    resolve_segments_from(segments, stack, shadow, value_position)
 }
 
 /// [`resolve_segments`]'s own resolution loop, over a segment list that is already known to
@@ -1539,11 +1570,12 @@ fn resolve_segments(path: &syn::Path, stack: &[&[syn::Item]], shadow: &[String])
 /// aliases could not finish resolving may itself be a module-level alias (issue #92, Codex's
 /// post-merge review).
 ///
-/// See [`resolve_segments`] for what `shadow` is.
+/// See [`resolve_segments`] for what `shadow` and `value_position` are.
 fn resolve_segments_from(
     mut segments: Vec<String>,
     stack: &[&[syn::Item]],
     shadow: &[String],
+    value_position: bool,
 ) -> Vec<String> {
     // Issue #181: a shadowed head segment names the generic parameter, not
     // a module or an alias. Leaving it unresolved keeps the segment in the
@@ -1600,8 +1632,14 @@ fn resolve_segments_from(
         // #197) — see `preferred_alias`. `terminal` is whether `first` is
         // the whole remaining path, which is what lets a value-namespace
         // `use` fall back in only where doing so cannot be wrong (Codex
-        // review of PR #204) — see `preferred_alias`'s own doc.
-        let terminal = segments.len() == 1;
+        // review of PR #204) — see `preferred_alias`'s own doc. Gated on
+        // `value_position` too, one round later: a bare segment count alone
+        // cannot tell a call's own callee from a construction path, an
+        // associated-type binding or a trait path, all of which can be
+        // terminal and none of which can be a value — that is a fact about
+        // where the caller's own path sits in real Rust's grammar, stated
+        // once by the entry point rather than guessed here from shape.
+        let terminal = value_position && segments.len() == 1;
         if let Some(alias) = preferred_alias(items.iter(), &first, false, terminal) {
             let mut resolved = alias.target.clone();
             resolved.extend(segments.drain(1..));
@@ -1635,8 +1673,11 @@ fn resolve_segments_from(
         // is the enum's own variant rather than whatever the module would
         // have named.
         if segments.len() > 1 {
-            let (live_items, _) =
-                live_named_items_in_scope(items.iter(), |item| declares_name(item, &first));
+            let (live_items, _) = live_named_items_in_scope(
+                items.iter(),
+                |item| declares_name(item, &first),
+                value_position,
+            );
             if let Some((_, module_items)) = own_modules(live_items.iter().copied())
                 .into_iter()
                 .find(|(name, _)| *name == first)
@@ -1730,8 +1771,10 @@ fn collect_future_implementors<'ast>(
                     // function body, and a generic type parameter cannot
                     // fill the trait position of an `impl` — a type
                     // parameter is a type, never a trait, so it has
-                    // nothing here to shadow.
-                    let resolved = resolve_segments(trait_path, stack, &[]);
+                    // nothing here to shadow. `false`: a trait path is
+                    // always type-namespace, never a value (Codex review
+                    // of PR #204).
+                    let resolved = resolve_segments(trait_path, stack, &[], false);
                     if resolved.last().is_some_and(|last| last == "Future") {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
                             if let Some(name) = self_type.path.segments.last() {
@@ -4222,7 +4265,10 @@ fn resolve_impl_trait_path(
         };
     };
     let scope_refs: Vec<&syn::Item> = scope.iter().collect();
-    if let Some((mut resolved, absolute)) = resolve_local_alias_chain(&[scope_refs], &first) {
+    // `false`: `trait_path` names an `impl`'s own trait, always type-
+    // namespace, never a value (Codex review of PR #204).
+    if let Some((mut resolved, absolute)) = resolve_local_alias_chain(&[scope_refs], &first, false)
+    {
         resolved.extend(segments.into_iter().skip(1));
         // Real Rust resolves a `use` item's own right-hand side the same way any
         // path is resolved: a local item first, the extern prelude only once none
@@ -5007,17 +5053,26 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
             .then(|| node.path.segments.first())
             .flatten()
             .map(|segment| ident_name(&segment.ident));
+        // `false` throughout: a struct-literal head is always type-namespace
+        // — real Rust's `Name { .. }` syntax can never construct a value —
+        // so it must never fall back to a value-namespace `use`, however
+        // many segments it has (Codex review of PR #204: `use
+        // values::CheckedDispatch as Allowed; struct Allowed { .. }`
+        // compiles, and `Allowed { .. }` constructs the local struct, never
+        // the function `values::CheckedDispatch`).
         let local = first
             .as_ref()
-            .and_then(|first| resolve_local_alias_chain(&self.block_items, first));
+            .and_then(|first| resolve_local_alias_chain(&self.block_items, first, false));
         let resolved = match local {
             // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
             // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
             Some((segments, true)) => segments,
             // Ran out of block-local aliases: the leftover head may itself be a
             // module-level alias — `resolve_segments_from` is a no-op if it is not.
-            Some((segments, false)) => resolve_segments_from(segments, &self.stack, &self.shadow),
-            None => resolve_segments(&node.path, &self.stack, &self.shadow),
+            Some((segments, false)) => {
+                resolve_segments_from(segments, &self.stack, &self.shadow, false)
+            }
+            None => resolve_segments(&node.path, &self.stack, &self.shadow, false),
         };
         let resolves_to_name = resolved
             .last()
@@ -5185,13 +5240,21 @@ struct AliasLookupCache<'a> {
 
 impl<'a> AliasLookupCache<'a> {
     /// The live `use`/`type` aliases in `items` whose local name is `first` —
-    /// see [`live_named_items_in_scope`] for what "live" excludes.
+    /// see [`live_named_items_in_scope`] for what "live" excludes. `false`:
+    /// this cache exists only for [`segments_could_reach_target`]'s own
+    /// search, whose sole caller ([`struct_literal_counts`]) is always
+    /// resolving a construction path, never a value (Codex review of PR
+    /// #204) — see [`live_named_items_in_scope`]'s own doc for why that
+    /// matters here.
     fn live_aliases_of(&mut self, items: &'a [syn::Item], first: &str) -> std::rc::Rc<[UseAlias]> {
         self.aliases
             .entry((scope_key(items), first.to_owned()))
             .or_insert_with(|| {
-                let (live_items, _) =
-                    live_named_items_in_scope(items.iter(), |item| declares_name(item, first));
+                let (live_items, _) = live_named_items_in_scope(
+                    items.iter(),
+                    |item| declares_name(item, first),
+                    false,
+                );
                 own_aliases(live_items.iter().copied())
                     .into_iter()
                     .filter(|candidate| candidate.local == first)
@@ -5202,13 +5265,18 @@ impl<'a> AliasLookupCache<'a> {
     }
 
     /// The live sibling modules in `items` named `first` — see
-    /// [`live_named_items_in_scope`] for what "live" excludes.
+    /// [`live_named_items_in_scope`] for what "live" excludes, and
+    /// [`live_aliases_of`](Self::live_aliases_of) for why `false` is right
+    /// here too.
     fn live_modules_of(&mut self, items: &'a [syn::Item], first: &str) -> CachedModules<'a> {
         self.modules
             .entry((scope_key(items), first.to_owned()))
             .or_insert_with(|| {
-                let (live_items, _) =
-                    live_named_items_in_scope(items.iter(), |item| declares_name(item, first));
+                let (live_items, _) = live_named_items_in_scope(
+                    items.iter(),
+                    |item| declares_name(item, first),
+                    false,
+                );
                 live_items
                     .into_iter()
                     .filter_map(|item| match item {
@@ -5625,6 +5693,18 @@ const fn is_namespace_unambiguous(item: &syn::Item) -> bool {
 /// all, and substituting the `use`'s own target there would be wrong. So
 /// this fallback is tried only when `terminal` is `true`, never when a
 /// further segment remains.
+///
+/// `terminal` alone is not enough, though (Codex review of PR #204, one
+/// round later): a struct-literal head, an associated-type binding's value,
+/// and a trait path in `impl Trait for T` are each terminal too — a bare
+/// segment count cannot tell them from a call's own callee — yet none of
+/// them can ever be a value, whatever the segment count says. `use
+/// values::CheckedDispatch as Allowed; struct Allowed { .. }` compiles —
+/// `values::CheckedDispatch` is a function — but `Allowed { .. }`
+/// constructs the local struct, never the function, so a caller resolving
+/// a construction path folds that fact into `terminal` itself before
+/// calling here, rather than this function trying to tell the two apart
+/// from `first` alone.
 fn preferred_alias<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     first: &str,
@@ -5699,10 +5779,20 @@ fn preferred_alias<'a>(
 /// PR #204: an unconditional `use` of a name real Rust never lets collide
 /// with a same-named `mod` had made this function's own first version
 /// exclude that `mod` anyway — a missed count, the direction this whole
-/// mechanism exists to close).
+/// mechanism exists to close) — but only while `value_position` says a
+/// value is even a possible answer here. A construction path can never be
+/// one (Codex review of PR #204, one round later): `use
+/// values::CheckedDispatch as Allowed; struct Allowed { .. }` compiles, but
+/// keeping the `use` live for `Allowed { .. }`'s own resolution reached a
+/// value no construction syntax can ever name, over-counting a guarded type
+/// that was never really built. So a caller resolving a path that can only
+/// ever be type-namespace passes `false`, which drops every non-namespace-
+/// unambiguous match once an unconditional winner exists, the same as if it
+/// were namespace-unambiguous too.
 fn live_named_items_in_scope<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     matches: impl Fn(&syn::Item) -> bool,
+    value_position: bool,
 ) -> (Vec<&'a syn::Item>, bool) {
     let matching: Vec<&'a syn::Item> = items
         .into_iter()
@@ -5719,7 +5809,7 @@ fn live_named_items_in_scope<'a>(
                     matching
                         .iter()
                         .copied()
-                        .filter(|item| !is_namespace_unambiguous(item)),
+                        .filter(|item| value_position && !is_namespace_unambiguous(item)),
                 )
                 .collect();
             (live, true)
@@ -5754,14 +5844,22 @@ fn live_named_items_in_scope<'a>(
 /// one name already fail to rule each other out. The second element is
 /// `true` — module scope stays live — exactly when the walk exhausts
 /// `block_items` without ever finding an unconditional declaration.
+///
+/// Passes `false` for [`live_named_items_in_scope`]'s own `value_position`:
+/// this function exists only for [`segments_could_reach_target`]'s search,
+/// whose sole caller ([`struct_literal_counts`]) always resolves a
+/// construction path, never a value (Codex review of PR #204).
 fn live_block_declarations<'a>(
     block_items: &[Vec<&'a syn::Item>],
     first: &str,
 ) -> (Vec<LiveDeclaration<'a>>, bool) {
     let mut live = Vec::new();
     for (depth, items) in block_items.iter().enumerate().rev() {
-        let (scope_live, unconditional) =
-            live_named_items_in_scope(items.iter().copied(), |item| declares_name(item, first));
+        let (scope_live, unconditional) = live_named_items_in_scope(
+            items.iter().copied(),
+            |item| declares_name(item, first),
+            false,
+        );
         live.extend(
             scope_live
                 .into_iter()
@@ -6873,8 +6971,13 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
         }
 
         fn visit_path(&mut self, node: &'ast syn::Path) {
+            // `true`: same standing as `resolved_path_uses`'s own
+            // `visit_path` (Codex review of PR #204) — this scan visits
+            // every path uniformly, so the type-position sub-case stays the
+            // documented same-spelled-alias residual, and `true` is what
+            // lets a call's own callee resolve through a value alias.
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(node, &self.stack, &self.shadow),
+                segments: resolve_segments(node, &self.stack, &self.shadow, true),
             });
             syn::visit::visit_path(self, node);
         }
@@ -25631,6 +25734,39 @@ mod cfg_alias_ambiguity_tests {
         .expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
     }
+
+    #[test]
+    fn a_struct_literal_head_does_not_fall_back_to_a_value_namespace_alias() {
+        // Codex review of PR #204: the twentieth round's `terminal` flag
+        // means "no further path segment follows", not "this reference
+        // could be a value" — a struct-literal head like `Allowed { .. }`
+        // is always terminal *and* always type-namespace, never a value,
+        // however many segments it has. Confirmed against real `rustc`:
+        // `use values::CheckedDispatch as Allowed; struct Allowed { intent:
+        // u8, bytes: u8 }` compiles — `values::CheckedDispatch` is a
+        // function, so the value import and the struct occupy different
+        // namespaces — and `Allowed { .. }` constructs the local struct,
+        // never `values::CheckedDispatch`. The fallback must not treat a
+        // construction path as a value context just because it is terminal.
+        let counts = struct_literal_counts(
+            "mod values {\n\
+             \x20   pub fn CheckedDispatch() -> u8 { 0 }\n\
+             }\n\
+             use values::CheckedDispatch as Allowed;\n\
+             struct Allowed {\n\
+             \x20   intent: u8,\n\
+             \x20   bytes: u8,\n\
+             }\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Allowed { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
 }
 
 #[cfg(test)]
@@ -25677,6 +25813,31 @@ mod alias_scope_tests {
              }\n";
         let implementors = future_trait_implementors(code).expect("the fixture parses");
         assert_eq!(implementors, ["Real"], "{implementors:?}");
+    }
+
+    #[test]
+    fn an_impl_trait_path_does_not_fall_back_to_a_value_namespace_alias() {
+        // Codex review of PR #204, the same shape one call site over: a
+        // trait path in `impl Trait for T` is always type-namespace, never
+        // a value, however many segments it has — so it must never fall
+        // back to a value-namespace `use` the way a call's own callee can.
+        // Confirmed against real `rustc`: `use values::Future as Marker;`
+        // (a function named `Future`) compiles alongside a local, unrelated
+        // `trait Marker {}` — a value import and a trait occupy different
+        // namespaces — and `impl Marker for Real {}` implements the local
+        // trait, never `values::Future`.
+        let code = "mod values {\n\
+             \x20   pub fn Future() {}\n\
+             }\n\
+             use values::Future as Marker;\n\
+             trait Marker {}\n\
+             struct Real;\n\
+             impl Marker for Real {}\n";
+        let implementors = future_trait_implementors(code).expect("the fixture parses");
+        assert!(
+            implementors.is_empty(),
+            "a local, unrelated trait was reported as Future through a value-namespace alias: {implementors:?}"
+        );
     }
 
     #[test]

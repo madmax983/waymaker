@@ -6233,3 +6233,37 @@ control, `a_cfg_gated_module_still_counts_with_no_competing_extern_crate_alias`,
 regression, the first confirmed RED against the pre-fix code (`total: 1` against an expected
 `0`) before this fix landed. No new ADR: nothing here moves a must-not-own cell, a dependency
 edge, or a rule id.
+
+Codex review of that same commit found a twenty-second, and it is a real gap in the
+twentieth round's own fix rather than a new class of bug: `terminal` means "no further path
+segment follows", never "this reference could be a value" — a struct-literal head like
+`Allowed { .. }` is terminal too, and always type-namespace, so the twentieth round's
+value-namespace fallback wrongly applied there as well. Confirmed against real `rustc`: `use
+values::CheckedDispatch as Allowed; struct Allowed { .. }` compiles — `values::CheckedDispatch`
+is a function, so the value import and the struct occupy different namespaces — but `Allowed
+{ .. }` constructs the local struct, never the function, and the fallback substituted the
+value alias anyway, over-counting a guarded type that was never really built. Worse, the
+same shape reached the fail-closed backstop too: `AliasLookupCache::live_aliases_of` and
+`live_block_declarations` — used exclusively by `struct_literal_counts`'s own construction-
+path search — inherited `live_named_items_in_scope`'s "always keep a `use` live" rule from
+the fifteenth round, which is the right general answer for a scanner that cannot tell value
+from type position, but categorically wrong for this one caller, whose path can never be
+value-namespace at all. `resolve_segments`, `resolve_segments_from` and
+`resolve_local_alias_chain` now take a `value_position` flag, stated once by each entry
+point from what kind of path it is resolving rather than guessed from segment count:
+`struct_literal_counts`'s own construction-path resolution, `generic_assoc_type_bindings_naming`'s
+associated-type-binding resolution, and `future_trait_implementors`'s and
+`resolve_impl_trait_path`'s trait-path resolution all pass `false`, since none of the three
+can ever denote a value in real Rust's own grammar; `resolved_path_uses`'s and `name_uses`'s
+own general path scans pass `true`, keeping the twentieth round's fix for a call's own
+callee and the same-spelled-alias-across-namespaces residual those two scans already carry
+for their remaining, undistinguished paths. `live_named_items_in_scope` takes the identical
+flag, and `live_aliases_of`/`live_modules_of`/`live_block_declarations` — reached only from
+`struct_literal_counts`'s own search — always pass `false`, dropping a `use` once an
+unconditional namespace-unambiguous winner exists, the same as if it were namespace-
+unambiguous too. `a_struct_literal_head_does_not_fall_back_to_a_value_namespace_alias` is the
+regression for the demonstrated case, confirmed RED against the pre-fix code (`total: 1`
+against an expected `0`) before landing; `an_impl_trait_path_does_not_fall_back_to_a_value_namespace_alias`
+covers the same fix applied proactively to the trait-path call sites, on the identical
+categorical reasoning, confirmed RED the same way before landing. No new ADR: nothing here
+moves a must-not-own cell, a dependency edge, or a rule id.
