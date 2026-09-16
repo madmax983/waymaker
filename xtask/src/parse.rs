@@ -254,11 +254,37 @@ impl Cfg {
     /// ([`AliasLookupCache::could_coexist`]) — not to widen
     /// [`AliasLookupCache`]'s own outer key, which [`AliasLookupCache`]'s
     /// own doc says is a different, already-tried-and-reverted mistake.
-    /// Two different formulas never render to the same key; two
-    /// *equivalent* formulas spelled differently still can, which costs a
-    /// cache miss, not a wrong answer.
+    ///
+    /// Canonical rather than a bare `{self:?}` (Codex review of the fix,
+    /// round 7): `all`/`any` are commutative, so `all(a, b)` and
+    /// `all(b, a)` are the same formula with the operands written in a
+    /// different order, but their derived `Debug` text differs — several
+    /// functions each writing their own permutation of one large predicate
+    /// therefore missed the cache entirely and each independently paid
+    /// [`Cfg::could_coexist_with`]'s own worst case, exponential in the
+    /// atoms the two formulas name together. `key` now sorts each `all`/
+    /// `any`'s own children's keys before joining them, so two orderings of
+    /// the same operands render identically; a genuinely different formula
+    /// still renders differently, because the leaves (`Test`, `Atom`) are
+    /// still rendered with `Debug`'s own escaping and the recursion is
+    /// still exact about structure, only blind to one commutative
+    /// reordering.
     fn key(&self) -> String {
-        format!("{self:?}")
+        match self {
+            Self::Test => "Test".to_owned(),
+            Self::Atom(name) => format!("Atom({name:?})"),
+            Self::All(children) => Self::commutative_key("All", children),
+            Self::Any(children) => Self::commutative_key("Any", children),
+            Self::Not(inner) => format!("Not({})", inner.key()),
+        }
+    }
+
+    /// [`Cfg::key`]'s helper for `All`/`Any`: every child's own key, sorted
+    /// so the operands' written order does not matter.
+    fn commutative_key(tag: &str, children: &[Self]) -> String {
+        let mut child_keys: Vec<String> = children.iter().map(Self::key).collect();
+        child_keys.sort();
+        format!("{tag}({child_keys:?})")
     }
 }
 
@@ -5132,6 +5158,27 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         let outer_cfg = self.enclosing_cfg.clone();
         self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
         syn::visit::visit_arm(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A struct literal field's own `cfg` is otherwise unseen: `syn::FieldValue`
+    // carries its own `attrs`, separate from the value expression's own —
+    // `visit_expr` above handles the latter, but `Wrapper { #[cfg(not(feature
+    // = "a"))] value: Unchecked {} }` needs the field's own condition folded
+    // in before the nested literal is checked too (Codex review of the fix,
+    // round 7). Same empty-attrs fast path as `visit_expr`/`visit_arm`, for
+    // the same reason: nearly every field in a real file carries none.
+    fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_field_value(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_field_value(self, node);
         self.enclosing_cfg = outer_cfg;
     }
 
@@ -26590,6 +26637,97 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_struct_literal_fields_own_cfg_excludes_a_candidate_the_sites_cfg_would_not() {
+        // Codex review of the fix, round 7: `syn::FieldValue` carries its
+        // own `attrs`, separate from the value expression's own — a struct
+        // literal's field can itself carry `#[cfg(..)]`
+        // (`Wrapper { #[cfg(not(feature = "a"))] value: Unchecked {} }`),
+        // and nothing folded that into `enclosing_cfg` before the nested
+        // literal was checked, over-counting a candidate the field's own
+        // `cfg` already rules out.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> Wrapper {\n\
+             \x20   Wrapper {\n\
+             \x20       #[cfg(not(feature = \"a\"))]\n\
+             \x20       value: self::Unchecked { intent: 0, bytes: 0 },\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn many_distinctly_ordered_cfg_predicates_over_one_pair_resolve_quickly() {
+        // Codex review of the fix, round 7: two semantically identical
+        // `cfg` predicates with reordered `any`/`all` operands produced
+        // different `Cfg::key` text, so several sites each using their own
+        // permutation of the same 20-atom `not(any(..))` predicate against
+        // one `any(..)` candidate each missed
+        // `AliasLookupCache::could_coexist`'s cache and independently
+        // exhausted all 1,048,576 assignments, each allocating a fresh
+        // `HashSet`.
+        //
+        // Distinct permutations, not a mere rotation: a rotation only
+        // produces as many distinct orderings as there are atoms, so a
+        // rotation-based fixture would silently stop stressing the cache
+        // past that many sites and pass even unfixed. `nth_permutation`
+        // walks the factorial number system instead, giving as many
+        // distinct orderings as there are sites, well under 20!.
+        use std::fmt::Write as _;
+
+        fn nth_permutation(items: &[String], mut n: usize) -> Vec<String> {
+            let mut remaining: Vec<String> = items.to_vec();
+            let len = remaining.len();
+            let mut factorial = vec![1usize; len];
+            for i in 1..len {
+                factorial[i] = factorial[i - 1] * i;
+            }
+            let mut out = Vec::with_capacity(len);
+            for i in (0..len).rev() {
+                let f = factorial[i];
+                let index = n / f;
+                n %= f;
+                out.push(remaining.remove(index));
+            }
+            out
+        }
+
+        let base_flags: Vec<String> = (0..20)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect();
+        let candidate_flags = base_flags.join(", ");
+        let mut src = format!(
+            "#[cfg(any({candidate_flags}))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(any({candidate_flags})))]\ntype Unchecked = Decoy;\n"
+        );
+        for s in 0..8 {
+            let flags = nth_permutation(&base_flags, s * 7).join(", ");
+            let _ = write!(
+                src,
+                "#[cfg(not(any({flags})))]\nfn forge{s}() -> u8 {{\n\
+                 \x20   let _ = self::Unchecked {{ intent: 0, bytes: 0 }};\n\
+                 \x20   0\n\
+                 }}\n"
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?} for 8 sites, each its own distinct ordering of one 20-atom pair",
+            start.elapsed()
+        );
     }
 
     #[test]

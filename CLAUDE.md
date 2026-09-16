@@ -6609,3 +6609,35 @@ fixed to `false`, matching `Cfg::requires_test`'s own fixed assignment.
 `coexistence_is_checked_in_a_production_build_only` is the regression, confirmed RED
 against the pre-fix two-valued search before landing. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+The next review found a ninth, in what feeds the check rather than in the check itself once
+more: `syn::FieldValue` carries its own `attrs`, separate from its value expression's own —
+`visit_expr` already folds the latter into `enclosing_cfg`, but a struct literal field's own
+`#[cfg(..)]` (`Wrapper { #[cfg(not(feature = "a"))] value: Unchecked {} }`) was never read
+at all, so a nested literal inside a cfg-gated field was checked against a site `cfg` that
+omitted the field's own narrower one — an over-count, a false gate violation on honest code,
+the same direction as every finding since the fourth. `visit_field_value` closes it, the
+same push-pop shape as `visit_local`/`visit_expr`/`visit_arm`, with the same empty-attrs
+fast path those two already carry: nearly every field in a real file carries none, so this
+stays a cheap no-op rather than a `Cfg` clone per field.
+`a_struct_literal_fields_own_cfg_excludes_a_candidate_the_sites_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+The same round found a tenth, in `Cfg::key` rather than in what calls it: `all`/`any` are
+commutative, so `all(a, b)` and `all(b, a)` are one formula with its operands written two
+ways — but `key`'s own bare `format!("{self:?}")` rendered the two differently, so several
+functions each writing their own permutation of one large `not(any(..))` predicate against
+one `any(..)` candidate missed `AliasLookupCache::could_coexist`'s cache on every one of
+them and each independently paid `Cfg::could_coexist_with`'s own worst case — exponential in
+the atoms two formulas name together, with a fresh `HashSet` allocated per assignment tried.
+`key` now sorts each `all`/`any`'s own children's keys before joining them, so two orderings
+of one operand list render identically; a genuinely different formula still renders
+differently, since the leaves are still rendered with `Debug`'s own escaping and the
+recursion is still exact about structure, blind only to a commutative reordering.
+`many_distinctly_ordered_cfg_predicates_over_one_pair_resolve_quickly` is the regression —
+distinct permutations from the factorial number system rather than a mere rotation, since a
+rotation only produces as many distinct orderings as there are atoms and would stop
+stressing the cache, and pass, past that count — confirmed RED at 63s against a 20s ceiling
+for eight sites over one 20-atom pair before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
