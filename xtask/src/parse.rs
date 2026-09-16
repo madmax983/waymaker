@@ -203,12 +203,25 @@ impl Cfg {
         }
     }
 
-    /// Checks if `self` and `other` can both be true at the same time.
-    ///
-    /// Tries every value of `test` and every atom named in either formula
-    /// ([`Cfg::atoms`]) — the same enumeration [`Cfg::requires_test`] uses,
-    /// over both formulas' atoms combined. Answers `true` on the first
+    /// Checks if `self` and `other` can both be true at the same time, in a
+    /// **production** build — `test` fixed to `false`, over every assignment
+    /// of the atoms named in either formula ([`Cfg::atoms`]), the same
+    /// enumeration [`Cfg::requires_test`] uses. Answers `true` on the first
     /// assignment where both formulas hold.
+    ///
+    /// `test` is fixed rather than tried both ways because this whole scanner
+    /// family already treats `#[cfg(test)]`-only code as unshipped and
+    /// invisible (issue #51): a candidate or a site gated in a way that is
+    /// only test-only is already skipped before either formula reaches this
+    /// method (`has_cfg_test`), so the two formulas compared here can each
+    /// individually hold with `test` either way — but this scan reasons only
+    /// about the build it gates, which never has `test` true. Trying
+    /// `test = true` as well let two formulas that are disjoint in every real
+    /// production build (e.g. `any(test, feature = "a")` and
+    /// `all(not(test), not(feature = "a"))`) still report coexisting, through
+    /// an assignment this scan has no business considering (Codex review of
+    /// the fix, round 5) — an over-count, a false gate violation on honest
+    /// code, the same direction as this issue's earlier rounds.
     ///
     /// [`struct_literal_counts`]'s fail-closed search (issue #206) uses this
     /// to check a candidate's own `cfg` against the construction site's own
@@ -232,9 +245,7 @@ impl Cfg {
                 .enumerate()
                 .filter_map(|(index, name)| (mask & (1 << index) != 0).then_some(name.as_str()))
                 .collect();
-            [false, true]
-                .into_iter()
-                .any(|test| self.eval(test, &true_atoms) && other.eval(test, &true_atoms))
+            self.eval(false, &true_atoms) && other.eval(false, &true_atoms)
         })
     }
 
@@ -26544,6 +26555,35 @@ mod cfg_alias_ambiguity_tests {
              \x20           0\n\
              \x20       }\n\
              \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn coexistence_is_checked_in_a_production_build_only() {
+        // Codex review of the fix, round 5: `Cfg::could_coexist_with` used
+        // to try `test = true` as well as `test = false`, but this scanner
+        // family already treats `#[cfg(test)]`-only code as never shipped
+        // (issue #51) — a candidate or a site that is *only* test-only is
+        // already skipped before either formula reaches this method. Two
+        // formulas that are disjoint in every real production build can
+        // still both hold when `test` is assumed `true`, which is a build
+        // this scan has no business reasoning about: the target's own
+        // `cfg` reduces to `feature = "a"` under `test = false`, the
+        // site's own `cfg` reduces to `not(feature = "a")`, and the two
+        // can never both hold in a production build — only through the
+        // `test = true` bridge the old code tried.
+        let counts = struct_literal_counts(
+            "#[cfg(any(test, feature = \"a\"))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(all(not(test), not(feature = \"a\")))]\ntype Unchecked = Decoy;\n\
+             #[cfg(any(test, not(feature = \"a\")))]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
              }",
             "CheckedDispatch",
             FnScope::None,

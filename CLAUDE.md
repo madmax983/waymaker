@@ -6594,3 +6594,18 @@ perf-sensitive fixtures issue #197 and this issue's own earlier rounds added, st
 `a_cfg_gated_match_arms_own_cfg_excludes_a_candidate` are the regressions, both confirmed
 RED against the pre-fix code (neither override existing) before landing. No new ADR:
 nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+The round after found an eighth, in the check itself rather than in what feeds it:
+`Cfg::could_coexist_with` tried `test = true` as well as `test = false` when looking for a
+satisfying assignment — but this whole scanner family already treats `#[cfg(test)]`-only
+code as unshipped and invisible (issue #51), so a candidate or a site that is *only*
+test-only never reaches this method at all (`has_cfg_test` skips it first). Two formulas
+that are disjoint in every real production build — a target under
+`any(test, feature = "a")`, a site under `any(test, not(feature = "a"))` — still hold
+together the moment `test` is assumed `true`, a build this scan has no business reasoning
+about, so they were reported as coexisting and the construction over-counted: a false gate
+violation on honest code, the same direction as every round since the fourth. `test` is now
+fixed to `false`, matching `Cfg::requires_test`'s own fixed assignment.
+`coexistence_is_checked_in_a_production_build_only` is the regression, confirmed RED
+against the pre-fix two-valued search before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
