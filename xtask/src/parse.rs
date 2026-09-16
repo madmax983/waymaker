@@ -5377,6 +5377,28 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         self.enclosing_cfg = outer_cfg;
     }
 
+    // A foreign item's own `cfg` is otherwise unseen: `syn::ForeignItem` —
+    // a member of an `extern` block — carries its own `attrs`, and none of
+    // `visit_item`/`visit_impl_item`/`visit_trait_item` dispatches through
+    // it, so a foreign function's or static's own declared type could hide
+    // an expression checked against the enclosing extern block's own
+    // `cfg` alone (Codex review of PR #209, issue #206). Same empty-attrs
+    // fast path as the other statement-level overrides.
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        let attrs = foreign_item_attrs(node);
+        if attrs.is_empty() {
+            syn::visit::visit_foreign_item(self, node);
+            return;
+        }
+        if has_cfg_test(attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(attrs)]);
+        syn::visit::visit_foreign_item(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
     shadow_generic_params!();
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
@@ -27112,6 +27134,28 @@ mod cfg_alias_ambiguity_tests {
              \x20   #[cfg(not(feature = \"a\"))]\n\
              \x20   _p: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
              ) {\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_foreign_items_own_cfg_excludes_a_candidate_the_externs_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): `syn::ForeignItem` — a
+        // member of an `extern` block — carries its own `attrs`, and none
+        // of `visit_item`/`visit_impl_item`/`visit_trait_item` ever
+        // dispatches through it, so a foreign static's own `cfg` was
+        // never folded into `enclosing_cfg` before its declared type was
+        // visited, missing the member's own narrower condition the same
+        // way a declaration field's or a function parameter's own did.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             unsafe extern \"C\" {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   static X: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }];\n\
              }",
             "CheckedDispatch",
             FnScope::None,

@@ -6785,3 +6785,16 @@ override closes it, the same push-pop shape and empty-attrs fast path as
 `a_function_parameters_own_cfg_excludes_a_candidate_the_functions_cfg_would_not` is the
 regression, confirmed RED against the pre-fix code (no such override) before landing. No
 new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of the same commit found a seventeenth, in the same family as the twelfth
+and thirteenth: `syn::ForeignItem` — a member of an `extern` block — carries its own
+`attrs`, and none of `visit_item`/`visit_impl_item`/`visit_trait_item` ever dispatches
+through it, so a foreign function's or static's own `cfg` was never folded into
+`enclosing_cfg` before its declared type was visited: an over-count, the same direction
+as every finding since the fourth. A `visit_foreign_item` override closes it, reading
+the member's own attributes through `foreign_item_attrs` — the same reader
+`declares_item_macro`'s `MacroVisitor` already uses for this node kind — with the same
+push-pop shape and empty-attrs fast path as the other statement-level overrides.
+`a_foreign_items_own_cfg_excludes_a_candidate_the_externs_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
