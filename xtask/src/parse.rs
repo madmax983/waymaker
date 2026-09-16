@@ -24546,8 +24546,19 @@ mod cfg_alias_ambiguity_tests {
         let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
             .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+        // A CI failure on commit aefa1af measured 2.229s here against the 2s ceiling
+        // this test used to hold, with this same sandbox measuring 1.6-2.3s across a
+        // handful of runs at every commit checked back to the original fix — this
+        // margin was already this tight before either of PR #204's own two review
+        // rounds touched this file, so it is host variance on a debug build rather
+        // than a regression either round introduced. The ceiling is what needs
+        // headroom, not the fixture: the bug this test exists to catch — an
+        // O(file-size) budget recomputed once per construction site rather than once
+        // per file — measured 10-23s, an order of magnitude past even the slowest
+        // run observed here, so 6s still separates "fixed" from "regressed" with
+        // real margin on either side.
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
+            start.elapsed() < std::time::Duration::from_secs(6),
             "took {:?} for {MODULES} modules and {LITERALS} literals",
             start.elapsed()
         );

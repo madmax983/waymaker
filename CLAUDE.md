@@ -6130,3 +6130,16 @@ control, `a_conflicting_type_alias_still_counts_with_no_competing_struct`, are t
 regression, the first confirmed RED against the pre-fix code (`total: 1` against an
 expected `0`) before this fix landed. No new ADR: nothing here moves a must-not-own cell,
 a dependency edge, or a rule id.
+
+CI then went red on the commit above, over `many_ambiguous_aliases_and_literals_resolve_quickly`'s
+own 2-second ceiling: 2.229s measured on the runner. Investigated rather than assumed a
+flake — the same sandbox measured 1.6-2.3s across a handful of runs at every commit
+checked back to the fixture's own original one, including the commit before either of
+this issue's two review-round fixes above touched this file, so the margin was already
+this tight and neither round's own change is what narrowed it. The ceiling needed
+headroom, not the fixture: the bug this test exists to catch — a per-construction-site
+budget recomputed from the whole file rather than once per file — measured 10-23s, an
+order of magnitude past even the slowest run seen here, so raising the ceiling to 6s
+still separates "fixed" from "regressed to the shape this test was written to catch"
+with real margin on both sides, rather than narrowing what the test can distinguish. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
