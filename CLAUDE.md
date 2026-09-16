@@ -7250,3 +7250,21 @@ still counts every coexisting peer exactly as before. All 2088 tests, `cargo fmt
 `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p xtask --no-deps` and
 `cargo xtask check-layering` (57 rules) are clean. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+A sixth finding, on the same review round, is in what the whole search starts from rather than
+in the search itself. A file-level inner attribute (`#![cfg(..)]`) gates the whole file the same
+way an item's own `#[cfg(..)]` gates that item — every construction site in the file inherits
+it — but the root `enclosing_cfg` `struct_literal_counts` seeds both `total`'s own visitor and
+`inside_targets`' own root formula from started empty, an always-true formula that gave the
+file's own gate no weight at all. `#![cfg(not(feature = "a"))]` at the top of a file, beside
+`#[cfg(feature = "a")] type Alias = CheckedDispatch;`, means the target alias itself never
+exists in any build that also has this file — the file requires `feature = "a"` off and the
+alias requires it on — but an empty root formula let a site anywhere in that file, however it
+was itself gated, count it as reachable anyway. Both roots now seed from
+`attrs_cfg(&file.attrs)` instead of `Cfg::All(Vec::new())`.
+`a_file_level_cfg_attribute_excludes_a_candidate_the_file_itself_could_never_compile_under` is
+the regression, confirmed RED against the pre-fix empty root (`total: 1` against an expected `0`)
+before landing; `a_file_with_no_file_level_cfg_still_counts_a_reachable_construction` is the
+control, confirming the seed does not turn into an always-excluding formula on a file that
+carries no inner attribute at all. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.

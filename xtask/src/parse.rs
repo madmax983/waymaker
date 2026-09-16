@@ -6193,12 +6193,19 @@ pub fn struct_literal_counts(
     // `&file.items`, so this is the same limit for every search either one runs
     // (issue #197).
     let alias_search_budget = alias_search_budget(&file.items);
-
+    // A file-level inner attribute (`#![cfg(..)]`) gates the whole file the same
+    // way an item's own `#[cfg(..)]` gates it — every construction site inherits
+    // it — so the root `enclosing_cfg` starts from it rather than from an empty,
+    // always-true formula (Codex review of PR #209, issue #206): a target alias
+    // gated `feature = "a"` beside a decoy gated `not(feature = "a")`, inside a
+    // file gated `not(feature = "a")`, is unreachable from any site in that file
+    // — the target alias itself never compiles there — but an empty root formula
+    // let the two coexist anyway.
     let mut total = Literals {
         stack: vec![&file.items],
         block_items: Vec::new(),
         shadow: Vec::new(),
-        enclosing_cfg: Cfg::All(Vec::new()),
+        enclosing_cfg: attrs_cfg(&file.attrs),
         block_shadow: Vec::new(),
         value_shadow: Vec::new(),
         name: name.to_owned(),
@@ -7745,7 +7752,12 @@ impl<'a> InsideTarget<'a> {
 /// The bodies [`FnScope`] selects, in source order.
 fn inside_targets<'a>(file: &'a syn::File, scope: &FnScope<'a>) -> Vec<InsideTarget<'a>> {
     let root_stack = vec![file.items.as_slice()];
-    let root_cfg = Cfg::All(Vec::new());
+    // Seeded from the file's own inner attributes, the same reason
+    // `struct_literal_counts`'s own root `enclosing_cfg` is (Codex review of
+    // PR #209, issue #206): a target this file only has under one `cfg` is
+    // unreachable from an `InsideTarget` this same gate excludes it from,
+    // and an empty, always-true root formula could not see that.
+    let root_cfg = attrs_cfg(&file.attrs);
     match *scope {
         FnScope::None => Vec::new(),
         FnScope::FirstFn(name) => {
@@ -28566,6 +28578,53 @@ mod cfg_alias_ambiguity_tests {
             "took {:?} for 100 sites repeating one unsatisfiable 16-atom pair",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn a_file_level_cfg_attribute_excludes_a_candidate_the_file_itself_could_never_compile_under() {
+        // Codex review of PR #209 (issue #206): the root `enclosing_cfg`
+        // started empty — always true — so a file-level inner attribute
+        // (`#![cfg(..)]`) gating the whole file was invisible to every
+        // construction site in it. `#![cfg(not(feature = "a"))]` at the top
+        // of a file, beside `#[cfg(feature = "a")] type Alias =
+        // CheckedDispatch;`, means the target alias itself never exists in
+        // any build that also has this file — the file requires `feature =
+        // "a"` off and the alias requires it on — so no site in the file,
+        // however it is itself gated, can ever really construct it.
+        let counts = struct_literal_counts(
+            "#![cfg(not(feature = \"a\"))]\n\
+             #[cfg(feature = \"a\")]\n\
+             type Alias = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Alias = Decoy;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_file_with_no_file_level_cfg_still_counts_a_reachable_construction() {
+        // The control for the test above: an unconditional file (no
+        // `#![cfg(..)]` at all) still lets an unconditional candidate
+        // through, confirming the file-level seed above does not turn into
+        // an always-excluding formula on a file that has none.
+        let counts = struct_literal_counts(
+            "type Alias = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 }
 
