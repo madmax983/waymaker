@@ -6143,3 +6143,21 @@ order of magnitude past even the slowest run seen here, so raising the ceiling t
 still separates "fixed" from "regressed to the shape this test was written to catch"
 with real margin on both sides, rather than narrowing what the test can distinguish. No
 new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of PR #204's commit before that CI fix found an eighteenth: `type_alias_target`
+discarded a `type` alias's own leading `::` entirely, and both its callers —
+`collect_item_aliases` and `own_aliases` — recorded `absolute: false` for every `type`
+alias unconditionally, never reading it. Confirmed against real `rustc`: `type Unchecked =
+::core::ops::Range<u8>;` reaches the extern prelude's own `core::ops::Range` directly,
+past every local scope, exactly as `use ::a::b as c;` already does (issue #92's own
+`absolute` field, added for exactly this shape) — but a local `mod core { pub mod ops {
+pub type Range = CheckedDispatch; } }` sharing the crate's own name was chased as though
+it might be what the alias really named, because nothing here ever told
+`try_alias_candidates`'s `if alias.absolute` short-circuit that this alias's target had a
+leading `::` at all. `type_alias_target` now returns the target segments paired with
+whether the path had one, and both callers thread it into `UseAlias::absolute` instead of
+a literal `false`. `an_absolute_type_alias_target_does_not_chase_a_same_named_local_module`
+and its control, `a_relative_type_alias_target_still_chases_a_same_named_local_module`,
+are the regression, the first confirmed RED against the pre-fix code before this fix
+landed. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
+id.

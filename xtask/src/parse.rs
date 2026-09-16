@@ -659,11 +659,11 @@ fn collect_item_aliases<'a>(
                 aliases,
             ),
             syn::Item::Type(type_item) => {
-                if let Some(target) = type_alias_target(&type_item.ty) {
+                if let Some((target, absolute)) = type_alias_target(&type_item.ty) {
                     aliases.push(UseAlias {
                         local: ident_name(&type_item.ident),
                         target,
-                        absolute: false,
+                        absolute,
                     });
                 }
             }
@@ -693,13 +693,26 @@ fn type_alias_path(ty: &syn::Type) -> Option<&syn::Path> {
     }
 }
 
-/// `ty`'s segments, if `ty` is a plain type path with no `<T as Trait>::` qualifier.
-fn type_alias_target(ty: &syn::Type) -> Option<Vec<String>> {
+/// `ty`'s segments, if `ty` is a plain type path with no `<T as Trait>::` qualifier —
+/// paired with whether that path was written with a leading `::`.
+///
+/// Codex review of PR #204: `type U = ::core::ops::Range<T>;` reaches the extern
+/// prelude directly, past every local scope, exactly as `use ::a::b as c;` already
+/// does — but both callers of this function had always recorded `absolute: false`
+/// for a `type` alias unconditionally, discarding `path.leading_colon` entirely,
+/// so a local `mod core { .. }` sharing a name with the crate the alias's target
+/// really names was chased as though it might be what the alias meant. Confirmed
+/// against real `rustc`: the two configurations resolve `core` to two different
+/// places, and only the leading `::` says which one a real build takes.
+fn type_alias_target(ty: &syn::Type) -> Option<(Vec<String>, bool)> {
     type_alias_path(ty).map(|path| {
-        path.segments
-            .iter()
-            .map(|segment| ident_name(&segment.ident))
-            .collect()
+        (
+            path.segments
+                .iter()
+                .map(|segment| ident_name(&segment.ident))
+                .collect(),
+            path.leading_colon.is_some(),
+        )
     })
 }
 
@@ -1176,11 +1189,11 @@ fn own_aliases<'a>(items: impl IntoIterator<Item = &'a syn::Item>) -> Vec<UseAli
                 );
             }
             syn::Item::Type(type_item) => {
-                if let Some(target) = type_alias_target(&type_item.ty) {
+                if let Some((target, absolute)) = type_alias_target(&type_item.ty) {
                     aliases.push(UseAlias {
                         local: ident_name(&type_item.ident),
                         target,
-                        absolute: false,
+                        absolute,
                     });
                 }
             }
@@ -24394,6 +24407,63 @@ mod cfg_alias_ambiguity_tests {
              fn forge<CheckedDispatch>() -> u8 {\n\
              \x20   type CheckedDispatch = inner::CheckedDispatch;\n\
              \x20   let _ = CheckedDispatch { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn an_absolute_type_alias_target_does_not_chase_a_same_named_local_module() {
+        // Codex review of PR #204, confirmed against real `rustc`: `type Unchecked
+        // = ::core::ops::Range<u8>;` reaches the extern prelude's own
+        // `core::ops::Range` directly, past every local scope, exactly as `use
+        // ::a::b as c;` already does — but `type_alias_target` had always
+        // discarded a type alias's own leading `::`, and both its callers
+        // recorded `absolute: false` unconditionally, so a local `mod core {
+        // pub mod ops { pub type Range = CheckedDispatch; } }` sharing the
+        // crate's own name was chased as though it might be what the alias
+        // really named, instead of stopping at the real `Range`'s own name.
+        let counts = struct_literal_counts(
+            "mod core {\n\
+             \x20   pub mod ops {\n\
+             \x20       pub type Range = CheckedDispatch;\n\
+             \x20   }\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = ::core::ops::Range<u8>;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_relative_type_alias_target_still_chases_a_same_named_local_module() {
+        // The control: with no leading `::`, the same target really does name
+        // the local module, and must still be counted.
+        let counts = struct_literal_counts(
+            "mod core {\n\
+             \x20   pub mod ops {\n\
+             \x20       pub type Range = CheckedDispatch;\n\
+             \x20   }\n\
+             }\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\n\
+             type Unchecked = core::ops::Range<u8>;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
              \x20   0\n\
              }",
             "CheckedDispatch",
