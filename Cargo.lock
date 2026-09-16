@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "waymaker-conformance"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "embedded-storage",
  "waymaker-fault",
@@ -404,11 +404,11 @@ dependencies = [
 
 [[package]]
 name = "waymaker-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "waymaker-drive"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "waymaker-core",
  "waymaker-fault",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "waymaker-embassy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "waymaker-emu"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "waymaker-facade-demo"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "waymaker-core",
  "waymaker-drive",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "waymaker-fault"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "waymaker-core",
  "waymaker-flash",
@@ -461,14 +461,14 @@ dependencies = [
 
 [[package]]
 name = "waymaker-flash"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "waymaker-core",
 ]
 
 [[package]]
 name = "waymaker-rig"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "embedded-storage",
  "waymaker-conformance",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "waymaker-size-probe"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "waymaker-core",
  "waymaker-embassy",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "waymaker-spec"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "waymaker-core",
  "waymaker-fault",
@@ -504,7 +504,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "pulldown-cmark",
