@@ -1152,6 +1152,130 @@ fn a_torn_outcome_at_the_reserve_boundary_still_leaves_room_for_the_retry() {
     commit(&mut rebooted, &mut device, &terminal()).expect("and the exit after it");
 }
 
+/// Fills `journal` with schedule/outcome pairs, admitted by the rule §10 used *before*
+/// issue #95: room for one outcome and the terminal record, with no extra slack for a torn
+/// retry. Every pair is written unreserved and checked by hand against `old_threshold`,
+/// which is `reserve().tail_bytes()` — the tail the current [`Reserve`] still asks for
+/// after an ordinary, already-resolved record, one `outcome_bytes` short of what it now
+/// asks for right after a fresh [`RecordRef::EffectScheduled`].
+///
+/// Returns how many whole pairs were committed.
+fn fill_to_the_old_boundary(journal: &mut Journal, device: &mut Nor, old_threshold: u32) -> u32 {
+    let mut committed = 0_u32;
+    loop {
+        if width(&schedule(committed)) + old_threshold > journal.room() {
+            return committed;
+        }
+        let Ok(_) = commit_unreserved(journal, device, &schedule(committed)) else {
+            unreachable!("the old rule admitted this schedule, so it fits")
+        };
+        let Ok(_) = commit_unreserved(journal, device, &outcome(committed)) else {
+            unreachable!("the old rule reserved room for this one outcome")
+        };
+        committed = committed.saturating_add(1);
+    }
+}
+
+#[test]
+fn a_schedule_admitted_by_a_weaker_reserve_can_strand_a_stricter_retry() {
+    // Issue #188. `Reserve::for_layout` is recomputed fresh from `Bounds` on every boot;
+    // nothing about it is on media, and `Recovery`/`Scan` decode bytes and a seal, never a
+    // reserve (`recovery-surface` pins that surface narrow on purpose). So a schedule a
+    // *weaker* firmware admitted carries no record of what its own formula promised, and a
+    // later, stricter firmware cannot tell that schedule apart from one its own formula
+    // admitted.
+    //
+    // ADR 0054 documents this as a precondition on how a fleet may be upgraded, not a code
+    // fix: this test is the falsifier that shows the gap is real and bounded. It reruns
+    // ADR 0052's own torn-outcome scenario one `outcome_bytes` short — the room a schedule
+    // gets under the rule before issue #95's `redelivery_slack` — and shows the retry a
+    // firmware with `redelivery_slack` needs is refused, forever, but *safely*: no byte
+    // moves, and the refusal is the same on every later boot.
+    let old_threshold = reserve().tail_bytes();
+
+    // Dry run: how many pairs the old rule admits in this bank.
+    let total = {
+        let mut device = Nor::new(geometry());
+        let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
+        let mut journal = opened(&mut device, region);
+        fill_to_the_old_boundary(&mut journal, &mut device, old_threshold)
+    };
+    assert!(total > 0, "a 4 KiB bank holds at least one effect");
+
+    let mut device = Nor::new(geometry());
+    let region = install(&mut device, BankId::A, Generation(1), RUN_INPUT);
+    let mut journal = opened(&mut device, region);
+    for seq in 0..total.saturating_sub(1) {
+        commit_unreserved(&mut journal, &mut device, &schedule(seq))
+            .expect("an earlier effect, admitted by the old rule");
+        commit_unreserved(&mut journal, &mut device, &outcome(seq)).expect("and resolved");
+    }
+    let last = total.saturating_sub(1);
+    let room_before_the_schedule = journal.room();
+    commit_unreserved(&mut journal, &mut device, &schedule(last))
+        .expect("the last effect the old rule admits");
+
+    // The smoking gun: the *current* reserve, asked about this exact schedule at this exact
+    // room, already refuses it. The old rule's promise and the new rule's promise disagree
+    // on the same bytes.
+    assert_eq!(
+        reserve().admits(&schedule(last), room_before_the_schedule),
+        Err(Refusal::NearCapacity),
+        "the schedule the old rule just admitted is one the current rule would not have"
+    );
+
+    // Tear the outcome: the frame body and its padding land, the commit seal never does —
+    // ADR 0052's own shape, on a schedule the *old* rule admitted rather than the current
+    // one.
+    let mut page = [0_u8; PAGE];
+    let staged = journal
+        .stage(&mut device, &outcome(last), &mut page)
+        .expect("the old rule reserved room for this one outcome");
+    let _sealable = staged
+        .payload_barrier()
+        .expect("the payload barrier returns");
+
+    // The boot after the crash, on firmware that has since gained `redelivery_slack`.
+    let mut recovery_page = [0_u8; PAGE];
+    let mut recovery = Recovery::new(region, &mut device);
+    while recovery.next(&mut recovery_page).is_some() {}
+    assert!(
+        matches!(recovery.ending(), Some(Ending::Clean { .. })),
+        "recovery cannot tell which firmware's reserve admitted the torn schedule, so it \
+         ignores the torn attempt exactly as issue #95 always does"
+    );
+
+    let mut rebooted = reserved(&mut device, region);
+    assert!(
+        rebooted.journal().room() < room_before_the_schedule,
+        "the torn slot still cost real bytes recovery cannot give back"
+    );
+
+    let before_the_retry = device.snapshot();
+    // The retry: the current rule needs `outcome_bytes` more than the old rule left behind
+    // for this schedule. This is issue #188 end to end — a schedule the old rule admitted
+    // has no redelivery slack for the current rule's retry.
+    assert_eq!(
+        commit(&mut rebooted, &mut device, &outcome(last)),
+        Err(ReservedError::Capacity(Refusal::NearCapacity)),
+        "a schedule the old rule admitted cannot be redelivered under the current rule"
+    );
+    assert_eq!(
+        device.snapshot(),
+        before_the_retry,
+        "the refusal moved no byte, exactly like every other refusal in this file"
+    );
+
+    // The stall is a stable, safe stop, not a one-time miscount: a second boot meets the
+    // same refusal.
+    let mut rebooted_again = reserved(&mut device, region);
+    assert_eq!(
+        commit(&mut rebooted_again, &mut device, &outcome(last)),
+        Err(ReservedError::Capacity(Refusal::NearCapacity)),
+        "the refusal is deterministic across reboots"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Admission, as a predicate
 // ---------------------------------------------------------------------------------------
