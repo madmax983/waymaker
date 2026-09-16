@@ -5652,6 +5652,25 @@ const fn is_namespace_unambiguous(item: &syn::Item) -> bool {
     )
 }
 
+/// Whether `item` is a unit or tuple struct — the two struct shapes whose
+/// name is *also* bound in the value namespace, as the implicit
+/// constructor real Rust generates for either one (`struct Allowed;` or
+/// `struct Allowed(u8);`, each callable as a value: `Allowed` or
+/// `Allowed(0)`). A record/braced struct (`struct Allowed { x: u8 }`) has
+/// no such constructor — construction is only ever `Allowed { x: 0 }`
+/// literal syntax — and binds only the type namespace, exactly like every
+/// other item [`is_namespace_unambiguous`] recognizes. Confirmed against
+/// real `rustc` (Codex review of PR #204).
+const fn is_unit_or_tuple_struct(item: &syn::Item) -> bool {
+    matches!(
+        item,
+        syn::Item::Struct(syn::ItemStruct {
+            fields: syn::Fields::Unit | syn::Fields::Unnamed(_),
+            ..
+        })
+    )
+}
+
 /// Picks which of `items`' own `use`/`type` aliases named `first` is the
 /// deterministic resolution answer — [`resolve_local_alias_chain`]'s and
 /// [`resolve_segments_from`]'s own single-alias pick, corrected for the same
@@ -5716,17 +5735,17 @@ fn preferred_alias<'a>(
         .filter(|item| !has_cfg_test(item_attrs(item)))
         .filter(|item| declares_name(item, first))
         .collect();
-    let chosen = candidates
+    let unconditional_winner = candidates
         .iter()
         .find(|item| is_namespace_unambiguous(item) && !has_any_cfg(item_attrs(item)))
-        .copied()
-        .or_else(|| {
-            if prefer_last {
-                candidates.last().copied()
-            } else {
-                candidates.first().copied()
-            }
-        })?;
+        .copied();
+    let chosen = unconditional_winner.or_else(|| {
+        if prefer_last {
+            candidates.last().copied()
+        } else {
+            candidates.first().copied()
+        }
+    })?;
     if let Some(alias) = own_aliases(core::iter::once(chosen))
         .into_iter()
         .find(|candidate| candidate.local == first)
@@ -5734,6 +5753,24 @@ fn preferred_alias<'a>(
         return Some(alias);
     }
     if !terminal {
+        return None;
+    }
+    // A unit or tuple struct's own name is *also* the value namespace's
+    // unconditional winner — its implicit constructor, callable as
+    // `Allowed` or `Allowed(0)` — unlike a record/braced struct, which has
+    // no constructor and never occupies the value namespace at all
+    // (confirmed against real `rustc`). So when the unconditional winner
+    // above is one of the two, it already owns this position outright and
+    // the value-namespace fallback below must not run at all: a competing
+    // `use` importing a value of the same name is either impossible code
+    // (E0255, if it too is unconditional) or dead code under every
+    // configuration that also compiles this struct (if it is `#[cfg]`-gated)
+    // — never a second, live answer this fallback may substitute (Codex
+    // review of PR #204: `struct Allowed(u8);` beside a `#[cfg]`-gated
+    // `use values::forbidden as Allowed;` still had this fallback rewrite a
+    // feature-off `Allowed(0)` call to `values::forbidden`, a name no
+    // compiling configuration of that call ever reaches).
+    if unconditional_winner.is_some_and(is_unit_or_tuple_struct) {
         return None;
     }
     let uses: Vec<&&'a syn::Item> = candidates
@@ -25925,6 +25962,65 @@ mod alias_scope_tests {
             paths
                 .iter()
                 .any(|path| path.segments == ["allowed", "Marker"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_unit_or_tuple_struct_excludes_a_cfg_gated_value_alias_of_one_name() {
+        // Codex review of PR #204, round 23: `struct Allowed(u8);` is
+        // unconditional and binds "Allowed" in the value namespace too, as
+        // its own implicit tuple-struct constructor. A same-scope
+        // `#[cfg(feature = "a")] use values::forbidden as Allowed;` can
+        // never be live wherever this struct compiles — enabling the
+        // feature collides with it in the value namespace (E0255), so the
+        // feature-off build's own `Allowed(0)` call always names the
+        // struct's constructor, confirmed against real `rustc`. The
+        // terminal fallback in `preferred_alias` had substituted the `use`
+        // regardless, rewriting a feature-off call to `values::forbidden`,
+        // a name no compiling configuration of it ever reaches.
+        let code = "mod values {\n\
+             \x20   pub fn forbidden() {}\n\
+             }\n\
+             struct Allowed(u8);\n\
+             #[cfg(feature = \"a\")]\n\
+             use values::forbidden as Allowed;\n\
+             fn forge() {\n\
+             \x20   Allowed(0);\n\
+             }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.segments == ["values", "forbidden"]),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_field_struct_does_not_suppress_a_value_alias_of_one_name() {
+        // The control for the test above: a struct with named fields has
+        // no implicit constructor at all — `Allowed { .. }` literal syntax
+        // constructs it, never a call — so it binds only the type
+        // namespace and never collides with a value import of the same
+        // name. `use values::forbidden as Allowed;` beside
+        // `struct Allowed { x: u8 }` compiles cleanly, confirmed against
+        // real `rustc`, and `Allowed()` still names the value import.
+        let code = "mod values {\n\
+             \x20   pub fn forbidden() {}\n\
+             }\n\
+             struct Allowed {\n\
+             \x20   x: u8,\n\
+             }\n\
+             use values::forbidden as Allowed;\n\
+             fn forge() {\n\
+             \x20   Allowed();\n\
+             }\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["values", "forbidden"]),
             "{paths:?}"
         );
     }

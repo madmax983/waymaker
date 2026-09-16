@@ -6267,3 +6267,35 @@ against an expected `0`) before landing; `an_impl_trait_path_does_not_fall_back_
 covers the same fix applied proactively to the trait-path call sites, on the identical
 categorical reasoning, confirmed RED the same way before landing. No new ADR: nothing here
 moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a twenty-third, and it is a gap in the twentieth
+round's own value-namespace fallback that neither the twenty-first nor the twenty-second
+round closed: the fallback substitutes the first or last `use` candidate it finds with no
+regard for whether an *unconditional* value-namespace winner already sits in the same
+scope. A unit or tuple struct's own name is bound in the value namespace too, as the
+implicit constructor real Rust generates for either shape — `struct Allowed;` or
+`struct Allowed(u8);`, each callable as a value — unlike a record/braced struct, which has
+no constructor and stays type-namespace-only. Confirmed against real `rustc`:
+`struct Allowed(u8);` beside `#[cfg(feature = "a")] use values::forbidden as Allowed;`
+compiles only with the feature off, where `Allowed(0)` calls the tuple-struct constructor;
+enabling the feature collides in the value namespace (E0255), so the `use` can never be
+live wherever this struct compiles. `resolved_path_uses` still passed `terminal = true` for
+a call's own callee, and the fallback rewrote the feature-off call to `values::forbidden` —
+a name no compiling configuration of it ever reaches, exactly the "unconditional winner
+excludes a conditional duplicate" pattern the fourteenth, seventeenth, nineteenth and
+twenty-first rounds each closed for the type namespace, met here in the value namespace
+instead. `is_unit_or_tuple_struct` is the new primitive, matching `syn::Item::Struct` with
+`Fields::Unit` or `Fields::Unnamed` — a record struct's `Fields::Named` is excluded, since
+it binds no value at all. `preferred_alias` now tracks whether its own strict, unconditional
+find (as opposed to the `prefer_last` fallback pick used when no unconditional winner
+exists) produced the chosen item, and when that unconditional winner is a unit or tuple
+struct, the value-namespace fallback never runs at all — the struct's own constructor
+already is the position's one live answer, and a competing `use` is either impossible code
+(if it too is unconditional) or dead code under every configuration that also compiles the
+struct (if `#[cfg]`-gated), never a second live candidate to substitute.
+`a_unit_or_tuple_struct_excludes_a_cfg_gated_value_alias_of_one_name` is the regression,
+confirmed RED against the pre-fix code (a call rewritten to `values::forbidden` in a
+feature-off build) before landing; `a_named_field_struct_does_not_suppress_a_value_alias_of_one_name`
+is the control, confirmed the fallback still substitutes a value alias when the
+unconditional winner is a record struct, which binds no value for it to compete with. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
