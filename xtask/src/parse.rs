@@ -844,7 +844,10 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 /// reset a struct, an enum, a union, or a `type` alias gets. A generic `const`
 /// item is not: `syn` cannot parse its syntax at all and falls back to an
 /// opaque `Item::Verbatim`, so no visitor ever reaches its bounds and no
-/// override is needed for it.
+/// override is needed for it. A generic `syn::ForeignItemType` (a `type`
+/// inside an `extern` block) needs no override for a different reason: `syn`
+/// does parse its generics, but rustc refuses them outright, on stable and on
+/// nightly alike, so no such item can ever appear in code that compiles.
 ///
 /// Issue #202: `visit_item_struct`, `visit_item_enum`, `visit_item_union`,
 /// `visit_item_type`, `visit_item_trait_alias`, `visit_trait_item_type`, and
