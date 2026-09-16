@@ -816,6 +816,197 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
     Ok(visitor.found)
 }
 
+/// The type-parameter names `generics` declares. Excludes lifetimes and
+/// const parameters: only a type parameter shares a namespace with a module
+/// or an alias, so only a type parameter can shadow one.
+fn generic_type_param_names(generics: &syn::Generics) -> Vec<String> {
+    generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            syn::GenericParam::Type(type_param) => Some(ident_name(&type_param.ident)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `struct`, `enum`, `union` and `trait` names `block` declares directly in its
+/// own statements. Each one shadows a same-named sibling module or `use` alias
+/// (issue #193). A `trait` is on this list for the same reason it is a
+/// [`LOCAL_SHADOWED_TYPE`] shadow: it occupies the same namespace a struct, enum or
+/// union does, so a block-local `trait Alias {}` shadows a module-level `use X as
+/// Alias;` in `dyn Alias` or `Alias::CONST` exactly the way a block-local struct
+/// already shadows one in `Alias { .. }` (Codex review of PR #203, round 4).
+///
+/// The shadow holds for the rest of this block, and for anything nested inside it —
+/// a nested `fn` or `impl` included. That is unlike a generic type parameter.
+/// Confirmed against `rustc`: real Rust resets this only at a `mod` boundary.
+///
+/// A `#[cfg(..)]`-gated declaration is excluded, whatever its condition — not only
+/// `#[cfg(test)]` — because this module does not evaluate a `cfg` (see
+/// [`has_any_cfg`]'s own doc). Shadowing suppresses a real resolution, the opposite
+/// of what [`own_aliases`] does with an uncertain alias, so the safe answer here is
+/// the opposite too: an item that might not ship must not be trusted to shadow
+/// (Codex review of this change, PR #203, on a `#[cfg(feature = "x")]` example). A
+/// `use` or `type` alias declared in the same block shadows too, but resolves to
+/// something instead of merely blocking resolution; [`resolve_local_alias_chain`]
+/// tracks those, not this list. A `let` binding is left out on purpose: it names a
+/// value, never a type or a module, so it cannot shadow a path this function's
+/// callers resolve.
+fn block_item_shadow_names(block: &syn::Block) -> Vec<String> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Item(item) = stmt else {
+                return None;
+            };
+            if has_any_cfg(item_attrs(item)) {
+                return None;
+            }
+            match item {
+                syn::Item::Struct(item) => Some(ident_name(&item.ident)),
+                syn::Item::Enum(item) => Some(ident_name(&item.ident)),
+                syn::Item::Union(item) => Some(ident_name(&item.ident)),
+                syn::Item::Trait(item) => Some(ident_name(&item.ident)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The subset of [`block_item_shadow_names`] whose declaration is a unit or tuple
+/// `struct` ([`is_unit_or_tuple_struct`]) — the one shape among the four
+/// `block_item_shadow_names` recognizes that also binds its name in the *value*
+/// namespace, as its own implicit constructor. Codex review of PR #203, on `use
+/// TimerSpec::AtPersistentTime as Chosen; fn f() { struct Chosen; let _ = Chosen; }`:
+/// `resolve_segments_from`'s own bare-segment check leaves a `block_shadow` name
+/// unrefused unless the path is qualified, because most of the four shapes
+/// (`enum`, `union`, `trait`, a record `struct`) occupy only the type/module
+/// namespace and cannot safely be assumed to shadow a bare reference that turns out
+/// to be a value. A unit or tuple `struct` is the one shape with no such ambiguity —
+/// it shadows *both* namespaces unconditionally — so a bare reference to one must
+/// still be refused, which is what this narrower list lets the bare-segment check
+/// ask for.
+fn block_item_value_shadow_names(block: &syn::Block) -> Vec<String> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let syn::Stmt::Item(item) = stmt else {
+                return None;
+            };
+            if has_any_cfg(item_attrs(item)) {
+                return None;
+            }
+            match item {
+                syn::Item::Struct(inner) if is_unit_or_tuple_struct(item) => {
+                    Some(ident_name(&inner.ident))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Adds `block`'s own [`block_item_shadow_names`] to `block_shadow` and its own
+/// [`block_item_value_shadow_names`] to `value_shadow`. Returns how many of each were
+/// added, to truncate both back off once the block is visited.
+///
+/// A separate list from a generic type parameter's own `shadow` (issue #181): the two
+/// reset at different points. `block_shadow` holds only for a `mod` boundary — a
+/// nested `fn`, `impl` or `trait` keeps seeing it — where `shadow` resets at all four
+/// (issue #193; see [`block_item_shadow_names`] for why).
+fn extend_block_shadow(
+    block_shadow: &mut Vec<String>,
+    value_shadow: &mut Vec<String>,
+    block: &syn::Block,
+) -> (usize, usize) {
+    let names = block_item_shadow_names(block);
+    let value_names = block_item_value_shadow_names(block);
+    let added = names.len();
+    let value_added = value_names.len();
+    block_shadow.extend(names);
+    value_shadow.extend(value_names);
+    (added, value_added)
+}
+
+/// Pushes `block`'s own item statements onto `block_items` (a stack, one entry per
+/// enclosing block — issue #197's twelfth round: resolving a block-local alias's own
+/// target has to stay within the block that declared it, which a single flattened list
+/// cannot express) and extends `block_shadow`/`value_shadow` with [`extend_block_shadow`],
+/// in one call. Returns how many `block_shadow`/`value_shadow` names were added, to
+/// truncate both back off once the block is visited; `block_items` is always popped by
+/// exactly one entry.
+///
+/// [`struct_literal_counts`] and [`generic_assoc_type_bindings_naming`] each call this
+/// from their own `visit_block`, in place of writing the same push-and-extend out by
+/// hand — which pushed both past `clippy::too_many_lines` once issue #193 added the
+/// second one.
+fn enter_block<'ast>(
+    block_items: &mut Vec<Vec<&'ast syn::Item>>,
+    block_shadow: &mut Vec<String>,
+    value_shadow: &mut Vec<String>,
+    block: &'ast syn::Block,
+) -> (usize, usize) {
+    let own_items: Vec<&'ast syn::Item> = block
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            syn::Stmt::Item(item) => Some(item),
+            _ => None,
+        })
+        .collect();
+    block_items.push(own_items);
+    extend_block_shadow(block_shadow, value_shadow, block)
+}
+
+/// Empties `shadow`, `block_shadow` and `value_shadow` for a module's own traversal.
+/// Returns all three outer values, to restore once it is done.
+///
+/// A module inherits neither a generic type parameter (issue #181) nor a block-local
+/// item (issue #193) from its lexical surroundings. Every visitor's own `visit_item_mod`
+/// calls this in place of three separate `core::mem::take`s, to stay under
+/// `clippy::too_many_lines`.
+fn reset_shadows_for_module(
+    shadow: &mut Vec<String>,
+    block_shadow: &mut Vec<String>,
+    value_shadow: &mut Vec<String>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    (
+        core::mem::take(shadow),
+        core::mem::take(block_shadow),
+        core::mem::take(value_shadow),
+    )
+}
+
+/// Adds `generics`'s own type-parameter names to `shadow` and returns how
+/// many were added, to truncate back off once the body is visited.
+///
+/// Additive, not a reset: an `impl`'s or a `trait`'s own methods really do
+/// see that block's generics, on top of any the method declares itself
+/// (issue #181). [`reset_generic_shadow`] is the sibling for every other
+/// item kind, which sees none of an enclosing scope's generics at all.
+fn extend_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> usize {
+    let names = generic_type_param_names(generics);
+    let added = names.len();
+    shadow.extend(names);
+    added
+}
+
+/// Replaces `shadow` with `generics`'s own type-parameter names. Returns the
+/// old value, to restore once the body is visited.
+///
+/// A nested `fn`, `impl`, `trait`, or `mod` inherits no generics from an
+/// enclosing item. Rustc says so directly: "nested items are independent
+/// from their parent item ... for name resolution" (`E0401`). Keeping the
+/// outer names here instead of a full reset would shadow a name real Rust
+/// still resolves through a sibling module or alias one level down (issue
+/// #181, Codex review of PR #195).
+fn reset_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> Vec<String> {
+    core::mem::replace(shadow, generic_type_param_names(generics))
+}
+
 /// The `syn::visit::Visit` overrides that keep `self.shadow` correct across a
 /// generics-bearing item's own body (issue #181).
 ///
@@ -869,6 +1060,19 @@ pub fn qself_type_alias_names(contents: &str) -> Result<Vec<String>, syn::Error>
 ///
 /// Defined here, above its first use in this file. A `macro_rules!` macro is
 /// visible only after its own definition.
+///
+/// Two more overrides sit outside this macro, on `self.block_shadow` and
+/// `self.value_shadow` rather than `self.shadow` (issue #193). `visit_block` feeds
+/// a block's own `struct`, `enum`, `union` and `trait` declarations to `block_shadow`,
+/// and its own unit-or-tuple-struct subset to `value_shadow`, via [`enter_block`]/
+/// [`extend_block_shadow`]. Neither is part of this macro's own reset: unlike a
+/// generic type parameter, a block-local item still shadows inside a nested `fn` or
+/// `impl` in the same block, so both stay untouched by every method this macro
+/// defines and reset only at `visit_item_mod`, in each visitor's own override, via
+/// [`reset_shadows_for_module`]. `visit_block` stays out of this macro for a second
+/// reason too: two visitors already have their own, for `self.block_items`, and the
+/// block-local names must join that same override rather than open a second one on
+/// the same node.
 macro_rules! shadow_generic_params {
     () => {
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -967,6 +1171,15 @@ struct AssocBindings<'a, 'ast> {
     // itself be a generic parameter, and a parameter named `CheckedDispatch` is not the
     // real type.
     shadow: Vec<String>,
+    // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
+    // (issue #193). A separate list from `shadow`: it resets only at a
+    // `mod` boundary, not at a nested `fn`/`impl`/`trait` — see
+    // `block_item_shadow_names`.
+    block_shadow: Vec<String>,
+    // The subset of `block_shadow` whose declaration is a unit or tuple `struct`
+    // (issue #193, Codex review of PR #203, round 2) — see
+    // `block_item_value_shadow_names`.
+    value_shadow: Vec<String>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
@@ -999,10 +1212,16 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
             self.stack.push(items);
         }
         let enclosing_block_items = core::mem::take(&mut self.block_items);
-        // A module sees none of an enclosing item's generics either (issue #181):
-        // reset for its own traversal, restore after.
-        let outer_shadow = core::mem::take(&mut self.shadow);
+        // A module inherits neither shadow (issues #181, #193): reset
+        // for its own traversal, restore after.
+        let (outer_shadow, outer_block_shadow, outer_value_shadow) = reset_shadows_for_module(
+            &mut self.shadow,
+            &mut self.block_shadow,
+            &mut self.value_shadow,
+        );
         syn::visit::visit_item_mod(self, node);
+        self.value_shadow = outer_value_shadow;
+        self.block_shadow = outer_block_shadow;
         self.shadow = outer_shadow;
         self.block_items = enclosing_block_items;
         if pushed {
@@ -1011,16 +1230,17 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
-        let own_items: Vec<&'ast syn::Item> = node
-            .stmts
-            .iter()
-            .filter_map(|stmt| match stmt {
-                syn::Stmt::Item(item) => Some(item),
-                _ => None,
-            })
-            .collect();
-        self.block_items.push(own_items);
+        let (shadowed, value_shadowed) = enter_block(
+            &mut self.block_items,
+            &mut self.block_shadow,
+            &mut self.value_shadow,
+            node,
+        );
         syn::visit::visit_block(self, node);
+        self.value_shadow
+            .truncate(self.value_shadow.len() - value_shadowed);
+        self.block_shadow
+            .truncate(self.block_shadow.len() - shadowed);
         self.block_items.pop();
     }
 
@@ -1042,29 +1262,34 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
             // with. `T: Alias<Dispatch = CheckedDispatch>` where `CheckedDispatch`
             // is a sibling generic parameter names that parameter, not the guarded
             // struct, so a shadowed head segment is excluded before the comparison
-            // below rather than matched on the string alone.
+            // below rather than matched on the string alone. A block-local
+            // `struct`/`enum`/`union`/`trait` of the same name shadows the same way
+            // (issue #193), gated the same way `resolve_segments_from` gates it —
+            // unconditionally for `shadow` and `value_shadow`, only for a qualified
+            // path for the rest of `block_shadow` (Codex review of PR #203, round 2:
+            // a bare, unit-or-tuple-struct block-local shadow occupies the value
+            // namespace too, so it must refuse a bare reference the same way a
+            // generic parameter already does).
             let shadowed = path.segments.first().is_some_and(|segment| {
-                self.shadow
-                    .iter()
-                    .any(|name| *name == ident_name(&segment.ident))
+                let name = ident_name(&segment.ident);
+                self.shadow.contains(&name)
+                    || self.value_shadow.contains(&name)
+                    || (path.segments.len() > 1 && self.block_shadow.contains(&name))
             });
             if !shadowed {
                 // `false`: an associated-type binding's value is always
                 // type-namespace, never a value — real Rust's own grammar
                 // decides that, not a segment count (Codex review of PR
                 // #204).
-                let local = (path.leading_colon.is_none() && path.segments.len() == 1)
-                    .then(|| path.segments.first())
-                    .flatten()
-                    .map(|segment| ident_name(&segment.ident))
-                    .and_then(|first| resolve_local_alias_chain(&self.block_items, &first, false));
-                let resolved = match local {
-                    Some((segments, true)) => segments,
-                    Some((segments, false)) => {
-                        resolve_segments_from(segments, &self.stack, &self.shadow, false)
-                    }
-                    None => resolve_segments(path, &self.stack, &self.shadow, false),
-                };
+                let (resolved, _) = resolve_with_block_alias(
+                    path,
+                    &self.stack,
+                    &self.shadow,
+                    &self.block_shadow,
+                    &self.value_shadow,
+                    &self.block_items,
+                    false,
+                );
                 if let Some(name) = resolved
                     .last()
                     .filter(|last| self.names.contains(&last.as_str()))
@@ -1106,6 +1331,8 @@ pub fn generic_assoc_type_bindings_naming(
         stack: vec![&file.items],
         block_items: Vec::new(),
         shadow: Vec::new(),
+        block_shadow: Vec::new(),
+        value_shadow: Vec::new(),
     };
     visitor.visit_file(&file);
     Ok(visitor.found)
@@ -1276,47 +1503,6 @@ fn own_modules<'a>(
         .collect()
 }
 
-/// The type-parameter names `generics` declares. Excludes lifetimes and
-/// const parameters: only a type parameter shares a namespace with a module
-/// or an alias, so only a type parameter can shadow one.
-fn generic_type_param_names(generics: &syn::Generics) -> Vec<String> {
-    generics
-        .params
-        .iter()
-        .filter_map(|param| match param {
-            syn::GenericParam::Type(type_param) => Some(ident_name(&type_param.ident)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Adds `generics`'s own type-parameter names to `shadow` and returns how
-/// many were added, to truncate back off once the body is visited.
-///
-/// Additive, not a reset: an `impl`'s or a `trait`'s own methods really do
-/// see that block's generics, on top of any the method declares itself
-/// (issue #181). [`reset_generic_shadow`] is the sibling for every other
-/// item kind, which sees none of an enclosing scope's generics at all.
-fn extend_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> usize {
-    let names = generic_type_param_names(generics);
-    let added = names.len();
-    shadow.extend(names);
-    added
-}
-
-/// Replaces `shadow` with `generics`'s own type-parameter names. Returns the
-/// old value, to restore once the body is visited.
-///
-/// A nested `fn`, `impl`, `trait`, or `mod` inherits no generics from an
-/// enclosing item. Rustc says so directly: "nested items are independent
-/// from their parent item ... for name resolution" (`E0401`). Keeping the
-/// outer names here instead of a full reset would shadow a name real Rust
-/// still resolves through a sibling module or alias one level down (issue
-/// #181, Codex review of PR #195).
-fn reset_generic_shadow(shadow: &mut Vec<String>, generics: &syn::Generics) -> Vec<String> {
-    core::mem::replace(shadow, generic_type_param_names(generics))
-}
-
 /// Every item anywhere in `items`, at any nesting depth, `mod` blocks
 /// included.
 ///
@@ -1468,11 +1654,16 @@ impl ResolvedPath {
 pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Error> {
     struct PathVisitor<'ast> {
         stack: Vec<&'ast [syn::Item]>,
-        // Generic type-parameter names in scope at the current point (issue
-        // #181), flat and cumulative like `block_items` elsewhere in this
-        // file: pushed on entering a generics-bearing item, truncated back
-        // off on the way out.
+        // Every generic type-parameter name currently shadowed (issue #181).
         shadow: Vec<String>,
+        // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
+        // (issue #193). Kept apart from `shadow`: the two reset at
+        // different points — see `block_item_shadow_names`.
+        block_shadow: Vec<String>,
+        // The subset of `block_shadow` whose declaration is a unit or tuple `struct`
+        // (issue #193, Codex review of PR #203, round 2) — see
+        // `block_item_value_shadow_names`.
+        value_shadow: Vec<String>,
         paths: Vec<ResolvedPath>,
     }
 
@@ -1504,14 +1695,32 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
             if let Some((_, items)) = node.content.as_ref() {
                 self.stack.push(items);
             }
-            // A module sees none of an enclosing item's generics either
-            // (issue #181): reset for its own traversal, restore after.
-            let outer_shadow = core::mem::take(&mut self.shadow);
+            // A module inherits neither shadow (issues #181, #193): reset
+            // for its own traversal, restore after.
+            let (outer_shadow, outer_block_shadow, outer_value_shadow) = reset_shadows_for_module(
+                &mut self.shadow,
+                &mut self.block_shadow,
+                &mut self.value_shadow,
+            );
             syn::visit::visit_item_mod(self, node);
+            self.value_shadow = outer_value_shadow;
+            self.block_shadow = outer_block_shadow;
             self.shadow = outer_shadow;
             if pushed {
                 self.stack.pop();
             }
+        }
+
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            // A block's own `struct`/`enum`/`union`/`trait` shadows a same-named
+            // module or alias for this block and everything nested inside
+            // it (issue #193).
+            let (added, value_added) =
+                extend_block_shadow(&mut self.block_shadow, &mut self.value_shadow, node);
+            syn::visit::visit_block(self, node);
+            self.value_shadow
+                .truncate(self.value_shadow.len() - value_added);
+            self.block_shadow.truncate(self.block_shadow.len() - added);
         }
 
         fn visit_path(&mut self, path: &'ast syn::Path) {
@@ -1522,7 +1731,14 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
             // call's own callee resolve through a value-namespace alias,
             // which is the case this fallback exists for.
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(path, &self.stack, &self.shadow, true),
+                segments: resolve_segments(
+                    path,
+                    &self.stack,
+                    &self.shadow,
+                    &self.block_shadow,
+                    &self.value_shadow,
+                    true,
+                ),
             });
             syn::visit::visit_path(self, path);
         }
@@ -1532,6 +1748,8 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
     let mut visitor = PathVisitor {
         stack: vec![&file.items],
         shadow: Vec::new(),
+        block_shadow: Vec::new(),
+        value_shadow: Vec::new(),
         paths: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -1568,9 +1786,17 @@ pub fn resolved_path_uses(contents: &str) -> Result<Vec<ResolvedPath>, syn::Erro
 /// there is nothing left to resolve inside it, so descending would only
 /// throw the name away.
 ///
-/// `shadow` is every generic type-parameter name currently in scope (issue
-/// #181): a bare head segment it names is never looked up, because a real
-/// generic parameter shadows a same-named module or alias outright.
+/// `shadow` is every generic type-parameter name currently in scope (issue #181), and
+/// `block_shadow` is every `struct`, `enum`, `union` or `trait` name a lexically
+/// enclosing block declares directly (issue #193) — two lists, not one, because they
+/// reset at different points; see [`block_item_shadow_names`]. `value_shadow` is the
+/// narrower subset of `block_shadow` whose declaration is a unit or tuple `struct`
+/// (issue #193, Codex review of PR #203) — the one shape that also binds its name in
+/// the value namespace, so a bare reference to it is shadowed unconditionally rather
+/// than only when the path is qualified; see [`block_item_value_shadow_names`]. A bare
+/// head segment any of these names is never looked up, because the real declaration
+/// shadows a same-named module or alias — a real compiler would resolve the name to
+/// it, not to the module.
 ///
 /// `value_position` is whether `path`, as the caller's own syntax placed it,
 /// could ever denote a value rather than a type, a module, an enum variant
@@ -1585,6 +1811,8 @@ fn resolve_segments(
     path: &syn::Path,
     stack: &[&[syn::Item]],
     shadow: &[String],
+    block_shadow: &[String],
+    value_shadow: &[String],
     value_position: bool,
 ) -> Vec<String> {
     let segments: Vec<String> = path
@@ -1595,7 +1823,14 @@ fn resolve_segments(
     if path.leading_colon.is_some() {
         return segments;
     }
-    resolve_segments_from(segments, stack, shadow, value_position)
+    resolve_segments_from(
+        segments,
+        stack,
+        shadow,
+        block_shadow,
+        value_shadow,
+        value_position,
+    )
 }
 
 /// [`resolve_segments`]'s own resolution loop, over a segment list that is already known to
@@ -1604,20 +1839,86 @@ fn resolve_segments(
 /// aliases could not finish resolving may itself be a module-level alias (issue #92, Codex's
 /// post-merge review).
 ///
-/// See [`resolve_segments`] for what `shadow` and `value_position` are.
+/// See [`resolve_segments`] for what `shadow`, `block_shadow`, `value_shadow` and
+/// `value_position` are.
 fn resolve_segments_from(
-    mut segments: Vec<String>,
+    segments: Vec<String>,
     stack: &[&[syn::Item]],
     shadow: &[String],
+    block_shadow: &[String],
+    value_shadow: &[String],
     value_position: bool,
 ) -> Vec<String> {
-    // Issue #181: a shadowed head segment names the generic parameter, not
-    // a module or an alias. Leaving it unresolved keeps the segment in the
-    // answer — a suffix check still reads it — rather than silently
-    // substituting through a same-named sibling module or alias.
-    if segments.first().is_some_and(|first| shadow.contains(first)) {
+    // Issues #181 and #193: a shadowed head segment names the generic
+    // parameter or the block-local item, not a module or an alias. Leaving
+    // it unresolved keeps the segment in the answer — a suffix check still
+    // reads it — rather than silently substituting through a same-named
+    // sibling module or alias.
+    //
+    // `block_shadow` only refuses a *qualified* head segment (more than one
+    // segment) for this reason (Codex review of PR #203, on
+    // `use TimerSpec::BestEffort as Chosen; fn f() { enum Chosen {} let _ =
+    // Chosen; }`): `block_item_shadow_names` names only a `struct`, `enum`,
+    // `union` or `trait`, and Rust puts those in the type/module namespace,
+    // never the value one, except a unit or tuple `struct` — which also
+    // introduces a value-namespace constructor of the same name — and this
+    // function has no way to tell the two shapes apart. A *qualified* path's
+    // head segment (`X::Y`) is always resolved in the type/module namespace,
+    // whichever shape declared it, so refusing there is sound either way. A
+    // *bare* one segment path can be either namespace, and `block_shadow`
+    // cannot tell without knowing whether the local declaration also
+    // occupies the value namespace — so refusing there risks exactly what
+    // Codex found: a real, aliased value the scanner has to see (an alias
+    // this file's own construction pins, like `timer-capability`'s
+    // `CLOCK_SPEC_CONSTRUCTION`, exist to catch) reported as an inert local
+    // name instead.
+    //
+    // `value_shadow` is the exception (Codex review of PR #203, round 2): when the
+    // local declaration is specifically a unit or tuple `struct`, its own implicit
+    // constructor occupies the value namespace too, so a bare reference genuinely is
+    // shadowed whichever namespace it turns out to be used in — `use
+    // TimerSpec::AtPersistentTime as Chosen; fn f() { struct Chosen; let _ = Chosen;
+    // }` names the local unit struct's constructor, never the imported clock spec,
+    // confirmed against real `rustc`. Refusing there closes the missed violation the
+    // wider, shape-blind exemption above left open, without reopening it for the
+    // three shapes that never occupy the value namespace at all. `shadow` (issue
+    // #181's generic type parameters) is not narrowed the same way: a type parameter
+    // never occupies the value namespace on its own, so a bare one has no namespace
+    // ambiguity to guess at.
+    if segments.first().is_some_and(|first| shadow.contains(first))
+        || segments
+            .first()
+            .is_some_and(|first| value_shadow.contains(first))
+        || (segments.len() > 1
+            && segments
+                .first()
+                .is_some_and(|first| block_shadow.contains(first)))
+    {
         return segments;
     }
+    resolve_segments_loop(segments, stack, value_position)
+}
+
+/// [`resolve_segments_from`]'s own resolution loop, run once its shadow check has
+/// already passed (or been skipped — see [`resolve_with_block_alias`]).
+///
+/// Split out for issue #193, Codex review of PR #203: a block-local alias's own
+/// *target* is source text written where the alias was declared, not where it is
+/// used, so it must not be checked against the *use* site's `block_shadow` — the
+/// same reason this loop's own alias substitutions, a few lines down, are never
+/// re-checked against `shadow`/`block_shadow` after they fire. Resolving a target
+/// against its declaration site's own shadow, rather than skipping the check
+/// entirely, would be the precise answer; it needs each block-local item paired
+/// with a shadow snapshot taken when it was declared, which is real estate this
+/// fix does not add — see [`resolve_with_block_alias`] for where that residual is
+/// recorded.
+///
+/// See [`resolve_segments`] for what `value_position` gates, via [`preferred_alias`].
+fn resolve_segments_loop(
+    mut segments: Vec<String>,
+    stack: &[&[syn::Item]],
+    value_position: bool,
+) -> Vec<String> {
     let mut scope = stack.len().saturating_sub(1);
     // `None` while resolution is still on the lexical ancestor stack;
     // `Some(items)` once it has stepped into a sibling module by name
@@ -1734,6 +2035,63 @@ fn resolve_segments_from(
     descended_prefix
 }
 
+/// Resolves a bare, single-segment `path` through a block-local `use`/`type` alias
+/// first, falling back to [`resolve_segments`]/[`resolve_segments_from`] over the
+/// module stack and both shadow lists otherwise. Returns the resolved segments and,
+/// when `path` was a bare single segment, that segment's own name before resolution.
+///
+/// [`struct_literal_counts`] and [`generic_assoc_type_bindings_naming`] each resolve a
+/// path this same way — a construction site's own path, or an associated-type
+/// binding's value — so this is the one place that logic lives, which is also what
+/// keeps both visitors' own methods under `clippy::too_many_lines` (issue #193).
+///
+/// A local alias's own *target* — the right-hand side of `type Local = Wrapper::X;`
+/// — is resolved through [`resolve_segments_loop`] directly, skipping the shadow
+/// check `resolve_segments`/`resolve_segments_from` open with. Codex review of PR
+/// #203: that text was written where the alias was declared, and a block nested
+/// deeper than the declaration — one that shadows `Wrapper` with a struct of its
+/// own — must not stop the target from resolving through the real module just
+/// because the *use* site sits inside that deeper block. The residual this still
+/// leaves: the target is resolved with no shadow check at all, rather than the
+/// declaration site's own — the same accepted shape [`resolve_segments_loop`]'s own
+/// alias substitutions already have. A construction pin's failure mode is a missed
+/// count, not an extra one, so resolving too eagerly here is the safe direction.
+fn resolve_with_block_alias(
+    path: &syn::Path,
+    stack: &[&[syn::Item]],
+    shadow: &[String],
+    block_shadow: &[String],
+    value_shadow: &[String],
+    block_items: &[Vec<&syn::Item>],
+    value_position: bool,
+) -> (Vec<String>, Option<String>) {
+    let first = (path.leading_colon.is_none() && path.segments.len() == 1)
+        .then(|| path.segments.first())
+        .flatten()
+        .map(|segment| ident_name(&segment.ident));
+    let local = first
+        .as_ref()
+        .and_then(|first| resolve_local_alias_chain(block_items, first, value_position));
+    let resolved = match local {
+        // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
+        // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
+        Some((segments, true)) => segments,
+        // Ran out of block-local aliases: the leftover head may itself be a
+        // module-level alias — `resolve_segments_loop` is a no-op if it is not.
+        // No shadow check here: see this function's own doc.
+        Some((segments, false)) => resolve_segments_loop(segments, stack, value_position),
+        None => resolve_segments(
+            path,
+            stack,
+            shadow,
+            block_shadow,
+            value_shadow,
+            value_position,
+        ),
+    };
+    (resolved, first)
+}
+
 /// Consumes a leading `self` segment, if there is one. The half of
 /// [`consume_scope_prefix`] that still applies once resolution has stepped
 /// into a module by name (issue #169): `self` still names that module, but
@@ -1801,14 +2159,14 @@ fn collect_future_implementors<'ast>(
         match item {
             syn::Item::Impl(implementation) => {
                 if let Some((_, trait_path, _)) = implementation.trait_.as_ref() {
-                    // No shadow set (issue #181): this scan never enters a
-                    // function body, and a generic type parameter cannot
-                    // fill the trait position of an `impl` — a type
-                    // parameter is a type, never a trait, so it has
-                    // nothing here to shadow. `false`: a trait path is
-                    // always type-namespace, never a value (Codex review
-                    // of PR #204).
-                    let resolved = resolve_segments(trait_path, stack, &[], false);
+                    // No shadow, any list (issues #181, #193): this scan
+                    // never enters a function body or a block, and a
+                    // generic type parameter cannot fill the trait position
+                    // of an `impl` — a type parameter is a type, never a
+                    // trait, so it has nothing here to shadow. `false`: a
+                    // trait path is always type-namespace, never a value
+                    // (Codex review of PR #204).
+                    let resolved = resolve_segments(trait_path, stack, &[], &[], &[], false);
                     if resolved.last().is_some_and(|last| last == "Future") {
                         if let syn::Type::Path(self_type) = implementation.self_ty.as_ref() {
                             if let Some(name) = self_type.path.segments.last() {
@@ -4989,6 +5347,15 @@ struct Literals<'ast> {
     // #181), same shape as `block_items`: pushed on entering a
     // generics-bearing item, truncated back off on the way out.
     shadow: Vec<String>,
+    // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
+    // (issue #193). A separate list from `shadow`: it resets only at a
+    // `mod` boundary, not at a nested `fn`/`impl`/`trait` — see
+    // `block_item_shadow_names`.
+    block_shadow: Vec<String>,
+    // The subset of `block_shadow` whose declaration is a unit or tuple `struct`
+    // (issue #193, Codex review of PR #203, round 2) — see
+    // `block_item_value_shadow_names`.
+    value_shadow: Vec<String>,
     name: String,
     count: usize,
     // The starting spending limit for one [`path_could_reach_target`] search — see
@@ -5041,10 +5408,16 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         // (Codex review) — so `block_items` is set aside for the module's own
         // traversal and restored once it is done, the same way `self.stack` is.
         let enclosing_block_items = core::mem::take(&mut self.block_items);
-        // A module sees none of an enclosing item's generics either
-        // (issue #181): reset for its own traversal, restore after.
-        let outer_shadow = core::mem::take(&mut self.shadow);
+        // A module inherits neither shadow (issues #181, #193): reset
+        // for its own traversal, restore after.
+        let (outer_shadow, outer_block_shadow, outer_value_shadow) = reset_shadows_for_module(
+            &mut self.shadow,
+            &mut self.block_shadow,
+            &mut self.value_shadow,
+        );
         syn::visit::visit_item_mod(self, node);
+        self.value_shadow = outer_value_shadow;
+        self.block_shadow = outer_block_shadow;
         self.shadow = outer_shadow;
         self.block_items = enclosing_block_items;
         if pushed {
@@ -5064,17 +5437,20 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         // block — kept a stack of separate scopes rather than one flattened list
         // so a further hop resolving one alias's own target can be bounded to
         // that alias's own declaration block (issue #197, Codex review of the
-        // PR).
-        let own_items: Vec<&'ast syn::Item> = node
-            .stmts
-            .iter()
-            .filter_map(|stmt| match stmt {
-                syn::Stmt::Item(item) => Some(item),
-                _ => None,
-            })
-            .collect();
-        self.block_items.push(own_items);
+        // PR). A block's own `struct`/`enum`/`union`/`trait` shadows a
+        // same-named module or alias for this block and everything nested
+        // inside it too (issue #193), tracked in `block_shadow` alongside it.
+        let (shadowed, value_shadowed) = enter_block(
+            &mut self.block_items,
+            &mut self.block_shadow,
+            &mut self.value_shadow,
+            node,
+        );
         syn::visit::visit_block(self, node);
+        self.value_shadow
+            .truncate(self.value_shadow.len() - value_shadowed);
+        self.block_shadow
+            .truncate(self.block_shadow.len() - shadowed);
         self.block_items.pop();
     }
 
@@ -5082,35 +5458,38 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         // A block-local alias is innermost, so it is tried first — and only for a
         // bare, single-segment path, the only shape a function-local `type`/`use`
         // alias is ever written against; a multi-segment path and module descent stay
-        // `resolve_segments`'s own job over the file's item-slice stack.
-        let first = (node.path.leading_colon.is_none() && node.path.segments.len() == 1)
-            .then(|| node.path.segments.first())
-            .flatten()
-            .map(|segment| ident_name(&segment.ident));
-        // `false` throughout: a struct-literal head is always type-namespace
-        // — real Rust's `Name { .. }` syntax can never construct a value —
-        // so it must never fall back to a value-namespace `use`, however
-        // many segments it has (Codex review of PR #204: `use
-        // values::CheckedDispatch as Allowed; struct Allowed { .. }`
-        // compiles, and `Allowed { .. }` constructs the local struct, never
-        // the function `values::CheckedDispatch`).
-        let local = first
-            .as_ref()
-            .and_then(|first| resolve_local_alias_chain(&self.block_items, first, false));
-        let resolved = match local {
-            // The chain ended on an absolute alias (`use ::a::b as c;`): already fully
-            // resolved, the same as `resolve_segments`'s own leading-colon short-circuit.
-            Some((segments, true)) => segments,
-            // Ran out of block-local aliases: the leftover head may itself be a
-            // module-level alias — `resolve_segments_from` is a no-op if it is not.
-            Some((segments, false)) => {
-                resolve_segments_from(segments, &self.stack, &self.shadow, false)
-            }
-            None => resolve_segments(&node.path, &self.stack, &self.shadow, false),
-        };
+        // `resolve_segments`'s own job over the file's item-slice stack. `false`
+        // throughout: a struct-literal head is always type-namespace — real Rust's
+        // `Name { .. }` syntax can never construct a value — so it must never fall
+        // back to a value-namespace `use`, however many segments it has (Codex
+        // review of PR #204: `use values::CheckedDispatch as Allowed; struct
+        // Allowed { .. }` compiles, and `Allowed { .. }` constructs the local
+        // struct, never the function `values::CheckedDispatch`).
+        let (resolved, _) = resolve_with_block_alias(
+            &node.path,
+            &self.stack,
+            &self.shadow,
+            &self.block_shadow,
+            &self.value_shadow,
+            &self.block_items,
+            false,
+        );
         let resolves_to_name = resolved
             .last()
             .is_some_and(|last| last.as_str() == self.name);
+        // Issue #193: a *qualified* head segment shadowed by a block-local
+        // `struct`/`enum`/`union`/`trait` names that local item outright, the same
+        // way `resolve_segments_from` treats it — there is no live alias for the
+        // fail-closed search below to consider either, so it is excluded from that
+        // search too rather than left to find an unrelated same-named candidate. A
+        // *bare* head shadowed by a unit-or-tuple-struct `value_shadow` entry is the
+        // same (Codex review of PR #203, round 2): that shape shadows unconditionally,
+        // so there is no live alias reachable through it here either.
+        let block_shadowed = node.path.segments.first().is_some_and(|segment| {
+            let name = ident_name(&segment.ident);
+            (node.path.segments.len() > 1 && self.block_shadow.contains(&name))
+                || self.value_shadow.contains(&name)
+        });
         // Issue #185: a name declared more than once, live under more than one
         // unevaluated `cfg`, is not something the deterministic resolution above
         // can pick correctly between. Ask separately whether *some* live
@@ -5118,6 +5497,7 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         // name or a qualified one alike (issue #197) — so an ambiguous alias is
         // never silently outvoted by another declaration sharing its name.
         let reachable_another_way = !resolves_to_name
+            && !block_shadowed
             && path_could_reach_target(
                 &node.path,
                 &self.stack,
@@ -5133,7 +5513,6 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         syn::visit::visit_expr_struct(self, node);
     }
 }
-
 /// Counts the struct literals in `contents` whose path's final segment is `name` — after
 /// resolving the file's `use` and `type` aliases — in total and inside a function body.
 ///
@@ -5176,6 +5555,8 @@ pub fn struct_literal_counts(
         stack: vec![&file.items],
         block_items: Vec::new(),
         shadow: Vec::new(),
+        block_shadow: Vec::new(),
+        value_shadow: Vec::new(),
         name: name.to_owned(),
         count: 0,
         alias_search_budget,
@@ -5185,16 +5566,17 @@ pub fn struct_literal_counts(
 
     let mut inside_count = 0_usize;
     for target in inside_targets(&file, &inside) {
-        // `shadow` starts empty here (issue #181): an `InsideTarget::Block` is
-        // visited from its `syn::Block` alone, with no `syn::Signature` in
-        // hand for the generics of the function that owns it. Any generics
-        // the target's own body declares afresh — a nested `fn` or `impl` —
-        // still push and pop correctly; only the outer function's own are
-        // unseen here, a narrower residual than the one this issue closes.
+        // `shadow` and `block_shadow` start empty here (issues #181, #193):
+        // an `InsideTarget::Block` has no outer function or block in hand
+        // to read either from. What the target's own body declares afresh
+        // still pushes and pops correctly; only an outer scope's own is
+        // unseen — a narrower residual than the one this issue closes.
         let mut visitor = Literals {
             stack: target.stack().to_vec(),
             block_items: Vec::new(),
             shadow: Vec::new(),
+            block_shadow: Vec::new(),
+            value_shadow: Vec::new(),
             name: name.to_owned(),
             count: 0,
             alias_search_budget,
@@ -7074,9 +7456,16 @@ impl NameUses {
 pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
     struct Names<'ast> {
         stack: Vec<&'ast [syn::Item]>,
-        // Generic type-parameter names in scope at the current point (issue
-        // #181), same shape as `PathVisitor`'s own.
+        // Every generic type-parameter name currently shadowed (issue #181),
+        // same shape as `PathVisitor`'s own.
         shadow: Vec<String>,
+        // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
+        // (issue #193), same shape as `PathVisitor`'s own.
+        block_shadow: Vec<String>,
+        // The subset of `block_shadow` whose declaration is a unit or tuple `struct`
+        // (issue #193, Codex review of PR #203, round 2) — see
+        // `block_item_value_shadow_names`.
+        value_shadow: Vec<String>,
         idents: Vec<String>,
         paths: Vec<ResolvedPath>,
     }
@@ -7112,14 +7501,32 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
             if let Some((_, items)) = node.content.as_ref() {
                 self.stack.push(items);
             }
-            // A module sees none of an enclosing item's generics either
-            // (issue #181): reset for its own traversal, restore after.
-            let outer_shadow = core::mem::take(&mut self.shadow);
+            // A module inherits neither shadow (issues #181, #193): reset
+            // for its own traversal, restore after.
+            let (outer_shadow, outer_block_shadow, outer_value_shadow) = reset_shadows_for_module(
+                &mut self.shadow,
+                &mut self.block_shadow,
+                &mut self.value_shadow,
+            );
             syn::visit::visit_item_mod(self, node);
+            self.value_shadow = outer_value_shadow;
+            self.block_shadow = outer_block_shadow;
             self.shadow = outer_shadow;
             if pushed {
                 self.stack.pop();
             }
+        }
+
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            // Issue #193: a block's own `struct`/`enum`/`union`/`trait` shadows a
+            // same-named module or alias for this block and everything
+            // nested inside it.
+            let (added, value_added) =
+                extend_block_shadow(&mut self.block_shadow, &mut self.value_shadow, node);
+            syn::visit::visit_block(self, node);
+            self.value_shadow
+                .truncate(self.value_shadow.len() - value_added);
+            self.block_shadow.truncate(self.block_shadow.len() - added);
         }
 
         fn visit_ident(&mut self, node: &'ast syn::Ident) {
@@ -7133,7 +7540,14 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
             // documented same-spelled-alias residual, and `true` is what
             // lets a call's own callee resolve through a value alias.
             self.paths.push(ResolvedPath {
-                segments: resolve_segments(node, &self.stack, &self.shadow, true),
+                segments: resolve_segments(
+                    node,
+                    &self.stack,
+                    &self.shadow,
+                    &self.block_shadow,
+                    &self.value_shadow,
+                    true,
+                ),
             });
             syn::visit::visit_path(self, node);
         }
@@ -7144,6 +7558,8 @@ pub fn name_uses(contents: &str) -> Result<NameUses, syn::Error> {
     let mut names = Names {
         stack: vec![&file.items],
         shadow: Vec::new(),
+        block_shadow: Vec::new(),
+        value_shadow: Vec::new(),
         idents: Vec::new(),
         paths: Vec::new(),
     };
@@ -26988,6 +27404,451 @@ mod generic_shadow_tests {
              S<Marker>(Marker);\n";
         let names = name_uses(code).expect("the fixture parses");
         assert!(names.names_decision("Disallowed"), "{:?}", names.paths);
+    }
+}
+
+#[cfg(test)]
+mod block_local_item_shadow_tests {
+    //! Issue #193: a block-local `struct`, `enum` or `union` shadows a same-named
+    //! sibling module or `use` alias for the rest of the block that declares it, the
+    //! same way a generic type parameter already does (issue #181). `resolve_segments`
+    //! had no notion of a block's own item declarations at all, so it stepped into the
+    //! sibling module anyway and rewrote the path through the module's alias — the
+    //! shape `generic_shadow_tests` already covers for a generic parameter, met here
+    //! for a block-local item instead.
+    use super::{
+        FnScope, generic_assoc_type_bindings_naming, name_uses, resolved_path_uses,
+        struct_literal_counts,
+    };
+
+    #[test]
+    fn a_block_local_struct_shadows_a_same_named_sibling_module() {
+        // `TimerSpec` names the block-local unit struct here, not the
+        // sibling module — real Rust resolves the bare head segment to it
+        // (and then refuses `TimerSpec::BestEffort` outright, since the
+        // struct has no such item; this scanner only has to agree that the
+        // struct is what the segment means, not replay that refusal).
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn f() {\n    \
+             struct TimerSpec;\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a block-local struct did not shadow the sibling module's alias: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed module's alias resolved anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_local_enum_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn f() {\n    \
+             enum TimerSpec {}\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a block-local enum did not shadow the sibling module's alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_local_union_shadows_a_same_named_sibling_module() {
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn f() {\n    \
+             union TimerSpec { a: u8 }\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a block-local union did not shadow the sibling module's alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn name_uses_also_respects_block_local_item_shadowing() {
+        // `name_uses` shares `resolve_segments` with `resolved_path_uses`;
+        // both must agree.
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn f() {\n    \
+             struct TimerSpec;\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let names = name_uses(code).expect("the fixture parses");
+        assert!(
+            names.names_decision("TimerSpec::BestEffort"),
+            "{:?}",
+            names.paths
+        );
+        assert!(!names.names_decision("Disallowed"), "{:?}", names.paths);
+    }
+
+    #[test]
+    fn struct_literal_counts_respects_block_local_item_shadowing() {
+        // A block-local struct can qualify an associated-type-shaped struct
+        // literal the same way a module can be stepped into — the count
+        // must not attribute a shadowed reference to the real, disallowed
+        // type behind the module's alias.
+        let code = "mod CheckedDispatch {\n    pub use Disallowed as Sneaky;\n}\nfn f() {\n    \
+             struct CheckedDispatch;\n    let _ = CheckedDispatch::Sneaky {};\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(
+            counts.total, 0,
+            "a shadowed block-local struct's construction counted as the real type: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn generic_assoc_type_bindings_naming_respects_block_local_item_shadowing() {
+        // The same shadowing has to hold for issue #184's scan, the third
+        // caller `resolve_segments`/`resolve_segments_from` feed. The
+        // binding sits in a `let`'s own type ascription so it is read in
+        // the same block as the shadowing struct — a binding in the
+        // enclosing `fn`'s own signature is elaborated before the block
+        // and cannot be shadowed by anything the block declares.
+        let code = "mod CheckedDispatch {\n    pub use Disallowed as Sneaky;\n}\nfn f() {\n    \
+             struct CheckedDispatch;\n    let _: &dyn Alias<Sneaky = \
+             CheckedDispatch::Sneaky>;\n}\n";
+        let found =
+            generic_assoc_type_bindings_naming(code, &["Disallowed"]).expect("the fixture parses");
+        assert!(
+            found.is_empty(),
+            "a shadowed block-local struct's binding counted as the real type: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_shadowing_block_local_struct_does_not_leak_into_a_sibling_function() {
+        // Only the declaring function's own body is shadowed. An ordinary
+        // function in the same file must still see the real module and
+        // descend into it as issue #169 intends.
+        let code = "mod TimerSpec {\n    pub use core::future::Future as BestEffort;\n}\nfn \
+             shadowed() {\n    struct TimerSpec;\n    let _ = TimerSpec::BestEffort;\n}\nfn \
+             plain() {\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future"]),
+            "an unshadowed sibling function lost ordinary module descent: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "the shadowed function's own reference was resolved through the module anyway: \
+             {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_fn_inherits_its_parents_block_local_shadow() {
+        // Unlike a generic type parameter, a block-local item is not reset
+        // by `E0401`: confirmed against `rustc` (issue #193 review) — a
+        // `fn` nested inside a block still sees that block's own `struct`,
+        // `enum` or `union`, the same way it still sees the block's own
+        // local variables. Only a `mod` boundary resets it.
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn outer() {\n    \
+             struct TimerSpec;\n    fn inner() {\n        let _ = TimerSpec::BestEffort;\n    \
+             }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a nested fn did not inherit its parent block's own shadow: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_impls_own_methods_inherit_its_parents_block_local_shadow() {
+        // Same confirmation, for an `impl` declared inside a block: its
+        // self type and its methods both still see that block's own item.
+        let code = "mod Local {\n    pub use Disallowed as Sneaky;\n}\nfn f() {\n    struct \
+             Local;\n    impl Local {\n        fn g() {\n            let _ = Local::Sneaky;\n    \
+             }\n    }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a nested impl's own method did not inherit its parent block's own shadow: \
+             {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_mod_does_not_inherit_its_parents_block_local_shadow() {
+        // A `mod` really is the one boundary that resets a block-local
+        // shadow (confirmed against `rustc`): a nested `mod`'s own items
+        // see the sibling module's real alias, not the enclosing block's
+        // struct of the same name.
+        let code = "mod TimerSpec {\n    pub use core::future::Future as BestEffort;\n}\nfn \
+             outer() {\n    struct TimerSpec;\n    mod inner {\n        fn h() {\n            \
+             let _ = super::TimerSpec::BestEffort;\n        }\n    }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["core", "future", "Future"]),
+            "a nested mod wrongly inherited its parent block's own shadow, hiding the real \
+             alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_block_inherits_its_parents_block_local_shadow() {
+        // Unlike a nested `fn`, a bare nested `{ .. }` block is not a new
+        // item — it still sees the enclosing block's own local items, the
+        // same way it still sees the enclosing block's own local variables.
+        let code = "mod TimerSpec {\n    pub use Disallowed as BestEffort;\n}\nfn f() {\n    \
+             struct TimerSpec;\n    {\n        let _ = TimerSpec::BestEffort;\n    }\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a nested block did not inherit its parent block's own shadow: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_test_gated_block_local_struct_does_not_shadow_production_code() {
+        // Test code is not shipped code (issue #51): a struct that exists
+        // only under `#[cfg(test)]` must not hide a production reference's
+        // real target.
+        let code = "mod TimerSpec {\n    pub use Real as BestEffort;\n}\nfn f() {\n    \
+             #[cfg(test)]\n    struct TimerSpec;\n    let _ = TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Real"]),
+            "a #[cfg(test)]-gated struct wrongly shadowed a production reference: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_struct_gated_by_a_non_test_cfg_does_not_shadow_either() {
+        // Codex review of this change (PR #203): this module does not
+        // evaluate a `cfg`, so a struct behind `#[cfg(feature = "x")]`
+        // might not ship either. Shadowing would suppress a real match in
+        // the build where it does not exist, so it must not shadow, the
+        // same as a `#[cfg(test)]`-gated one.
+        let code = "mod TimerSpec {\n    pub use Real as BestEffort;\n}\nfn f() {\n    \
+             #[cfg(feature = \"local\")]\n    struct TimerSpec;\n    let _ = \
+             TimerSpec::BestEffort;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Real"]),
+            "a struct gated by a non-test cfg wrongly shadowed a production reference: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_deeper_blocks_shadow_does_not_reach_back_into_an_aliass_own_target() {
+        // Codex review of this change (PR #203): `Local`'s own target,
+        // `Wrapper::Sneaky`, is source text written where `Local` was
+        // declared — outside the inner block. A struct the *inner* block
+        // declares must not stop that target from resolving through the
+        // real module just because `Local` happens to be used from
+        // inside that inner block.
+        let code = "mod Wrapper {\n    pub use Real as Sneaky;\n}\nfn f() {\n    type Local = \
+             Wrapper::Sneaky;\n    {\n        struct Wrapper;\n        let _ = Local {};\n    \
+             }\n}\n";
+        let counts =
+            struct_literal_counts(code, "Real", FnScope::None).expect("the fixture parses");
+        assert_eq!(
+            counts.total, 1,
+            "an inner block's own shadow reached back into an outer alias's target: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_deeper_blocks_own_struct_does_not_outrank_an_outer_alias_of_the_same_name() {
+        // Codex review of this change (PR #203): a residual, not fixed here.
+        // `resolve_local_alias_chain` finds the outer `type Alias = ...`
+        // before `block_shadow` is ever consulted, so the inner block's
+        // own `struct Alias;` does not win the way real Rust says it
+        // should. `own_aliases` never reads a struct/enum/union
+        // declaration at all, so telling the two apart needs each one
+        // paired with the depth it was declared at — machinery this fix
+        // does not add. This is an over-count, not a missed one, which is
+        // the safe side for a construction pin (see
+        // `alias_could_reach_target`'s own doc). Pinned so a future
+        // change cannot silently flip it to a missed count instead.
+        let code = "fn f() {\n    type Alias = Disallowed;\n    {\n        struct Alias;\n        \
+             let _ = Alias {};\n    }\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn path_could_reach_target_does_not_consult_block_shadow_for_a_type_only_shape() {
+        // Codex review of this change (PR #203): the same residual met a second way,
+        // narrowed by the merge's own P1 fix (round 2) to the shapes it did not close.
+        // A unit or tuple `struct` used to demonstrate this residual, but that shape is
+        // now closed: `resolve_with_block_alias` correctly leaves a bare reference to
+        // one unresolved (`value_shadow`), and `Literals::visit_expr_struct`'s own
+        // `block_shadowed` pre-check now excludes it from the fail-closed backstop too,
+        // so `struct Alias; let _ = Alias {};` beside `use Disallowed as Alias;`
+        // correctly counts zero. An `enum`, which has no implicit constructor and so
+        // stays namespace-ambiguous for a bare reference the same way it does in
+        // `resolved_path_uses` (see the `_items_name` test above), still reaches this
+        // gap: `resolve_with_block_alias` correctly leaves `Alias` unresolved here in
+        // the type-only sense `resolve_segments_from`'s own qualified-only narrowing
+        // does not reach for a *bare* segment, but `path_could_reach_target` (issue
+        // #185's own fallback) reads only `own_aliases`, which is blind to the
+        // block-local enum entirely, so it still finds the module-level `use` and
+        // counts anyway. An over-count, still pinned rather than fixed, for the same
+        // reason issue #205 files the class of gap this belongs to.
+        let code = "use Disallowed as Alias;\nfn f() {\n    enum Alias {}\n    let _ = Alias \
+             {};\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_bare_construction_of_a_block_local_unit_struct_no_longer_over_counts() {
+        // The positive case the round above leaves closed: Codex review of the merge
+        // of this change with `main` (P1) found that a bare reference to a unit or
+        // tuple `struct` — unlike an `enum`, `union`, `trait` or record `struct` — is
+        // never namespace-ambiguous, since its own implicit constructor occupies the
+        // value namespace too. `struct Alias {};` genuinely constructs the local unit
+        // struct, never `Disallowed`, so this must count zero rather than the one the
+        // test above still pins for a type-only shape.
+        let code = "use Disallowed as Alias;\nfn f() {\n    struct Alias;\n    let _ = Alias \
+             {};\n}\n";
+        let counts =
+            struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_trait_shadows_a_same_named_sibling_alias_for_a_qualified_reference() {
+        // Codex review of this change (PR #203): `Alias` occupies the same
+        // namespace a struct, enum or union does, so a block-local
+        // `trait Alias {}` shadows a module-level `use Disallowed as
+        // Alias;` for a *qualified* reference (`Alias::CONST`) exactly the
+        // way a block-local struct already shadows one for `Alias { .. }`
+        // — `block_item_shadow_names` had matched only
+        // `Item::Struct`/`Item::Enum`/`Item::Union` and fell through to
+        // `_ => None` on `Item::Trait`. A *bare* reference (`dyn Alias`) is
+        // a separate, narrower finding — see
+        // `a_bare_reference_to_a_block_local_trait_is_not_shadowed_either`,
+        // below, for why it is pinned rather than fixed the same way.
+        let code = "use Disallowed as Alias;\nfn f() {\n    trait Alias {}\n    let _ = \
+             Alias::CONST;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Alias", "CONST"]),
+            "a block-local trait did not shadow the module-level alias: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "the shadowed alias resolved through the block-local trait anyway: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_a_block_local_trait_is_not_shadowed_either() {
+        // The mirror image of the qualified case above, and a known,
+        // deliberate residual rather than a bug this change chases: a bare
+        // `dyn Alias` is a single-segment path, so the narrowing in
+        // `resolve_segments_from` (Codex review, PR #203, P1 — see its own
+        // doc comment) leaves it unshadowed the same way a bare value
+        // reference now is, and it resolves through the module alias to
+        // `Disallowed`. That is the *safe* direction for the checks this
+        // scanner backs — an over-strict false positive on legitimate code
+        // that uses a local trait, never a missed violation — where letting
+        // a bare *value* reference stay wrongly shadowed was the dangerous
+        // one. Fixing this one too needs the same namespace-aware
+        // machinery the doc comment on the narrowing already says this
+        // scanner does not have.
+        let code = "use Disallowed as Alias;\nfn f() {\n    trait Alias {}\n    fn accepts(_: \
+             &dyn Alias) {}\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a bare reference to a block-local trait was unexpectedly shadowed: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_a_block_local_items_name_still_resolves_a_value_namespace_alias() {
+        // Codex review of this change (PR #203, P1): `Chosen` names a
+        // module-level value import (`TimerSpec::BestEffort`, a const) and
+        // a block-local zero-variant `enum`, which occupies only the
+        // type/module namespace and so cannot shadow the import for a
+        // *bare* reference — real Rust resolves `let _bad = Chosen;` to the
+        // import. `block_shadow` used to refuse every occurrence of a
+        // shadowed name regardless of how many segments the path had, which
+        // hid the alias from a construction pin like `timer-capability`'s
+        // `CLOCK_SPEC_CONSTRUCTION`: it would see only the allowed
+        // `TimerSpec::AtPersistentTime` reference and miss the disallowed
+        // one reached through `Chosen`.
+        let code = "use TimerSpec::BestEffort as Chosen;\nfn f() {\n    enum Chosen {}\n    let \
+             _ok = TimerSpec::AtPersistentTime;\n    let _bad = Chosen;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "BestEffort"]),
+            "a bare reference wrongly stayed shadowed instead of resolving the value-namespace \
+             alias: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_a_block_local_unit_struct_still_shadows_a_value_namespace_alias() {
+        // Codex review of the merge of this change with `main` (P1): the fix above
+        // widened the exemption to every `block_shadow` shape, but a unit or tuple
+        // `struct` is not namespace-ambiguous the way an `enum`/`union`/`trait`/record
+        // `struct` is — its own implicit constructor occupies the *value* namespace
+        // too, so a bare reference to it genuinely is shadowed whichever namespace it
+        // turns out to be used in. `use TimerSpec::AtPersistentTime as Chosen; fn f() {
+        // struct Chosen; let _ = Chosen; }` names the local unit struct's constructor,
+        // never the imported clock spec, confirmed against real `rustc` — so
+        // `resolved_path_uses` must not resolve `Chosen` through the alias here, or a
+        // construction pin like `timer-capability`'s `CLOCK_SPEC_CONSTRUCTION` would
+        // see an allowed `TimerSpec::AtPersistentTime` reference that production code
+        // never actually makes.
+        let code = "use TimerSpec::AtPersistentTime as Chosen;\nfn f() {\n    struct \
+             Chosen;\n    let _ = Chosen;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "AtPersistentTime"]),
+            "a bare reference to a block-local unit struct resolved through the \
+             value-namespace alias instead of staying shadowed: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_reference_to_a_block_local_record_struct_still_resolves_a_value_namespace_alias() {
+        // The control for the fix above: a *record* struct (`Fields::Named`) has no
+        // implicit constructor at all, so it stays namespace-ambiguous for a bare
+        // reference exactly like the zero-variant `enum` case does, and must not be
+        // swept into the narrower `value_shadow` refusal alongside a unit/tuple one.
+        let code = "use TimerSpec::AtPersistentTime as Chosen;\nfn f() {\n    struct Chosen \
+             { x: u8 }\n    let _bad = Chosen;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.segments == ["TimerSpec", "AtPersistentTime"]),
+            "a bare reference to a block-local record struct was wrongly treated as a \
+             value-namespace shadow: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_reference_through_a_block_local_items_name_still_shadows() {
+        // The narrowing above must not reopen issue #193's own bug: a
+        // *qualified* reference (`Local::Sneaky`) is always the type/module
+        // namespace at its head segment, whichever kind of item shadows it,
+        // so it must still refuse to resolve through the sibling module.
+        let code = "mod Local {\n    pub use Disallowed as Sneaky;\n}\nfn f() {\n    enum Local \
+             {}\n    let _ = Local::Sneaky;\n}\n";
+        let paths = resolved_path_uses(code).expect("the fixture parses");
+        assert!(
+            !paths.iter().any(|path| path.segments == ["Disallowed"]),
+            "a qualified reference resolved through the sibling module despite the block-local \
+             enum: {paths:?}"
+        );
     }
 }
 
