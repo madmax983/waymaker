@@ -24158,6 +24158,28 @@ mod raw_identifier_tests {
     }
 
     #[test]
+    fn a_generic_bound_bound_through_a_block_local_module_sharing_an_outer_generic_name_is_reported()
+     {
+        // Codex review of PR #208, issue #205. A nested item's own generic
+        // parameter always resets `shadow` (issue #181). So `forge`'s own
+        // `T` replaces the outer `Traits` before its bound is checked. The
+        // outer `Traits` is gone. The backstop runs and finds the module.
+        // Checked against real `rustc`. It confirms this compiles. A second
+        // check confirms the opposite case: a bound naming its *own* item's
+        // generic parameter through a same-named sibling module does not
+        // compile at all (`E0220`). The parameter always wins there. That is
+        // what the outer `shadowed` gate above assumes.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn outer<Traits>() {\n\
+             \x20   mod Traits { pub use CheckedDispatch as Marker; }\n\
+             \x20   fn forge<T: Alias<Dispatch = Traits::Marker>>() {}\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
     fn an_assignment_beneath_a_guarded_ancestor_field_is_reported() {
         // Codex, issue #92's tenth round: `dispatch.intent.request.kind = x;` assigns to
         // `kind`, not to a guarded name directly — but `intent` and `request` are both
