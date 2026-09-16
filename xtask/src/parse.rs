@@ -5084,6 +5084,46 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         self.enclosing_cfg = outer_cfg;
     }
 
+    // An expression-statement's own `cfg` is otherwise unseen too: Rust
+    // permits `#[cfg(..)]` directly on an expression in statement
+    // position (`#[cfg(not(feature = "a"))] { let _ = Unchecked {}; }`),
+    // and `expr_attrs` is this file's existing, exhaustive per-variant
+    // reader for it (Codex review of the fix, round 4). Skipped whenever
+    // an expression carries no attributes at all — nearly every one in a
+    // real file — so this stays a cheap no-op push/pop rather than a
+    // clone on every expression node.
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        let attrs = expr_attrs(node);
+        if attrs.is_empty() {
+            syn::visit::visit_expr(self, node);
+            return;
+        }
+        if has_cfg_test(attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(attrs)]);
+        syn::visit::visit_expr(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A `match` arm's own `cfg` is the other half of the same finding:
+    // `syn::Arm` carries its own `attrs` too, and the default descent
+    // never reads them (Codex review of the fix, round 4).
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_arm(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_arm(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
     shadow_generic_params!();
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
@@ -26458,6 +26498,52 @@ mod cfg_alias_ambiguity_tests {
              \x20   #[cfg(not(feature = \"a\"))]\n\
              \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
              \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_cfg_gated_block_expression_statements_own_cfg_excludes_a_candidate() {
+        // Codex review of the fix, round 4: `#[cfg(..)]` directly on an
+        // expression in statement position — a block expression here —
+        // is neither a `Local` nor any of the three item kinds, so it
+        // was never folded into `enclosing_cfg` either.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   {\n\
+             \x20       let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_cfg_gated_match_arms_own_cfg_excludes_a_candidate() {
+        // Codex review of the fix, round 4: `syn::Arm` carries its own
+        // `attrs` too, unreached by the default descent.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge(x: u8) -> u8 {\n\
+             \x20   match x {\n\
+             \x20       #[cfg(not(feature = \"a\"))]\n\
+             \x20       _ => {\n\
+             \x20           let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20           0\n\
+             \x20       }\n\
+             \x20   }\n\
              }",
             "CheckedDispatch",
             FnScope::None,

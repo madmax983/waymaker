@@ -6578,3 +6578,19 @@ push-pop shape. `a_local_statements_own_cfg_excludes_a_candidate_the_functions_c
 is the regression, confirmed RED against the pre-fix code (no such override) before
 landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
 id.
+
+The next round found a seventh, in the same shape as the sixth: Rust permits
+`#[cfg(..)]` directly on an expression in statement position — `#[cfg(not(feature =
+"a"))] { let _ = Unchecked { .. }; }`, a cfg-gated block expression — and on a `match`
+arm's own pattern, and neither was any of the four kinds `Literals` already tracked.
+`visit_expr` closes the expression half using `expr_attrs`, this file's existing
+exhaustive per-variant `&[syn::Attribute]` reader, already relied on elsewhere; `visit_arm`
+closes the match-arm half. Both skip the push/pop outright when the node carries no
+attributes — true of nearly every expression in a real file — so the fix stays a cheap
+no-op rather than a `Cfg` clone on every expression node; the full suite, including the
+perf-sensitive fixtures issue #197 and this issue's own earlier rounds added, stayed under
+15s total with both in place.
+`a_cfg_gated_block_expression_statements_own_cfg_excludes_a_candidate` and
+`a_cfg_gated_match_arms_own_cfg_excludes_a_candidate` are the regressions, both confirmed
+RED against the pre-fix code (neither override existing) before landing. No new ADR:
+nothing here moves a must-not-own cell, a dependency edge, or a rule id.
