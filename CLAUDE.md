@@ -1591,6 +1591,20 @@ Stated so that nobody mistakes silence for coverage:
   cannot resolve" already names for this alias-resolution machinery (a glob import, an
   out-of-line module, a macro expansion, an unevaluated `cfg`). Left as a residual rather
   than chased further, per this project's own two-or-three-round guidance.
+- **Whether a block-local `use` overrides a shadowed generic parameter's own name, when the
+  `use`'s own target is a value rather than a type.** Issue #205, round 3, then round 4:
+  `generic_assoc_type_bindings_naming` treats any same-named block-local declaration as
+  reason enough to ask the fail-closed backstop whether a shadowed name reaches the guarded
+  type, `use` included. A `use` importing a value of the same name as the parameter (`use
+  values::CheckedDispatch;` where that names a function) can make the backstop report a
+  match that a real build would still resolve to the parameter — the same "same-spelled
+  alias across namespaces" residual named below, met here for a shadowed generic parameter
+  rather than an ordinary path. Narrowing the gate to a namespace-unambiguous declaration
+  closes that over-count and reopens a real miss instead: a `use` importing a same-named
+  *type* alias is exactly as valid an override as a `mod`, and this scanner cannot tell the
+  two `use` shapes apart without resolving what each one names. Accepted as an over-count
+  rather than chased further, for the reason every bullet in this list gives: a missed count
+  is the danger, not an extra one.
 - **That the run half of a redelivered identity is the device's.** §14's guarantee is about
   a `(RunId, EffectSeq)` pair, and only the sequence half is read from media: `ReplayCursor`
   takes it from the schedule record, and the `RunId` is an argument to `Driver::new` that no
@@ -6515,8 +6529,19 @@ value. `fn outer<CheckedDispatch>() { use values::CheckedDispatch; let _: dyn
 Alias<Dispatch = CheckedDispatch>; }` compiles — the bound still means the parameter, not
 the imported function, checked against real `rustc` — but the backstop ran anyway and
 reported a match, since it will happily chase the `use`'s own path to a last segment that
-coincidentally spells the guarded name. That is issue #189's exact false positive again, one
-level removed. The gate now asks for a *namespace-unambiguous* block-local item —
-`is_namespace_unambiguous`: a `mod`, `type`, `struct`, `enum`, `union`, `trait` or `extern
-crate` — never a bare `use`, which this scanner can never show collides with the parameter
-at all. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+coincidentally spells the guarded name. That looked like issue #189's exact false positive
+again, one level removed, and the gate was narrowed to ask for a *namespace-unambiguous*
+block-local item instead — `is_namespace_unambiguous`: a `mod`, `type`, `struct`, `enum`,
+`union`, `trait` or `extern crate` — never a bare `use`.
+
+A fourth round found that narrowing wrong: a `use` importing a same-named *type* alias
+(`mod values { pub type Hidden = CheckedDispatch; } fn outer<Hidden>() { use values::Hidden;
+let _: dyn Alias<Dispatch = Hidden>; }`, checked against real `rustc`) is exactly as real an
+override as a `mod`, and excluding every bare `use` missed it — the dangerous direction. This
+scanner cannot tell the two `use` shapes apart without resolving what each one names, which
+is the same "same-spelled alias across namespaces" residual [what is not
+checked](#what-is-not-checked) already states for every other caller in this file. The third
+round's narrowing is reverted: the gate is "any live block-local declaration" again, and the
+round-three false positive is accepted rather than chased — a missed count is the danger this
+whole mechanism exists to close, not an extra one. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.

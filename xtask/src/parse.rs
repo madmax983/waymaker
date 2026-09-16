@@ -1053,8 +1053,8 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
             // same rule `struct_literal_counts` already relies on for a
             // struct literal.
             //
-            // But when `shadowed` and no block-local item can actually win
-            // the type namespace, the identifier can only ever mean the
+            // But when `shadowed` and no block-local declaration of that
+            // name exists at all, the identifier can only ever mean the
             // parameter — issue #189's own case, still true here. Calling
             // the backstop then would reintroduce it:
             // `path_could_reach_target`'s own "shadowed, no override" answer
@@ -1062,27 +1062,34 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
             // `struct_literal_counts`'s question (could this parameter be
             // instantiated with the guarded type) and wrong for this one
             // (does this identifier name the guarded type). So the backstop
-            // runs on a shadowed name only once a namespace-unambiguous
-            // block-local item of it exists (`is_namespace_unambiguous`: a
-            // `mod`, `type`, `struct`, `enum`, `union`, `trait` or `extern
-            // crate`) to actually decide between the two — never a bare
-            // `use`, which can just as easily import a value of the same
-            // name (Codex review of PR #208, round 3: `fn
-            // outer<CheckedDispatch>() { use values::CheckedDispatch; let _:
-            // dyn Alias<Dispatch = CheckedDispatch>; }`, where the import is
-            // a function, still means the parameter — checked against real
-            // `rustc` — and treating the mere presence of that `use` as an
-            // override reported it anyway).
+            // runs on a shadowed name only once some block-local declaration
+            // of it exists to actually decide between the two.
+            //
+            // Codex review of PR #208, rounds 3 and 4, tried narrowing this
+            // to a namespace-unambiguous declaration only — never a bare
+            // `use`, which can import a value. That closed round 3's own
+            // false positive (a `use` importing a same-named function) but
+            // reopened a real miss round 4 found: a `use` importing a
+            // same-named *type* alias (`mod values { pub type Hidden =
+            // CheckedDispatch; } fn outer<Hidden>() { use values::Hidden; let
+            // _: dyn Alias<Dispatch = Hidden>; }`, checked against real
+            // `rustc`) is exactly as real an override, and this scanner
+            // cannot tell the two `use` shapes apart without resolving what
+            // each one names — the same "same-spelled alias across
+            // namespaces" residual [what is not
+            // checked](../../CLAUDE.md#what-is-not-checked) already states.
+            // Reverted to "any live declaration": a miss is the danger this
+            // whole mechanism exists to close, so an over-count from a
+            // wrong-namespace `use` is accepted, not chased further.
             let first = path
                 .segments
                 .first()
                 .map(|segment| ident_name(&segment.ident));
             let overridable = !shadowed
                 || first.is_some_and(|first| {
-                    live_block_declarations(&self.block_items, &first)
+                    !live_block_declarations(&self.block_items, &first)
                         .0
-                        .iter()
-                        .any(|declaration| is_namespace_unambiguous(declaration.item))
+                        .is_empty()
                 });
             if overridable {
                 for name in self.names {
@@ -24261,12 +24268,20 @@ mod raw_identifier_tests {
     }
 
     #[test]
-    fn a_value_only_use_sharing_a_shadowed_generic_names_name_does_not_override_it() {
-        // Codex review of PR #208, round 3. A `use` can import a value, and a
-        // shadowed type parameter has nothing to do with the value
-        // namespace. Checked against real `rustc`: this compiles, and the
-        // bound still means the generic parameter, not the imported
-        // function — a `use` alone is not enough to run the backstop.
+    fn a_value_only_use_sharing_a_shadowed_generic_names_name_is_an_accepted_over_count() {
+        // Codex review of PR #208, round 3, then round 4. A `use` can import
+        // a value, and a shadowed type parameter has nothing to do with the
+        // value namespace — checked against real `rustc`, this compiles, and
+        // the bound still means the parameter, not the imported function.
+        // Round 3 tried excluding a bare `use` from the override check to
+        // catch exactly this. Round 4 found that reopened a real miss: a
+        // `use` importing a same-named *type* looks identical to this scanner,
+        // and this scanner cannot tell the two apart without resolving what
+        // each one names — the same "same-spelled alias across namespaces"
+        // residual this file already accepts elsewhere. So this case is an
+        // accepted over-count again, not something to chase further; see
+        // `a_generic_bound_bound_through_a_use_alias_that_resolves_to_a_type_is_reported`
+        // for the real-miss case this trades against.
         let found = generic_assoc_type_bindings_naming(
             "fn outer<CheckedDispatch>() {\n\
              \x20   use values::CheckedDispatch;\n\
@@ -24274,7 +24289,24 @@ mod raw_identifier_tests {
             &["CheckedDispatch"],
         )
         .expect("the fixture parses");
-        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_use_alias_that_resolves_to_a_type_is_reported() {
+        // Codex review of PR #208, round 4. A `use` importing a same-named
+        // *type* alias is exactly as real an override as a `mod` — checked
+        // against real `rustc`, this compiles, and the bound resolves to the
+        // block-local `use`, not the outer generic parameter.
+        let found = generic_assoc_type_bindings_naming(
+            "mod values {\n    pub type Hidden = CheckedDispatch;\n}\n\
+             fn outer<Hidden>() {\n\
+             \x20   use values::Hidden;\n\
+             \x20   let _: Box<dyn Alias<Dispatch = Hidden>>;\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
     }
 
     #[test]
