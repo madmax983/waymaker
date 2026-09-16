@@ -6509,3 +6509,48 @@ only, not an ancestor module's — stated in
 [what is not checked](#what-is-not-checked) rather than closed, since under-checking there
 can only miss an exclusion, never make a wrong one. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that fix found a narrower cost in the same shape: `live_aliases_of` called
+the whole-tree-walking `own_aliases` fresh on every site query over the (correctly cached)
+candidate list, so a scope with a large grouped `use` statement paid that expansion once
+per construction site sharing it rather than once. A second cache tier,
+`AliasLookupCache::aliases`, pre-expands and cfg-tags each `(scope, name)`'s aliases once;
+the site's own `cfg` filter then runs cheaply over that small, pre-expanded list. The raw
+`Rc<[(Cfg, UseAlias)]>` field tripped `clippy::type_complexity`, closed with a
+`type TaggedAliases` alias.
+
+The same review round found four more, all in `path_could_reach_target` and the visitor
+that feeds it. First: `Cfg::could_coexist_with` itself was unmemoized, so many literals
+sharing one scope could each pay its full enumeration — capped at `MAX_CFG_ATOMS`, so not
+unbounded, but still `O(sites × atoms)` where one memoized answer would do. Rigorously
+measured: 46.73s against a 10s ceiling without memoization, 0.63s with it.
+`AliasLookupCache::could_coexist` memoizes by `(site_cfg.key(), candidate_cfg.key())`,
+`Cfg::key()` a `format!("{self:?}")` off a reintroduced `#[derive(Debug)]`.
+`a_repeated_site_candidate_cfg_pair_is_not_recomputed` pins it. Second, and the sharpest:
+`visit_expr_struct` still ran the cheap, `cfg`-blind deterministic resolvers
+(`resolve_local_alias_chain`/`resolve_segments_from`) first and only fell back to
+`path_could_reach_target` when they disagreed with the target name — so a deterministic
+pick that itself named a candidate whose own `cfg` cannot coexist with the site still
+counted. Confirmed real: `#[cfg(feature = "a")] type Unchecked = CheckedDispatch;`
+declared *before* its `not(feature = "a")` twin, at a site gated `not(feature = "a")`,
+is exactly the shape the shortcut counted wrongly, because the module-scope deterministic
+pick prefers the first declaration regardless of which build it survives in.
+`path_could_reach_target` is now the sole, unconditional decision-maker — the deterministic
+pre-check is gone from `visit_expr_struct` entirely, since the function is built to find
+every live declaration a deterministic pick could have reached and running it every time
+is a slower check, not a weaker one. Third: `Literals` never tracked a default trait
+method's own `cfg` — `TraitItem` is neither `Item` nor `ImplItem`, so neither existing
+override reached it — closed with a `visit_trait_item` override matching the other two's
+push-pop shape. Fourth: the `inside`-count visitor `struct_literal_counts` builds for
+`FnScope`-specific counting started every target at an empty `enclosing_cfg`, diverging
+from `total`'s now-cfg-aware count — a divergence other gate rules compare `total` against
+`inside` to catch, so this could produce a false violation on honest code. `InsideTarget`
+now carries the accumulated `Cfg` for the block or `impl` it names, threaded through
+`fn_blocks`/`inherent_impls`/`inside_targets` the same way `Literals`'s own `enclosing_cfg`
+is. Four regressions, one per finding:
+`a_deterministically_resolved_candidate_is_still_excluded_by_the_sites_own_cfg`,
+`a_default_trait_methods_own_cfg_excludes_a_candidate_the_traits_own_cfg_would_not`, and
+`the_inside_count_sees_the_selected_functions_own_cfg_too`, each confirmed RED against the
+pre-fix code before landing (`a_repeated_site_candidate_cfg_pair_is_not_recomputed`'s own
+RED is the 46.73s measurement above). No new ADR: nothing here moves a must-not-own cell,
+a dependency edge, or a rule id.
