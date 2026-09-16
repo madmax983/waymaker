@@ -6554,3 +6554,15 @@ is. Four regressions, one per finding:
 pre-fix code before landing (`a_repeated_site_candidate_cfg_pair_is_not_recomputed`'s own
 RED is the 46.73s measurement above). No new ADR: nothing here moves a must-not-own cell,
 a dependency edge, or a rule id.
+
+Codex review of that same commit found a fifth: making `path_could_reach_target` the sole
+decision-maker also removed the one thing the deterministic resolver used to do for an
+*absolute* path — `#[cfg(..)]` aside, `::dep::CheckedDispatch { .. }` reaches the extern
+prelude directly, and `resolve_segments` had always returned such a path's own segments
+unresolved, letting the old `resolves_to_name` check compare the last one to the target.
+`path_could_reach_target` instead bailed `false` outright for any leading-colon path — a
+missed count, the one unacceptable direction. It now matches `resolve_segments`'s own
+shape: an absolute path's last segment is compared to `target` directly, with no local
+scope consulted. `an_absolute_path_construction_still_counts` is the regression, confirmed
+RED against the pre-fix `false` shortcut before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.

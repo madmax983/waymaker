@@ -5483,9 +5483,6 @@ fn path_could_reach_target<'a>(
     cache: &mut AliasLookupCache<'a>,
     site_cfg: &Cfg,
 ) -> bool {
-    if path.leading_colon.is_some() {
-        return false;
-    }
     let segments: Vec<String> = path
         .segments
         .iter()
@@ -5493,6 +5490,17 @@ fn path_could_reach_target<'a>(
         .collect();
     if segments.is_empty() {
         return false;
+    }
+    // An absolute path (`::dep::CheckedDispatch { .. }`) reaches the extern
+    // prelude directly, past every local scope this search otherwise walks —
+    // the same shape `resolve_segments` already gives it, unresolved, since
+    // there is no local alias to chase. Removing the deterministic
+    // resolver's own `resolves_to_name` fast path (issue #206, Codex review)
+    // left nothing comparing an absolute path's own last segment to
+    // `target` at all, a missed count over a real construction (Codex
+    // review of PR #209).
+    if path.leading_colon.is_some() {
+        return segments.last().is_some_and(|last| last == target);
     }
     // A block-local `use`/`type` alias is visible as the *first* segment of any
     // plain relative path in its own block, not only a bare, single-segment one
@@ -26396,6 +26404,26 @@ mod cfg_alias_ambiguity_tests {
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
         assert_eq!(counts.inside, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_absolute_path_construction_still_counts() {
+        // Codex review of the fix: removing the deterministic resolver's
+        // own `resolves_to_name` fast path left `path_could_reach_target`
+        // as the sole decision-maker, and it bailed `false` outright for
+        // any leading-colon path — a missed count, since the deterministic
+        // resolver used to return an absolute path's own segments
+        // unresolved and compare its last one to the target.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   let _ = ::CheckedDispatch { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
     }
 
     #[test]
