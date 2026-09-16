@@ -6566,3 +6566,15 @@ shape: an absolute path's last segment is compared to `target` directly, with no
 scope consulted. `an_absolute_path_construction_still_counts` is the regression, confirmed
 RED against the pre-fix `false` shortcut before landing. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+A further review round found a sixth: a statement-level `#[cfg(..)]` on a `let` is
+neither an `Item`, an `ImplItem` nor a `TraitItem`, so none of `Literals`'s three
+existing overrides ever folded it into `enclosing_cfg` —
+`#[cfg(not(feature = "a"))] let _ = Unchecked { .. };` was checked against the enclosing
+function's own `cfg` alone, missing the `let`'s own narrower one, and a candidate the
+local's own `cfg` already rules out was still counted: an over-count, a false gate
+violation on honest code. A `visit_local` override closes it, matching the other three's
+push-pop shape. `a_local_statements_own_cfg_excludes_a_candidate_the_functions_cfg_would_not`
+is the regression, confirmed RED against the pre-fix code (no such override) before
+landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
+id.

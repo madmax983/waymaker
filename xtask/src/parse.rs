@@ -5067,6 +5067,23 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         self.enclosing_cfg = outer_cfg;
     }
 
+    // A `let` statement's own `cfg` is otherwise unseen: `syn::Local` is
+    // neither an `Item`, an `ImplItem` nor a `TraitItem`, so none of the
+    // three overrides above reach a statement-level attribute like
+    // `#[cfg(not(feature = "a"))] let _ = Unchecked {};` (Codex review of
+    // the fix, round 3) — the initializer was checked against a site `cfg`
+    // that omitted the one condition actually gating it, over-counting a
+    // candidate the local's own `cfg` already rules out.
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_local(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
     shadow_generic_params!();
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
@@ -26424,6 +26441,29 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_local_statements_own_cfg_excludes_a_candidate_the_functions_cfg_would_not() {
+        // Codex review of the fix, round 3: a statement-level `#[cfg(..)]`
+        // on a `let` is neither an `Item`, an `ImplItem` nor a `TraitItem`,
+        // so it was never folded into `enclosing_cfg` — the site was
+        // checked against the enclosing function's own (unconditional)
+        // `cfg` alone, missing the `let`'s own, narrower one, and a
+        // candidate the local's own `cfg` rules out was still counted.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 
     #[test]
