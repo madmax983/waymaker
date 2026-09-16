@@ -6482,3 +6482,13 @@ landing, with the function declared first to match the shape that actually loses
 old tie-break; `a_use_declared_first_still_resolves_past_a_later_value_only_declaration` is
 the control, confirming the fix is not merely papering over one declaration order. No new
 ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Issue #205 found that `generic_assoc_type_bindings_naming` had no fail-closed backstop,
+unlike `struct_literal_counts`. `resolve_local_alias_chain` cannot see a block-local `mod`.
+So a binding qualified through one was never checked: `mod traits { pub use CheckedDispatch
+as Marker; } fn forge<T: Alias<Dispatch = traits::Marker>>() {}` names the guarded type in
+real `rustc`, and the old code missed it — a missed count, the dangerous direction. The fix
+runs the same `path_could_reach_target` search `struct_literal_counts` already uses, for
+each guarded name the deterministic walk did not already find. `struct_literal_counts`
+itself needed no change: its own backstop already covers every shape issue #205 named. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.

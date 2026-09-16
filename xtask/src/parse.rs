@@ -879,6 +879,10 @@ struct AssocBindings<'a, 'ast> {
     // itself be a generic parameter, and a parameter named `CheckedDispatch` is not the
     // real type.
     shadow: Vec<String>,
+    // Issue #205: the walk below cannot see a block-local `mod`. These two fields
+    // run `path_could_reach_target` as a backstop, the same way `Literals` does.
+    alias_search_budget: usize,
+    alias_lookup_cache: AliasLookupCache<'ast>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
@@ -1037,6 +1041,24 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
                 {
                     self.found.push(name.clone());
                 }
+                // Issue #205: the walk above cannot see a block-local `mod`. Run
+                // the same fail-closed search `struct_literal_counts` uses, for
+                // each guarded name the walk above did not already find.
+                for name in self.names {
+                    if resolved.last().map(String::as_str) != Some(*name)
+                        && path_could_reach_target(
+                            path,
+                            &self.stack,
+                            &self.block_items,
+                            &self.shadow,
+                            name,
+                            self.alias_search_budget,
+                            &mut self.alias_lookup_cache,
+                        )
+                    {
+                        self.found.push((*name).to_owned());
+                    }
+                }
             }
         }
         syn::visit::visit_assoc_type(self, node);
@@ -1072,6 +1094,8 @@ pub fn generic_assoc_type_bindings_naming(
         stack: vec![&file.items],
         block_items: Vec::new(),
         shadow: Vec::new(),
+        alias_search_budget: alias_search_budget(&file.items),
+        alias_lookup_cache: AliasLookupCache::default(),
     };
     visitor.visit_file(&file);
     Ok(visitor.found)
@@ -24092,6 +24116,39 @@ mod raw_identifier_tests {
         )
         .expect("the fixture parses");
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_block_local_module_of_a_guarded_name_is_reported() {
+        // Issue #205: a block-local `mod` is invisible to the deterministic walk.
+        // Real Rust still reads this as a live use of the guarded name (checked
+        // against `rustc`). The fail-closed backstop below closes the gap.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn outer() {\n\
+             \x20   mod traits { pub use CheckedDispatch as Marker; }\n\
+             \x20   fn forge<T: Alias<Dispatch = traits::Marker>>() {}\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
+    }
+
+    #[test]
+    fn a_generic_bound_bound_through_a_deeper_blocks_alias_over_an_outer_items_own_struct_is_reported()
+     {
+        // Issue #205, shape 1: the innermost declaration always wins. An outer
+        // block's own struct must not hide a real alias declared closer in.
+        let found = generic_assoc_type_bindings_naming(
+            "pub fn outer() {\n\
+             \x20   struct Hidden;\n\
+             \x20   {\n\
+             \x20       type Hidden = CheckedDispatch;\n\
+             \x20       fn forge<T: Alias<Dispatch = Hidden>>() {}\n\
+             \x20   }\n}",
+            &["CheckedDispatch"],
+        )
+        .expect("the fixture parses");
+        assert_eq!(found, ["CheckedDispatch"], "{found:?}");
     }
 
     #[test]
