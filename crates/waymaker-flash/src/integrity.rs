@@ -4,9 +4,16 @@
 //! CRC32C or a smaller table-free CRC implementation", and
 //! [ADR 0010](https://github.com/madmax983/waymaker/blob/main/docs/adr/0010-the-integrity-check-is-catalogued-and-table-free.md)
 //! settles it with measurements taken on `thumbv6m-none-eabi`: CRC-32/ISO-HDLC over the
-//! header and payload, CRC-16/CCITT-FALSE over the header, both table-free. This module is
-//! where that answer is *bound* rather than assumed — [`Catalogued`] is the binding, and
-//! [`IntegrityCheck`] is what makes it one choice among possible ones.
+//! header and payload, CRC-16/CCITT-FALSE over the header, both table-free at the time. This
+//! module is where that answer is *bound* rather than assumed — [`Catalogued`] is the
+//! binding, and [`IntegrityCheck`] is what makes it one choice among possible ones.
+//! [ADR 0046](https://github.com/madmax983/waymaker/blob/main/docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md)
+//! later folds `crc16`'s nibble round to a closed-form multiply — still table-free — and
+//! declines a table for `crc32`; [ADR 0053](https://github.com/madmax983/waymaker/blob/main/docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md)
+//! then supersedes that `crc32` clause, once a profile of this workspace's own workloads
+//! showed it worth a 64-byte nibble table after all. `Catalogued` is unchanged by any of
+//! the three ADRs — all bind to the same two free functions, whichever algorithm each
+//! currently is.
 //!
 //! # Why there is a trait at all, when only one implementation ships
 //!
@@ -115,8 +122,13 @@ pub trait IntegrityCheck {
 /// CRC-16/CCITT-FALSE over the header — polynomial `0x1021`, initial value `0xFFFF`, no
 /// reflection, no final xor, published check value `0x29B1` — and CRC-32/ISO-HDLC over the
 /// header and payload — reflected polynomial `0xEDB8_8320`, initial value and final xor
-/// `0xFFFF_FFFF`, published check value `0xCBF4_3926`. Both computed bitwise, with no
-/// lookup table.
+/// `0xFFFF_FFFF`, published check value `0xCBF4_3926`. CRC-16 is computed bitwise, with no
+/// lookup table at all. CRC-32 is not:
+/// [ADR 0053](https://github.com/madmax983/waymaker/blob/main/docs/adr/0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md)
+/// supersedes [ADR 0046](https://github.com/madmax983/waymaker/blob/main/docs/adr/0046-crc16-folds-its-nibble-round-to-a-multiply-crc32-stays-bitwise.md)'s
+/// `crc32` clause, once a profile of this workspace's own workloads showed it worth a
+/// 64-byte nibble table spent as a `match` — no `[u32; 16]` ever appears in source, so
+/// `crc32` stays a `const fn`.
 ///
 /// Both are catalogued algorithms rather than something invented here, which is the
 /// property ADR 0010 chose them for: a journal pulled off a device is verifiable with a
@@ -125,8 +137,8 @@ pub trait IntegrityCheck {
 /// agrees with its own bugs.
 ///
 /// The `integrity-check` gate rule fails a pull request that changes either polynomial or
-/// initial value, that adds a lookup table to the checksum module, or that binds this type
-/// to anything but those two functions.
+/// initial value, that adds a lookup table to the checksum module beyond the one ADR 0053
+/// permits for CRC-32, or that binds this type to anything but those two functions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Catalogued;
 
