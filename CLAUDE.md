@@ -6485,6 +6485,46 @@ old tie-break; `a_use_declared_first_still_resolves_past_a_later_value_only_decl
 the control, confirming the fix is not merely papering over one declaration order. No new
 ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
 
+Issue #202 closes a gap Codex found on review of PR #199. That PR first wired
+`AssocBindings` into `shadow_generic_params!()`, to fix an unrelated compile break. At the
+time, the macro tracked only a function's, an `impl`'s, and a `trait`'s own generic
+parameters — not a struct's, an enum's, a union's, a type alias's, a trait alias's, or a
+generic associated type's own. PR #201 then gave `AssocBindings` its own, separate overrides
+for all seven of these shapes, found and added one at a time across several of that PR's own
+review rounds. The macro's other three callers — `resolved_path_uses`,
+`struct_literal_counts`, and `name_uses` — never gained them, so a same-named module or
+alias could still shadow one of these parameters for those three. Codex's own example:
+`struct S<CheckedDispatch: HasHidden, T: Alias<Dispatch = CheckedDispatch::Hidden>>` beside
+`mod CheckedDispatch { pub use DurableIntent as Hidden; }` resolved the bound through the
+module, not the struct's own parameter. The fix moves all seven overrides into
+`shadow_generic_params!()` itself, so every caller shares one definition; `AssocBindings`
+keeps none of its own. Six regression tests, one per new item kind (a struct, an enum, a
+union, a type alias, a trait GAT, an impl GAT), confirm `resolved_path_uses`; one further
+test each confirms `struct_literal_counts` and `name_uses` still agree — the same, narrower
+coverage this file's own `generic_shadow_tests` module used for the original fn/impl/trait
+fix, since the three callers share one macro body with `AssocBindings`. No new ADR: nothing
+here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of PR #207 found a real gap in the fix above, and it turned out to be older
+than the PR: a same-named module or alias could still shadow a generic parameter inside the
+generics-bearing item's own outer attribute — `#[Marker::guard] struct S<Marker>(Marker);`
+beside `mod Marker { pub use Disallowed as guard; }` — because `syn`'s own default traversal
+visits an item's attributes before its generics, and every reset/extend override installs
+`self.shadow` before calling that default traversal. Confirmed against real `rustc`: an
+item's own outer attribute resolves in the scope outside the item, before its own generics
+exist, and this holds at any nesting depth — an enclosing `impl`'s own generic parameter
+does not shadow a method's attribute either. Reordering each of the twelve reset/extend
+overrides to visit attributes first would only fix item-level attributes on these twelve
+item kinds, missing the identical rule for an attribute on a field, a variant, or anything
+else. `shadow_generic_params!()` gains a thirteenth override instead, `visit_attribute`,
+clearing `self.shadow` for the span of one attribute and restoring it after: a generic type
+parameter is never a valid macro-path segment at all, so clearing it outright is correct
+rather than only reordering one item kind's own reset. Three regression tests cover an
+item's own attribute and an enclosing `impl`'s, against `resolved_path_uses` and `name_uses`
+— `struct_literal_counts` and `generic_assoc_type_bindings_naming` need none, because neither
+ever resolves a path from inside an attribute's own token stream. No new ADR: nothing here
+moves a must-not-own cell, a dependency edge, or a rule id.
+
 Issue #206 closes the gap Codex found on review of PR #204: `path_could_reach_target`'s
 fail-closed search checked a candidate's own `cfg` against nothing else. It never checked
 the construction site's own `cfg`. A candidate gated the wrong way could still be counted,
