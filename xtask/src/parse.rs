@@ -5601,12 +5601,17 @@ impl<'a> AliasLookupCache<'a> {
     }
 
     /// The live `use`/`type` aliases in `items` whose local name is `first`
-    /// and whose own `cfg` can coexist with `site_cfg` (issue #206) — see
-    /// [`live_named_items_in_scope`] for what "live" excludes and
-    /// [`Cfg::could_coexist_with`] for the `cfg` check. `false`: this cache
-    /// exists only for [`segments_could_reach_target`]'s own search, whose
-    /// sole caller ([`struct_literal_counts`]) is always resolving a
-    /// construction path, never a value (Codex review of PR #204) — see
+    /// and whose own `cfg` can coexist with `site_cfg` (issue #206), each
+    /// paired with that own `cfg` — see [`live_named_items_in_scope`] for
+    /// what "live" excludes and [`Cfg::could_coexist_with`] for the `cfg`
+    /// check. The candidate's own `cfg` travels with it, rather than being
+    /// dropped once it has passed the filter, so [`try_alias_candidates`]
+    /// can conjoin it into the `cfg` a further hop is checked against
+    /// (Codex review of the fix, round 9 — see [`try_alias_candidates`]'s
+    /// own doc for why that matters). `false`: this cache exists only for
+    /// [`segments_could_reach_target`]'s own search, whose sole caller
+    /// ([`struct_literal_counts`]) is always resolving a construction path,
+    /// never a value (Codex review of PR #204) — see
     /// [`live_named_items_in_scope`]'s own doc for why that matters here.
     ///
     /// [`own_aliases`] walks a `use` item's whole tree, so a group naming
@@ -5621,7 +5626,7 @@ impl<'a> AliasLookupCache<'a> {
         items: &'a [syn::Item],
         first: &str,
         site_cfg: &Cfg,
-    ) -> Vec<UseAlias> {
+    ) -> Vec<(Cfg, UseAlias)> {
         let candidates = self.candidates_of(items, first);
         let tagged = self
             .aliases
@@ -5643,7 +5648,7 @@ impl<'a> AliasLookupCache<'a> {
         tagged
             .iter()
             .filter(|(cfg, _)| self.could_coexist(site_cfg, cfg))
-            .map(|(_, alias)| alias.clone())
+            .cloned()
             .collect()
     }
 
@@ -5880,8 +5885,12 @@ fn path_could_reach_target<'a>(
 /// name can name more than one live module, "the one match" is no longer a thing a
 /// loop can just step into and carry on from.
 ///
-/// `cache` is [`path_could_reach_target`]'s own — see there. `site_cfg` too
-/// (issue #206) — passed through, unchanged, to every recursive call.
+/// `cache` is [`path_could_reach_target`]'s own — see there. `site_cfg` is
+/// conjoined with each candidate's own `cfg` (issue #206, round 9's second
+/// finding) before it is passed to the recursive call: a chain of alias hops
+/// gated by mutually exclusive `cfg` conditions can each individually
+/// coexist with the unconditional site while the two hops together never
+/// can, and passing `site_cfg` through unchanged missed exactly that.
 ///
 /// Tries every alias in `candidates`, recursing into [`segments_could_reach_target`]
 /// with `next_block_eligible` for the ones that are not absolute — shared by
@@ -5889,7 +5898,7 @@ fn path_could_reach_target<'a>(
 /// differ only in which candidates they gather and what `next_block_eligible` is.
 #[allow(clippy::too_many_arguments)]
 fn try_alias_candidates<'a>(
-    candidates: Vec<UseAlias>,
+    candidates: Vec<(Cfg, UseAlias)>,
     rest: &[String],
     stack: &[&'a [syn::Item]],
     scope: usize,
@@ -5902,7 +5911,8 @@ fn try_alias_candidates<'a>(
     cache: &mut AliasLookupCache<'a>,
     site_cfg: &Cfg,
 ) -> bool {
-    for alias in candidates {
+    for (candidate_cfg, alias) in candidates {
+        let accumulated_cfg = Cfg::All(vec![site_cfg.clone(), candidate_cfg]);
         // An alias target written `self::`/`super::`-qualified explicitly names
         // the enclosing module's own item, never a block-local one — the same
         // fact [`path_could_reach_target`]'s own `block_eligible` already
@@ -5950,7 +5960,7 @@ fn try_alias_candidates<'a>(
             target,
             budget,
             cache,
-            site_cfg,
+            &accumulated_cfg,
         ) {
             return true;
         }
@@ -6475,10 +6485,13 @@ fn try_block_local_candidates<'a>(
     let mut claimed = false;
     for declaration in live_items {
         let own_scope = block_items.get(..=declaration.depth).unwrap_or(block_items);
-        let alias_candidates: Vec<UseAlias> = own_aliases(core::iter::once(declaration.item))
-            .into_iter()
-            .filter(|candidate| candidate.local == first)
-            .collect();
+        let declaration_cfg = attrs_cfg(item_attrs(declaration.item));
+        let alias_candidates: Vec<(Cfg, UseAlias)> =
+            own_aliases(core::iter::once(declaration.item))
+                .into_iter()
+                .filter(|candidate| candidate.local == first)
+                .map(|alias| (declaration_cfg.clone(), alias))
+                .collect();
         if !alias_candidates.is_empty() {
             claimed = true;
             if try_alias_candidates(
@@ -6740,7 +6753,8 @@ fn try_module_scope_candidates<'a>(
     cache: &mut AliasLookupCache<'a>,
     site_cfg: &Cfg,
 ) -> Option<bool> {
-    let module_alias_candidates: Vec<UseAlias> = cache.live_aliases_of(items, first, site_cfg);
+    let module_alias_candidates: Vec<(Cfg, UseAlias)> =
+        cache.live_aliases_of(items, first, site_cfg);
     let mut claimed = !module_alias_candidates.is_empty();
     if try_alias_candidates(
         module_alias_candidates,
@@ -26895,6 +26909,36 @@ mod cfg_alias_ambiguity_tests {
              struct Holder {\n\
              \x20   #[cfg(not(feature = \"a\"))]\n\
              \x20   field: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_chained_alias_cannot_combine_mutually_exclusive_cfg_hops() {
+        // Codex review of the fix, round 9: `site_cfg` passed through a
+        // chain of alias hops unchanged, rather than conjoined with each
+        // selected candidate's own `cfg`, let the search combine two hops
+        // that can never coexist. `A = B` and `B = Decoy` hold under
+        // `feature = "a"`; `A = Decoy` and `B = CheckedDispatch` hold under
+        // its negation. Every real build resolves `A` to `Decoy` — under
+        // `a`, through `B`; under `not(a)`, directly — never to
+        // `CheckedDispatch`, which only ever exists on the branch where `A`
+        // does not name `B` at all. The unfixed search still reached it, by
+        // picking `A = B` from the `a` branch and then `B = CheckedDispatch`
+        // from the `not(a)` branch: each hop's own `cfg` coexists with the
+        // unconditional site on its own, even though the two together do
+        // not.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype A = B;\n\
+             #[cfg(feature = \"a\")]\ntype B = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\ntype A = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\ntype B = CheckedDispatch;\n\
+             fn forge() {\n\
+             \x20   let _ = self::A { intent: 0, bytes: 0 };\n\
              }",
             "CheckedDispatch",
             FnScope::None,

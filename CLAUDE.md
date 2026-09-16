@@ -6725,3 +6725,25 @@ closes it, the same push-pop shape and empty-attrs fast path as `visit_field_val
 `a_declaration_fields_own_cfg_excludes_a_candidate_the_structs_cfg_would_not` is the
 regression, confirmed RED against the pre-fix code (no such override) before landing. No
 new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a fourteenth, and it is in the search's own accumulation rather
+than in what feeds it: `try_alias_candidates`'s own doc comment already said what was
+wrong — `site_cfg` was "passed through, unchanged, to every recursive call" — so a chain
+of alias hops each gated on a different, mutually exclusive `cfg` could combine two hops
+that can never coexist, each individually checked against only the unconditional
+construction site rather than against each other. Confirmed against real `rustc`:
+`#[cfg(feature = "a")] type A = B; #[cfg(feature = "a")] type B = Decoy;` beside
+`#[cfg(not(feature = "a"))] type A = Decoy; #[cfg(not(feature = "a"))] type B =
+CheckedDispatch;` can only ever resolve `A` to `Decoy` — under `feature = "a"`, through
+`B`; under its negation, directly — because `A = B` and `B = CheckedDispatch` never hold
+in the same build, yet the unfixed search reached `CheckedDispatch` anyway by picking
+`A = B` from the `a` branch and `B = CheckedDispatch` from the `not(a)` branch, each hop
+alone coexisting with the unconditional site. `try_alias_candidates` now conjoins each
+selected candidate's own `cfg` with the accumulated path `cfg` — `Cfg::All(vec![site_cfg,
+candidate_cfg])` — before passing it on to the next hop, rather than forwarding
+`site_cfg` untouched; `AliasLookupCache::live_aliases_of` stops discarding the tag it
+already filters by, and `try_block_local_candidates` tags a block-local candidate with
+its own declaring item's `cfg` the same way.
+`a_chained_alias_cannot_combine_mutually_exclusive_cfg_hops` is the regression, confirmed
+RED against the pre-fix code (`total: 1` against an expected `0`) before landing. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
