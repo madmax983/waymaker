@@ -6747,3 +6747,41 @@ its own declaring item's `cfg` the same way.
 `a_chained_alias_cannot_combine_mutually_exclusive_cfg_hops` is the regression, confirmed
 RED against the pre-fix code (`total: 1` against an expected `0`) before landing. No new
 ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a fifteenth, and it is a different direction from
+the fourteenth's own: not two hops each individually checked against the site, but a
+block-local declaration whose own `cfg` is not syntactically unconditional yet is still
+*guaranteed* wherever the construction site itself exists. Confirmed against real
+`rustc`: inside a `#[cfg(feature = "a")]` function, a block-local
+`#[cfg(feature = "a")] type Unchecked = Decoy;` always shadows a module-scope
+`#[cfg(feature = "a")] type Unchecked = CheckedDispatch;`, because the two conditions are
+identical rather than merely coexisting — but `live_block_declarations` only ever
+stopped the outward search on a *syntactically* unconditional declaration
+(`!has_any_cfg`), so this one was kept as a mere coexisting branch and module scope was
+searched too, counting `CheckedDispatch`. `Cfg::is_guaranteed_by` is the new check: the
+same enumeration `Cfg::could_coexist_with` uses, over the same union of atoms, but the
+opposite predicate — every assignment where `site_cfg` holds must also make the
+candidate's own `cfg` hold, i.e. `site_cfg && !candidate_cfg` is unsatisfiable. The
+dangerous direction is reversed from `could_coexist_with`'s own: `true` is what lets a
+caller stop searching, so past `MAX_CFG_ATOMS`, or on any assignment the guarantee does
+not survive, the answer is `false` — assume no guarantee, keep searching outward.
+`AliasLookupCache::guaranteed_by` memoizes it by the same `(candidate, site)` key shape
+`could_coexist` already uses, for the same reason: `live_block_declarations` asks it once
+per coexisting candidate of every scope it visits. `a_site_guaranteed_block_local_alias_shadows_a_module_scope_one`
+and its control, `a_block_local_alias_whose_cfg_the_site_does_not_guarantee_still_lets_module_scope_through`,
+are the regression, the first confirmed RED against the pre-fix code (`total: 1` against
+an expected `0`) before landing. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
+
+Codex review of the same commit found a sixteenth, in what feeds the check rather than
+in the check itself: stable Rust lets a function parameter carry its own `#[cfg(..)]` to
+conditionally compile one argument, and `syn::PatType` carries its own `attrs` separate
+from the enclosing function item's — `Literals` had no override for it, so a nested
+literal buried in a parameter's own declared type (an array length, say) was checked
+against the function's own `cfg` alone, missing the parameter's own narrower one: an
+over-count, the same direction as every finding since the fourth. A `visit_pat_type`
+override closes it, the same push-pop shape and empty-attrs fast path as
+`visit_field`/`visit_field_value`/`visit_variant`.
+`a_function_parameters_own_cfg_excludes_a_candidate_the_functions_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
