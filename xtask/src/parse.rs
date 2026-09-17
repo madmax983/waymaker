@@ -30,11 +30,36 @@ use syn::visit::Visit as _;
 /// Every structural query in this module starts here so that there is exactly one
 /// place where "the file would not parse" becomes an error the caller must handle.
 ///
+/// `syn::parse_file` is a pure function of `contents`, and dozens of the rule checks in
+/// this crate each call a handful of the functions built on this one over the same file's
+/// text — `check-layering` on this workspace calls it 550 times over only 76 distinct
+/// files. Memoizing here, rather than in each caller, is what keeps that "parse once, read
+/// structurally" contract in the module's own doc comment true of the *cost* and not only
+/// of the API: a cache keyed on anything narrower than the caller's own file set would
+/// have to be threaded through every function this one feeds, which is the kind of
+/// surface change the pinned rule scanners in this crate treat as a correctness risk in
+/// its own right. The cache is `thread_local`, not shared across threads: `cargo test`
+/// runs many of this module's own tests in parallel, and a lock contended by every one of
+/// them would trade a cheap clone for contention `syn::parse_file` never had.
+///
 /// # Errors
 ///
 /// Returns [`syn::Error`] when `contents` does not parse as Rust.
 pub fn parse_rust(contents: &str) -> Result<syn::File, syn::Error> {
-    syn::parse_file(contents)
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, Result<syn::File, syn::Error>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|cache| {
+        if let Some(cached) = cache.borrow().get(contents) {
+            return cached.clone();
+        }
+        let parsed = syn::parse_file(contents);
+        cache
+            .borrow_mut()
+            .insert(contents.to_owned(), parsed.clone());
+        parsed
+    })
 }
 
 /// The name of `ident`. Strips a leading `r#` marker.
