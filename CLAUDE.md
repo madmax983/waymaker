@@ -1242,18 +1242,20 @@ Stated so that nobody mistakes silence for coverage:
   construction is counted when *any* live alias sharing its name could reach it, not only
   the one declaration `resolve_local_alias_chain`/`resolve_segments_from` would pick — for a
   bare construction path or a qualified one, and chased into a module a multi-segment alias
-  target names, mirroring `resolve_segments_from`'s own `own_modules` descent. What that
-  search still does not do is intersect a candidate's own `cfg` with the construction
-  *site's* own enclosing `cfg`: a candidate declared under `feature = "a"` is treated as a
-  live branch even when the function containing the literal is itself only compiled under
-  `not(feature = "a")`, so no build ever has both — a real, `rustc`-confirmed over-count
-  (Codex review of PR #204) that needs a general `cfg`-vs-`cfg` satisfiability check beside
-  `Cfg::requires_test`, enclosing-`cfg` accumulation in the visitor, and a wider
-  `AliasLookupCache` key than `(scope, name)` to stay sound, none of which exists yet. See
-  issue [#206](https://github.com/madmax983/waymaker/issues/206), filed rather than chased
-  under review-driven time pressure for the same reason issues #171/#186/#193 were: it needs
-  new machinery across several pieces, and getting one wrong in the exclude direction is a
-  missed count, the opposite failure mode from the one it would fix.
+  target names, mirroring `resolve_segments_from`'s own `own_modules` descent.
+  [Issue #206](https://github.com/madmax983/waymaker/issues/206) closes the next gap: a
+  candidate's own `cfg` is now checked against the construction site's own enclosing `cfg`
+  too. `Cfg::could_coexist_with` is the check — a satisfiability test between two `cfg`
+  formulas, capped at `MAX_CFG_ATOMS` like `Cfg::requires_test`, and it fails open past that
+  cap. `Literals` tracks `enclosing_cfg`: every enclosing item's and impl member's own `cfg`,
+  combined. A first version of this fix widened `AliasLookupCache`'s key to carry the
+  site's own `cfg`, and reopened issue #197's own cost along a different axis: many sites
+  with a different `cfg` sharing one scope each paid a full re-scan of it, measured over a
+  minute on an adversarial file (Codex review of the fix). The cache stays keyed on
+  `(scope, name)` alone; a site's own `cfg` is checked afterward, cheaply, over that small
+  cached answer, by `coexisting_with_site`. One residual stays open: the check reads a
+  candidate's own immediate `cfg` only, never an ancestor module's `cfg`. That can only
+  miss an exclusion, never make a wrong one, so it is stated rather than chased further here.
   `resolved_path_uses` and `future_trait_implementors` still have the wider residual, because
   they need `resolve_segments`'s and `resolve_segments_from`'s one deterministic answer for
   reasons of their own — see the Status section's own paragraph on issue #185 for why
@@ -6740,6 +6742,320 @@ item's own attribute and an enclosing `impl`'s, against `resolved_path_uses` and
 ever resolves a path from inside an attribute's own token stream. No new ADR: nothing here
 moves a must-not-own cell, a dependency edge, or a rule id.
 
+Issue #206 closes the gap Codex found on review of PR #204: `path_could_reach_target`'s
+fail-closed search checked a candidate's own `cfg` against nothing else. It never checked
+the construction site's own `cfg`. A candidate gated the wrong way could still be counted,
+even though no build could ever reach it from that site. Confirmed against real `rustc`:
+`#[cfg(not(feature = "a"))] fn forge() { self::Unchecked { .. } }`, beside two declarations
+of `Unchecked` gated on `feature = "a"` and its negation, can only ever build the negation's
+— `forge` itself does not exist in the other build. `Cfg::could_coexist_with` is the fix: a
+satisfiability check between two `cfg` formulas, over every value of `test` and every named
+atom, capped at `MAX_CFG_ATOMS` like `Cfg::requires_test`, and it fails open past that cap —
+a missed count is the one unacceptable answer here. `Literals` tracks `enclosing_cfg`: every
+enclosing item's and impl member's own `cfg`, combined, pushed and popped like `shadow`.
+`live_named_items_in_scope` keeps its old three-argument shape and its old, `(scope, name)`-
+only answer, so `AliasLookupCache` still caches across every site that shares a scope and a
+name; a new `coexisting_with_site` applies the check afterward, over that small cached
+answer. A first version applied the check inside `live_named_items_in_scope` and widened the
+cache key by the site's own `cfg` instead — sound, but it reopened issue #197's own cost
+along a different axis: many sites with a different `cfg` sharing one scope each paid a full
+re-scan, measured over a minute on an adversarial file, found on review of this fix and
+fixed before it landed. `many_distinctly_gated_construction_sites_over_one_ambiguous_scope_resolve_quickly`
+pins that this stays fast. What is owed: the check reads a candidate's own immediate `cfg`
+only, not an ancestor module's — stated in
+[what is not checked](#what-is-not-checked) rather than closed, since under-checking there
+can only miss an exclusion, never make a wrong one. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that fix found a narrower cost in the same shape: `live_aliases_of` called
+the whole-tree-walking `own_aliases` fresh on every site query over the (correctly cached)
+candidate list, so a scope with a large grouped `use` statement paid that expansion once
+per construction site sharing it rather than once. A second cache tier,
+`AliasLookupCache::aliases`, pre-expands and cfg-tags each `(scope, name)`'s aliases once;
+the site's own `cfg` filter then runs cheaply over that small, pre-expanded list. The raw
+`Rc<[(Cfg, UseAlias)]>` field tripped `clippy::type_complexity`, closed with a
+`type TaggedAliases` alias.
+
+The same review round found four more, all in `path_could_reach_target` and the visitor
+that feeds it. First: `Cfg::could_coexist_with` itself was unmemoized, so many literals
+sharing one scope could each pay its full enumeration — capped at `MAX_CFG_ATOMS`, so not
+unbounded, but still `O(sites × atoms)` where one memoized answer would do. Rigorously
+measured: 46.73s against a 10s ceiling without memoization, 0.63s with it.
+`AliasLookupCache::could_coexist` memoizes by `(site_cfg.key(), candidate_cfg.key())`,
+`Cfg::key()` a `format!("{self:?}")` off a reintroduced `#[derive(Debug)]`.
+`a_repeated_site_candidate_cfg_pair_is_not_recomputed` pins it. Second, and the sharpest:
+`visit_expr_struct` still ran the cheap, `cfg`-blind deterministic resolvers
+(`resolve_local_alias_chain`/`resolve_segments_from`) first and only fell back to
+`path_could_reach_target` when they disagreed with the target name — so a deterministic
+pick that itself named a candidate whose own `cfg` cannot coexist with the site still
+counted. Confirmed real: `#[cfg(feature = "a")] type Unchecked = CheckedDispatch;`
+declared *before* its `not(feature = "a")` twin, at a site gated `not(feature = "a")`,
+is exactly the shape the shortcut counted wrongly, because the module-scope deterministic
+pick prefers the first declaration regardless of which build it survives in.
+`path_could_reach_target` is now the sole, unconditional decision-maker — the deterministic
+pre-check is gone from `visit_expr_struct` entirely, since the function is built to find
+every live declaration a deterministic pick could have reached and running it every time
+is a slower check, not a weaker one. Third: `Literals` never tracked a default trait
+method's own `cfg` — `TraitItem` is neither `Item` nor `ImplItem`, so neither existing
+override reached it — closed with a `visit_trait_item` override matching the other two's
+push-pop shape. Fourth: the `inside`-count visitor `struct_literal_counts` builds for
+`FnScope`-specific counting started every target at an empty `enclosing_cfg`, diverging
+from `total`'s now-cfg-aware count — a divergence other gate rules compare `total` against
+`inside` to catch, so this could produce a false violation on honest code. `InsideTarget`
+now carries the accumulated `Cfg` for the block or `impl` it names, threaded through
+`fn_blocks`/`inherent_impls`/`inside_targets` the same way `Literals`'s own `enclosing_cfg`
+is. Four regressions, one per finding:
+`a_deterministically_resolved_candidate_is_still_excluded_by_the_sites_own_cfg`,
+`a_default_trait_methods_own_cfg_excludes_a_candidate_the_traits_own_cfg_would_not`, and
+`the_inside_count_sees_the_selected_functions_own_cfg_too`, each confirmed RED against the
+pre-fix code before landing (`a_repeated_site_candidate_cfg_pair_is_not_recomputed`'s own
+RED is the 46.73s measurement above). No new ADR: nothing here moves a must-not-own cell,
+a dependency edge, or a rule id.
+
+Codex review of that same commit found a fifth: making `path_could_reach_target` the sole
+decision-maker also removed the one thing the deterministic resolver used to do for an
+*absolute* path — `#[cfg(..)]` aside, `::dep::CheckedDispatch { .. }` reaches the extern
+prelude directly, and `resolve_segments` had always returned such a path's own segments
+unresolved, letting the old `resolves_to_name` check compare the last one to the target.
+`path_could_reach_target` instead bailed `false` outright for any leading-colon path — a
+missed count, the one unacceptable direction. It now matches `resolve_segments`'s own
+shape: an absolute path's last segment is compared to `target` directly, with no local
+scope consulted. `an_absolute_path_construction_still_counts` is the regression, confirmed
+RED against the pre-fix `false` shortcut before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+A further review round found a sixth: a statement-level `#[cfg(..)]` on a `let` is
+neither an `Item`, an `ImplItem` nor a `TraitItem`, so none of `Literals`'s three
+existing overrides ever folded it into `enclosing_cfg` —
+`#[cfg(not(feature = "a"))] let _ = Unchecked { .. };` was checked against the enclosing
+function's own `cfg` alone, missing the `let`'s own narrower one, and a candidate the
+local's own `cfg` already rules out was still counted: an over-count, a false gate
+violation on honest code. A `visit_local` override closes it, matching the other three's
+push-pop shape. `a_local_statements_own_cfg_excludes_a_candidate_the_functions_cfg_would_not`
+is the regression, confirmed RED against the pre-fix code (no such override) before
+landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule
+id.
+
+The next round found a seventh, in the same shape as the sixth: Rust permits
+`#[cfg(..)]` directly on an expression in statement position — `#[cfg(not(feature =
+"a"))] { let _ = Unchecked { .. }; }`, a cfg-gated block expression — and on a `match`
+arm's own pattern, and neither was any of the four kinds `Literals` already tracked.
+`visit_expr` closes the expression half using `expr_attrs`, this file's existing
+exhaustive per-variant `&[syn::Attribute]` reader, already relied on elsewhere; `visit_arm`
+closes the match-arm half. Both skip the push/pop outright when the node carries no
+attributes — true of nearly every expression in a real file — so the fix stays a cheap
+no-op rather than a `Cfg` clone on every expression node; the full suite, including the
+perf-sensitive fixtures issue #197 and this issue's own earlier rounds added, stayed under
+15s total with both in place.
+`a_cfg_gated_block_expression_statements_own_cfg_excludes_a_candidate` and
+`a_cfg_gated_match_arms_own_cfg_excludes_a_candidate` are the regressions, both confirmed
+RED against the pre-fix code (neither override existing) before landing. No new ADR:
+nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+The round after found an eighth, in the check itself rather than in what feeds it:
+`Cfg::could_coexist_with` tried `test = true` as well as `test = false` when looking for a
+satisfying assignment — but this whole scanner family already treats `#[cfg(test)]`-only
+code as unshipped and invisible (issue #51), so a candidate or a site that is *only*
+test-only never reaches this method at all (`has_cfg_test` skips it first). Two formulas
+that are disjoint in every real production build — a target under
+`any(test, feature = "a")`, a site under `any(test, not(feature = "a"))` — still hold
+together the moment `test` is assumed `true`, a build this scan has no business reasoning
+about, so they were reported as coexisting and the construction over-counted: a false gate
+violation on honest code, the same direction as every round since the fourth. `test` is now
+fixed to `false`, matching `Cfg::requires_test`'s own fixed assignment.
+`coexistence_is_checked_in_a_production_build_only` is the regression, confirmed RED
+against the pre-fix two-valued search before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+The next review found a ninth, in what feeds the check rather than in the check itself once
+more: `syn::FieldValue` carries its own `attrs`, separate from its value expression's own —
+`visit_expr` already folds the latter into `enclosing_cfg`, but a struct literal field's own
+`#[cfg(..)]` (`Wrapper { #[cfg(not(feature = "a"))] value: Unchecked {} }`) was never read
+at all, so a nested literal inside a cfg-gated field was checked against a site `cfg` that
+omitted the field's own narrower one — an over-count, a false gate violation on honest code,
+the same direction as every finding since the fourth. `visit_field_value` closes it, the
+same push-pop shape as `visit_local`/`visit_expr`/`visit_arm`, with the same empty-attrs
+fast path those two already carry: nearly every field in a real file carries none, so this
+stays a cheap no-op rather than a `Cfg` clone per field.
+`a_struct_literal_fields_own_cfg_excludes_a_candidate_the_sites_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+The same round found a tenth, in `Cfg::key` rather than in what calls it: `all`/`any` are
+commutative, so `all(a, b)` and `all(b, a)` are one formula with its operands written two
+ways — but `key`'s own bare `format!("{self:?}")` rendered the two differently, so several
+functions each writing their own permutation of one large `not(any(..))` predicate against
+one `any(..)` candidate missed `AliasLookupCache::could_coexist`'s cache on every one of
+them and each independently paid `Cfg::could_coexist_with`'s own worst case — exponential in
+the atoms two formulas name together, with a fresh `HashSet` allocated per assignment tried.
+`key` now sorts each `all`/`any`'s own children's keys before joining them, so two orderings
+of one operand list render identically; a genuinely different formula still renders
+differently, since the leaves are still rendered with `Debug`'s own escaping and the
+recursion is still exact about structure, blind only to a commutative reordering.
+`many_distinctly_ordered_cfg_predicates_over_one_pair_resolve_quickly` is the regression —
+distinct permutations from the factorial number system rather than a mere rotation, since a
+rotation only produces as many distinct orderings as there are atoms and would stop
+stressing the cache, and pass, past that count — confirmed RED at 63s against a 20s ceiling
+for eight sites over one 20-atom pair before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+A further round found an eleventh, and it is the tenth's own fix taken further rather than a
+new class of gap: sorting one combinator's own children left `Cfg::key` blind to shape —
+`enclosing_cfg` nests one `all` per level of `visit_item`/`visit_impl_item`/etc. it has
+descended through, whether or not that level carries a `cfg` of its own, so the identical
+20-atom predicate inherited at two different nesting depths — two functions wrapped in a
+different number of enclosing modules, say — rendered to two different keys and missed the
+cache on every distinct depth, recreating the same tens-of-seconds regression. `key` now
+normalizes before rendering: `all`/`any` are associative, so a same-kind child is spliced
+into its parent rather than kept nested (`all(all(a, b), c)` is exactly `all(a, b, c)`, and
+splicing an empty child list — an unconditional level's own contribution — adds nothing),
+and a combinator left with exactly one child collapses to that child. Both are real
+algebraic identities, not an approximation, so this never changes what a formula means —
+only two of its equivalent shapes now share one rendering.
+`many_differently_nested_but_equivalent_cfg_predicates_resolve_quickly` is the regression,
+confirmed RED at 65s against a 20s ceiling for eight sites nesting one 20-atom predicate at
+eight different depths before landing. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
+
+The same round found a twelfth, back in what feeds the check: `syn::Variant` carries its own
+`attrs`, and `syn` dispatches it through `visit_variant`, which none of `Literals`'s
+overrides intercepted — a discriminant expression's own literal
+(`#[cfg(not(feature = "a"))] V = { let _ = Unchecked { .. }; 0 }`) was checked against the
+enclosing enum's own `cfg` alone, missing the variant's own narrower one: an over-count, the
+same direction as every finding since the fourth. A `visit_variant` override closes it, the
+same push-pop shape and empty-attrs fast path as `visit_field_value`/`visit_expr`/
+`visit_arm`.
+`an_enum_variants_own_cfg_excludes_a_candidate_the_enums_cfg_would_not` is the regression,
+confirmed RED against the pre-fix code (no such override) before landing. No new ADR:
+nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a thirteenth, in the same family as the ninth and twelfth:
+`syn::Field` — a struct or enum *declaration*'s own field, as opposed to `syn::FieldValue`
+in a struct *literal*, which round 7 already handles — carries its own `attrs` too, and its
+own declared type can hide an expression the default descent still reaches: an array
+length, `#[cfg(not(feature = "a"))] field: [u8; { let _ = Unchecked { .. }; 0 }]`. Nothing
+folded the field's own condition into `enclosing_cfg` before `visit_field` reached it, so
+the nested literal was checked against the enclosing struct's own `cfg` alone: an
+over-count, the same direction as every finding since the fourth. A `visit_field` override
+closes it, the same push-pop shape and empty-attrs fast path as `visit_field_value`/
+`visit_variant`.
+`a_declaration_fields_own_cfg_excludes_a_candidate_the_structs_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+A further round found a fourteenth, and it is in the search's own accumulation rather
+than in what feeds it: `try_alias_candidates`'s own doc comment already said what was
+wrong — `site_cfg` was "passed through, unchanged, to every recursive call" — so a chain
+of alias hops each gated on a different, mutually exclusive `cfg` could combine two hops
+that can never coexist, each individually checked against only the unconditional
+construction site rather than against each other. Confirmed against real `rustc`:
+`#[cfg(feature = "a")] type A = B; #[cfg(feature = "a")] type B = Decoy;` beside
+`#[cfg(not(feature = "a"))] type A = Decoy; #[cfg(not(feature = "a"))] type B =
+CheckedDispatch;` can only ever resolve `A` to `Decoy` — under `feature = "a"`, through
+`B`; under its negation, directly — because `A = B` and `B = CheckedDispatch` never hold
+in the same build, yet the unfixed search reached `CheckedDispatch` anyway by picking
+`A = B` from the `a` branch and `B = CheckedDispatch` from the `not(a)` branch, each hop
+alone coexisting with the unconditional site. `try_alias_candidates` now conjoins each
+selected candidate's own `cfg` with the accumulated path `cfg` — `Cfg::All(vec![site_cfg,
+candidate_cfg])` — before passing it on to the next hop, rather than forwarding
+`site_cfg` untouched; `AliasLookupCache::live_aliases_of` stops discarding the tag it
+already filters by, and `try_block_local_candidates` tags a block-local candidate with
+its own declaring item's `cfg` the same way.
+`a_chained_alias_cannot_combine_mutually_exclusive_cfg_hops` is the regression, confirmed
+RED against the pre-fix code (`total: 1` against an expected `0`) before landing. No new
+ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a fifteenth, and it is a different direction from
+the fourteenth's own: not two hops each individually checked against the site, but a
+block-local declaration whose own `cfg` is not syntactically unconditional yet is still
+*guaranteed* wherever the construction site itself exists. Confirmed against real
+`rustc`: inside a `#[cfg(feature = "a")]` function, a block-local
+`#[cfg(feature = "a")] type Unchecked = Decoy;` always shadows a module-scope
+`#[cfg(feature = "a")] type Unchecked = CheckedDispatch;`, because the two conditions are
+identical rather than merely coexisting — but `live_block_declarations` only ever
+stopped the outward search on a *syntactically* unconditional declaration
+(`!has_any_cfg`), so this one was kept as a mere coexisting branch and module scope was
+searched too, counting `CheckedDispatch`. `Cfg::is_guaranteed_by` is the new check: the
+same enumeration `Cfg::could_coexist_with` uses, over the same union of atoms, but the
+opposite predicate — every assignment where `site_cfg` holds must also make the
+candidate's own `cfg` hold, i.e. `site_cfg && !candidate_cfg` is unsatisfiable. The
+dangerous direction is reversed from `could_coexist_with`'s own: `true` is what lets a
+caller stop searching, so past `MAX_CFG_ATOMS`, or on any assignment the guarantee does
+not survive, the answer is `false` — assume no guarantee, keep searching outward.
+`AliasLookupCache::guaranteed_by` memoizes it by the same `(candidate, site)` key shape
+`could_coexist` already uses, for the same reason: `live_block_declarations` asks it once
+per coexisting candidate of every scope it visits. `a_site_guaranteed_block_local_alias_shadows_a_module_scope_one`
+and its control, `a_block_local_alias_whose_cfg_the_site_does_not_guarantee_still_lets_module_scope_through`,
+are the regression, the first confirmed RED against the pre-fix code (`total: 1` against
+an expected `0`) before landing. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
+
+Codex review of the same commit found a sixteenth, in what feeds the check rather than
+in the check itself: stable Rust lets a function parameter carry its own `#[cfg(..)]` to
+conditionally compile one argument, and `syn::PatType` carries its own `attrs` separate
+from the enclosing function item's — `Literals` had no override for it, so a nested
+literal buried in a parameter's own declared type (an array length, say) was checked
+against the function's own `cfg` alone, missing the parameter's own narrower one: an
+over-count, the same direction as every finding since the fourth. A `visit_pat_type`
+override closes it, the same push-pop shape and empty-attrs fast path as
+`visit_field`/`visit_field_value`/`visit_variant`.
+`a_function_parameters_own_cfg_excludes_a_candidate_the_functions_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of the same commit found a seventeenth, in the same family as the twelfth
+and thirteenth: `syn::ForeignItem` — a member of an `extern` block — carries its own
+`attrs`, and none of `visit_item`/`visit_impl_item`/`visit_trait_item` ever dispatches
+through it, so a foreign function's or static's own `cfg` was never folded into
+`enclosing_cfg` before its declared type was visited: an over-count, the same direction
+as every finding since the fourth. A `visit_foreign_item` override closes it, reading
+the member's own attributes through `foreign_item_attrs` — the same reader
+`declares_item_macro`'s `MacroVisitor` already uses for this node kind — with the same
+push-pop shape and empty-attrs fast path as the other statement-level overrides.
+`a_foreign_items_own_cfg_excludes_a_candidate_the_externs_cfg_would_not` is the
+regression, confirmed RED against the pre-fix code (no such override) before landing. No
+new ADR: nothing here moves a must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found an eighteenth, and it is the module twin of round
+fourteen's own finding: module descent — both `try_module_scope_candidates`'s own hop
+and `try_block_local_candidates`'s block-local one — passed `site_cfg` through unchanged
+to the recursive call after entering a module, rather than conjoining the selected
+module's own `cfg` first, exactly the bug round fourteen closed for an alias hop.
+Confirmed against real `rustc`: `#[cfg(feature = "a")] mod m { #[cfg(not(feature = "a"))]
+pub type X = CheckedDispatch; #[cfg(feature = "a")] pub type X = Decoy; }` can only ever
+resolve `m::X` to `Decoy` — `m` exists only under `feature = "a"`, and in that exact
+build `X` only has its `feature = "a"` declaration — yet the unfixed search still
+reached `CheckedDispatch`, because the module's own `cfg` coexists with the
+unconditional site on its own, and `X`'s own `cfg` then coexists with that same
+unconditional `site_cfg` too, the two never checked against each other.
+`AliasLookupCache::live_modules_of` now tags each live module with its own `cfg`,
+mirroring `live_aliases_of`'s own tag; `try_module_scope_candidates` conjoins it with
+`site_cfg` before recursing, and `try_block_local_candidates`'s module branch reuses the
+`declaration_cfg` it already computes for its alias branch, since the found module *is*
+`declaration.item`. `a_module_hop_cannot_combine_with_a_mutually_exclusive_further_cfg`
+and `a_block_local_module_hop_cannot_combine_with_a_mutually_exclusive_further_cfg` are
+the regressions, both confirmed RED against the pre-fix code (`total: 1` against an
+expected `0`) before landing. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.
+
+Codex review of the same commit found a nineteenth and a twentieth, both in the same
+family as the ninth, twelfth and sixteenth: two more node kinds carry their own `attrs`
+that none of `Literals`'s overrides reached. Stable Rust lets a generic type or const
+parameter carry its own `#[cfg(..)]`, and a type parameter's default can hide an
+expression the same way a declaration field's or a function parameter's own can, while a
+const parameter's default is an expression that can construct the target directly. And a
+parameter in a function-*pointer* type is `syn::BareFnArg`, a separate node from
+`syn::PatType` (an ordinary function declaration's parameter) with its own `attrs` the
+`visit_pat_type` override does not cover. Three overrides close them —
+`visit_type_param`, `visit_const_param` and `visit_bare_fn_arg` — the same push-pop
+shape and empty-attrs fast path as every other statement-level override in this family.
+`a_type_params_own_cfg_excludes_a_candidate_the_items_cfg_would_not`,
+`a_const_params_own_cfg_excludes_a_candidate_the_items_cfg_would_not` and
+`a_bare_fn_args_own_cfg_excludes_a_candidate_the_aliass_cfg_would_not` are the
+regressions, each confirmed RED against the pre-fix code (no such override) before
+landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.
+
 Issue #205 found that `generic_assoc_type_bindings_naming` had no fail-closed backstop,
 unlike `struct_literal_counts`. `resolve_local_alias_chain` cannot see a block-local `mod`.
 So a binding qualified through one was never checked. Real `rustc` reads `mod traits { pub
@@ -6788,3 +7104,167 @@ round's narrowing is reverted: the gate is "any live block-local declaration" ag
 round-three false positive is accepted rather than chased — a missed count is the danger this
 whole mechanism exists to close, not an extra one. No new ADR: nothing here moves a
 must-not-own cell, a dependency edge, or a rule id.
+
+Merging this branch (issue #206's own PR) with `main`'s issue #193 and #205 work found one
+real behavior change, in the seam between the two — neither review touched the same lines,
+so neither caught it. Issue #193 gave `Literals::visit_expr_struct` a `block_shadowed` gate
+so a bare or qualified head segment shadowed by an unconditional block-local declaration is
+excluded from the fail-closed backstop; issue #206's own round 2 (above) separately made the
+backstop itself run whenever the path is not `block_shadowed`, full stop, rather than only
+when a cheap, `cfg`-blind `resolves_to_name` disagreed. Combined literally, `resolves_to_name`
+dropped out of the count entirely except inside `block_shadowed`'s own branch. One of main's
+own regression tests, `path_could_reach_target_does_not_consult_block_shadow_for_a_type_only_shape`,
+pinned the old, `resolves_to_name`-first structure's own accepted over-count for a *bare*
+reference shadowed by a block-local `enum` — `resolve_segments` deliberately never refuses a
+bare reference through `block_shadow` (only through the narrower `value_shadow`, since most
+of the four shadowing shapes occupy no value namespace to be safely conservative about), so
+the old shortcut resolved straight through to a module-scope alias the enum should have
+blocked. Bringing `resolves_to_name` back as an unconditional second route to a count would
+have reverted round 2's own fix outright — the exact structure that fix replaced, and the
+exact shape round 2's own regression test still guards against elsewhere in this file. The
+two fixes are not reconcilable as separately written for this one path, and round 2's is the
+one worth keeping: it corrects an outright wrong claim (a `cfg`-gated candidate the
+construction site itself can never coexist with), where the `enum` case is merely an
+accepted, safe-direction imprecision `resolve_segments` already documents as deliberate and
+unfixed. The merged code keeps round 2's structure — `path_could_reach_target` runs whenever
+the path is not `block_shadowed` — and the test's own expectation moves from the old
+shortcut's `1` to `0`: `live_block_declarations` (unchanged by either PR) already treats an
+unconditional block-local declaration of *any* of the four shapes, not only an alias, as
+shadowing everything further out, so the backstop's own independent search finds nothing
+reachable once it is actually asked. The fixture was never compilable Rust either way — an
+`enum` with no unit variant cannot be built with `Name { .. }` syntax — so neither answer
+ever corresponded to a real missed or extra count in a shipping build; this is a side effect
+of unifying two fixes that happened to converge on the more principled one, not a new,
+targeted fix of its own. No new ADR: nothing here moves a must-not-own cell, a dependency
+edge, or a rule id.
+
+Codex review of the merge commit found three more real gaps, all in the same shape as the
+family of `Literals` overrides above. First: a method's `self` parameter is `syn::Receiver`,
+a separate node from `syn::PatType` with its own `attrs` — stable arbitrary self types let it
+carry an explicit type (`self: SomeType`) that can hide an expression an existing override
+never reached. Second: a `match` arm's own struct or tuple-struct pattern field is
+`syn::FieldPat`, with its own `attrs` separate from a declaration field's (`visit_field`) and
+a struct literal's own field (`visit_field_value`) — its own sub-pattern can carry a const
+generic argument that hides an expression the same way either of those can. Both close with
+`visit_receiver`/`visit_field_pat` overrides, the identical push-pop shape and empty-attrs
+fast path every other statement-level override in this family already has.
+`a_receivers_own_cfg_excludes_a_candidate_the_methods_cfg_would_not` and
+`a_field_pats_own_cfg_excludes_a_candidate_the_arms_cfg_would_not` are the regressions, both
+confirmed RED against the pre-fix code (the two new overrides stubbed to a bare delegate, no
+`cfg` folding) before landing.
+
+Third, and different from every finding above: `Cfg::key`'s own `commutative_key` sorts a
+combinator's children but never deduplicates them, and `all`/`any` are idempotent —
+`all(P, P, P)` is exactly `P` — so a predicate repeated as several separate children of one
+combinator still rendered a longer, distinct key at every count. `enclosing_cfg` accumulates
+one more copy of an identical predicate per level of *nested* items that each carry it —
+unlike round 8's own flattening fix, which collapses a `cfg`-bearing item's `all` into its
+parent's but does nothing about the same predicate appearing as more than one child of the
+result — so a construction nested `N` levels inside identically-gated items missed
+`AliasLookupCache::could_coexist`'s cache at every one of `N` distinct depths and
+independently repeated the same worst-case, unsatisfiable enumeration `N` times.
+`commutative_key` now also calls `dedup` after `sort`, so every duplicate — made consecutive
+by the sort — collapses to one. Sound rather than approximate, for the same reason `dedup`ing
+before the sort would not be: two semantically identical `Cfg` values (one true fact, spelled
+`N` times) can only ever agree on `could_coexist_with`'s answer, so sharing the cache entry
+never returns a wrong one for either.
+`a_predicate_repeated_across_nested_functions_shares_one_cache_key` is the regression, nested
+functions rather than nested modules on purpose — a module does not inherit its enclosing
+scope's own declarations, so a construction site nested inside one could not reach the target
+type at all and the test would exercise nothing. Confirmed RED against the pre-fix code: 58.6s
+against this test's own 30s ceiling at 20 atoms and 8 levels (13.95s with the fix, the same
+order of margin the sibling `many_differently_nested_..._resolve_quickly` test already keeps
+against its own regressed shape) before landing. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+Codex review of that same commit found a fourth, and it is a missed count rather than an
+over-count — the dangerous direction this whole mechanism exists to close first.
+`live_block_declarations`'s own `site_guaranteed` check asked whether *any* coexisting item's
+`cfg` was guaranteed by the site's, with no regard for which namespace that item occupies —
+but `unconditional`, right beside it, is already restricted to a namespace-unambiguous winner
+through `live_named_items_in_scope`'s own `is_namespace_unambiguous` check, for exactly the
+reason issue #193 states of `block_shadow`: a value-only declaration (a `const`, a `static`,
+a `fn`) or an ambiguous `use` can never be proven to occupy the type namespace a struct-
+literal path always resolves in. Confirmed against real `rustc`: a block-local `#[cfg(feature
+= "a")] const Unchecked: u8 = 0;`, gated identically to a `#[cfg(feature = "a")]` construction
+site, never shadows a module-scope `#[cfg(feature = "a")] type Unchecked = CheckedDispatch;`
+— the two occupy different namespaces entirely — but the unrestricted check still treated the
+`const` as a guaranteed shadow and skipped module scope outright, missing the real
+construction the outer alias reaches. `site_guaranteed` now requires
+`is_namespace_unambiguous` too, the identical test `unconditional` already passes through.
+`a_value_only_site_guaranteed_declaration_does_not_shadow_a_type_namespace_module_scope_one`
+is the regression, confirmed RED against the pre-fix code (`total: 0` against an expected `1`)
+before landing. No new ADR: nothing here moves a must-not-own cell, a dependency edge, or a
+rule id.
+
+A fifth finding, on the same review round, closes the last gap
+`live_aliases_of`/`live_modules_of` left open. Two namespace-unambiguous declarations of one
+name in one scope are always `E0428`/`E0255` — never two live branches the way two
+`#[cfg]`-gated declarations under mutually exclusive flags are — so a merely *coexisting* peer
+beside a *guaranteed* one is dead code in every build that reaches the site: `#[cfg(a)] type
+Alias = Decoy;` beside `#[cfg(b)] type Alias = CheckedDispatch;`, referenced bare inside a
+`#[cfg(a)]` function, only ever compiles as `Decoy` — a build with `b` also enabled never
+compiles at all — but both scans kept every coexisting peer regardless, over-counting the
+construction. `AliasLookupCache::guaranteed_unambiguous_winner` is the fix: among a scope's
+namespace-unambiguous candidates coexisting with a site, the one — if there is exactly one —
+`is_guaranteed_by` that site excludes every other namespace-unambiguous peer sharing the name;
+`use` is never among the candidates, for `is_namespace_unambiguous`'s own reason. `TaggedAliases`
+widens to carry each alias's own declaring item, compared against the winner by identity
+(`core::ptr::eq`) rather than by `cfg` equality, since two distinct namespace-unambiguous items
+sharing one name in one scope always have distinct `cfg`s in a real, compiling build.
+
+Landing it exposed two more, both closed before landing rather than left as a regression. The
+first: `is_guaranteed_by`'s own enumeration is exactly as expensive as `could_coexist_with`'s,
+and `a_repeated_site_candidate_cfg_pair_is_not_recomputed`'s own fixture now paid two full
+worst-case enumerations where it used to pay one, roughly doubling that test's own runtime.
+`is_guaranteed_by` now short-circuits when a candidate's `cfg` and the site's are the identical
+formula (`self.key() == site_cfg.key()`) — `p && !p` is unsatisfiable for any `p`, so a
+candidate declared under the site's own exact `cfg`, a common shape once a block-local
+declaration repeats its enclosing item's own gate, never needs the enumeration at all.
+
+The second is a real gap in `Cfg::key()`'s own claim to be an equality test, and the fast path
+above still missed it at every nesting depth past the first:
+`a_predicate_repeated_across_nested_functions_shares_one_cache_key`'s own fixture is built to
+prove one cache key is shared across eight levels of identical, repeated `cfg`, and
+`enclosing_cfg` conjoins one more copy of that identical predicate per level of nesting.
+`commutative_key`'s own dedup (round 7) only ever collapses the *rendered strings* of an
+`All`/`Any`'s children to one entry — it still wraps that surviving entry in `all([..])`, where
+`Cfg::flattened`'s own single-*raw*-child collapse (round 8) renders the identical formula bare,
+with no wrapper, whenever accumulation stops after exactly one real copy. `all(p, p, p)` and `p`
+mean the same formula and rendered as two different keys, so `is_guaranteed_by`'s fast path, and
+every `AliasLookupCache` lookup keyed on `.key()`, missed the identical formula at every depth
+past the one where accumulation happened to collapse to a single raw child. `Cfg::flattened` now
+dedups by `key_raw` at the *value* level too — the identical identity `commutative_key` already
+uses for its own string-level dedup — so a singleton left over after dedup collapses to its own
+bare child the same way a genuinely single raw child already did. Measured directly: the nested
+fixture ran in 21.6s before this fix (worse than the pre-winner-exclusion baseline of 13.79s in
+this environment) and 6.88s after it, with `is_guaranteed_by`'s own fast path confirmed hitting
+at every depth once the two keys agreed.
+
+`a_site_guaranteed_module_scope_alias_excludes_a_merely_coexisting_peer`,
+`a_site_guaranteed_module_scope_declaration_excludes_a_merely_coexisting_module_peer` and
+`a_merely_coexisting_module_scope_peer_still_counts_with_no_guaranteed_winner` are the
+winner-exclusion regressions, the last a control confirming a scope with no guaranteed winner
+still counts every coexisting peer exactly as before. All 2088 tests, `cargo fmt --all --check`,
+`cargo clippy -p xtask --locked --all-targets -- -D warnings`,
+`RUSTDOCFLAGS="-D warnings" cargo doc --locked -p xtask --no-deps` and
+`cargo xtask check-layering` (57 rules) are clean. No new ADR: nothing here moves a
+must-not-own cell, a dependency edge, or a rule id.
+
+A sixth finding, on the same review round, is in what the whole search starts from rather than
+in the search itself. A file-level inner attribute (`#![cfg(..)]`) gates the whole file the same
+way an item's own `#[cfg(..)]` gates that item — every construction site in the file inherits
+it — but the root `enclosing_cfg` `struct_literal_counts` seeds both `total`'s own visitor and
+`inside_targets`' own root formula from started empty, an always-true formula that gave the
+file's own gate no weight at all. `#![cfg(not(feature = "a"))]` at the top of a file, beside
+`#[cfg(feature = "a")] type Alias = CheckedDispatch;`, means the target alias itself never
+exists in any build that also has this file — the file requires `feature = "a"` off and the
+alias requires it on — but an empty root formula let a site anywhere in that file, however it
+was itself gated, count it as reachable anyway. Both roots now seed from
+`attrs_cfg(&file.attrs)` instead of `Cfg::All(Vec::new())`.
+`a_file_level_cfg_attribute_excludes_a_candidate_the_file_itself_could_never_compile_under` is
+the regression, confirmed RED against the pre-fix empty root (`total: 1` against an expected `0`)
+before landing; `a_file_with_no_file_level_cfg_still_counts_a_reachable_construction` is the
+control, confirming the seed does not turn into an always-excluding formula on a file that
+carries no inner attribute at all. No new ADR: nothing here moves a must-not-own cell, a
+dependency edge, or a rule id.

@@ -124,7 +124,7 @@ fn attrs_cfg(attrs: &[syn::Attribute]) -> Cfg {
 /// residual limit rather than a guess — it cannot know that `feature = "a"` and
 /// `feature = "b"` are mutually exclusive, only that two occurrences of the identical
 /// text name the same flag.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Cfg {
     /// The bare identifier `test`.
     Test,
@@ -200,6 +200,239 @@ impl Cfg {
             Self::All(children) => children.iter().all(|child| child.eval(test, true_atoms)),
             Self::Any(children) => children.iter().any(|child| child.eval(test, true_atoms)),
             Self::Not(inner) => !inner.eval(test, true_atoms),
+        }
+    }
+
+    /// Checks if `self` and `other` can both be true at the same time, in a
+    /// **production** build — `test` fixed to `false`, over every assignment
+    /// of the atoms named in either formula ([`Cfg::atoms`]), the same
+    /// enumeration [`Cfg::requires_test`] uses. Answers `true` on the first
+    /// assignment where both formulas hold.
+    ///
+    /// `test` is fixed rather than tried both ways because this whole scanner
+    /// family already treats `#[cfg(test)]`-only code as unshipped and
+    /// invisible (issue #51): a candidate or a site gated in a way that is
+    /// only test-only is already skipped before either formula reaches this
+    /// method (`has_cfg_test`), so the two formulas compared here can each
+    /// individually hold with `test` either way — but this scan reasons only
+    /// about the build it gates, which never has `test` true. Trying
+    /// `test = true` as well let two formulas that are disjoint in every real
+    /// production build (e.g. `any(test, feature = "a")` and
+    /// `all(not(test), not(feature = "a"))`) still report coexisting, through
+    /// an assignment this scan has no business considering (Codex review of
+    /// the fix, round 5) — an over-count, a false gate violation on honest
+    /// code, the same direction as this issue's earlier rounds.
+    ///
+    /// [`struct_literal_counts`]'s fail-closed search (issue #206) uses this
+    /// to check a candidate's own `cfg` against the construction site's own
+    /// enclosing `cfg`. A missed count is the danger there, so this method
+    /// answers `true` — "assume they can coexist" — whenever it cannot be
+    /// sure: past [`MAX_CFG_ATOMS`] distinct atoms, the same cap
+    /// [`Cfg::requires_test`] uses.
+    fn could_coexist_with(&self, other: &Self) -> bool {
+        let mut atoms = Vec::new();
+        self.atoms(&mut atoms);
+        other.atoms(&mut atoms);
+        atoms.sort();
+        atoms.dedup();
+        if atoms.len() > MAX_CFG_ATOMS {
+            return true;
+        }
+        let assignments = 1usize << atoms.len();
+        (0..assignments).any(|mask| {
+            let true_atoms: std::collections::HashSet<&str> = atoms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| (mask & (1 << index) != 0).then_some(name.as_str()))
+                .collect();
+            self.eval(false, &true_atoms) && other.eval(false, &true_atoms)
+        })
+    }
+
+    /// Whether `site_cfg` holding guarantees this formula holds too — i.e.,
+    /// `site_cfg && !self` is unsatisfiable in a production build (`test`
+    /// fixed to `false`, [`could_coexist_with`](Self::could_coexist_with)'s
+    /// own reason). The same enumeration as `could_coexist_with`, over the
+    /// same union of atoms, but the opposite predicate: every assignment
+    /// where `site_cfg` holds must also make `self` hold.
+    ///
+    /// A `true` answer here lets a caller — [`live_block_declarations`] —
+    /// treat a `cfg`-gated declaration as though it were unconditional
+    /// *relative to one specific site*, and stop searching further out:
+    /// wherever the site exists, this declaration is guaranteed to exist
+    /// too, so an outer declaration of the same name is dead code from
+    /// that site's own construction, exactly as a syntactically
+    /// unconditional inner declaration already is (Codex review of PR
+    /// #209, issue #206: a block-local `#[cfg(feature = "a")] type
+    /// Unchecked = Decoy;` inside a `#[cfg(feature = "a")]` function
+    /// always shadows a module-scope `#[cfg(feature = "a")] type
+    /// Unchecked = CheckedDispatch;`, never leaving both live the way two
+    /// declarations under genuinely different, unrelated flags can). So
+    /// `true` is the dangerous direction here, the opposite of
+    /// `could_coexist_with`'s: past [`MAX_CFG_ATOMS`], or on any
+    /// assignment where the guarantee does not hold, this answers `false`
+    /// — assume no guarantee, so the outward search still runs.
+    fn is_guaranteed_by(&self, site_cfg: &Self) -> bool {
+        // A formula always guarantees itself (`p && !p` is unsatisfiable
+        // whatever `p` names), so a candidate declared under the site's own
+        // exact `cfg` — a common shape, since a block-local declaration
+        // often repeats its enclosing item's own gate — never needs the
+        // enumeration below at all. `key()` is `could_coexist`'s own
+        // equality test for a `Cfg`, so this stays consistent with how the
+        // rest of this cache already treats two formulas as "the same"
+        // (Codex review of the fix, issue #206: nested functions each
+        // carrying the identical `cfg` repeat this exact shape once per
+        // level, and without this the enumeration below ran again, from
+        // scratch, at every depth).
+        if self.key() == site_cfg.key() {
+            return true;
+        }
+        let mut atoms = Vec::new();
+        self.atoms(&mut atoms);
+        site_cfg.atoms(&mut atoms);
+        atoms.sort();
+        atoms.dedup();
+        if atoms.len() > MAX_CFG_ATOMS {
+            return false;
+        }
+        let assignments = 1usize << atoms.len();
+        (0..assignments).all(|mask| {
+            let true_atoms: std::collections::HashSet<&str> = atoms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| (mask & (1 << index) != 0).then_some(name.as_str()))
+                .collect();
+            !site_cfg.eval(false, &true_atoms) || self.eval(false, &true_atoms)
+        })
+    }
+
+    /// A text key for this formula (issue #206, Codex review of the fix).
+    /// Used only to memoize [`Cfg::could_coexist_with`]'s own result
+    /// ([`AliasLookupCache::could_coexist`]) — not to widen
+    /// [`AliasLookupCache`]'s own outer key, which [`AliasLookupCache`]'s
+    /// own doc says is a different, already-tried-and-reverted mistake.
+    ///
+    /// Normalizes first (round 8), then renders and sorts each `all`/`any`'s
+    /// own children (round 7) — see [`Cfg::normalized`] for what the first
+    /// step buys beyond the second.
+    fn key(&self) -> String {
+        self.normalized().key_raw()
+    }
+
+    /// [`Cfg::key`]'s own rendering, over an already-[`Cfg::normalized`]
+    /// tree: sorts each `all`/`any`'s own children's keys before joining
+    /// them, so two orderings of one operand list render identically — a
+    /// genuinely different formula still renders differently, because the
+    /// leaves (`Test`, `Atom`) are still rendered with `Debug`'s own
+    /// escaping and the recursion is still exact about structure, only
+    /// blind to a commutative reordering (Codex review of the fix, round
+    /// 7).
+    fn key_raw(&self) -> String {
+        match self {
+            Self::Test => "Test".to_owned(),
+            Self::Atom(name) => format!("Atom({name:?})"),
+            Self::All(children) => Self::commutative_key("All", children),
+            Self::Any(children) => Self::commutative_key("Any", children),
+            Self::Not(inner) => format!("Not({})", inner.key_raw()),
+        }
+    }
+
+    /// [`Cfg::key_raw`]'s helper for `All`/`Any`: every child's own key,
+    /// sorted so the operands' written order does not matter, and
+    /// deduplicated so a repeated operand does not either (Codex review of
+    /// PR #209, issue #206): `all`/`any` are idempotent (`x && x` and
+    /// `x || x` are both just `x`), so `all(a, a, b)` and `all(a, b)` are
+    /// the same formula, but sorting alone still renders them as two
+    /// different keys — `enclosing_cfg` conjoins one more identical child
+    /// per level of nesting a repeated predicate is declared under (a
+    /// module inside a module, each carrying the same `#[cfg(..)]`), so
+    /// every depth missed [`AliasLookupCache::could_coexist`]'s cache and
+    /// independently repeated the same worst-case enumeration. Sorting
+    /// first makes every duplicate consecutive, so `dedup` after it removes
+    /// all of them, not only adjacent-in-source ones.
+    fn commutative_key(tag: &str, children: &[Self]) -> String {
+        let mut child_keys: Vec<String> = children.iter().map(Self::key_raw).collect();
+        child_keys.sort();
+        child_keys.dedup();
+        format!("{tag}({child_keys:?})")
+    }
+
+    /// A shape-normalized copy of this formula, by two real algebraic
+    /// identities rather than an approximation — never changes what the
+    /// formula means (Codex review of the fix, round 8). `all`/`any` are
+    /// associative, so a same-kind child is spliced into its parent rather
+    /// than kept as a nested node (`all(all(a, b), c)` is exactly
+    /// `all(a, b, c)`); and a combinator left with exactly one child after
+    /// that collapses to that child (`all(a)` is exactly `a`).
+    ///
+    /// `enclosing_cfg` nests one `all` per level of `visit_item`/
+    /// `visit_impl_item`/etc. it has descended through, whether or not that
+    /// level carries a `cfg` of its own — an unconditional item still folds
+    /// in an empty `all()`, which splicing then drops entirely, since
+    /// splicing an empty child list adds nothing to its parent. So the
+    /// identical predicate reached at two different nesting depths — two
+    /// different nested nested modules or functions, say — normalizes to
+    /// one flat, sorted shape and shares one [`Cfg::key`], where the un-
+    /// normalized tree shapes differed and missed
+    /// [`AliasLookupCache::could_coexist`]'s cache on every distinct depth.
+    fn normalized(&self) -> Self {
+        match self {
+            Self::Test => Self::Test,
+            Self::Atom(name) => Self::Atom(name.clone()),
+            Self::Not(inner) => Self::Not(Box::new(inner.normalized())),
+            Self::All(children) => Self::flattened(children, true),
+            Self::Any(children) => Self::flattened(children, false),
+        }
+    }
+
+    /// [`Cfg::normalized`]'s helper: normalizes every child, splices in the
+    /// children of any that normalized to the same kind of combinator
+    /// (`is_all` says which), deduplicates identical children (`all`/`any`
+    /// are idempotent — `all(a, a)` is exactly `a`), and collapses the
+    /// result to its own single child when exactly one remains.
+    ///
+    /// The dedup is by [`Cfg::key_raw`], the identical identity
+    /// [`Cfg::commutative_key`] already uses to dedup a *key string*'s own
+    /// rendered children — done here too, at the value level, so a
+    /// singleton left over after dedup collapses to its own bare child
+    /// rather than staying wrapped in a combinator of one. Skipping this
+    /// left the two forms different formulas by [`Cfg::key`], even though
+    /// they mean the same thing: `enclosing_cfg` conjoins one more copy of
+    /// an identical predicate per level of nesting (a function inside a
+    /// function, each carrying the same `#[cfg(..)]`), and `commutative_key`
+    /// alone dedups the *rendered strings* to one entry but still wraps
+    /// that entry in `all([..])`, so a formula with two or more accumulated
+    /// copies renders as `all(["p"])` where the accumulation stops after
+    /// exactly one copy — `all(EMPTY, p)` — renders as the bare `"p"`
+    /// [`Cfg::flattened`]'s own single-raw-child collapse already gives it.
+    /// [`Cfg::is_guaranteed_by`]'s own fast path for two structurally
+    /// identical formulas relies on `key()` agreeing between the two, and
+    /// missed exactly this case (Codex review of the fix, issue #206):
+    /// `is_guaranteed_by`'s enumeration ran again, from scratch, at every
+    /// nesting depth past the first, on a fixture already built to prove
+    /// one cache key is shared across every depth.
+    fn flattened(children: &[Self], is_all: bool) -> Self {
+        let mut flat = Vec::with_capacity(children.len());
+        for child in children {
+            let normalized_child = child.normalized();
+            match (&normalized_child, is_all) {
+                (Self::All(grandchildren), true) | (Self::Any(grandchildren), false) => {
+                    flat.extend(grandchildren.iter().cloned());
+                }
+                _ => flat.push(normalized_child),
+            }
+        }
+        let mut keyed: Vec<(String, Self)> = flat.into_iter().map(|c| (c.key_raw(), c)).collect();
+        keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+        keyed.dedup_by(|(a, _), (b, _)| a == b);
+        let mut flat: Vec<Self> = keyed.into_iter().map(|(_, c)| c).collect();
+        if flat.len() == 1 {
+            return flat.remove(0);
+        }
+        if is_all {
+            Self::All(flat)
+        } else {
+            Self::Any(flat)
         }
     }
 }
@@ -1347,9 +1580,18 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
                 .map(|segment| ident_name(&segment.ident));
             let overridable = !shadowed
                 || first.is_some_and(|first| {
-                    !live_block_declarations(&self.block_items, &first)
-                        .0
-                        .is_empty()
+                    // Same no-cfg-tracking choice as the `path_could_reach_target`
+                    // call below: `Cfg::All(Vec::new())` ("always true") never
+                    // excludes a live declaration, matching this caller's own
+                    // pre-#206 behaviour.
+                    !live_block_declarations(
+                        &self.block_items,
+                        &first,
+                        &Cfg::All(Vec::new()),
+                        &mut self.alias_lookup_cache,
+                    )
+                    .0
+                    .is_empty()
                 });
             if overridable {
                 for name in self.names {
@@ -1367,6 +1609,13 @@ impl<'ast> syn::visit::Visit<'ast> for AssocBindings<'_, 'ast> {
                             name,
                             self.alias_search_budget,
                             &mut self.alias_lookup_cache,
+                            // This visitor tracks no enclosing `cfg` of its own
+                            // (issue #206 only threads it through `Literals`),
+                            // so the site-`cfg` exclusion is a no-op here rather
+                            // than missing: "always true" never excludes a live
+                            // candidate, matching this caller's own pre-#206
+                            // behaviour exactly.
+                            &Cfg::All(Vec::new()),
                         )
                     {
                         self.found.push((*name).to_owned());
@@ -5425,6 +5674,20 @@ struct Literals<'ast> {
     // #181), same shape as `block_items`: pushed on entering a
     // generics-bearing item, truncated back off on the way out.
     shadow: Vec<String>,
+    // The `cfg` that must hold for the current point to exist at all — every
+    // enclosing item's and impl member's own `cfg`, combined (issue #206).
+    // Starts empty (always true) and grows by one conjunct on `visit_item`/
+    // `visit_impl_item`/`visit_trait_item`, restored on the way out — the
+    // same push/pop shape as `shadow`, keyed on a `Cfg` formula instead of a
+    // name. A struct literal's own path is checked against this: a
+    // candidate alias whose own `cfg` cannot hold at the same time as this
+    // one is never really reachable from here, whatever this scanner's own
+    // alias resolution picks. For one `InsideTarget` alone
+    // (`struct_literal_counts`'s `inside_targets` loop), this starts at
+    // that target's own `InsideTarget::cfg` — every enclosing item's `cfg`
+    // down to the selected function or `impl`, not empty (issue #206, Codex
+    // review of the fix).
+    enclosing_cfg: Cfg,
     // Every block-local `struct`/`enum`/`union`/`trait` name currently shadowed
     // (issue #193). A separate list from `shadow`: it resets only at a
     // `mod` boundary, not at a nested `fn`/`impl`/`trait` — see
@@ -5454,14 +5717,299 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
         if has_cfg_test(item_attrs(node)) {
             return;
         }
+        // Push this item's own `cfg` onto `enclosing_cfg` before descending
+        // into it, pop it back off on the way out — issue #206.
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(item_attrs(node))]);
         syn::visit::visit_item(self, node);
+        self.enclosing_cfg = outer_cfg;
     }
 
     fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
         if has_cfg_test(impl_item_attrs(node)) {
             return;
         }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(impl_item_attrs(node))]);
         syn::visit::visit_impl_item(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A default trait method's own `cfg` is otherwise unseen: it is a
+    // `TraitItem`, not an `Item` or an `ImplItem`, so neither override
+    // above reaches it (issue #206, Codex review of the fix).
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        if has_cfg_test(trait_item_attrs(node)) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(trait_item_attrs(node))]);
+        syn::visit::visit_trait_item(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A `let` statement's own `cfg` is otherwise unseen: `syn::Local` is
+    // neither an `Item`, an `ImplItem` nor a `TraitItem`, so none of the
+    // three overrides above reach a statement-level attribute like
+    // `#[cfg(not(feature = "a"))] let _ = Unchecked {};` (Codex review of
+    // the fix, round 3) — the initializer was checked against a site `cfg`
+    // that omitted the one condition actually gating it, over-counting a
+    // candidate the local's own `cfg` already rules out.
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_local(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // An expression-statement's own `cfg` is otherwise unseen too: Rust
+    // permits `#[cfg(..)]` directly on an expression in statement
+    // position (`#[cfg(not(feature = "a"))] { let _ = Unchecked {}; }`),
+    // and `expr_attrs` is this file's existing, exhaustive per-variant
+    // reader for it (Codex review of the fix, round 4). Skipped whenever
+    // an expression carries no attributes at all — nearly every one in a
+    // real file — so this stays a cheap no-op push/pop rather than a
+    // clone on every expression node.
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        let attrs = expr_attrs(node);
+        if attrs.is_empty() {
+            syn::visit::visit_expr(self, node);
+            return;
+        }
+        if has_cfg_test(attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(attrs)]);
+        syn::visit::visit_expr(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A `match` arm's own `cfg` is the other half of the same finding:
+    // `syn::Arm` carries its own `attrs` too, and the default descent
+    // never reads them (Codex review of the fix, round 4).
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_arm(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_arm(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A struct literal field's own `cfg` is otherwise unseen: `syn::FieldValue`
+    // carries its own `attrs`, separate from the value expression's own —
+    // `visit_expr` above handles the latter, but `Wrapper { #[cfg(not(feature
+    // = "a"))] value: Unchecked {} }` needs the field's own condition folded
+    // in before the nested literal is checked too (Codex review of the fix,
+    // round 7). Same empty-attrs fast path as `visit_expr`/`visit_arm`, for
+    // the same reason: nearly every field in a real file carries none.
+    fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_field_value(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_field_value(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // An enum variant's own `cfg` is otherwise unseen: `syn::Variant`
+    // carries its own `attrs`, and `syn` dispatches it through
+    // `visit_variant`, which none of the overrides above intercept — a
+    // discriminant expression's own literal was checked against the
+    // enum's own `cfg` alone, missing the variant's own narrower one
+    // (Codex review of the fix, round 8). Same empty-attrs fast path as
+    // `visit_field_value`/`visit_expr`/`visit_arm`.
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_variant(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_variant(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A struct or enum *declaration*'s own field's `cfg` is otherwise
+    // unseen: `syn::Field` carries its own `attrs`, separate from
+    // `syn::FieldValue`'s (a struct *literal*'s own field, already handled
+    // above), and its own type can hide an expression — an array length —
+    // that `visit_field` reaches with no override folding the field's own
+    // condition in first (Codex review of the fix, round 9). Same
+    // empty-attrs fast path as the other statement-level overrides.
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_field(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_field(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A typed function parameter's own `cfg` is otherwise unseen: stable
+    // Rust lets a parameter carry `#[cfg(..)]` to conditionally compile
+    // one argument, and `syn::PatType` carries its own `attrs` separate
+    // from the enclosing function item's — a nested literal buried in the
+    // parameter's own declared type (an array length, say) was checked
+    // against the function's own `cfg` alone, missing the parameter's own
+    // narrower one (Codex review of PR #209, issue #206). Same
+    // empty-attrs fast path as the other statement-level overrides.
+    fn visit_pat_type(&mut self, node: &'ast syn::PatType) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_pat_type(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_pat_type(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A foreign item's own `cfg` is otherwise unseen: `syn::ForeignItem` —
+    // a member of an `extern` block — carries its own `attrs`, and none of
+    // `visit_item`/`visit_impl_item`/`visit_trait_item` dispatches through
+    // it, so a foreign function's or static's own declared type could hide
+    // an expression checked against the enclosing extern block's own
+    // `cfg` alone (Codex review of PR #209, issue #206). Same empty-attrs
+    // fast path as the other statement-level overrides.
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        let attrs = foreign_item_attrs(node);
+        if attrs.is_empty() {
+            syn::visit::visit_foreign_item(self, node);
+            return;
+        }
+        if has_cfg_test(attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(attrs)]);
+        syn::visit::visit_foreign_item(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A generic type parameter's own `cfg` is otherwise unseen: stable
+    // Rust lets one carry `#[cfg(..)]`, and its default can hide an
+    // expression — an array length, say — the same way a declaration
+    // field's or a function parameter's own can (Codex review of PR
+    // #209, issue #206). Same empty-attrs fast path as the other
+    // statement-level overrides.
+    fn visit_type_param(&mut self, node: &'ast syn::TypeParam) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_type_param(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_type_param(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A generic const parameter's own `cfg` is otherwise unseen: its
+    // default is an expression that can construct the target directly,
+    // not only hide one inside a type the way a type parameter's default
+    // can (Codex review of PR #209, issue #206). Same empty-attrs fast
+    // path as the other statement-level overrides.
+    fn visit_const_param(&mut self, node: &'ast syn::ConstParam) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_const_param(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_const_param(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A parameter in a function-*pointer* type's own `cfg` is otherwise
+    // unseen: `syn::BareFnArg` is a separate node from `syn::PatType` (an
+    // ordinary function declaration's parameter), with its own `attrs`
+    // `visit_pat_type` does not cover, and it can carry its own
+    // `#[cfg(..)]` just the same (Codex review of PR #209, issue #206).
+    // Same empty-attrs fast path as the other statement-level overrides.
+    fn visit_bare_fn_arg(&mut self, node: &'ast syn::BareFnArg) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_bare_fn_arg(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_bare_fn_arg(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A method's `self` parameter has its own `attrs`, separate from
+    // `visit_pat_type`'s — an *explicit* receiver type (`self: P<Self, ..>`,
+    // stable arbitrary self types) can hide an expression in a const generic
+    // argument the same way a declaration field's or a function parameter's
+    // own type can (Codex review of PR #209, issue #206). Same empty-attrs
+    // fast path as the other statement-level overrides.
+    fn visit_receiver(&mut self, node: &'ast syn::Receiver) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_receiver(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_receiver(self, node);
+        self.enclosing_cfg = outer_cfg;
+    }
+
+    // A `match` arm's own struct or tuple-struct *pattern*'s field has its
+    // own `attrs`, separate from a declaration field's (`visit_field`) and a
+    // struct literal's own field (`visit_field_value`) — `syn::FieldPat`'s
+    // own pattern can carry a const generic argument that hides an
+    // expression the same way either of those can (Codex review of PR #209,
+    // issue #206). Same empty-attrs fast path as the other statement-level
+    // overrides.
+    fn visit_field_pat(&mut self, node: &'ast syn::FieldPat) {
+        if node.attrs.is_empty() {
+            syn::visit::visit_field_pat(self, node);
+            return;
+        }
+        if has_cfg_test(&node.attrs) {
+            return;
+        }
+        let outer_cfg = self.enclosing_cfg.clone();
+        self.enclosing_cfg = Cfg::All(vec![outer_cfg.clone(), attrs_cfg(&node.attrs)]);
+        syn::visit::visit_field_pat(self, node);
+        self.enclosing_cfg = outer_cfg;
     }
 
     shadow_generic_params!();
@@ -5569,14 +6117,29 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
                 || self.value_shadow.contains(&name)
         });
         // Issue #185: a name declared more than once, live under more than one
-        // unevaluated `cfg`, is not something the deterministic resolution above
-        // can pick correctly between. Ask separately whether *some* live
+        // unevaluated `cfg`, is not something a single deterministic resolution
+        // could pick correctly between — this asks whether *some* live
         // declaration could reach `self.name`, from the path as written — a bare
         // name or a qualified one alike (issue #197) — so an ambiguous alias is
         // never silently outvoted by another declaration sharing its name.
-        let reachable_another_way = !resolves_to_name
-            && !block_shadowed
-            && path_could_reach_target(
+        //
+        // Run unconditionally whenever the path is not `block_shadowed`, rather
+        // than only when `resolves_to_name` disagreed (issue #206, Codex review
+        // of the fix): a deterministic pick can itself be a candidate whose own
+        // `cfg` cannot coexist with this site — `#[cfg(feature = "a")] type
+        // Unchecked = CheckedDispatch;` declared before its `not(feature = "a")`
+        // twin, at a site gated `not(feature = "a")`, is exactly the shape the
+        // old shortcut counted wrongly. `block_shadowed` is the one case where
+        // trusting the deterministic `resolves_to_name` answer alone stays sound
+        // even so (issue #193 merged with issue #206): real Rust's own shadowing
+        // rule leaves no live external alias for the search below to find there,
+        // whatever `cfg` it is written under, because `block_shadow`/
+        // `value_shadow` only ever record an *unconditional* local declaration
+        // (see `enter_block`) — there is nothing a `cfg` could have excluded.
+        let counts = if block_shadowed {
+            resolves_to_name
+        } else {
+            path_could_reach_target(
                 &node.path,
                 &self.stack,
                 &self.block_items,
@@ -5584,8 +6147,10 @@ impl<'ast> syn::visit::Visit<'ast> for Literals<'ast> {
                 &self.name,
                 self.alias_search_budget,
                 &mut self.alias_lookup_cache,
-            );
-        if resolves_to_name || reachable_another_way {
+                &self.enclosing_cfg,
+            )
+        };
+        if counts {
             self.count = self.count.saturating_add(1);
         }
         syn::visit::visit_expr_struct(self, node);
@@ -5628,11 +6193,19 @@ pub fn struct_literal_counts(
     // `&file.items`, so this is the same limit for every search either one runs
     // (issue #197).
     let alias_search_budget = alias_search_budget(&file.items);
-
+    // A file-level inner attribute (`#![cfg(..)]`) gates the whole file the same
+    // way an item's own `#[cfg(..)]` gates it — every construction site inherits
+    // it — so the root `enclosing_cfg` starts from it rather than from an empty,
+    // always-true formula (Codex review of PR #209, issue #206): a target alias
+    // gated `feature = "a"` beside a decoy gated `not(feature = "a")`, inside a
+    // file gated `not(feature = "a")`, is unreachable from any site in that file
+    // — the target alias itself never compiles there — but an empty root formula
+    // let the two coexist anyway.
     let mut total = Literals {
         stack: vec![&file.items],
         block_items: Vec::new(),
         shadow: Vec::new(),
+        enclosing_cfg: attrs_cfg(&file.attrs),
         block_shadow: Vec::new(),
         value_shadow: Vec::new(),
         name: name.to_owned(),
@@ -5653,6 +6226,7 @@ pub fn struct_literal_counts(
             stack: target.stack().to_vec(),
             block_items: Vec::new(),
             shadow: Vec::new(),
+            enclosing_cfg: target.cfg().clone(),
             block_shadow: Vec::new(),
             value_shadow: Vec::new(),
             name: name.to_owned(),
@@ -5661,8 +6235,8 @@ pub fn struct_literal_counts(
             alias_lookup_cache: AliasLookupCache::default(),
         };
         match &target {
-            InsideTarget::Block(block, _) => visitor.visit_block(block),
-            InsideTarget::Impl(implementation, _) => visitor.visit_item_impl(implementation),
+            InsideTarget::Block(block, ..) => visitor.visit_block(block),
+            InsideTarget::Impl(implementation, ..) => visitor.visit_item_impl(implementation),
         }
         inside_count = inside_count.saturating_add(visitor.count);
     }
@@ -5702,46 +6276,106 @@ fn scope_key(items: &[syn::Item]) -> ScopeKey {
     (items.as_ptr() as usize, items.len())
 }
 
-/// Caches the *live* `use`/`type` aliases and sibling modules named `first`
-/// in one scope, keyed by [`scope_key`] and `first` together.
+/// Caches the *live* items named `first` in one scope, keyed by
+/// [`scope_key`] and `first` together — [`live_named_items_in_scope`]'s own
+/// answer, before either `use`/`type` aliases or sibling modules are pulled
+/// out of it.
 ///
 /// Many construction sites of one name can share the same scope and the same
 /// ambiguous alias — every literal in a `for` loop, say. Without this cache, every one
 /// of them re-walks that scope's items from scratch (issue #197, Codex review: this
 /// measured seconds on a file with many ambiguous aliases and many literals). One
 /// cache is shared across every search [`path_could_reach_target`] runs for one
-/// [`struct_literal_counts`] visitor, so one (scope, name) pair's live aliases and
-/// modules are each computed once no matter how many construction sites or branches
-/// revisit it — keyed by name, not by scope alone, because [`live_named_items_in_scope`]'s
-/// own shadowing rule is a per-name answer: caching a whole scope's *unfiltered*
-/// alias and module lists, the way an earlier version of this cache did, could not
-/// tell an unconditional declaration of one name from a `#[cfg]`-gated duplicate of
-/// it after the fact — issue #197, Codex review of the PR, is why the cache moved
-/// from that shape to this one.
+/// [`struct_literal_counts`] visitor, so one (scope, name) pair's live items are
+/// computed once no matter how many construction sites or branches revisit it —
+/// keyed by name, not by scope alone, because [`live_named_items_in_scope`]'s own
+/// shadowing rule is a per-name answer: caching a whole scope's *unfiltered* list,
+/// the way an earlier version of this cache did, could not tell an unconditional
+/// declaration of one name from a `#[cfg]`-gated duplicate of it after the fact —
+/// issue #197, Codex review of the PR, is why the cache moved from that shape to
+/// this one.
 ///
-/// One scope's own sibling modules, cached — already filtered to `first`. See
-/// [`AliasLookupCache`].
-type CachedModules<'a> = std::rc::Rc<[&'a [syn::Item]]>;
-
+/// The key stays `(scope, name)` — not the construction site's own `cfg` too.
+/// Issue #206's first attempt keyed on `cfg` as well, and reopened issue
+/// #197's own O(file-size)-per-site cost along a different axis: measured
+/// over a minute on a file with many distinctly-`cfg`-gated call sites
+/// sharing one scope. [`live_named_items_in_scope`]'s own answer does not
+/// depend on a site's `cfg`, so caching it this way is still exact — each
+/// site's own `cfg` is applied afterward, cheaply, over this already-small
+/// cached list ([`coexisting_with_site`]), by
+/// [`AliasLookupCache::live_modules_of`]. [`AliasLookupCache::live_aliases_of`]
+/// caches a further step too — see its own doc.
+///
 /// Holds no block-local lookup: [`segments_could_reach_target`]'s `block_items` is a
 /// scattered slice of references, not one contiguous scope, so it has no single
 /// address to key a cache entry on — [`live_block_declarations`] runs it uncached.
+///
+/// One `use`/`type` alias, tagged with the `cfg` of the item that declared
+/// it and that item itself — [`AliasLookupCache::live_aliases_of`]'s own
+/// cache entry, so a site's own `cfg` can be checked against each alias
+/// without re-expanding the item it came from, and so the declaring item
+/// can be compared by identity against a
+/// [`guaranteed_unambiguous_winner`](AliasLookupCache::guaranteed_unambiguous_winner)
+/// (issue #206, Codex review of the fix).
+type TaggedAliases<'a> = std::rc::Rc<[(Cfg, UseAlias, &'a syn::Item)]>;
+
 #[derive(Default)]
 struct AliasLookupCache<'a> {
-    aliases: std::collections::HashMap<(ScopeKey, String), std::rc::Rc<[UseAlias]>>,
-    modules: std::collections::HashMap<(ScopeKey, String), CachedModules<'a>>,
+    candidates: std::collections::HashMap<(ScopeKey, String), std::rc::Rc<[&'a syn::Item]>>,
+    aliases: std::collections::HashMap<(ScopeKey, String), TaggedAliases<'a>>,
+    coexistence: std::collections::HashMap<(String, String), bool>,
+    guarantee: std::collections::HashMap<(String, String), bool>,
+    // `(scope, name, site_cfg.key())` — a further key than `coexistence`'s
+    // and `guarantee`'s own, since a winner depends on which candidates a
+    // scope and name name, not only on two `Cfg` values (issue #206, Codex
+    // review of the fix). Without this, `live_aliases_of` and
+    // `live_modules_of` each recomputed a fresh
+    // `coexisting_with_site` — an `O(candidates)` allocation, on top of the
+    // already-memoized per-pair checks inside it — on every call, reopening
+    // a narrower version of the per-site cost this whole cache exists to
+    // avoid: `many_distinctly_ordered_cfg_predicates_over_one_pair_resolve_quickly`
+    // and its own siblings nearly doubled before this was added.
+    winners: std::collections::HashMap<(ScopeKey, String, String), Option<&'a syn::Item>>,
 }
 
 impl<'a> AliasLookupCache<'a> {
-    /// The live `use`/`type` aliases in `items` whose local name is `first` —
-    /// see [`live_named_items_in_scope`] for what "live" excludes. `false`:
-    /// this cache exists only for [`segments_could_reach_target`]'s own
-    /// search. Every caller ([`struct_literal_counts`], and since issue
-    /// #205, [`generic_assoc_type_bindings_naming`]) always resolves a
-    /// construction path, never a value (Codex review of PR #204) — see
-    /// [`live_named_items_in_scope`]'s own doc for why that matters here.
-    fn live_aliases_of(&mut self, items: &'a [syn::Item], first: &str) -> std::rc::Rc<[UseAlias]> {
-        self.aliases
+    /// Whether `site_cfg` and `candidate_cfg` can coexist
+    /// ([`Cfg::could_coexist_with`]), memoized by their own text keys
+    /// (issue #206, Codex review of the fix). `could_coexist_with`'s own
+    /// worst case is exponential in the atoms two formulas name together.
+    /// Many literals inside one `cfg`-gated scope repeat the identical
+    /// `(site, candidate)` pair — every literal asks the same question of
+    /// the same candidates — so without this, that worst case multiplies
+    /// by every literal sharing the scope rather than paying for it once.
+    fn could_coexist(&mut self, site_cfg: &Cfg, candidate_cfg: &Cfg) -> bool {
+        *self
+            .coexistence
+            .entry((site_cfg.key(), candidate_cfg.key()))
+            .or_insert_with(|| site_cfg.could_coexist_with(candidate_cfg))
+    }
+
+    /// Whether `site_cfg` guarantees `candidate_cfg`
+    /// ([`Cfg::is_guaranteed_by`]), memoized by their own text keys the
+    /// same way [`AliasLookupCache::could_coexist`] is, and for the same
+    /// reason: [`live_block_declarations`] asks this once per coexisting
+    /// candidate of every scope it visits, and the enumeration underneath
+    /// it is the same exponential-in-shared-atoms worst case.
+    fn guaranteed_by(&mut self, candidate_cfg: &Cfg, site_cfg: &Cfg) -> bool {
+        *self
+            .guarantee
+            .entry((candidate_cfg.key(), site_cfg.key()))
+            .or_insert_with(|| candidate_cfg.is_guaranteed_by(site_cfg))
+    }
+
+    /// The live items of `items` named `first`, cached by `(scope, name)`.
+    /// Not yet filtered by any construction site's own `cfg` — see
+    /// [`AliasLookupCache`]'s own doc for why.
+    fn candidates_of(
+        &mut self,
+        items: &'a [syn::Item],
+        first: &str,
+    ) -> std::rc::Rc<[&'a syn::Item]> {
+        self.candidates
             .entry((scope_key(items), first.to_owned()))
             .or_insert_with(|| {
                 let (live_items, _) = live_named_items_in_scope(
@@ -5749,41 +6383,162 @@ impl<'a> AliasLookupCache<'a> {
                     |item| declares_name(item, first),
                     false,
                 );
-                own_aliases(live_items.iter().copied())
-                    .into_iter()
-                    .filter(|candidate| candidate.local == first)
-                    .collect::<Vec<_>>()
-                    .into()
+                live_items.into()
             })
             .clone()
     }
 
-    /// The live sibling modules in `items` named `first` — see
-    /// [`live_named_items_in_scope`] for what "live" excludes, and
-    /// [`live_aliases_of`](Self::live_aliases_of) for why `false` is right
-    /// here too.
-    fn live_modules_of(&mut self, items: &'a [syn::Item], first: &str) -> CachedModules<'a> {
-        self.modules
+    /// Among `items`' candidates named `first`, the one whose own `cfg`
+    /// coexists with `site_cfg`, is [namespace-unambiguous](is_namespace_unambiguous)
+    /// and is [guaranteed](Cfg::is_guaranteed_by) by `site_cfg` — the type-
+    /// namespace analogue of [`live_named_items_in_scope`]'s own
+    /// unconditional winner, one layer up: real Rust can declare `first`
+    /// this one way in *any* build that reaches a site with this `cfg`, not
+    /// only in the specific build the winner's own `cfg` selects (Codex
+    /// review of PR #209, issue #206). Two namespace-unambiguous
+    /// declarations of one name in one scope are always `E0428`/`E0255`,
+    /// so a *merely* coexisting namespace-unambiguous peer — one whose own
+    /// `cfg` is not itself guaranteed — can only ever exist alongside the
+    /// winner in a build that also satisfies the peer's own `cfg`, and that
+    /// build does not compile: `#[cfg(a)] type Alias = Decoy;` beside
+    /// `#[cfg(b)] type Alias = CheckedDispatch;`, referenced bare inside a
+    /// `#[cfg(a)]` function, only ever compiles as `Decoy` — a build with
+    /// `b` also enabled never compiles at all, so it is not a build this
+    /// site is ever really reached from. `None` when there is no such
+    /// single winner: zero, or more than one, coexisting namespace-
+    /// unambiguous candidates are guaranteed — the latter means the site
+    /// itself is unreachable in any compiling build, so nothing needs
+    /// excluding to stay sound. `use` is never a winner, for
+    /// [`is_namespace_unambiguous`]'s own reason: this scanner cannot prove
+    /// which namespace it occupies.
+    fn guaranteed_unambiguous_winner(
+        &mut self,
+        items: &'a [syn::Item],
+        first: &str,
+        site_cfg: &Cfg,
+    ) -> Option<&'a syn::Item> {
+        let key = (scope_key(items), first.to_owned(), site_cfg.key());
+        if let Some(winner) = self.winners.get(&key) {
+            return *winner;
+        }
+        let candidates = self.candidates_of(items, first);
+        let coexisting = coexisting_with_site(candidates.iter().copied(), site_cfg, self);
+        let mut winners = coexisting.into_iter().filter(|item| {
+            is_namespace_unambiguous(item)
+                && self.guaranteed_by(&attrs_cfg(item_attrs(item)), site_cfg)
+        });
+        let winner = winners.next().filter(|_| winners.next().is_none());
+        self.winners.insert(key, winner);
+        winner
+    }
+
+    /// The live `use`/`type` aliases in `items` whose local name is `first`
+    /// and whose own `cfg` can coexist with `site_cfg` (issue #206), each
+    /// paired with that own `cfg` — see [`live_named_items_in_scope`] for
+    /// what "live" excludes and [`Cfg::could_coexist_with`] for the `cfg`
+    /// check. The candidate's own `cfg` travels with it, rather than being
+    /// dropped once it has passed the filter, so [`try_alias_candidates`]
+    /// can conjoin it into the `cfg` a further hop is checked against
+    /// (Codex review of the fix, round 9 — see [`try_alias_candidates`]'s
+    /// own doc for why that matters). `false`: this cache exists only for
+    /// [`segments_could_reach_target`]'s own search, whose sole caller
+    /// ([`struct_literal_counts`]) is always resolving a construction path,
+    /// never a value (Codex review of PR #204) — see
+    /// [`live_named_items_in_scope`]'s own doc for why that matters here.
+    ///
+    /// [`own_aliases`] walks a `use` item's whole tree, so a group naming
+    /// many bindings costs more than one lookup. This expansion is cached
+    /// too, one call per `(scope, name)`, each alias tagged with its own
+    /// item's `cfg` — not re-expanded on every site (Codex review of the
+    /// fix: a first version called [`own_aliases`] fresh per site, over
+    /// this already-small candidate list, which still reopened a narrower
+    /// version of the per-site cost this whole cache exists to avoid).
+    ///
+    /// A [`guaranteed_unambiguous_winner`](Self::guaranteed_unambiguous_winner)
+    /// excludes every other namespace-unambiguous alias — a `type` item's,
+    /// never a `use`'s, since a `use` is never namespace-unambiguous —
+    /// sharing this scope and name, keeping only the winner's own (Codex
+    /// review of PR #209, issue #206). Compared by item identity
+    /// (`core::ptr::eq`) against the tagged alias's own declaring item,
+    /// rather than by `cfg` equality: two distinct namespace-unambiguous
+    /// items sharing one name in one scope always have distinct `cfg`s (or
+    /// neither compiles), so the two comparisons agree, but identity is
+    /// exact where a formula's own text rendering is not guaranteed to be
+    /// injective.
+    fn live_aliases_of(
+        &mut self,
+        items: &'a [syn::Item],
+        first: &str,
+        site_cfg: &Cfg,
+    ) -> Vec<(Cfg, UseAlias)> {
+        let candidates = self.candidates_of(items, first);
+        let tagged = self
+            .aliases
             .entry((scope_key(items), first.to_owned()))
             .or_insert_with(|| {
-                let (live_items, _) = live_named_items_in_scope(
-                    items.iter(),
-                    |item| declares_name(item, first),
-                    false,
-                );
-                live_items
-                    .into_iter()
-                    .filter_map(|item| match item {
-                        syn::Item::Mod(module) => module
-                            .content
-                            .as_ref()
-                            .map(|(_, mod_items)| mod_items.as_slice()),
-                        _ => None,
+                candidates
+                    .iter()
+                    .flat_map(|item| {
+                        let cfg = attrs_cfg(item_attrs(item));
+                        own_aliases(core::iter::once(*item))
+                            .into_iter()
+                            .filter(|candidate| candidate.local == first)
+                            .map(move |alias| (cfg.clone(), alias, *item))
                     })
                     .collect::<Vec<_>>()
                     .into()
             })
-            .clone()
+            .clone();
+        let winner = self.guaranteed_unambiguous_winner(items, first, site_cfg);
+        tagged
+            .iter()
+            .filter(|(cfg, _, _)| self.could_coexist(site_cfg, cfg))
+            .filter(|(_, _, source)| {
+                winner.is_none_or(|winner| {
+                    !is_namespace_unambiguous(source) || core::ptr::eq(*source, winner)
+                })
+            })
+            .map(|(cfg, alias, _)| (cfg.clone(), alias.clone()))
+            .collect()
+    }
+
+    /// The live sibling modules in `items` named `first` and whose own
+    /// `cfg` can coexist with `site_cfg` (issue #206), each paired with
+    /// that own `cfg` — see [`live_named_items_in_scope`] for what "live"
+    /// excludes, and [`live_aliases_of`](Self::live_aliases_of) for why
+    /// `false` is right here too. The module's own `cfg` travels with it
+    /// for the identical reason an alias's does: so the caller can
+    /// conjoin it into the `cfg` a further hop inside the module is
+    /// checked against, rather than passing `site_cfg` through unchanged
+    /// (Codex review of PR #209, issue #206 — see
+    /// [`try_alias_candidates`]'s own doc for why that matters for an
+    /// alias hop; a module hop needs the identical treatment).
+    ///
+    /// A [`guaranteed_unambiguous_winner`](Self::guaranteed_unambiguous_winner)
+    /// that is not this module excludes it — a `mod` is always namespace-
+    /// unambiguous, so it can never coexist with a guaranteed `type` alias
+    /// of the same name in any build that compiles (Codex review of PR
+    /// #209, issue #206) — see [`live_aliases_of`](Self::live_aliases_of)'s
+    /// own doc for the identical rule stated for an alias.
+    fn live_modules_of(
+        &mut self,
+        items: &'a [syn::Item],
+        first: &str,
+        site_cfg: &Cfg,
+    ) -> Vec<(Cfg, &'a [syn::Item])> {
+        let candidates = self.candidates_of(items, first);
+        let live = coexisting_with_site(candidates.iter().copied(), site_cfg, self);
+        let winner = self.guaranteed_unambiguous_winner(items, first, site_cfg);
+        live.into_iter()
+            .filter(|item| winner.is_none_or(|winner| core::ptr::eq(*item, winner)))
+            .filter_map(|item| match item {
+                syn::Item::Mod(module) => module
+                    .content
+                    .as_ref()
+                    .map(|(_, mod_items)| (attrs_cfg(&module.attrs), mod_items.as_slice())),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -5829,6 +6584,10 @@ impl<'a> AliasLookupCache<'a> {
 /// `cache` is [`AliasLookupCache`] — the caller's own, reused across every
 /// construction site so a scope's aliases and modules are read from the file, not
 /// recomputed, once another search has already visited it.
+///
+/// `site_cfg` is the construction site's own enclosing `cfg` (issue #206) —
+/// see [`live_named_items_in_scope`]'s own doc for what it excludes.
+#[allow(clippy::too_many_arguments)]
 fn path_could_reach_target<'a>(
     path: &syn::Path,
     stack: &[&'a [syn::Item]],
@@ -5837,10 +6596,8 @@ fn path_could_reach_target<'a>(
     target: &str,
     budget: usize,
     cache: &mut AliasLookupCache<'a>,
+    site_cfg: &Cfg,
 ) -> bool {
-    if path.leading_colon.is_some() {
-        return false;
-    }
     let segments: Vec<String> = path
         .segments
         .iter()
@@ -5848,6 +6605,17 @@ fn path_could_reach_target<'a>(
         .collect();
     if segments.is_empty() {
         return false;
+    }
+    // An absolute path (`::dep::CheckedDispatch { .. }`) reaches the extern
+    // prelude directly, past every local scope this search otherwise walks —
+    // the same shape `resolve_segments` already gives it, unresolved, since
+    // there is no local alias to chase. Removing the deterministic
+    // resolver's own `resolves_to_name` fast path (issue #206, Codex review)
+    // left nothing comparing an absolute path's own last segment to
+    // `target` at all, a missed count over a real construction (Codex
+    // review of PR #209).
+    if path.leading_colon.is_some() {
+        return segments.last().is_some_and(|last| last == target);
     }
     // A block-local `use`/`type` alias is visible as the *first* segment of any
     // plain relative path in its own block, not only a bare, single-segment one
@@ -5891,6 +6659,7 @@ fn path_could_reach_target<'a>(
         target,
         &mut budget,
         cache,
+        site_cfg,
     )
 }
 
@@ -5981,7 +6750,12 @@ fn path_could_reach_target<'a>(
 /// name can name more than one live module, "the one match" is no longer a thing a
 /// loop can just step into and carry on from.
 ///
-/// `cache` is [`path_could_reach_target`]'s own — see there.
+/// `cache` is [`path_could_reach_target`]'s own — see there. `site_cfg` is
+/// conjoined with each candidate's own `cfg` (issue #206, round 9's second
+/// finding) before it is passed to the recursive call: a chain of alias hops
+/// gated by mutually exclusive `cfg` conditions can each individually
+/// coexist with the unconditional site while the two hops together never
+/// can, and passing `site_cfg` through unchanged missed exactly that.
 ///
 /// Tries every alias in `candidates`, recursing into [`segments_could_reach_target`]
 /// with `next_block_eligible` for the ones that are not absolute — shared by
@@ -5989,7 +6763,7 @@ fn path_could_reach_target<'a>(
 /// differ only in which candidates they gather and what `next_block_eligible` is.
 #[allow(clippy::too_many_arguments)]
 fn try_alias_candidates<'a>(
-    candidates: Vec<UseAlias>,
+    candidates: Vec<(Cfg, UseAlias)>,
     rest: &[String],
     stack: &[&'a [syn::Item]],
     scope: usize,
@@ -6000,8 +6774,10 @@ fn try_alias_candidates<'a>(
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
+    site_cfg: &Cfg,
 ) -> bool {
-    for alias in candidates {
+    for (candidate_cfg, alias) in candidates {
+        let accumulated_cfg = Cfg::All(vec![site_cfg.clone(), candidate_cfg]);
         // An alias target written `self::`/`super::`-qualified explicitly names
         // the enclosing module's own item, never a block-local one — the same
         // fact [`path_could_reach_target`]'s own `block_eligible` already
@@ -6049,6 +6825,7 @@ fn try_alias_candidates<'a>(
             target,
             budget,
             cache,
+            &accumulated_cfg,
         ) {
             return true;
         }
@@ -6405,6 +7182,20 @@ fn preferred_alias<'a>(
 /// ever be type-namespace passes `false`, which drops every non-namespace-
 /// unambiguous match once an unconditional winner exists, the same as if it
 /// were namespace-unambiguous too.
+///
+/// This function's own answer depends only on `(scope, name)` — never on a
+/// calling construction site's own `cfg`. That is what lets
+/// [`AliasLookupCache`] cache it, and share the cached answer across every
+/// site that asks about the same name in the same scope, however many
+/// different `cfg`s those sites carry (issue #206: a first version filtered
+/// each site's own `cfg` in here, which meant one cache entry per distinct
+/// site `cfg` instead of one per `(scope, name)` — measured over a minute
+/// on a file with many distinctly-gated call sites and one ambiguous name,
+/// the O(file-size)-per-site cost issue #197 already fixed once, reopened
+/// through a different door). A site's own `cfg` is checked afterward, by
+/// [`AliasLookupCache`] and [`live_block_declarations`], over this
+/// function's already-small answer rather than over the whole scope — see
+/// [`coexisting_with_site`].
 fn live_named_items_in_scope<'a>(
     items: impl IntoIterator<Item = &'a syn::Item>,
     matches: impl Fn(&syn::Item) -> bool,
@@ -6434,6 +7225,27 @@ fn live_named_items_in_scope<'a>(
     }
 }
 
+/// Keeps only the items of `items` whose own `cfg` can coexist with
+/// `site_cfg` (issue #206). See [`Cfg::could_coexist_with`].
+///
+/// Called after [`live_named_items_in_scope`], not from inside it, so that
+/// function's own answer stays cacheable by `(scope, name)` alone —
+/// [`live_named_items_in_scope`]'s own doc says why that matters.
+///
+/// Checked through `cache` ([`AliasLookupCache::could_coexist`]), not
+/// [`Cfg::could_coexist_with`] directly, so a repeated `(site, candidate)`
+/// pair is not recomputed (issue #206, Codex review of the fix).
+fn coexisting_with_site<'a>(
+    items: impl IntoIterator<Item = &'a syn::Item>,
+    site_cfg: &Cfg,
+    cache: &mut AliasLookupCache<'a>,
+) -> Vec<&'a syn::Item> {
+    items
+        .into_iter()
+        .filter(|item| cache.could_coexist(site_cfg, &attrs_cfg(item_attrs(item))))
+        .collect()
+}
+
 /// The `use`/`type` alias and `mod` declarations of `first` in `block_items`
 /// that are actually live from the construction site this search started
 /// from — searched innermost block to outermost, one scope
@@ -6459,16 +7271,38 @@ fn live_named_items_in_scope<'a>(
 /// whatever is further out any more than two `cfg`-gated declarations of
 /// one name already fail to rule each other out. The second element is
 /// `true` — module scope stays live — exactly when the walk exhausts
-/// `block_items` without ever finding an unconditional declaration.
+/// `block_items` without ever finding an unconditional declaration *or* a
+/// declaration `site_cfg` guarantees — see the paragraph below.
+///
+/// A conditionally-gated declaration still stops the walk when its own
+/// `cfg` is [guaranteed](Cfg::is_guaranteed_by) by `site_cfg`: wherever
+/// the construction site exists, such a declaration is guaranteed to
+/// exist too, so it shadows everything further out exactly as a
+/// syntactically unconditional one does — confirmed against real `rustc`
+/// (Codex review of PR #209, issue #206): inside a
+/// `#[cfg(feature = "a")]` function, a block-local
+/// `#[cfg(feature = "a")] type Unchecked = Decoy;` always shadows a
+/// module-scope `#[cfg(feature = "a")] type Unchecked = CheckedDispatch;`,
+/// never leaving both live the way two declarations under genuinely
+/// different, unrelated flags can.
 ///
 /// Passes `false` for [`live_named_items_in_scope`]'s own `value_position`:
 /// this function exists only for [`segments_could_reach_target`]'s search.
 /// Every caller ([`struct_literal_counts`], and since issue #205,
 /// [`generic_assoc_type_bindings_naming`]) always resolves a construction
 /// path, never a value (Codex review of PR #204).
+///
+/// `site_cfg` (issue #206) is applied with [`coexisting_with_site`], after
+/// [`live_named_items_in_scope`] answers: a block-local declaration whose
+/// own `cfg` cannot hold at the construction site is excluded the same way
+/// a module-scope one is. The scope scan itself is not cached — see this
+/// function's own doc above on why — but each `(site, candidate)` pair's
+/// own coexistence answer still is, through `cache`.
 fn live_block_declarations<'a>(
     block_items: &[Vec<&'a syn::Item>],
     first: &str,
+    site_cfg: &Cfg,
+    cache: &mut AliasLookupCache<'a>,
 ) -> (Vec<LiveDeclaration<'a>>, bool) {
     let mut live = Vec::new();
     for (depth, items) in block_items.iter().enumerate().rev() {
@@ -6477,12 +7311,31 @@ fn live_block_declarations<'a>(
             |item| declares_name(item, first),
             false,
         );
+        let coexisting = coexisting_with_site(scope_live, site_cfg, cache);
+        // Restricted to a namespace-unambiguous item, the same test
+        // `unconditional` above is already restricted to (via
+        // `live_named_items_in_scope`'s own `is_namespace_unambiguous`
+        // check) — a value-only declaration (a `const`, a `static`, a
+        // `fn`) or an ambiguous `use` can never be proven to occupy the
+        // type namespace a struct-literal path always resolves in, so
+        // treating either as a guaranteed shadow of a type-namespace
+        // module-scope declaration is a missed count: `#[cfg(feature =
+        // "a")] const Unchecked: u8 = 0;` beside a site gated the
+        // identical `feature = "a"` never shadows a module-scope
+        // `#[cfg(feature = "a")] type Unchecked = CheckedDispatch;` in
+        // real Rust — the two occupy different namespaces — but the
+        // unrestricted check still skipped module scope over it (Codex
+        // review of PR #209, issue #206).
+        let site_guaranteed = coexisting.iter().any(|item| {
+            is_namespace_unambiguous(item)
+                && cache.guaranteed_by(&attrs_cfg(item_attrs(item)), site_cfg)
+        });
         live.extend(
-            scope_live
+            coexisting
                 .into_iter()
                 .map(|item| LiveDeclaration { depth, item }),
         );
-        if unconditional {
+        if unconditional || site_guaranteed {
             return (live, false);
         }
     }
@@ -6507,6 +7360,10 @@ fn live_block_declarations<'a>(
 /// `first` at all. A block-local alias's own target stays `block_eligible`,
 /// since it can itself chain through a further block-local hop — see
 /// [`segments_could_reach_target`]'s own docs.
+///
+/// `live_items` already passed the `site_cfg` check ([`live_block_declarations`]
+/// ran it). `site_cfg` is passed on here only for the recursive calls this
+/// function makes, unchanged (issue #206).
 #[allow(clippy::too_many_arguments)]
 fn try_block_local_candidates<'a>(
     live_items: &[LiveDeclaration<'a>],
@@ -6521,14 +7378,18 @@ fn try_block_local_candidates<'a>(
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
+    site_cfg: &Cfg,
 ) -> Option<bool> {
     let mut claimed = false;
     for declaration in live_items {
         let own_scope = block_items.get(..=declaration.depth).unwrap_or(block_items);
-        let alias_candidates: Vec<UseAlias> = own_aliases(core::iter::once(declaration.item))
-            .into_iter()
-            .filter(|candidate| candidate.local == first)
-            .collect();
+        let declaration_cfg = attrs_cfg(item_attrs(declaration.item));
+        let alias_candidates: Vec<(Cfg, UseAlias)> =
+            own_aliases(core::iter::once(declaration.item))
+                .into_iter()
+                .filter(|candidate| candidate.local == first)
+                .map(|alias| (declaration_cfg.clone(), alias))
+                .collect();
         if !alias_candidates.is_empty() {
             claimed = true;
             if try_alias_candidates(
@@ -6543,6 +7404,7 @@ fn try_block_local_candidates<'a>(
                 target,
                 budget,
                 cache,
+                site_cfg,
             ) {
                 return Some(true);
             }
@@ -6565,6 +7427,15 @@ fn try_block_local_candidates<'a>(
             continue;
         };
         claimed = true;
+        // `declaration_cfg` is `declaration.item`'s own `cfg`, and
+        // `declaration.item` is the very `mod` this branch just matched
+        // by name — so it is this module's own `cfg` too. Conjoined with
+        // `site_cfg` before recursing, the same treatment
+        // `try_module_scope_candidates` gives a module-scope hop (Codex
+        // review of PR #209, issue #206): a block-local module entered by
+        // name can combine with a further, mutually exclusive `cfg`
+        // exactly as a module-scope one can.
+        let accumulated_cfg = Cfg::All(vec![site_cfg.clone(), declaration_cfg.clone()]);
         if segments_could_reach_target(
             rest.to_vec(),
             stack,
@@ -6577,6 +7448,7 @@ fn try_block_local_candidates<'a>(
             target,
             budget,
             cache,
+            &accumulated_cfg,
         ) {
             return Some(true);
         }
@@ -6584,6 +7456,9 @@ fn try_block_local_candidates<'a>(
     claimed.then_some(false)
 }
 
+/// `site_cfg` is the construction site's own enclosing `cfg` (issue #206),
+/// passed on unchanged to every candidate lookup this search makes — see
+/// [`live_named_items_in_scope`]'s own doc for what it excludes.
 #[allow(clippy::too_many_arguments)]
 fn segments_could_reach_target<'a>(
     mut segments: Vec<String>,
@@ -6597,6 +7472,7 @@ fn segments_could_reach_target<'a>(
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
+    site_cfg: &Cfg,
 ) -> bool {
     // A missed count is the danger this search exists to close, so running out of
     // budget answers "could reach" rather than "could not" — see this function's
@@ -6679,7 +7555,8 @@ fn segments_could_reach_target<'a>(
     // `block_items` — see `live_block_declarations`'s own docs.
     let mut module_scope_shadowed = false;
     if block_applies {
-        let (live_items, module_scope_live) = live_block_declarations(block_items, &first);
+        let (live_items, module_scope_live) =
+            live_block_declarations(block_items, &first, site_cfg, cache);
         if !live_items.is_empty() {
             module_scope_shadowed = !module_scope_live;
             match try_block_local_candidates(
@@ -6695,6 +7572,7 @@ fn segments_could_reach_target<'a>(
                 target,
                 budget,
                 cache,
+                site_cfg,
             ) {
                 Some(true) => return true,
                 Some(false) => resolved_elsewhere = true,
@@ -6744,6 +7622,7 @@ fn segments_could_reach_target<'a>(
             target,
             budget,
             cache,
+            site_cfg,
         ) {
             Some(true) => return true,
             Some(false) => resolved_elsewhere = true,
@@ -6761,6 +7640,17 @@ fn segments_could_reach_target<'a>(
 /// not ruled out by an alias that did not pan out, or by another same-named
 /// module that did not either. Same `Some`/`None` shape as
 /// [`try_block_local_candidates`].
+///
+/// `site_cfg` is the construction site's own enclosing `cfg` (issue #206) —
+/// passed to [`AliasLookupCache`]'s own two lookups. Every recursive call
+/// conjoins it with the selected candidate's own `cfg` first — an alias
+/// hop already did this (round 14); a module hop needs the identical
+/// treatment, since a module entered by name is exactly as capable of
+/// combining with an incompatible further hop as an alias is (Codex
+/// review of PR #209, issue #206: `#[cfg(a)] mod m { .. }` beside a
+/// `#[cfg(not(a))]` sibling module of the same name, entered with
+/// `site_cfg` passed through unchanged, let the search accept a further
+/// hop that could only ever coexist with the *other* module).
 #[allow(clippy::too_many_arguments)]
 fn try_module_scope_candidates<'a>(
     items: &'a [syn::Item],
@@ -6775,8 +7665,10 @@ fn try_module_scope_candidates<'a>(
     target: &str,
     budget: &mut usize,
     cache: &mut AliasLookupCache<'a>,
+    site_cfg: &Cfg,
 ) -> Option<bool> {
-    let module_alias_candidates: Vec<UseAlias> = cache.live_aliases_of(items, first).to_vec();
+    let module_alias_candidates: Vec<(Cfg, UseAlias)> =
+        cache.live_aliases_of(items, first, site_cfg);
     let mut claimed = !module_alias_candidates.is_empty();
     if try_alias_candidates(
         module_alias_candidates,
@@ -6790,14 +7682,16 @@ fn try_module_scope_candidates<'a>(
         target,
         budget,
         cache,
+        site_cfg,
     ) {
         return Some(true);
     }
     if segments.len() > 1 {
         let remaining: Vec<String> = segments.get(1..).unwrap_or_default().to_vec();
-        let modules: Vec<&'a [syn::Item]> = cache.live_modules_of(items, first).to_vec();
+        let modules: Vec<(Cfg, &'a [syn::Item])> = cache.live_modules_of(items, first, site_cfg);
         claimed |= !modules.is_empty();
-        for module_items in modules {
+        for (module_cfg, module_items) in modules {
+            let accumulated_cfg = Cfg::All(vec![site_cfg.clone(), module_cfg]);
             // Push onto `entered` rather than replacing it: `items` may
             // already be an entered module's own items — `traits::deeper`
             // descending past `traits` — and a nested `super` needs that
@@ -6818,6 +7712,7 @@ fn try_module_scope_candidates<'a>(
                 target,
                 budget,
                 cache,
+                &accumulated_cfg,
             ) {
                 return Some(true);
             }
@@ -6828,18 +7723,28 @@ fn try_module_scope_candidates<'a>(
 
 /// Something [`struct_literal_counts`] can count literals inside of, with the
 /// aliases in scope at the point it was found (issue #109 review: an inner
-/// module's own, not inherited from where the search started).
+/// module's own, not inherited from where the search started), and the `cfg`
+/// that must hold for that point to exist — every enclosing item's own,
+/// combined, down to the selected function or `impl` itself (issue #206,
+/// Codex review of the fix: `inside`'s own visitor used to start with no
+/// `cfg` at all, so it could count a candidate `total` correctly excluded).
 enum InsideTarget<'a> {
     /// A function body.
-    Block(&'a syn::Block, Vec<&'a [syn::Item]>),
+    Block(&'a syn::Block, Vec<&'a [syn::Item]>, Cfg),
     /// An `impl` block, visited whole.
-    Impl(&'a syn::ItemImpl, Vec<&'a [syn::Item]>),
+    Impl(&'a syn::ItemImpl, Vec<&'a [syn::Item]>, Cfg),
 }
 
 impl<'a> InsideTarget<'a> {
     fn stack(&self) -> &[&'a [syn::Item]] {
         match self {
-            Self::Block(_, stack) | Self::Impl(_, stack) => stack,
+            Self::Block(_, stack, _) | Self::Impl(_, stack, _) => stack,
+        }
+    }
+
+    const fn cfg(&self) -> &Cfg {
+        match self {
+            Self::Block(_, _, cfg) | Self::Impl(_, _, cfg) => cfg,
         }
     }
 }
@@ -6847,36 +7752,50 @@ impl<'a> InsideTarget<'a> {
 /// The bodies [`FnScope`] selects, in source order.
 fn inside_targets<'a>(file: &'a syn::File, scope: &FnScope<'a>) -> Vec<InsideTarget<'a>> {
     let root_stack = vec![file.items.as_slice()];
+    // Seeded from the file's own inner attributes, the same reason
+    // `struct_literal_counts`'s own root `enclosing_cfg` is (Codex review of
+    // PR #209, issue #206): a target this file only has under one `cfg` is
+    // unreachable from an `InsideTarget` this same gate excludes it from,
+    // and an empty, always-true root formula could not see that.
+    let root_cfg = attrs_cfg(&file.attrs);
     match *scope {
         FnScope::None => Vec::new(),
         FnScope::FirstFn(name) => {
             let mut blocks = Vec::new();
-            fn_blocks(&file.items, &root_stack, name, &mut blocks);
+            fn_blocks(&file.items, &root_stack, &root_cfg, name, &mut blocks);
             blocks.truncate(1);
             blocks
                 .into_iter()
-                .map(|(block, stack)| InsideTarget::Block(block, stack))
+                .map(|(block, stack, cfg)| InsideTarget::Block(block, stack, cfg))
                 .collect()
         }
         FnScope::InherentFns { ty, name } => {
             let mut blocks = Vec::new();
-            for (implementation, stack) in inherent_impls(&file.items, &root_stack, ty) {
+            for (implementation, stack, impl_cfg) in
+                inherent_impls(&file.items, &root_stack, &root_cfg, ty)
+            {
                 for item in &implementation.items {
                     if has_cfg_test(impl_item_attrs(item)) {
                         continue;
                     }
                     if let syn::ImplItem::Fn(function) = item {
                         if ident_is(&function.sig.ident, name) {
-                            blocks.push(InsideTarget::Block(&function.block, stack.clone()));
+                            let fn_cfg =
+                                Cfg::All(vec![impl_cfg.clone(), attrs_cfg(impl_item_attrs(item))]);
+                            blocks.push(InsideTarget::Block(
+                                &function.block,
+                                stack.clone(),
+                                fn_cfg,
+                            ));
                         }
                     }
                 }
             }
             blocks
         }
-        FnScope::InherentImpls(ty) => inherent_impls(&file.items, &root_stack, ty)
+        FnScope::InherentImpls(ty) => inherent_impls(&file.items, &root_stack, &root_cfg, ty)
             .into_iter()
-            .map(|(implementation, stack)| InsideTarget::Impl(implementation, stack))
+            .map(|(implementation, stack, cfg)| InsideTarget::Impl(implementation, stack, cfg))
             .collect(),
     }
 }
@@ -6885,19 +7804,23 @@ fn inside_targets<'a>(file: &'a syn::File, scope: &FnScope<'a>) -> Vec<InsideTar
 /// blocks, skipping `#[cfg(test)]`. Each body carries the alias stack visible where
 /// it was found: `stack` plus an inline module's own on top of it (issue #109
 /// review), so `super::`/`crate::` inside the body can still reach an ancestor scope.
+/// It also carries the `cfg` that must hold for the body to exist: `enclosing_cfg`
+/// combined with every item's own down to the function itself (issue #206).
 fn fn_blocks<'a>(
     items: &'a [syn::Item],
     stack: &[&'a [syn::Item]],
+    enclosing_cfg: &Cfg,
     name: &str,
-    blocks: &mut Vec<(&'a syn::Block, Vec<&'a [syn::Item]>)>,
+    blocks: &mut Vec<(&'a syn::Block, Vec<&'a [syn::Item]>, Cfg)>,
 ) {
     for item in items {
         if has_cfg_test(item_attrs(item)) {
             continue;
         }
+        let item_cfg = Cfg::All(vec![enclosing_cfg.clone(), attrs_cfg(item_attrs(item))]);
         match item {
             syn::Item::Fn(function) if ident_is(&function.sig.ident, name) => {
-                blocks.push((&function.block, stack.to_vec()));
+                blocks.push((&function.block, stack.to_vec(), item_cfg));
             }
             syn::Item::Impl(implementation) => {
                 for impl_item in &implementation.items {
@@ -6906,7 +7829,11 @@ fn fn_blocks<'a>(
                     }
                     if let syn::ImplItem::Fn(function) = impl_item {
                         if ident_is(&function.sig.ident, name) {
-                            blocks.push((&function.block, stack.to_vec()));
+                            let fn_cfg = Cfg::All(vec![
+                                item_cfg.clone(),
+                                attrs_cfg(impl_item_attrs(impl_item)),
+                            ]);
+                            blocks.push((&function.block, stack.to_vec(), fn_cfg));
                         }
                     }
                 }
@@ -6915,7 +7842,7 @@ fn fn_blocks<'a>(
                 if let Some((_, nested)) = module.content.as_ref() {
                     let mut nested_stack = stack.to_vec();
                     nested_stack.push(nested);
-                    fn_blocks(nested, &nested_stack, name, blocks);
+                    fn_blocks(nested, &nested_stack, &item_cfg, name, blocks);
                 }
             }
             _ => {}
@@ -6925,29 +7852,33 @@ fn fn_blocks<'a>(
 
 /// The inherent `impl` blocks for `ty`, in source order through inline modules,
 /// skipping `#[cfg(test)]`. Each carries the alias stack visible where it was
-/// found: `stack` plus an inline module's own on top of it (issue #109 review).
+/// found: `stack` plus an inline module's own on top of it (issue #109 review),
+/// and the `cfg` that must hold for the `impl` to exist (issue #206) — see
+/// [`fn_blocks`]'s own doc.
 fn inherent_impls<'a>(
     items: &'a [syn::Item],
     stack: &[&'a [syn::Item]],
+    enclosing_cfg: &Cfg,
     ty: &str,
-) -> Vec<(&'a syn::ItemImpl, Vec<&'a [syn::Item]>)> {
+) -> Vec<(&'a syn::ItemImpl, Vec<&'a [syn::Item]>, Cfg)> {
     let mut found = Vec::new();
     for item in items {
         if has_cfg_test(item_attrs(item)) {
             continue;
         }
+        let item_cfg = Cfg::All(vec![enclosing_cfg.clone(), attrs_cfg(item_attrs(item))]);
         match item {
             syn::Item::Impl(implementation)
                 if implementation.trait_.is_none()
                     && self_ty_names(&implementation.self_ty, ty) =>
             {
-                found.push((implementation, stack.to_vec()));
+                found.push((implementation, stack.to_vec(), item_cfg));
             }
             syn::Item::Mod(module) => {
                 if let Some((_, nested)) = module.content.as_ref() {
                     let mut nested_stack = stack.to_vec();
                     nested_stack.push(nested);
-                    found.extend(inherent_impls(nested, &nested_stack, ty));
+                    found.extend(inherent_impls(nested, &nested_stack, &item_cfg, ty));
                 }
             }
             _ => {}
@@ -24969,7 +25900,7 @@ mod cfg_alias_ambiguity_tests {
     //! Issue #185, Codex review of PR #183: a `type`/`use` alias declared more than
     //! once under `#[cfg(..)]` must not let a construction pin silently pick the wrong
     //! declaration.
-    use super::{AliasLookupCache, FnScope, path_could_reach_target, struct_literal_counts};
+    use super::{AliasLookupCache, Cfg, FnScope, path_could_reach_target, struct_literal_counts};
 
     #[test]
     fn a_dead_cfg_type_alias_does_not_hide_a_live_construction_at_module_scope() {
@@ -25603,6 +26534,71 @@ mod cfg_alias_ambiguity_tests {
     }
 
     #[test]
+    fn many_distinctly_gated_construction_sites_over_one_ambiguous_scope_resolve_quickly() {
+        // Issue #206's own first fix widened `AliasLookupCache`'s key to
+        // include each site's own `cfg`. That reopened the O(file-size)
+        // cost issue #197 already fixed, along a different axis: many
+        // sites with a different `cfg` sharing one scope each paid a full
+        // re-scan of that scope. Measured over a minute on a file shaped
+        // like this one (Codex review of the fix). The fix keeps the cache
+        // keyed on `(scope, name)` alone and checks each site's own `cfg`
+        // afterward, over the small cached answer — see
+        // `coexisting_with_site`.
+        use std::fmt::Write as _;
+        const MODULES: usize = 40;
+        const SITES: usize = 200;
+        let mut src = String::new();
+        for m in 0..MODULES {
+            let _ = write!(
+                src,
+                "mod m{m} {{\n\
+                 \x20   #[cfg(not(feature = \"x\"))]\n\
+                 \x20   pub struct Marker;\n\
+                 \x20   #[cfg(feature = \"x\")]\n\
+                 \x20   pub struct Decoy;\n\
+                 }}\n"
+            );
+        }
+        for m in 0..MODULES {
+            let _ = writeln!(
+                src,
+                "#[cfg(feature = \"f{m}\")]\nuse m{m}::Marker as Unchecked;"
+            );
+        }
+        src.push_str("#[cfg(not(any(feature = \"f0\")))]\ntype Unchecked = m0::Decoy;\n");
+        for s in 0..SITES {
+            // Each site carries its own, distinct `cfg` — the dimension the
+            // first fix's cache key added, and the one that has to stay
+            // cheap.
+            let _ = write!(
+                src,
+                "#[cfg(feature = \"g{s}\")]\nfn forge{s}() -> u8 {{\n\
+                 \x20   let _ = Unchecked {{ x: 0 }};\n\
+                 \x20   0\n\
+                 }}\n"
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        // A CI run measured 7.58s against a 6s ceiling this test first held,
+        // on the same host that runs `many_ambiguous_aliases_and_literals_
+        // resolve_quickly` in 1.6-2.3s — this fixture asks for more work
+        // (200 distinctly-gated sites, not 200 literals sharing one site),
+        // so it needs its own, wider margin rather than the sibling test's.
+        // The regressed shape (the site-keyed cache) measured 77-81s for
+        // this same fixture — an order of magnitude past 20s either way —
+        // so 20s still separates "fixed" from "regressed" with real margin.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?} for {MODULES} modules and {SITES} distinctly-gated sites",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn exhausting_the_budget_counts_the_construction_rather_than_clearing_it() {
         // Codex review of PR #204: this is a fail-closed check, where a missed count
         // is the danger and an extra one is not. A search that runs out of budget
@@ -25613,7 +26609,16 @@ mod cfg_alias_ambiguity_tests {
         let path: syn::Path = syn::parse_str("Nonexistent").expect("a bare path parses");
         let mut cache = AliasLookupCache::default();
         assert!(
-            path_could_reach_target(&path, &[&[]], &[], &[], "Target", 0, &mut cache),
+            path_could_reach_target(
+                &path,
+                &[&[]],
+                &[],
+                &[],
+                "Target",
+                0,
+                &mut cache,
+                &Cfg::All(Vec::new())
+            ),
             "a budget of zero must count rather than clear the construction"
         );
     }
@@ -25625,7 +26630,16 @@ mod cfg_alias_ambiguity_tests {
         let path: syn::Path = syn::parse_str("Nonexistent").expect("a bare path parses");
         let mut cache = AliasLookupCache::default();
         assert!(
-            !path_could_reach_target(&path, &[&[]], &[], &[], "Target", 8, &mut cache),
+            !path_could_reach_target(
+                &path,
+                &[&[]],
+                &[],
+                &[],
+                "Target",
+                8,
+                &mut cache,
+                &Cfg::All(Vec::new())
+            ),
             "a name with no alias at all must not be reachable"
         );
     }
@@ -26374,6 +27388,175 @@ mod cfg_alias_ambiguity_tests {
     }
 
     #[test]
+    fn a_site_guaranteed_block_local_alias_shadows_a_module_scope_one() {
+        // Codex review of PR #209 (issue #206): a block-local declaration
+        // is not only shadowing when it is syntactically unconditional —
+        // one gated by exactly the construction site's own enclosing
+        // `cfg` is guaranteed to exist wherever the site does, confirmed
+        // against real `rustc`: inside a `#[cfg(feature = "a")]`
+        // function, a block-local `#[cfg(feature = "a")] type Unchecked =
+        // Decoy;` always shadows a module-scope `#[cfg(feature = "a")]
+        // type Unchecked = CheckedDispatch;`, never leaving both
+        // simultaneously live the way two declarations under genuinely
+        // different, unrelated flags can.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Unchecked = CheckedDispatch;\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_whose_cfg_the_site_does_not_guarantee_still_lets_module_scope_through() {
+        // The control for the test above: the block-local declaration's
+        // own `cfg` (`feature = "b"`) is not implied by the site's
+        // (`feature = "a"`), so it does not shadow module scope, and both
+        // stay live under this scanner's own unevaluated-`cfg` residual.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Unchecked = CheckedDispatch;\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"b\")]\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_value_only_site_guaranteed_declaration_does_not_shadow_a_type_namespace_module_scope_one()
+    {
+        // Codex review of PR #209 (issue #206): `site_guaranteed` asked
+        // whether *any* coexisting item's own `cfg` was guaranteed by the
+        // site's, with no regard for which namespace that item occupies. A
+        // block-local `const` of the same name, gated identically to the
+        // construction site, occupies only the value namespace and never
+        // shadows a type-namespace module-scope alias — confirmed against
+        // real `rustc` — but the unrestricted check still treated it as a
+        // guaranteed shadow and skipped module scope outright, missing the
+        // real construction the outer alias reaches.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Unchecked = CheckedDispatch;\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   const Unchecked: u8 = 0;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_site_guaranteed_module_scope_alias_excludes_a_merely_coexisting_peer() {
+        // Codex review of PR #209 (issue #206): `live_aliases_of` kept every
+        // module-scope alias whose own `cfg` merely *coexists* with the
+        // site's, with no regard for whether a different, *guaranteed*
+        // namespace-unambiguous declaration of the same name also exists.
+        // `#[cfg(feature = "a")] type Alias = Decoy;` beside
+        // `#[cfg(feature = "b")] type Alias = CheckedDispatch;`, referenced
+        // bare inside a `#[cfg(feature = "a")]` function, only ever compiles
+        // as `Decoy` — `feature = "a"` and `feature = "b"` can both be true
+        // as a raw satisfiability question, but a build where both hold
+        // never compiles at all (`E0428`, two declarations of `Alias`), so
+        // it is not a build this site is ever really reached from. The
+        // unrestricted coexistence check still counted `CheckedDispatch`
+        // anyway.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Alias = Decoy;\n\
+             #[cfg(feature = \"b\")]\n\
+             type Alias = CheckedDispatch;\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_site_guaranteed_module_scope_declaration_excludes_a_merely_coexisting_module_peer() {
+        // The module twin of the test above: a `mod` is always namespace-
+        // unambiguous, so it can never coexist with a guaranteed `type`
+        // alias of the same name in any build that compiles either — a
+        // `#[cfg(feature = "b")] mod Alias { .. }` beside the identical
+        // `#[cfg(feature = "a")] type Alias = Decoy;` and
+        // `#[cfg(feature = "a")]` site is excluded the same way. Qualified
+        // (`Alias::X { .. }`), not bare, on purpose: `live_modules_of` is
+        // only ever consulted for a path with a further segment to look up
+        // inside the module — a bare `Alias { .. }` never enters module
+        // descent at all, so it would not exercise this exclusion.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Alias = Decoy;\n\
+             #[cfg(feature = \"b\")]\n\
+             mod Alias {\n\
+             \x20   pub type X = super::CheckedDispatch;\n\
+             }\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias::X { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_merely_coexisting_module_scope_peer_still_counts_with_no_guaranteed_winner() {
+        // The control for both tests above: neither alias's own `cfg` is
+        // guaranteed by the site's own `not(feature = "a")` — `feature =
+        // "a"` and `feature = "b"` are genuinely independent flags this
+        // scanner cannot evaluate between, so both stay live candidates and
+        // the guarded one is still counted, under this scanner's own
+        // unevaluated-`cfg` residual (issue #185).
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             type Alias = Decoy;\n\
+             #[cfg(feature = \"b\")]\n\
+             type Alias = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
     fn an_unconditional_inner_block_alias_shadows_an_outer_block_one() {
         // Codex review of PR #204: `block_items` is flattened across
         // enclosing blocks, and the same shadowing rule applies one level
@@ -26554,6 +27737,944 @@ mod cfg_alias_ambiguity_tests {
         )
         .expect("the fixture parses");
         assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_scope_alias_that_cannot_coexist_with_the_sites_own_cfg_is_excluded() {
+        // Issue #206, Codex review of PR #204. `forge` exists only in a
+        // build where `feature = "a"` is off. In that build, `Unchecked`
+        // has only its own `not(feature = "a")` declaration — `Decoy`. The
+        // `feature = "a"` declaration does not exist there either. So no
+        // build ever has `forge`'s own `Unchecked { .. }` construct
+        // `CheckedDispatch`. Confirmed against real `rustc`.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_scope_alias_that_can_coexist_with_the_sites_own_cfg_still_counts() {
+        // The control for the test above: `forge` now exists only where
+        // `feature = "a"` is on — the same build where `Unchecked` names
+        // `CheckedDispatch`.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_scope_alias_that_cannot_coexist_with_an_enclosing_modules_cfg_is_excluded() {
+        // The site's own `cfg` is every enclosing item's `cfg` combined, not
+        // only the function's own. `forge` itself carries no `cfg` — the
+        // enclosing module's `cfg` alone rules `CheckedDispatch` out.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             mod outer {\n\
+             \x20   pub fn forge() -> u8 {\n\
+             \x20       let _ = super::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20       0\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_alias_that_cannot_coexist_with_the_sites_own_cfg_is_excluded() {
+        // The block-local search must check the site's own `cfg` too, not
+        // only the module-scope search. `CheckedDispatch` is declared
+        // first so the deterministic resolver's own "last declared wins"
+        // pick at block scope lands on `Decoy` — the backstop is what
+        // finds `CheckedDispatch` at all, and it must reject it here.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   type Unchecked = CheckedDispatch;\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   type Unchecked = Decoy;\n\
+             \x20   let _ = Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_shared_module_scope_alias_is_filtered_independently_for_each_calling_sites_own_cfg() {
+        // The cache [`AliasLookupCache`] keeps must key on the construction
+        // site's own `cfg` too, not only the scope and the name (issue
+        // #206): two functions in one file, gated on opposite values of
+        // one flag, ask about the same module-scope alias and must get two
+        // different answers, not one cached for both.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             fn forge_a() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }\n\
+             #[cfg(feature = \"a\")]\n\
+             fn forge_b() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_deterministically_resolved_candidate_is_still_excluded_by_the_sites_own_cfg() {
+        // Codex review of the fix. `CheckedDispatch` is declared *first*, so
+        // module-scope deterministic resolution (which prefers the first
+        // declaration when none is unconditional) picks it directly — the
+        // old code counted this from `resolves_to_name` alone, without ever
+        // checking `CheckedDispatch`'s own `cfg` against the site. `forge`
+        // exists only where `feature = "a"` is off, the build where
+        // `Unchecked` names `Decoy`, not `CheckedDispatch`.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_default_trait_methods_own_cfg_excludes_a_candidate_the_traits_own_cfg_would_not() {
+        // Codex review of the fix: a default trait method is a `TraitItem`,
+        // not an `Item` or an `ImplItem`, so its own `cfg` was unseen unless
+        // `Literals` also tracks it through `visit_trait_item`.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             trait Forge {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   fn forge() -> u8 {\n\
+             \x20       let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20       0\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn the_inside_count_sees_the_selected_functions_own_cfg_too() {
+        // Codex review of the fix: `struct_literal_counts`'s `inside`
+        // visitor starts directly at the selected function's own body, so
+        // it used to start with no `cfg` at all — `total` could correctly
+        // exclude a candidate that `inside` still admitted, which is
+        // exactly the divergence the rule callers in `source.rs` compare
+        // `total` and `inside` to catch.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::FirstFn("forge"),
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        assert_eq!(counts.inside, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn an_absolute_path_construction_still_counts() {
+        // Codex review of the fix: removing the deterministic resolver's
+        // own `resolves_to_name` fast path left `path_could_reach_target`
+        // as the sole decision-maker, and it bailed `false` outright for
+        // any leading-colon path — a missed count, since the deterministic
+        // resolver used to return an absolute path's own segments
+        // unresolved and compare its last one to the target.
+        let counts = struct_literal_counts(
+            "fn forge() -> u8 {\n\
+             \x20   let _ = ::CheckedDispatch { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_local_statements_own_cfg_excludes_a_candidate_the_functions_cfg_would_not() {
+        // Codex review of the fix, round 3: a statement-level `#[cfg(..)]`
+        // on a `let` is neither an `Item`, an `ImplItem` nor a `TraitItem`,
+        // so it was never folded into `enclosing_cfg` — the site was
+        // checked against the enclosing function's own (unconditional)
+        // `cfg` alone, missing the `let`'s own, narrower one, and a
+        // candidate the local's own `cfg` rules out was still counted.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_cfg_gated_block_expression_statements_own_cfg_excludes_a_candidate() {
+        // Codex review of the fix, round 4: `#[cfg(..)]` directly on an
+        // expression in statement position — a block expression here —
+        // is neither a `Local` nor any of the three item kinds, so it
+        // was never folded into `enclosing_cfg` either.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   {\n\
+             \x20       let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   }\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_cfg_gated_match_arms_own_cfg_excludes_a_candidate() {
+        // Codex review of the fix, round 4: `syn::Arm` carries its own
+        // `attrs` too, unreached by the default descent.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge(x: u8) -> u8 {\n\
+             \x20   match x {\n\
+             \x20       #[cfg(not(feature = \"a\"))]\n\
+             \x20       _ => {\n\
+             \x20           let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20           0\n\
+             \x20       }\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn coexistence_is_checked_in_a_production_build_only() {
+        // Codex review of the fix, round 5: `Cfg::could_coexist_with` used
+        // to try `test = true` as well as `test = false`, but this scanner
+        // family already treats `#[cfg(test)]`-only code as never shipped
+        // (issue #51) — a candidate or a site that is *only* test-only is
+        // already skipped before either formula reaches this method. Two
+        // formulas that are disjoint in every real production build can
+        // still both hold when `test` is assumed `true`, which is a build
+        // this scan has no business reasoning about: the target's own
+        // `cfg` reduces to `feature = "a"` under `test = false`, the
+        // site's own `cfg` reduces to `not(feature = "a")`, and the two
+        // can never both hold in a production build — only through the
+        // `test = true` bridge the old code tried.
+        let counts = struct_literal_counts(
+            "#[cfg(any(test, feature = \"a\"))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(all(not(test), not(feature = \"a\")))]\ntype Unchecked = Decoy;\n\
+             #[cfg(any(test, not(feature = \"a\")))]\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Unchecked { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_struct_literal_fields_own_cfg_excludes_a_candidate_the_sites_cfg_would_not() {
+        // Codex review of the fix, round 7: `syn::FieldValue` carries its
+        // own `attrs`, separate from the value expression's own — a struct
+        // literal's field can itself carry `#[cfg(..)]`
+        // (`Wrapper { #[cfg(not(feature = "a"))] value: Unchecked {} }`),
+        // and nothing folded that into `enclosing_cfg` before the nested
+        // literal was checked, over-counting a candidate the field's own
+        // `cfg` already rules out.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge() -> Wrapper {\n\
+             \x20   Wrapper {\n\
+             \x20       #[cfg(not(feature = \"a\"))]\n\
+             \x20       value: self::Unchecked { intent: 0, bytes: 0 },\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn many_distinctly_ordered_cfg_predicates_over_one_pair_resolve_quickly() {
+        // Codex review of the fix, round 7: two semantically identical
+        // `cfg` predicates with reordered `any`/`all` operands produced
+        // different `Cfg::key` text, so several sites each using their own
+        // permutation of the same 20-atom `not(any(..))` predicate against
+        // one `any(..)` candidate each missed
+        // `AliasLookupCache::could_coexist`'s cache and independently
+        // exhausted all 1,048,576 assignments, each allocating a fresh
+        // `HashSet`.
+        //
+        // Distinct permutations, not a mere rotation: a rotation only
+        // produces as many distinct orderings as there are atoms, so a
+        // rotation-based fixture would silently stop stressing the cache
+        // past that many sites and pass even unfixed. `nth_permutation`
+        // walks the factorial number system instead, giving as many
+        // distinct orderings as there are sites, well under 20!.
+        use std::fmt::Write as _;
+
+        fn nth_permutation(items: &[String], mut n: usize) -> Vec<String> {
+            let mut remaining: Vec<String> = items.to_vec();
+            let len = remaining.len();
+            let mut factorial = vec![1usize; len];
+            for i in 1..len {
+                factorial[i] = factorial[i - 1] * i;
+            }
+            let mut out = Vec::with_capacity(len);
+            for i in (0..len).rev() {
+                let f = factorial[i];
+                let index = n / f;
+                n %= f;
+                out.push(remaining.remove(index));
+            }
+            out
+        }
+
+        let base_flags: Vec<String> = (0..20)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect();
+        let candidate_flags = base_flags.join(", ");
+        let mut src = format!(
+            "#[cfg(any({candidate_flags}))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(any({candidate_flags})))]\ntype Unchecked = Decoy;\n"
+        );
+        for s in 0..8 {
+            let flags = nth_permutation(&base_flags, s * 7).join(", ");
+            let _ = write!(
+                src,
+                "#[cfg(not(any({flags})))]\nfn forge{s}() -> u8 {{\n\
+                 \x20   let _ = self::Unchecked {{ intent: 0, bytes: 0 }};\n\
+                 \x20   0\n\
+                 }}\n"
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?} for 8 sites, each its own distinct ordering of one 20-atom pair",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_enum_variants_own_cfg_excludes_a_candidate_the_enums_cfg_would_not() {
+        // Codex review of the fix, round 8: `syn::Variant` carries its own
+        // `attrs`, and `syn` dispatches it through `visit_variant`, which
+        // none of the overrides above intercept — a discriminant
+        // expression's own literal was checked against the enum's own
+        // `cfg` alone, missing the variant's own narrower one.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             enum E {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   V = { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 },\n\
+             \x20   Other,\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_declaration_fields_own_cfg_excludes_a_candidate_the_structs_cfg_would_not() {
+        // Codex review of the fix, round 9: `syn::Field` (a struct or enum
+        // *declaration*'s own field, as opposed to `syn::FieldValue` in a
+        // struct literal) carries its own `attrs` too, and its own type can
+        // hide an expression — an array length, here — that `visit_field`
+        // reaches with no override folding the field's own `cfg` in first.
+        let counts = struct_literal_counts(
+            "#[cfg(not(feature = \"a\"))]\ntype Unchecked = Decoy;\n\
+             #[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct Holder {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   field: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_chained_alias_cannot_combine_mutually_exclusive_cfg_hops() {
+        // Codex review of the fix, round 9: `site_cfg` passed through a
+        // chain of alias hops unchanged, rather than conjoined with each
+        // selected candidate's own `cfg`, let the search combine two hops
+        // that can never coexist. `A = B` and `B = Decoy` hold under
+        // `feature = "a"`; `A = Decoy` and `B = CheckedDispatch` hold under
+        // its negation. Every real build resolves `A` to `Decoy` — under
+        // `a`, through `B`; under `not(a)`, directly — never to
+        // `CheckedDispatch`, which only ever exists on the branch where `A`
+        // does not name `B` at all. The unfixed search still reached it, by
+        // picking `A = B` from the `a` branch and then `B = CheckedDispatch`
+        // from the `not(a)` branch: each hop's own `cfg` coexists with the
+        // unconditional site on its own, even though the two together do
+        // not.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype A = B;\n\
+             #[cfg(feature = \"a\")]\ntype B = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\ntype A = Decoy;\n\
+             #[cfg(not(feature = \"a\"))]\ntype B = CheckedDispatch;\n\
+             fn forge() {\n\
+             \x20   let _ = self::A { intent: 0, bytes: 0 };\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_function_parameters_own_cfg_excludes_a_candidate_the_functions_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): a function parameter can
+        // carry its own `#[cfg(..)]`, stable Rust for conditionally
+        // compiling one argument, and `syn::PatType` carries its own
+        // `attrs` separate from the function item's — nothing folded a
+        // parameter's own condition into `enclosing_cfg` before its type
+        // was visited, so a nested literal buried in the parameter's own
+        // type (an array length, here) was checked against the enclosing
+        // function's own `cfg` alone, missing the parameter's own
+        // narrower one.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             fn forge(\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   _p: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
+             ) {\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_module_hop_cannot_combine_with_a_mutually_exclusive_further_cfg() {
+        // Codex review of PR #209 (issue #206): module descent — the
+        // module twin of round 14's alias-hop finding — passed `site_cfg`
+        // through unchanged to the recursive call after entering a
+        // module, rather than conjoining the selected module's own
+        // `cfg`. `m` exists only under `feature = "a"`, and inside it
+        // `X = CheckedDispatch` exists only under `not(feature = "a")` —
+        // a combination no build ever has, since `m` and that `X` can
+        // never both compile. The unfixed search still reached
+        // `CheckedDispatch`, because the module's own `cfg` coexists with
+        // the unconditional site on its own, and `X`'s own `cfg` then
+        // coexists with that same unconditional `site_cfg` too — the two
+        // never checked against each other.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\n\
+             mod m {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   pub type X = CheckedDispatch;\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   pub type X = Decoy;\n\
+             }\n\
+             fn forge() {\n\
+             \x20   let _ = m::X { intent: 0, bytes: 0 };\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_block_local_module_hop_cannot_combine_with_a_mutually_exclusive_further_cfg() {
+        // The block-local twin of the test above: `try_block_local_candidates`'s
+        // own module branch has the identical shape — a block-local `mod`
+        // reached by name, entered with `site_cfg` unchanged rather than
+        // conjoined with its own `cfg`.
+        let counts = struct_literal_counts(
+            "fn forge() {\n\
+             \x20   #[cfg(feature = \"a\")]\n\
+             \x20   mod m {\n\
+             \x20       #[cfg(not(feature = \"a\"))]\n\
+             \x20       pub type X = CheckedDispatch;\n\
+             \x20       #[cfg(feature = \"a\")]\n\
+             \x20       pub type X = Decoy;\n\
+             \x20   }\n\
+             \x20   let _ = m::X { intent: 0, bytes: 0 };\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_foreign_items_own_cfg_excludes_a_candidate_the_externs_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): `syn::ForeignItem` — a
+        // member of an `extern` block — carries its own `attrs`, and none
+        // of `visit_item`/`visit_impl_item`/`visit_trait_item` ever
+        // dispatches through it, so a foreign static's own `cfg` was
+        // never folded into `enclosing_cfg` before its declared type was
+        // visited, missing the member's own narrower condition the same
+        // way a declaration field's or a function parameter's own did.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             unsafe extern \"C\" {\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   static X: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }];\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_type_params_own_cfg_excludes_a_candidate_the_items_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): stable Rust lets a
+        // generic type parameter carry its own `#[cfg(..)]`, and its
+        // default can hide an expression — an array length, here — the
+        // same way a declaration field's or a function parameter's own
+        // can, but nothing folded the parameter's own condition into
+        // `enclosing_cfg` before its default type was visited.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct Holder<\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   T = [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
+             \x20   U = u8,\n\
+             \x20   const N: usize = 0,\n\
+             \x20   >(T, U);",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_const_params_own_cfg_excludes_a_candidate_the_items_cfg_would_not() {
+        // The const-generic twin: a `syn::ConstParam` can carry its own
+        // `cfg` too, and its default is an expression that can construct
+        // the target directly, not merely hide one inside a type.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct Holder<\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   const N: u8 = { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 },\n\
+             \x20   >;",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_bare_fn_args_own_cfg_excludes_a_candidate_the_aliass_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): a parameter in a
+        // function-*pointer* type is `syn::BareFnArg`, not `syn::PatType`
+        // — a separate node with its own `attrs` the `visit_pat_type`
+        // override does not cover, and it can carry its own `#[cfg(..)]`
+        // just as an ordinary function declaration's parameter can.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             type F = fn(\n\
+             \x20   #[cfg(not(feature = \"a\"))]\n\
+             \x20   [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
+             );",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_receivers_own_cfg_excludes_a_candidate_the_methods_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): a method's `self` parameter is
+        // `syn::Receiver`, not `syn::PatType` — a separate node with its own
+        // `attrs`, and stable arbitrary self types let it carry an explicit
+        // type (`self: SomeType`) that can hide an expression the same way an
+        // ordinary parameter's own type can.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct S;\n\
+             impl S {\n\
+             \x20   fn f(\n\
+             \x20       #[cfg(not(feature = \"a\"))]\n\
+             \x20       self: [u8; { let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }],\n\
+             \x20   ) {}\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_field_pats_own_cfg_excludes_a_candidate_the_arms_cfg_would_not() {
+        // Codex review of PR #209 (issue #206): a struct or tuple-struct
+        // *pattern*'s own field is `syn::FieldPat`, with its own `attrs`
+        // separate from a declaration field's (`visit_field`) and a struct
+        // literal's own field (`visit_field_value`) — its own sub-pattern can
+        // carry a const generic argument that hides an expression the same
+        // way either of those can.
+        let counts = struct_literal_counts(
+            "#[cfg(feature = \"a\")]\ntype Unchecked = CheckedDispatch;\n\
+             struct Wrap<const N: u8>;\n\
+             struct S {\n\
+             \x20   x: Wrap<0>,\n\
+             }\n\
+             fn f(s: S) {\n\
+             \x20   match s {\n\
+             \x20       S {\n\
+             \x20           #[cfg(not(feature = \"a\"))]\n\
+             \x20           x: Wrap::<{ let _ = self::Unchecked { intent: 0, bytes: 0 }; 0 }>,\n\
+             \x20           #[cfg(feature = \"a\")]\n\
+             \x20           x: _,\n\
+             \x20       } => {}\n\
+             \x20   }\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn many_differently_nested_but_equivalent_cfg_predicates_resolve_quickly() {
+        // Codex review of the fix, round 8: `Cfg::key` sorted a single
+        // combinator's own children (round 7) but never flattened nested
+        // `All`s of the same kind — `enclosing_cfg` nests one `All` per
+        // level of `visit_item` it has descended through, so the identical
+        // 20-atom predicate inherited at two different nesting depths
+        // rendered to two different keys and missed the memoization cache
+        // on every one of them.
+        use std::fmt::Write as _;
+
+        let flags: Vec<String> = (0..20)
+            .map(|index| format!("feature = \"y{index}\""))
+            .collect();
+        let candidate_flags = flags.join(", ");
+        let mut src = format!(
+            "#[cfg(any({candidate_flags}))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(any({candidate_flags})))]\ntype Unchecked = Decoy;\n"
+        );
+        for depth in 0..8usize {
+            let mut body = "let _ = self::Unchecked { intent: 0, bytes: 0 };".to_owned();
+            for level in (0..depth).rev() {
+                body = format!("fn wrap{depth}_{level}() {{ {body} }}");
+            }
+            let _ = write!(
+                src,
+                "#[cfg(not(any({candidate_flags})))]\nfn forge{depth}() {{\n{body}\n}}\n"
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?} for 8 sites, each nesting the same 20-atom pair at its own depth",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_predicate_repeated_across_nested_functions_shares_one_cache_key() {
+        // Codex review of PR #209 (issue #206): round 8's own flattening
+        // (`Cfg::normalized`) splices a nested `all` of the same kind into
+        // its parent, but never deduplicates the result — `all`/`any` are
+        // idempotent, so `all(P, P, P)` is exactly `P`, but it still rendered
+        // as a three-element key distinct from a two- or one-element one.
+        // Nesting a function inside a function, each carrying the identical
+        // `#[cfg(..)]` (a nested `fn` is still a `syn::Item`, reached through
+        // the same `visit_item` override an outer one is), makes
+        // `enclosing_cfg` accumulate one more copy of that same predicate per
+        // level — flattened into one `All` by round 8's fix, but with a
+        // growing number of identical children the key never collapsed, so
+        // every depth missed the memoized answer and independently repeated
+        // the same worst-case, unsatisfiable enumeration. Nested functions
+        // rather than nested modules on purpose: a module does not inherit
+        // its enclosing scope's own declarations, so a construction site
+        // nested inside one could not reach `Unchecked` at all and this test
+        // would exercise nothing.
+        use std::fmt::Write as _;
+
+        let flags: Vec<String> = (0..20)
+            .map(|index| format!("feature = \"z{index}\""))
+            .collect();
+        let candidate_flags = flags.join(", ");
+        let mut src = format!(
+            "#[cfg(any({candidate_flags}))]\ntype Unchecked = CheckedDispatch;\n\
+             #[cfg(not(any({candidate_flags})))]\ntype Unchecked = Decoy;\n"
+        );
+        for depth in 1..=8usize {
+            let mut body = "let _ = self::Unchecked { intent: 0, bytes: 0 };".to_owned();
+            for level in (0..depth).rev() {
+                body = format!(
+                    "#[cfg(not(any({candidate_flags})))]\nfn wrap{depth}_{level}() {{ {body} }}"
+                );
+            }
+            let _ = writeln!(src, "{body}");
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        // Reproduced unfixed (no `dedup` in `commutative_key`) at 58.6s; fixed,
+        // 13.95s locally in the same debug profile CI runs. This test's own
+        // 20-atom, 8-level fixture is heavier than the sibling
+        // `many_differently_nested_..._resolve_quickly` test's 6.93s (each of
+        // these 8 sites pays its own growing chain of identical children,
+        // where the sibling's stays one child at every depth), so it needs
+        // more of today's demonstrated CI margin than that test's 20s ceiling
+        // gives: 30s keeps real headroom below both the regressed shape and
+        // observed runner variance.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "took {:?} for 8 sites, each nesting the identical predicate one more level deep",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_repeated_site_candidate_cfg_pair_is_not_recomputed() {
+        // Codex review of the fix: `Cfg::could_coexist_with`'s own worst
+        // case is exponential in the atoms two formulas name together, and
+        // it used to be called fresh for every candidate at every site —
+        // many literals sharing one `cfg`-gated scope repeat the identical
+        // pair. `AliasLookupCache::could_coexist` memoizes it.
+        //
+        // The site and `CheckedDispatch` share the same 16 flags, negated
+        // against each other (`not(any(x0..x15))` against `any(x0..x15)`):
+        // the two can never coexist, so `could_coexist_with`'s own `.any()`
+        // must exhaust every one of 2^17 assignments before answering
+        // `false` — it cannot short-circuit true early, the way a
+        // genuinely-coexisting pair would. Repeated at 100 identically-
+        // gated sites, if that answer were recomputed instead of cached,
+        // this would not finish anywhere near the ceiling below.
+        use std::fmt::Write as _;
+        let flags = (0..20)
+            .map(|index| format!("feature = \"x{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut src = format!(
+            "#[cfg(not(any({flags})))]\ntype Unchecked = Decoy;\n\
+             #[cfg(any({flags}))]\ntype Unchecked = CheckedDispatch;\n"
+        );
+        for s in 0..100 {
+            let _ = write!(
+                src,
+                "#[cfg(not(any({flags})))]\nfn forge{s}() -> u8 {{\n\
+                 \x20   let _ = self::Unchecked {{ intent: 0, bytes: 0 }};\n\
+                 \x20   0\n\
+                 }}\n"
+            );
+        }
+
+        let start = std::time::Instant::now();
+        let counts = struct_literal_counts(&src, "CheckedDispatch", FnScope::None)
+            .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+        // CI measured 14.6s against the 10s ceiling this test first held, on a run
+        // this workspace's own history already documents as prone to "severe,
+        // repeated congestion" (see the PR #1479 check-in precedent, and
+        // `many_distinctly_ordered_cfg_predicates_over_one_pair_resolve_quickly`'s
+        // own 20s ceiling for the identical reason). Reproduced locally at 8.24s in
+        // the same `cargo test` profile CI runs, well within the "memoized" shape —
+        // this module's own doc comment above measures 0.63s with memoization
+        // against 46.73s without it, so 30s still separates "fixed" from
+        // "regressed to the unmemoized shape" with real margin on both sides.
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "took {:?} for 100 sites repeating one unsatisfiable 16-atom pair",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_file_level_cfg_attribute_excludes_a_candidate_the_file_itself_could_never_compile_under() {
+        // Codex review of PR #209 (issue #206): the root `enclosing_cfg`
+        // started empty — always true — so a file-level inner attribute
+        // (`#![cfg(..)]`) gating the whole file was invisible to every
+        // construction site in it. `#![cfg(not(feature = "a"))]` at the top
+        // of a file, beside `#[cfg(feature = "a")] type Alias =
+        // CheckedDispatch;`, means the target alias itself never exists in
+        // any build that also has this file — the file requires `feature =
+        // "a"` off and the alias requires it on — so no site in the file,
+        // however it is itself gated, can ever really construct it.
+        let counts = struct_literal_counts(
+            "#![cfg(not(feature = \"a\"))]\n\
+             #[cfg(feature = \"a\")]\n\
+             type Alias = CheckedDispatch;\n\
+             #[cfg(not(feature = \"a\"))]\n\
+             type Alias = Decoy;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_file_with_no_file_level_cfg_still_counts_a_reachable_construction() {
+        // The control for the test above: an unconditional file (no
+        // `#![cfg(..)]` at all) still lets an unconditional candidate
+        // through, confirming the file-level seed above does not turn into
+        // an always-excluding formula on a file that has none.
+        let counts = struct_literal_counts(
+            "type Alias = CheckedDispatch;\n\
+             fn forge() -> u8 {\n\
+             \x20   let _ = self::Alias { intent: 0, bytes: 0 };\n\
+             \x20   0\n\
+             }",
+            "CheckedDispatch",
+            FnScope::None,
+        )
+        .expect("the fixture parses");
+        assert_eq!(counts.total, 1, "{counts:?}");
+    }
+}
+
+#[cfg(test)]
+mod cfg_coexistence_tests {
+    //! Issue #206: [`Cfg::could_coexist_with`] checks if two `cfg` formulas
+    //! can both be true. Direct tests, so a logic bug here does not hide
+    //! behind alias resolution.
+    use super::Cfg;
+
+    #[test]
+    fn two_unrelated_atoms_can_coexist() {
+        let a = Cfg::Atom("feature=\"a\"".to_owned());
+        let b = Cfg::Atom("feature=\"b\"".to_owned());
+        assert!(a.could_coexist_with(&b));
+    }
+
+    #[test]
+    fn a_formula_and_its_own_negation_cannot_coexist() {
+        let a = Cfg::Atom("feature=\"a\"".to_owned());
+        let not_a = Cfg::Not(Box::new(a.clone()));
+        assert!(!a.could_coexist_with(&not_a));
+    }
+
+    #[test]
+    fn a_formula_coexists_with_itself() {
+        let a = Cfg::Atom("feature=\"a\"".to_owned());
+        assert!(a.could_coexist_with(&a));
+    }
+
+    #[test]
+    fn an_empty_formula_coexists_with_anything() {
+        // `Cfg::All(vec![])` is the value an item with no `cfg` at all
+        // gets: an empty conjunction, always true.
+        let anything = Cfg::Not(Box::new(Cfg::Atom("feature=\"a\"".to_owned())));
+        assert!(Cfg::All(Vec::new()).could_coexist_with(&anything));
+    }
+
+    #[test]
+    fn a_formula_past_the_atom_cap_assumes_it_can_coexist() {
+        // Fails open, not closed (issue #206): a construction pin must
+        // never miss a real construction. Past `MAX_CFG_ATOMS`, this check
+        // gives up and answers `true` rather than guess `false`.
+        let a = Cfg::All(
+            (0..=super::MAX_CFG_ATOMS)
+                .map(|index| Cfg::Atom(format!("feature=\"f{index}\"")))
+                .collect(),
+        );
+        let not_a = Cfg::Not(Box::new(a.clone()));
+        assert!(a.could_coexist_with(&not_a));
     }
 }
 
@@ -27893,27 +30014,37 @@ mod block_local_item_shadow_tests {
     #[test]
     fn path_could_reach_target_does_not_consult_block_shadow_for_a_type_only_shape() {
         // Codex review of this change (PR #203): the same residual met a second way,
-        // narrowed by the merge's own P1 fix (round 2) to the shapes it did not close.
-        // A unit or tuple `struct` used to demonstrate this residual, but that shape is
-        // now closed: `resolve_with_block_alias` correctly leaves a bare reference to
-        // one unresolved (`value_shadow`), and `Literals::visit_expr_struct`'s own
-        // `block_shadowed` pre-check now excludes it from the fail-closed backstop too,
-        // so `struct Alias; let _ = Alias {};` beside `use Disallowed as Alias;`
-        // correctly counts zero. An `enum`, which has no implicit constructor and so
-        // stays namespace-ambiguous for a bare reference the same way it does in
-        // `resolved_path_uses` (see the `_items_name` test above), still reaches this
-        // gap: `resolve_with_block_alias` correctly leaves `Alias` unresolved here in
-        // the type-only sense `resolve_segments_from`'s own qualified-only narrowing
-        // does not reach for a *bare* segment, but `path_could_reach_target` (issue
-        // #185's own fallback) reads only `own_aliases`, which is blind to the
-        // block-local enum entirely, so it still finds the module-level `use` and
-        // counts anyway. An over-count, still pinned rather than fixed, for the same
-        // reason issue #205 files the class of gap this belongs to.
+        // narrowed by the merge's own P1 fix (round 2) to the shapes it did not close
+        // at the time. `resolve_with_block_alias` correctly leaves a bare reference to
+        // a block-local `enum` unresolved in the type-only sense `resolve_segments_from`'s
+        // own qualified-only narrowing does not reach for a *bare* segment — an `enum`
+        // has no implicit constructor, so it stays namespace-ambiguous for a bare
+        // reference the same way it does in `resolved_path_uses` (see the `_items_name`
+        // test above), and `resolve_segments` deliberately does not treat `block_shadow`
+        // as refusing a bare one either.
+        //
+        // Merging with issue #206 closes this specific case too, as a side effect
+        // rather than a targeted fix: `Literals::visit_expr_struct` no longer trusts
+        // `resolves_to_name` as an independent, unconditional route to a count — issue
+        // #206's own round 2 found that shortcut unsound (a deterministic pick can
+        // itself be a `cfg`-gated candidate the site cannot coexist with), so
+        // `path_could_reach_target` now runs whenever the path is not `block_shadowed`,
+        // full stop, rather than only when `resolves_to_name` disagreed. Its own
+        // `live_block_declarations` independently treats an unconditional block-local
+        // declaration of any of the four shapes — not only an alias — as shadowing
+        // everything further out (see that function's own doc), so it finds nothing
+        // reachable here and correctly answers zero, closing the gap the old
+        // resolves_to_name-first shortcut used to paper over.
+        //
+        // The fixture itself is not compilable Rust either way — `enum Alias {}` has
+        // no unit variant, so `Alias {}` cannot construct it — which is exactly why
+        // this was only ever a scanner residual and not a real missed or extra count in
+        // any shipping build.
         let code = "use Disallowed as Alias;\nfn f() {\n    enum Alias {}\n    let _ = Alias \
              {};\n}\n";
         let counts =
             struct_literal_counts(code, "Disallowed", FnScope::None).expect("the fixture parses");
-        assert_eq!(counts.total, 1, "{counts:?}");
+        assert_eq!(counts.total, 0, "{counts:?}");
     }
 
     #[test]
