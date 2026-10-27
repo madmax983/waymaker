@@ -27,6 +27,8 @@ required-features = ["probe"]
 waymaker-core = { workspace = true, optional = true }
 waymaker-flash = { workspace = true, optional = true }
 waymaker-embassy = { workspace = true, optional = true }
+waymaker-drive = { workspace = true, optional = true }
+waymaker-bridge = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -38,6 +40,13 @@ engine = ["dep:waymaker-core", "dep:waymaker-flash"]
 # The async façade on top of the engine, measured separately so that its cost is its own
 # line rather than part of the kernel's.
 facade = ["engine", "dep:waymaker-embassy"]
+# ADR 0055's driver on top of the engine: the loop a firmware runs a workflow on flash with.
+# Its own row and its own ceiling, for the façade's reason: §04 states the engine's number for
+# "core + flash adapter", and the driver is neither.
+drive = ["engine", "dep:waymaker-drive"]
+# The bridge between the driver and the façade, which needs both: the configuration a
+# firmware that writes its workflows as `async fn`s over `Ctx` links.
+bridge = ["facade", "drive", "dep:waymaker-bridge"]
 # The mirrors of the façade's own optional features. A `--features waymaker-embassy/serde`
 # on the command line enables that feature and defines no `cfg` here, so the probe could
 # not write a call the row turns on and the row would measure an image it never reached.

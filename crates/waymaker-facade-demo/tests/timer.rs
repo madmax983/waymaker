@@ -14,11 +14,11 @@ use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::{GateId, VersionRange};
 use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
-use waymaker_drive::demo::{DELAYED_BOUNDS, DOWNLOADED, Delayed, World};
 use waymaker_drive::{
     Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
 };
+use waymaker_facade_demo::demo::{DELAYED_BOUNDS, DOWNLOADED, Delayed, World};
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;
@@ -330,8 +330,8 @@ fn replay_prefix(device: &mut Device, upto: usize) -> Result<(), ()> {
     };
     let mut encoded = [0_u8; 128];
     let record = RecordRef::RunStarted {
-        workflow_kind: waymaker_drive::demo::DELAYED_KIND,
-        workflow_version: waymaker_drive::demo::DELAYED_VERSION,
+        workflow_kind: waymaker_facade_demo::demo::DELAYED_KIND,
+        workflow_version: waymaker_facade_demo::demo::DELAYED_VERSION,
         input: b"seed",
     };
     let Ok(written) = frame::encode(&record, align, &mut encoded) else {

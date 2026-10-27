@@ -1,7 +1,7 @@
 //! Design document §14's failure-semantics table, run on the rig.
 //!
 //! Issue [#31](https://github.com/madmax983/waymaker/issues/31): every row of the table is an
-//! executable assertion. The model half is `crates/waymaker-drive/tests/matrix.rs`. This is
+//! executable assertion. The model half is `crates/waymaker-facade-demo/tests/matrix.rs`. This is
 //! the rig half: every crash point the injector lists is classified into a [`Row`], the rig
 //! is *resumed* from the media the crash left, and the row's required behaviour is checked
 //! against what the resume dispatched. One test per row, named after it, and the

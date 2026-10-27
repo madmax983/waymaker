@@ -6,7 +6,7 @@
 //! durable, that it dispatches nothing on replay, and that it records what the world
 //! answered before the workflow sees it.
 //!
-//! The end-to-end run over real media is `crates/waymaker-drive/tests/ota.rs`.
+//! The end-to-end run over real media is `crates/waymaker-facade-demo/tests/ota.rs`.
 
 use core::future::Future;
 use core::pin::pin;

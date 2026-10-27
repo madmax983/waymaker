@@ -12,7 +12,7 @@
 //!
 //! # Here rather than in `tests/`
 //!
-//! For `waymaker_drive::demo`'s reason. The `facade-demo-firmware` stage builds this
+//! For `waymaker_facade_demo::demo`'s reason. The `facade-demo-firmware` stage builds this
 //! crate's library for `thumbv6m-none-eabi`.
 //!
 //! [`ota_update`] and [`Ota`] are generic, and a generic body no caller names is
@@ -24,7 +24,7 @@
 //! It uses neither `TimerFuture` nor `ContinueFuture`, so neither is in this rlib. The size
 //! probe drives all four, which is what the `facade` row of `cargo xtask size` measures.
 //!
-//! [`Bridge`]: crate::Bridge
+//! [`Bridge`]: waymaker_bridge::Bridge
 
 use core::convert::Infallible;
 use core::future::Future;
@@ -40,7 +40,7 @@ use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Decode, Journal};
 use waymaker_flash::capacity::Bounds;
 
-use crate::facade::Bridge;
+use waymaker_bridge::Bridge;
 
 /// Fetch the image and leave it somewhere the device can reach.
 pub const DOWNLOAD: ActivityKind = ActivityKind(11);

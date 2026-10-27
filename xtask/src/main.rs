@@ -99,7 +99,7 @@ fn run_check() -> ExitCode {
                 eprintln!("  {violation}");
             }
             eprintln!(
-                "\nThe layering contract is design document §05: waymaker-embassy -> waymaker-flash -> waymaker-core."
+                "\nThe layering contract is design document §05 and ADR 0055: waymaker-bridge -> waymaker-embassy, waymaker-drive -> waymaker-flash -> waymaker-core."
             );
             ExitCode::FAILURE
         }

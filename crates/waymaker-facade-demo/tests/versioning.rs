@@ -11,10 +11,10 @@
 
 use waymaker_core::version::{GateId, VersionRange};
 use waymaker_core::{KernelError, RecordKind, RecordRef, RunId};
-use waymaker_drive::demo::{
+use waymaker_drive::{Conclusion, DriveError, Driver, Identity, Progress, Scratch, Workflow};
+use waymaker_facade_demo::demo::{
     Branching, FINISH, PREPARE, UPGRADABLE_BOUNDS, UPGRADE_GATE, Upgradable, V1, V2, VERIFY, World,
 };
-use waymaker_drive::{Conclusion, DriveError, Driver, Identity, Progress, Scratch, Workflow};
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::append::Journal;
 use waymaker_flash::bank::BankLayout;
@@ -510,7 +510,7 @@ struct MovedGate;
 impl Workflow for MovedGate {
     fn identity(&self) -> Identity<'_> {
         Identity {
-            kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            kind: waymaker_facade_demo::demo::UPGRADABLE_KIND,
             versions: VersionRange::exact(V1),
             input: b"seed",
         }
@@ -559,7 +559,7 @@ struct RenumberedGate;
 impl Workflow for RenumberedGate {
     fn identity(&self) -> Identity<'_> {
         Identity {
-            kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            kind: waymaker_facade_demo::demo::UPGRADABLE_KIND,
             versions: VersionRange::exact(V1),
             input: b"seed",
         }
@@ -717,7 +717,7 @@ struct SeenVersion(Option<u16>);
 impl Workflow for SeenVersion {
     fn identity(&self) -> Identity<'_> {
         Identity {
-            kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            kind: waymaker_facade_demo::demo::UPGRADABLE_KIND,
             versions: VersionRange::new(V1, V2).unwrap_or(VersionRange::exact(V2)),
             input: b"seed",
         }
@@ -785,7 +785,7 @@ struct SplitThenGate;
 impl Workflow for SplitThenGate {
     fn identity(&self) -> Identity<'_> {
         Identity {
-            kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            kind: waymaker_facade_demo::demo::UPGRADABLE_KIND,
             versions: VersionRange::exact(V1),
             input: b"seed",
         }
@@ -862,7 +862,7 @@ fn a_marker_recorded_at_another_position_is_refused() {
     append_past_the_end(
         &mut ahead,
         &RecordRef::RunStarted {
-            workflow_kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            workflow_kind: waymaker_facade_demo::demo::UPGRADABLE_KIND,
             workflow_version: V1,
             input: b"seed",
         },
@@ -899,7 +899,7 @@ struct OnlyAGate;
 impl Workflow for OnlyAGate {
     fn identity(&self) -> Identity<'_> {
         Identity {
-            kind: waymaker_drive::demo::UPGRADABLE_KIND,
+            kind: waymaker_facade_demo::demo::UPGRADABLE_KIND,
             versions: VersionRange::exact(V1),
             input: b"seed",
         }

@@ -24,7 +24,14 @@ pub struct LayerSpec {
     pub must_not_own: &'static str,
 }
 
-/// The three firmware crates, ordered from the kernel outwards.
+/// The firmware crates, ordered from the kernel outwards.
+///
+/// Five since [ADR 0055](https://github.com/madmax983/waymaker/blob/main/docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md):
+/// `waymaker-drive` and `waymaker-bridge` were test support above the layers (ADR 0024, ADR
+/// 0032), which left a board that wanted to run a workflow on flash copying a driver this
+/// workspace proved but did not ship. The driver depends on the kernel and the flash adapter
+/// and never on the façade; the bridge is the one layer that names both the driver and the
+/// façade, and it is above both.
 pub const LAYERS: &[LayerSpec] = &[
     LayerSpec {
         name: "waymaker-core",
@@ -39,6 +46,12 @@ pub const LAYERS: &[LayerSpec] = &[
         must_not_own: "activities, workflow types, timers, Embassy",
     },
     LayerSpec {
+        name: "waymaker-drive",
+        may_depend_on: &["waymaker-core", "waymaker-flash"],
+        may_depend_on_external: &[],
+        must_not_own: "on-media authority, the transition table, futures, Embassy, allocation",
+    },
+    LayerSpec {
         name: "waymaker-embassy",
         may_depend_on: &["waymaker-core", "waymaker-flash"],
         // The designed escape hatch, used narrowly. Issue #37's codec helpers are
@@ -50,6 +63,19 @@ pub const LAYERS: &[LayerSpec] = &[
         // add no bytes to an image. Rung 0.4 adds the Embassy crates here.
         may_depend_on_external: &["cobs", "postcard", "serde", "serde_core", "thiserror"],
         must_not_own: "on-media authority or hidden global state",
+    },
+    LayerSpec {
+        name: "waymaker-bridge",
+        may_depend_on: &[
+            "waymaker-core",
+            "waymaker-flash",
+            "waymaker-drive",
+            "waymaker-embassy",
+        ],
+        // The façade's own escape hatch, inherited rather than widened: the bridge names none
+        // of these, and reaches one only through `waymaker-embassy` with a codec feature on.
+        may_depend_on_external: &["cobs", "postcard", "serde", "serde_core", "thiserror"],
+        must_not_own: "on-media authority, workflows, or a dispatcher",
     },
 ];
 
@@ -64,9 +90,9 @@ pub const HOST_TOOLS: &[&str] = &["xtask"];
 /// committed, `#![no_std]` firmware crate that CI links on every push.
 ///
 /// The size probe is firmware — `#![no_std]`, `#![no_main]`, built for
-/// `thumbv6m-none-eabi` — but it is not a layer: it depends on all three of them at once,
+/// `thumbv6m-none-eabi` — but it is not a layer: it depends on all of them at once,
 /// on purpose, and nothing depends on it. Listing it here is what keeps
-/// [`crate::graph::check_workspace_membership`] from reading it as a fourth layer that no
+/// [`crate::graph::check_workspace_membership`] from reading it as another layer that no
 /// rule covers, while [`crate::size::check_size_probe`] applies the rules that do belong
 /// to it.
 pub const MEASUREMENT_CRATES: &[&str] = &["waymaker-size-probe"];
@@ -104,7 +130,7 @@ pub const EMULATION_CRATES: &[&str] = &["waymaker-emu"];
 /// for design document §12's storage contract, models media in `Vec<u8>`, and is kept out
 /// of `default-members` so that no firmware target ever builds it.
 ///
-/// Why the category exists rather than the crate being a fourth layer: a layer's public
+/// Why the category exists rather than the crate being another layer: a layer's public
 /// functions must all be reached by the size probe, so an exhaustive host-side crash
 /// enumerator listed in [`LAYERS`] would be charged against an 8 KiB code-flash budget it
 /// has nothing to do with. See
@@ -144,25 +170,15 @@ pub const EMULATION_CRATES: &[&str] = &["waymaker-emu"];
 /// and this crate is not a layer. See
 /// [ADR 0031](https://github.com/madmax983/waymaker/blob/main/docs/adr/0031-a-persistent-clock-is-two-registers-and-the-board-run-is-a-checked-absence.md).
 ///
-/// `waymaker-drive` is issue [#28](https://github.com/madmax983/waymaker/issues/28)'s
-/// synchronous driver for design document §06's explicit kernel boundary. It is the third
-/// member of this category that is `#![no_std]` and allocation-free, and the reason is the
-/// claim it exists to make: a workflow runs to completion with "no `Future`, no Embassy and
-/// no allocation", and a driver that could only be built for the host would leave the last
-/// third of that unchecked. It is not the Embassy façade either — `Ctx`, the async
-/// dispatcher and wakeups are rung 0.4's — and driving the protocol here is what makes
-/// "`waymaker-embassy` is a façade and nothing more" falsifiable rather than intended. See
-/// [ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
-///
 /// `waymaker-facade-demo` is issue
-/// [#106](https://github.com/madmax983/waymaker/issues/106)'s bridge from `waymaker-drive`
-/// to `waymaker-embassy`, and design document §06's two examples run through it. It used to
-/// be three modules of `waymaker-drive` itself, removed by a feature flag to test that the
-/// driver did not need them — which proved only that no *other* module needed them, since
-/// the manifest edge to `waymaker-embassy` stayed. Moving the edge to a crate of its own
-/// makes `waymaker-drive`'s independence a fact about the resolved dependency graph rather
-/// than about a build with a flag set. See
-/// [ADR 0032](https://github.com/madmax983/waymaker/blob/main/docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md).
+/// [#106](https://github.com/madmax983/waymaker/issues/106)'s crate split, narrowed by
+/// [ADR 0055](https://github.com/madmax983/waymaker/blob/main/docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md):
+/// design document §06's two examples, the driver's reference workflow, and the tests that
+/// run them at every crash point. It used to hold the bridge to `waymaker-embassy` as well,
+/// and `waymaker-drive` used to be a member of this category; both are layers now, firmware
+/// Waymaker ships. What stays here is what no layer may hold — demonstrations, and tests that
+/// depend on `waymaker-fault` and `waymaker-rig` — and it is `#![no_std]` and
+/// allocation-free so that the examples build for the part.
 ///
 /// What this category does *not* license is a layer depending on one of these, in any
 /// dependency kind: [`check_dependency_direction`](crate::graph::check_dependency_direction)
@@ -174,7 +190,6 @@ pub const TEST_SUPPORT_CRATES: &[&str] = &[
     "waymaker-spec",
     "waymaker-conformance",
     "waymaker-rig",
-    "waymaker-drive",
     "waymaker-facade-demo",
 ];
 
@@ -182,25 +197,21 @@ pub const TEST_SUPPORT_CRATES: &[&str] = &[
 ///
 /// A subset of [`TEST_SUPPORT_CRATES`], because most of that category is host code:
 /// `waymaker-fault` models media in a `Vec` and `waymaker-spec` enumerates a state space, and
-/// asking either for `#![no_std]` would be asking it to stop doing its job. These four make
+/// asking either for `#![no_std]` would be asking it to stop doing its job. These three make
 /// the claim, each for a reason of its own — `waymaker-conformance` because the adapter
 /// author it exists for may only be able to run it on the target the driver is for,
 /// `waymaker-rig` because a rig that could only run on a host would be a simulation wearing a
-/// rig's name, `waymaker-drive` because issue #28's "done when" is a workflow driven to
-/// completion with "no `Future`, no Embassy, and **no allocation**", and
-/// `waymaker-facade-demo` for the same reason one layer up: issue #106's crate split moved
-/// design document §06's two examples off `waymaker-drive`, and a bridge that could only be
-/// built for the host would leave that claim unchecked on the one crate that names the
-/// façade at all.
+/// rig's name, and `waymaker-facade-demo` because design document §06's two examples and the
+/// driver's reference workflow are what a firmware author copies, and a demonstration that
+/// could only be built for the host would demonstrate nothing about the part.
 ///
 /// The firmware-target build stages are what hold the `std` half; they cannot hold the
 /// allocation half, because `cargo build --lib` produces an rlib and never links, so no
-/// global allocator is required and an `extern crate alloc` under any of these four would
+/// global allocator is required and an `extern crate alloc` under any of these three would
 /// compile clean. [`crate::source::check_crate_attributes`] is what fails a build over it.
 pub const NO_STD_TEST_SUPPORT_CRATES: &[&str] = &[
     "waymaker-conformance",
     "waymaker-rig",
-    "waymaker-drive",
     "waymaker-facade-demo",
 ];
 
@@ -215,7 +226,7 @@ pub const EMBASSY_PREFIXES: &[&str] = &["embassy"];
 
 /// Every workspace crate the manifest and crate-root rules apply to.
 ///
-/// The three layers plus the test-support crates. Not the size probe, which has
+/// The layers plus the test-support crates. Not the size probe, which has
 /// [`crate::size::check_size_probe`] of its own, and not `xtask`, which is the gate.
 ///
 /// A rule that iterates [`LAYERS`] alone leaves a test-support crate free to drop
@@ -275,7 +286,22 @@ mod tests {
         assert_eq!(LAYERS[0].name, "waymaker-core");
         assert!(LAYERS[0].may_depend_on.is_empty());
         assert_eq!(LAYERS[1].may_depend_on, ["waymaker-core"]);
+        assert_eq!(LAYERS[2].name, "waymaker-drive");
         assert_eq!(LAYERS[2].may_depend_on, ["waymaker-core", "waymaker-flash"]);
+        assert_eq!(LAYERS[3].name, EMBASSY_FACADE);
+        assert_eq!(LAYERS[3].may_depend_on, ["waymaker-core", "waymaker-flash"]);
+        assert_eq!(LAYERS[4].name, "waymaker-bridge");
+        assert!(LAYERS[4].may_depend_on.contains(&"waymaker-drive"));
+        assert!(LAYERS[4].may_depend_on.contains(&EMBASSY_FACADE));
+    }
+
+    #[test]
+    fn the_driver_may_not_reach_the_facade() {
+        let Some(driver) = layer("waymaker-drive") else {
+            unreachable!("ADR 0055 lists the driver as a layer")
+        };
+        assert!(!driver.may_depend_on.contains(&EMBASSY_FACADE));
+        assert!(driver.may_depend_on_external.is_empty());
     }
 
     #[test]

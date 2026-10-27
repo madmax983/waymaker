@@ -192,11 +192,11 @@ pub struct WorkspaceCrate {
 
 /// The crates whose allocation count is gated at [`ENGINE_HEAP_BLOCKS`].
 ///
-/// The three layers plus [`crate::policy::NO_STD_TEST_SUPPORT_CRATES`] — derived from the
+/// The layers plus [`crate::policy::NO_STD_TEST_SUPPORT_CRATES`] — derived from the
 /// layering table rather than listed again, so a crate joining either category is gated here
-/// without anybody remembering a row. Those four test-support crates belong for the reason
-/// `policy` gives for their `#![no_std]`: each claims to be allocation-free, and
-/// `waymaker-drive`'s claim is issue #28's own "done when".
+/// without anybody remembering a row. Those three test-support crates belong for the reason
+/// `policy` gives for their `#![no_std]`: each claims to be allocation-free. `waymaker-drive`
+/// is a layer since ADR 0055, and issue #28's "done when" is its own claim to be.
 #[must_use]
 pub fn engine_crates() -> Vec<&'static str> {
     crate::policy::LAYERS

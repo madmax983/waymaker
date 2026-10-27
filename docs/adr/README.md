@@ -63,6 +63,7 @@ be superseded.
 | [0052](0052-a-torn-record-redelivers-when-its-reserved-slot-is-clean.md) | A torn record redelivers when its reserved slot is clean | accepted |
 | [0053](0053-a-crc32-nibble-table-still-beats-the-branchless-loop.md) | A `crc32` nibble table still beats the branchless loop | accepted |
 | [0054](0054-the-capacity-reserve-formula-is-a-fleet-precondition.md) | The capacity reserve formula is a fleet precondition | accepted |
+| [0055](0055-the-driver-and-the-bridge-are-layers-firmware-ships.md) | The driver and the bridge are layers firmware ships | accepted |
 
 ## Reading the numbers
 
@@ -82,7 +83,7 @@ In date order, then, the decisions run 0003 → 0004 → 0001 → 0002 → 0005 
 → 0009 → 0010 → 0011 → 0012 → 0013 → 0014 → 0015 → 0016 → 0017 → 0018 → 0019 → 0020 → 0021 →
 0022 → 0023 → 0024 → 0025 → 0026 → 0027 → 0028 → 0029 → 0030 → 0031 → 0032 → 0033 → 0034 →
 0035 → 0036 → 0037 → 0038 → 0039 → 0040 → 0041 → 0042 → 0043 → 0044 → 0045 → 0046 → 0047 →
-0048 → 0049 → 0050 → 0051 → 0052 → 0053 → 0054.
+0048 → 0049 → 0050 → 0051 → 0052 → 0053 → 0054 → 0055.
 
 ## Writing one
 

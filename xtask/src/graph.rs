@@ -863,6 +863,11 @@ pub fn check_kernel_has_no_dependencies(graph: &PackageGraph) -> Vec<Violation> 
 ///
 /// The direction rule already forbids it. This one exists so that the failure message
 /// says "Embassy", which is the wording the layering contract uses.
+///
+/// A layer *above* the façade — one whose row may depend on `waymaker-embassy`, which since
+/// ADR 0055 is `waymaker-bridge` — may reach the façade crate itself, because that edge is
+/// what it is for. It may still not reach the Embassy ecosystem behind it: only the façade
+/// may know Embassy exists, and a bridge that named an executor would be a second façade.
 #[must_use]
 pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
     let mut violations = Vec::new();
@@ -871,7 +876,11 @@ pub fn check_embassy_stays_above_flash(graph: &PackageGraph) -> Vec<Violation> {
         if spec.name == policy::EMBASSY_FACADE {
             continue;
         }
+        let above_facade = spec.may_depend_on.contains(&policy::EMBASSY_FACADE);
         for reached in graph.transitive_dependencies(spec.name) {
+            if above_facade && reached == policy::EMBASSY_FACADE {
+                continue;
+            }
             if policy::is_embassy_package(&reached) {
                 violations.push(Violation::new(
                     "embassy-below-facade",
@@ -1083,6 +1092,15 @@ mod tests {
             Package::new("waymaker-embassy")
                 .with_dependency("waymaker-core", DepKind::Normal)
                 .with_dependency("waymaker-flash", DepKind::Normal),
+            // ADR 0055's two layers, appended so that tests which replace a package by
+            // index keep replacing the one they mean.
+            Package::new("waymaker-drive")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal),
+            Package::new("waymaker-bridge")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-drive", DepKind::Normal)
+                .with_dependency("waymaker-embassy", DepKind::Normal),
         ])
     }
 
@@ -1200,6 +1218,52 @@ mod tests {
         let violations = rules(&graph);
         assert!(fired(&violations, "dependency-direction", "waymaker-flash"));
         assert!(fired(&violations, "embassy-below-facade", "waymaker-flash"));
+    }
+
+    /// ADR 0055: the bridge sits above the façade, so the façade crate is an edge it may
+    /// hold — but the Embassy ecosystem behind the façade is still out of its reach.
+    #[test]
+    fn the_bridge_may_reach_the_facade_and_nothing_behind_it() {
+        let layers = |behind: Option<&str>| {
+            let mut facade = Package::new("waymaker-embassy")
+                .with_dependency("waymaker-core", DepKind::Normal)
+                .with_dependency("waymaker-flash", DepKind::Normal);
+            let mut packages = vec![
+                Package::new("waymaker-core"),
+                Package::new("waymaker-flash").with_dependency("waymaker-core", DepKind::Normal),
+                Package::new("waymaker-drive")
+                    .with_dependency("waymaker-core", DepKind::Normal)
+                    .with_dependency("waymaker-flash", DepKind::Normal),
+                Package::new("waymaker-bridge")
+                    .with_dependency("waymaker-core", DepKind::Normal)
+                    .with_dependency("waymaker-drive", DepKind::Normal)
+                    .with_dependency("waymaker-embassy", DepKind::Normal),
+            ];
+            if let Some(name) = behind {
+                facade = facade.with_dependency(name, DepKind::Normal);
+                packages.push(Package::new(name));
+            }
+            packages.push(facade);
+            PackageGraph::new(packages)
+        };
+
+        let clean = rules(&layers(None));
+        assert!(
+            !clean
+                .iter()
+                .any(|violation| violation.rule == "embassy-below-facade"),
+            "the bridge's edge to the façade is the edge it exists for: {clean:?}"
+        );
+
+        let behind = rules(&layers(Some("embassy-executor")));
+        assert!(
+            behind.iter().any(|violation| {
+                violation.rule == "embassy-below-facade"
+                    && violation.subject == "waymaker-bridge"
+                    && violation.detail.contains("embassy-executor")
+            }),
+            "an executor behind the façade is still Embassy to the bridge: {behind:?}"
+        );
     }
 
     #[test]
@@ -1558,7 +1622,15 @@ mod tests {
             .filter(|violation| violation.rule == "layer-missing")
             .map(|violation| violation.subject.as_str())
             .collect();
-        assert_eq!(missing, ["waymaker-flash", "waymaker-embassy"]);
+        assert_eq!(
+            missing,
+            [
+                "waymaker-flash",
+                "waymaker-drive",
+                "waymaker-embassy",
+                "waymaker-bridge"
+            ]
+        );
     }
 
     #[test]

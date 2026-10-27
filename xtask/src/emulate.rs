@@ -63,7 +63,7 @@
 //! real, on-target figure where before there was none, and it closes a limit `CLAUDE.md`'s
 //! budgets section names: §04's runtime RAM figure is stack-blind for call-chain depth, and
 //! this is the depth for *this* image, on *this* run. It is not the same figure. This image
-//! links `waymaker-rig` and `waymaker-conformance` alongside the three layers, so what is
+//! links `waymaker-rig` and `waymaker-conformance` alongside the layers they reach, so what is
 //! reported is the whole call chain's depth, not the engine's share of it. It is a lower
 //! bound rather than an exact reading — a frame can reserve bytes it never writes, which the
 //! paint pattern cannot see — and it fails closed only for running out of room, against no
@@ -108,7 +108,7 @@ pub const EMULATOR: &str = "qemu-system-arm";
 /// Passed through `RUSTFLAGS` on this one child `cargo` rather than written into
 /// `.cargo/config.toml`, and that is a rule rather than a preference: a target-scoped
 /// `rustflags` entry there would put `-Tlink.x` on **every** `thumbv6m-none-eabi` build in
-/// the workspace, including the three layers and the size probe, neither of which has a
+/// the workspace, including the layers and the size probe, neither of which has a
 /// `cortex-m-rt` to supply one — so the code-flash measurement would be taken against an
 /// image linked differently from the one the budget is stated for. `cargo-config-profile` is
 /// the rule that would otherwise have to grow a fourth thing to forbid.

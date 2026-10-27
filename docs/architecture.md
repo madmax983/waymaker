@@ -25,11 +25,13 @@ diagram renders, which is what the preview in a pull request is for.
 
 Arrows point the way `Cargo.toml` does: a crate points at what it depends on. Every solid
 arrow below is one `may_depend_on` entry in `xtask::policy::LAYERS`, and the gate compares
-them one for one — add a fourth layer to that table and the build fails until its edge is
-drawn here.
+them one for one — add a layer to that table and the build fails until its edges are
+drawn here, which is how ADR 0055's two arrived.
 
 `waymaker-core` points at nothing at all: not at another layer, and not at a registry
-crate. Nothing points down into `waymaker-embassy`.
+crate. `waymaker-drive` points at the same two crates the façade does and never at the
+façade, and `waymaker-bridge` is the one layer that points at both — the only solid arrow
+into `waymaker-embassy`.
 
 `waymaker-embassy` is the first layer with a registry dependency, and it is not drawn here.
 Issue [#37](https://github.com/madmax983/waymaker/issues/37)'s `serde` and `postcard` are
@@ -39,20 +41,19 @@ is what keeps them optional, and `waymaker-core`'s and `waymaker-flash`'s extern
 still empty.
 
 `waymaker-size-probe` is in the picture because it is a real crate CI links on every pull
-request and on every push to `main`, but it is not a layer: it declares all three as
-*optional* dependencies, so that a variant linking none of them gives the baseline the
+request and on every push to `main`, but it is not a layer: it declares every layer as an
+*optional* dependency, so that a variant linking none of them gives the baseline the
 code-flash budget is a delta against, and nothing depends on it. `waymaker-fault` — the
 in-memory storage model and crash injector — is in it for the same reason: it is a
 workspace member, it depends on `waymaker-flash` for the storage contract, and nothing
 depends on it, in any dependency kind. `waymaker-rig` — design document §15's power-cut and
-watchdog-reset rig — is there too, and so is `waymaker-drive`, the synchronous driver and
-§07's effect protocol. `waymaker-facade-demo` is issue
-[#106](https://github.com/madmax983/waymaker/issues/106)'s bridge from `waymaker-drive` to
-`waymaker-embassy`, and design document §06's two examples run through it — the one crate
-above the layers with an edge to both `waymaker-drive` and `waymaker-embassy` at once, which
-is what makes `waymaker-drive`'s own arrow below it point at neither. `xtask` is in the
-picture because it depends on all four, and for one
-reason: it measures rather than transcribes. The write-amplification figure `cargo xtask size`
+watchdog-reset rig — is there too. `waymaker-facade-demo` holds design document §06's two
+examples, run through `waymaker-bridge`, and the driver's reference workflow, with the tests
+that drive them at every crash point; it is above the layers because those tests depend on
+`waymaker-fault`, which no layer may name
+([ADR 0055](adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md)). `xtask` is in
+the picture because it depends on the layers and the harnesses, and for one reason: it
+measures rather than transcribes. The write-amplification figure `cargo xtask size`
 publishes comes from running the real writer through the rig over the fault harness's media
 model, and §04's context term and generated workflow future sizes come from the types §06's
 two examples really link. Every one of these crates' edges is dashed, and the gate ignores
@@ -62,20 +63,29 @@ dashed edges — the contract is the solid ones.
 
 ```mermaid
 graph TD
+  waymaker-bridge["waymaker-bridge<br/>the driver's boundary as the façade's journal"]
   waymaker-embassy["waymaker-embassy<br/>async façade · Ctx · dispatcher · wakeups · clock"]
+  waymaker-drive["waymaker-drive<br/>synchronous driver · effect protocol · boundary"]
   waymaker-flash["waymaker-flash<br/>two banks · wire encoding · CRC and seals · capacity reserve · compaction"]
   waymaker-core["waymaker-core<br/>records · replay cursor · effect identity · transition rules"]
   waymaker-size-probe["waymaker-size-probe<br/>linked to be measured, never shipped"]
   waymaker-fault["waymaker-fault<br/>storage model · crash injector · never flashed"]
   waymaker-rig["waymaker-rig<br/>power-cut and watchdog rig · durable witness · wear meter · no_std, never flashed here"]
-  waymaker-drive["waymaker-drive<br/>synchronous driver · effect protocol · no_std, never flashed here"]
-  waymaker-facade-demo["waymaker-facade-demo<br/>bridge to the façade · §06 examples · no_std, never flashed here"]
+  waymaker-facade-demo["waymaker-facade-demo<br/>§06 examples · reference workflow · crash tests · no_std, never flashed here"]
   xtask["xtask<br/>the gate · the size and wear reports"]
 
+  waymaker-bridge --> waymaker-core
+  waymaker-bridge --> waymaker-flash
+  waymaker-bridge --> waymaker-drive
+  waymaker-bridge --> waymaker-embassy
   waymaker-embassy --> waymaker-core
   waymaker-embassy --> waymaker-flash
+  waymaker-drive --> waymaker-core
+  waymaker-drive --> waymaker-flash
   waymaker-flash --> waymaker-core
 
+  waymaker-size-probe -.-> waymaker-bridge
+  waymaker-size-probe -.-> waymaker-drive
   waymaker-size-probe -.-> waymaker-embassy
   waymaker-size-probe -.-> waymaker-flash
   waymaker-size-probe -.-> waymaker-core
@@ -83,8 +93,7 @@ graph TD
   waymaker-rig -.-> waymaker-flash
   waymaker-rig -.-> waymaker-embassy
   waymaker-rig -.-> waymaker-core
-  waymaker-drive -.-> waymaker-flash
-  waymaker-drive -.-> waymaker-core
+  waymaker-facade-demo -.-> waymaker-bridge
   waymaker-facade-demo -.-> waymaker-drive
   waymaker-facade-demo -.-> waymaker-embassy
   waymaker-facade-demo -.-> waymaker-flash
@@ -98,8 +107,8 @@ graph TD
 
   classDef layer fill:#eef4ff,stroke:#3b6fd4,color:#12233f;
   classDef tool fill:#f5f5f5,stroke:#999999,color:#333333;
-  class waymaker-embassy,waymaker-flash,waymaker-core layer;
-  class waymaker-size-probe,waymaker-fault,waymaker-rig,waymaker-drive,waymaker-facade-demo,xtask tool;
+  class waymaker-bridge,waymaker-embassy,waymaker-drive,waymaker-flash,waymaker-core layer;
+  class waymaker-size-probe,waymaker-fault,waymaker-rig,waymaker-facade-demo,xtask tool;
 ```
 
 What each layer must not own is the other half of the contract, and it lives in

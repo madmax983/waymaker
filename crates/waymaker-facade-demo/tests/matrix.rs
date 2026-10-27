@@ -50,10 +50,10 @@ use core::cell::RefCell;
 use waymaker_core::{
     ActivityKind, DecodeError, EffectId, EffectSeq, KernelError, Outcome, RecordRef, RunId,
 };
-use waymaker_drive::demo::{BOUNDS, DOWNLOAD, DOWNLOADED, HASHED, Pipeline, World};
 use waymaker_drive::{
     Boundary, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
 };
+use waymaker_facade_demo::demo::{BOUNDS, DOWNLOAD, DOWNLOADED, HASHED, Pipeline, World};
 use waymaker_fault::{
     Device, FaultError, Harness, Injection, Interruption, Op, Progress as Landed, Run, Session,
 };
@@ -744,8 +744,8 @@ const fn header_of(run: RunId, layout: BankLayout) -> BankHeader<'static> {
     BankHeader {
         run,
         align: layout.align(),
-        workflow_kind: waymaker_drive::demo::WORKFLOW_KIND,
-        workflow_version: waymaker_drive::demo::WORKFLOW_VERSION,
+        workflow_kind: waymaker_facade_demo::demo::WORKFLOW_KIND,
+        workflow_version: waymaker_facade_demo::demo::WORKFLOW_VERSION,
         input_schema: 0,
         input: b"seed",
     }

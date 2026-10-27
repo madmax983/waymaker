@@ -161,9 +161,11 @@ pub const STAGES: &[Stage] = &[
         name: "firmware",
         job: "firmware",
         // No `--workspace`: `default-members` in the workspace manifest is exactly the
-        // three firmware crates, so a crate added to the layering is built here without
-        // anyone remembering to add a `-p` flag. `xtask` is host tooling and is excluded
-        // by the same mechanism, which is the point of it.
+        // firmware layers, so a crate added to the layering is built here without anyone
+        // remembering to add a `-p` flag — ADR 0055's `waymaker-drive` and `waymaker-bridge`
+        // arrived that way, and issue #28's "no `Future`, no Embassy, no allocation" is now
+        // this stage's to hold. `xtask` is host tooling and is excluded by the same
+        // mechanism, which is the point of it.
         command: "cargo build --locked --no-default-features --target thumbv6m-none-eabi",
         in_hook: false,
         why: "design document §15: a change that only builds on the host is not a change that works",
@@ -185,36 +187,19 @@ pub const STAGES: &[Stage] = &[
         why: "ADR 0021: a rig that could only run on a host would be a simulation wearing a rig's name",
     },
     Stage {
-        name: "drive-firmware",
-        job: "firmware",
-        // `waymaker-drive` is outside `default-members` too, and issue #28's "done when" is
-        // that a workflow runs to completion with no `Future`, no Embassy and *no
-        // allocation*. The first two are visible in the source; the third is not, and a
-        // host build would never notice an `extern crate alloc` appearing under it.
-        //
-        // `--lib`, not `--all-targets`: the tests drive `waymaker-fault`, which models media
-        // in a `Vec`, and it is the library — the driver and its reference workflow — that a
-        // board would link.
-        command: "cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi",
-        in_hook: false,
-        why: "issue #28: \"no `Future`, no Embassy, no allocation\" is a build failure rather than an inspection",
-    },
-    Stage {
         name: "facade-demo-firmware",
         job: "firmware",
-        // `waymaker-facade-demo` is issue #106's crate split: the bridge to
-        // `waymaker-embassy` and design document §06's two examples, above `waymaker-drive`
-        // rather than inside it. `waymaker-drive`'s own firmware build (the stage above) no
-        // longer touches the façade at all, so this is where `Bridge`, `poll_ota` and
-        // `poll_provisioning` are compiled for the part — replacing `drive-facadeless`,
-        // which used to build `waymaker-drive` with those three modules deleted to make the
-        // same claim from the other side.
+        // `waymaker-facade-demo` is outside `default-members`: design document §06's two
+        // examples and the driver's reference workflow, above the layers (ADR 0055). This
+        // is where `poll_ota`, `poll_provisioning` and the `demo` world are compiled for the
+        // part, so the context and future sizes `cargo xtask size` reports are of types the
+        // part really links.
         //
-        // `--lib`, for the reason `drive-firmware` gives: the tests drive `waymaker-fault`,
-        // which models media in a `Vec`, and it is the library a board would link.
+        // `--lib`, for the reason `rig-firmware` gives: the tests drive `waymaker-fault`,
+        // which models media in a `Vec`, and it is the library a board would copy.
         command: "cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi",
         in_hook: false,
-        why: "issue #106: the fa\u{e7}ade bridge and design document \u{a7}06's two examples are firmware, so a change to them is measured on the part",
+        why: "design document \u{a7}06's two examples are what a firmware author copies, so a change to them is measured on the part",
     },
     Stage {
         name: "codec-firmware",
@@ -240,12 +225,13 @@ pub const STAGES: &[Stage] = &[
         // configuration in which a `#![no_main]` crate with a `#[panic_handler]` links at
         // all.
         //
-        // `embassy-postcard` rather than `facade`, because it is the widest selection the
-        // probe has: it implies `embassy-serde`, which implies `facade`, which implies
-        // `engine`. Under `facade` alone the two codec rows compile to their empty
+        // `bridge,embassy-postcard` rather than `facade`, because together they are the
+        // widest selection the probe has: `embassy-postcard` implies `embassy-serde`, which
+        // implies `facade`, which implies `engine`, and `bridge` adds ADR 0055's `drive`.
+        // Under `facade` alone the codec and driver rows compile to their empty
         // `#[cfg(not(..))]` stubs, so the bodies the size job links were linted by nothing
         // — Codex round 1 found that, and a `Vec` in `codec_postcard` passed this stage.
-        command: "cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings",
+        command: "cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,bridge,embassy-postcard --bins -- -D warnings",
         in_hook: false,
         why: "the probe's crate attributes are checked by the layering gate and by no compiler without this",
     },
@@ -310,7 +296,9 @@ pub const STAGES: &[Stage] = &[
         // Issue #31's exit criterion, beside issue #20's for the same reason: a red
         // `verification` job says a row of design document §14's table no longer holds,
         // under the name of the row. The `test` stage runs both files too.
-        command: "cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix",
+        // The model half lives in `waymaker-facade-demo` since ADR 0055: it drives the driver
+        // through `waymaker-fault`'s crash injector, which no layer may depend on.
+        command: "cargo test --locked -p waymaker-facade-demo -p waymaker-rig --no-default-features --test matrix",
         in_hook: false,
         why: "issue #31: design document \u{a7}14's failure-semantics table runs in CI as a check of its own, on the model and on the rig",
     },

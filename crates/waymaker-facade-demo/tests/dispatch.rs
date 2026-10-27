@@ -24,6 +24,7 @@ use core::future::Future;
 use core::pin::pin;
 use core::task::{Context as Task, Poll, Waker};
 
+use waymaker_bridge::Bridge;
 use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
@@ -35,7 +36,6 @@ use waymaker_embassy::ctx::{Conclusion, Ctx, Failure};
 use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::wiring::{Activity, Table};
 use waymaker_embassy::{ActivityDispatcher, Journal};
-use waymaker_facade_demo::Bridge;
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::{Bounds, Reserve};

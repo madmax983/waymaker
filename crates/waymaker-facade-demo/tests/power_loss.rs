@@ -27,12 +27,12 @@ use core::cell::Cell;
 
 use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::{KernelError, RecordKind, RunId};
-use waymaker_drive::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_drive::{
     Activities, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Performed, Progress,
     Scratch,
 };
 use waymaker_embassy::clock::PersistentClock;
+use waymaker_facade_demo::demo::{DELAYED_BOUNDS, Delayed, World};
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;

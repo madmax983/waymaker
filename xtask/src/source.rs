@@ -7389,9 +7389,10 @@ pub const CTX_FORBIDDEN_VOCABULARY: &[(&str, &str)] = &[
 /// The driver files that may name the façade.
 ///
 /// Empty. Issue [#106](https://github.com/madmax983/waymaker/issues/106) moved the façade
-/// edge — `facade`, `ota` and `provisioning` — into `waymaker-facade-demo`, a crate above
-/// `waymaker-drive` rather than inside it, so no `waymaker-drive` module needs an exemption
-/// any more. The list stays rather than being deleted: it is what
+/// edge — `facade`, `ota` and `provisioning` — into a crate above `waymaker-drive` rather
+/// than inside it (since ADR 0055, `waymaker-bridge` for the first and
+/// `waymaker-facade-demo` for the other two), so no `waymaker-drive` module needs an
+/// exemption any more. The list stays rather than being deleted: it is what
 /// `check_facade_free_driver` iterates, and an empty list read by a live rule is a
 /// stronger statement than a rule with nothing to hold.
 pub const FACADE_DRIVER_MODULES: &[&str] = &[];
@@ -7451,8 +7452,9 @@ pub const FACADE_FREE_VOCABULARY: &[(&str, &str)] = &[
 /// And **no hidden global state**: a `static` in either module is the other half of the
 /// must-not-own cell, and a façade with one is a façade two runs on a device would share.
 /// The vocabulary and static bans, and the future-set and macro bans beside them, read every
-/// file of `waymaker-facade-demo` too — `Bridge` is the one other caller of this boundary,
-/// and the must-not-own cell binds it exactly as it binds `waymaker-embassy`.
+/// file of `waymaker-bridge` and `waymaker-facade-demo` too — `Bridge` is the one other
+/// caller of this boundary, and the must-not-own cell binds it exactly as it binds
+/// `waymaker-embassy`.
 ///
 /// The fourth half is the driver's. Every `waymaker-drive` module — [`FACADE_DRIVER_MODULES`]
 /// is empty, since issue #106 moved the edge above the crate rather than exempting a file
@@ -7475,6 +7477,7 @@ pub fn check_ctx_facade(
 ) -> Vec<Violation> {
     const RULE: &str = "ctx-facade";
     const FACADE: &str = "waymaker-embassy";
+    const BRIDGE: &str = "waymaker-bridge";
     const DRIVER: &str = "waymaker-drive";
 
     let mut violations = Vec::new();
@@ -7500,13 +7503,16 @@ pub fn check_ctx_facade(
     // method into `impl Ctx` in `dispatch.rs` — one file over from the two the surface pins
     // read — and watched the gate stay green on all three.
     //
-    // `waymaker-facade-demo` reads the same way, for the same must-not-own cell: it holds
+    // `waymaker-bridge` reads the same way, for the same must-not-own cell: it holds
     // `Bridge`, the one other place a caller reaches this boundary, and Codex's review of
     // issue #106 found that the crate split moved the edge without moving this ban — a
-    // `facade.rs` naming `StableStorage` directly would have passed every check here.
+    // `facade.rs` naming `StableStorage` directly would have passed every check here. ADR
+    // 0055 made the bridge a layer, so its files arrive with the layers' rather than with
+    // `waymaker-facade-demo`'s; the demonstrations above it are still read, because they are
+    // the code a firmware author copies.
     for source in sources
         .iter()
-        .filter(|source| source.crate_name == FACADE)
+        .filter(|source| source.crate_name == FACADE || source.crate_name == BRIDGE)
         .chain(facade_demo)
     {
         let subject = source.crate_name.as_str();
@@ -7683,7 +7689,7 @@ pub const WIRING_SELECTION_FORBIDDEN: &[(&str, &str)] = &[(
 /// A function added from a sibling module — it pins two files, exactly as
 /// `capacity-reserve`, `recovery-surface` and `storage-contract` each say of the one they
 /// pin, and a `trait TableExt` with a blanket impl is the shape. And it compares *names*:
-/// that a name never reaches media is `crates/waymaker-drive/tests/dispatch.rs`, which
+/// that a name never reaches media is `crates/waymaker-facade-demo/tests/dispatch.rs`, which
 /// reads the device image back, and §09's `EffectScheduled` is what makes it true.
 #[must_use]
 pub fn check_dispatch_wiring(sources: &[crate::size::LayerSource]) -> Vec<Violation> {
@@ -8299,7 +8305,7 @@ fn check_no_hidden_state(
 /// What it cannot see is a protocol step added from another file — it pins one file, exactly
 /// as `capacity-reserve`, `recovery-surface` and `storage-contract` each do — and whether the
 /// barriers are real, which is §12's contract and `waymaker-conformance`'s across-reset
-/// witness. The crash windows are `crates/waymaker-drive/tests/crash.rs`.
+/// witness. The crash windows are `crates/waymaker-facade-demo/tests/crash.rs`.
 #[must_use]
 pub fn check_effect_protocol(driver: &[crate::size::LayerSource]) -> Vec<Violation> {
     const RULE: &str = "effect-protocol";
@@ -9043,7 +9049,7 @@ fn check_effect_proof_position(code: &str) -> Vec<Violation> {
 /// commented-out variant cannot fail the pin.
 ///
 /// What it cannot see: a widened member behind a name already on the list, and a driver that
-/// names every decision and then ignores one. `crates/waymaker-drive/tests/` is what holds
+/// names every decision and then ignores one. `crates/waymaker-facade-demo/tests/` is what holds
 /// the behaviour — a diverging workflow that dispatches nothing, a redelivery that reuses
 /// its identity, and the whole protocol swept at every crash point the injector lists.
 #[must_use]
@@ -17641,13 +17647,25 @@ mod deferred_answer_pins {
         .collect()
     }
 
-    /// A clean `waymaker-facade-demo/src/facade.rs`, with `contents` in place of it.
+    /// A `waymaker-facade-demo/src/ota.rs` with `contents` in place of it.
     fn facade_demo_sources(contents: &str) -> Vec<crate::size::LayerSource> {
         vec![crate::size::LayerSource {
             crate_name: "waymaker-facade-demo".to_owned(),
-            path: "waymaker-facade-demo/src/facade.rs".to_owned(),
+            path: "waymaker-facade-demo/src/ota.rs".to_owned(),
             contents: contents.to_owned(),
         }]
+    }
+
+    /// The façade's clean layer sources, plus a `waymaker-bridge/src/bridge.rs` holding
+    /// `contents` — the bridge is a layer since ADR 0055, so it arrives with the layers.
+    fn bridge_sources(contents: &str) -> Vec<crate::size::LayerSource> {
+        let mut sources = facade_sources("", "");
+        sources.push(crate::size::LayerSource {
+            crate_name: "waymaker-bridge".to_owned(),
+            path: "waymaker-bridge/src/bridge.rs".to_owned(),
+            contents: contents.to_owned(),
+        });
+        sources
     }
 
     /// The two wiring files `dispatch-wiring` reads, with one of them replaced.
@@ -17938,9 +17956,28 @@ mod deferred_answer_pins {
 
     #[test]
     fn the_moved_bridge_is_held_to_the_same_authority_ban() {
-        // Issue #106 moved `Bridge` into `waymaker-facade-demo`; Codex's review found that
-        // the authority ban still read only `waymaker-embassy`'s files, so a `facade.rs`
-        // reaching a `StableStorage` directly would have passed every check here.
+        // Issue #106 moved `Bridge` out of the driver; Codex's review found that the
+        // authority ban still read only `waymaker-embassy`'s files, so a `facade.rs` reaching
+        // a `StableStorage` directly would have passed every check here. ADR 0055 made the
+        // bridge a layer of its own, and the ban follows it there.
+        let module = "pub fn record(storage: &mut impl StableStorage) { let _ = storage; }\n";
+        let details: Vec<String> = check_ctx_facade(
+            &bridge_sources(module),
+            &[],
+            &facade_free_driver_sources("", ""),
+        )
+        .into_iter()
+        .map(|violation| violation.detail)
+        .collect();
+        assert!(
+            details.iter().any(|detail| detail.contains("StableStorage")
+                && detail.contains("waymaker-bridge/src/bridge.rs")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn the_examples_above_the_bridge_are_held_to_the_authority_ban_too() {
         let module = "pub fn record(storage: &mut impl StableStorage) { let _ = storage; }\n";
         let details: Vec<String> = check_ctx_facade(
             &facade_sources("", ""),

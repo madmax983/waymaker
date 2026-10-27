@@ -22,9 +22,9 @@
 //! assumed.
 
 use waymaker_core::{Outcome as DriveOutcome, RunId};
-use waymaker_drive::demo::{BOUNDS, DOWNLOAD, HASH, Pipeline, World};
 use waymaker_drive::{Conclusion, Driver, Progress, Scratch};
 use waymaker_drive::{Identity, Suspended, Workflow};
+use waymaker_facade_demo::demo::{BOUNDS, DOWNLOAD, HASH, Pipeline, World};
 use waymaker_facade_demo::ota::{self, Downloader, Ota, poll_ota};
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;

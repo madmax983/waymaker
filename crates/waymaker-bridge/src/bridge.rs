@@ -1,26 +1,4 @@
-//! The bridge from `waymaker-drive` to the async façade.
-//!
-//! Issue [#106](https://github.com/madmax983/waymaker/issues/106). This crate is the only
-//! edge between `waymaker-drive`'s synchronous boundary and `waymaker-embassy`'s `Journal`.
-//! `waymaker-drive` names no dependency on `waymaker-embassy` at all, so `cargo metadata`
-//! proves the protocol is usable without the façade — not a feature flag.
-//!
-//! # What the bridge adds
-//!
-//! Nothing. It renames four calls. The authority is the driver's, and the façade's own
-//! documentation says the façade has none.
-//!
-//! # Carrying `Suspended` across an `.await`
-//!
-//! [`Suspended`]'s field is private to `waymaker-drive`, so nothing outside it may build
-//! one — a workflow that could forge a stop would report a wait no activity is behind. A
-//! plain poll cannot see one fall out of an `.await`: it only ever answers
-//! [`Poll::Pending`](core::task::Poll::Pending). So [`Bridge`] keeps the real value the
-//! boundary returned, and [`ota`](crate::ota) and [`provisioning`](crate::provisioning)
-//! read it back after the poll — the same value, never a new one. A dispatcher that is
-//! still working stalls a future with no boundary call behind it at all, so there is no
-//! value to keep; that case reads `None` back and falls to
-//! [`Suspended::awaiting_dispatch`](waymaker_drive::Suspended::awaiting_dispatch) instead.
+//! [`Bridge`], the one type in this crate. See the crate documentation.
 
 use waymaker_core::timer::{ClockKind, TimerSpec};
 use waymaker_core::{ActivityKind, Outcome};

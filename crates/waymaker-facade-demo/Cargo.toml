@@ -1,6 +1,6 @@
 [package]
 name = "waymaker-facade-demo"
-description = "The bridge from waymaker-drive to waymaker-embassy, and design document §06's two examples run through it. Test support: never linked into Waymaker's own firmware, never published, but written to run on the part."
+description = "Design document §06's two examples run through waymaker-bridge, the driver's reference workflow, and the tests that drive both at every crash point. Test support: never linked into Waymaker's own firmware, never published, but written to run on the part."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,20 +16,27 @@ publish = false
 waymaker-core.workspace = true
 # `Bounds`, for §10's reserve, which each example's workflow declares.
 waymaker-flash.workspace = true
-# `waymaker-drive`'s synchronous protocol, driven through the boundary above.
+# `waymaker-drive`'s synchronous protocol, driven through the boundary above, and the layer
+# the reference workflow in `demo` is written against.
 waymaker-drive.workspace = true
-# The façade this crate is the bridge for: `Ctx`, the two examples' async syntax, and the
-# board clocks issue #34 adds. This is the one edge to `waymaker-embassy` anywhere in the
-# workspace's driver side — see issue #106.
+# The façade the two examples are written against: `Ctx`, their async syntax, and the board
+# clocks issue #34 adds.
 waymaker-embassy.workspace = true
+# The layer that joins the two above (ADR 0055): `Bridge` turns the driver's boundary into
+# the façade's `Journal`.
+waymaker-bridge.workspace = true
 
 [dev-dependencies]
-# The in-memory NOR model and the crash injector. The two examples are run at every crash
-# point the injector lists, which is what makes "across a power cut" a loop rather than a
-# claim.
+# The in-memory NOR model and the crash injector. The driver and the two examples are run at
+# every crash point the injector lists, which is what makes "across a power cut" a loop
+# rather than a claim. These tests used to live in `waymaker-drive`; a layer may not depend on
+# test support in any table, so ADR 0055 moved them here.
 waymaker-fault.workspace = true
 # Issue #34's board clocks: `tests/power_loss.rs` drives a persistent deadline across a
 # total power cut through `waymaker_rig::rtc::Rtc` and `waymaker_rig::epoch::RestoredEpoch`.
+# Design document §14's failure-semantics table as a vocabulary: `tests/matrix.rs` classifies
+# every crash point into a row the rig also names, so both halves of issue #31's matrix use
+# one vocabulary.
 waymaker-rig.workspace = true
 
 [lints]

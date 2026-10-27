@@ -7,6 +7,7 @@
 //!
 //! The ordinary path is `crates/waymaker-facade-demo/tests/ota.rs`.
 
+use waymaker_bridge::Bridge;
 use waymaker_core::Outcome;
 use waymaker_core::timer::{ClockCapability, ClockKind, TimerSpec};
 use waymaker_core::version::VersionRange;
@@ -15,7 +16,6 @@ use waymaker_drive::{
     Performed, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::journal::{Answer, Journal as _};
-use waymaker_facade_demo::Bridge;
 use waymaker_facade_demo::ota::{BOUNDS, DOWNLOAD, URL, WORKFLOW_KIND, WORKFLOW_VERSION};
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;
@@ -228,7 +228,7 @@ fn a_refused_misuse_writes_no_effect_record() {
 // A caller that schedules and then stops without resolving is the window the façade lives
 // in, and `Driver` reports it as `Progress::Waiting`. It cannot be driven from here:
 // `Suspended` has a private field, so only this crate can stop a run without going through a
-// boundary. `crates/waymaker-drive/tests/ota.rs` drives it through the façade instead.
+// boundary. `crates/waymaker-facade-demo/tests/ota.rs` drives it through the façade instead.
 
 /// A workflow that drives the bridge itself, one call at a time.
 ///

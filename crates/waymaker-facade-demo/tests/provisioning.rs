@@ -12,12 +12,12 @@ use core::cell::RefCell;
 use core::task::{Context as Task, Poll};
 
 use waymaker_core::{ActivityKind, EffectId, RecordRef, RunId};
-use waymaker_drive::demo::World;
 use waymaker_drive::{
     Boundary, Conclusion, DriveError, Driver, Identity, Progress, Scratch, Suspended, Workflow,
 };
 use waymaker_embassy::ActivityDispatcher;
 use waymaker_embassy::dispatch::Produced;
+use waymaker_facade_demo::demo::World;
 use waymaker_facade_demo::ota;
 use waymaker_facade_demo::provisioning::{
     BOUNDS, DEVICE_ID, EXHAUSTED, MAX_ATTEMPTS, Provisioning, ProvisioningContext, REGISTER,

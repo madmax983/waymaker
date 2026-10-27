@@ -79,6 +79,7 @@ fn probe() -> usize {
     let mut kept = core::hint::black_box(0_usize);
     kept = kept.wrapping_add(engine());
     kept = kept.wrapping_add(facade());
+    kept = kept.wrapping_add(driver());
     kept = kept.wrapping_add(codec_bridge());
     kept = kept.wrapping_add(codec_postcard());
     kept = kept.wrapping_add(crc_candidates());
@@ -2212,6 +2213,332 @@ fn ctx_facade() -> usize {
 #[inline(never)]
 fn facade() -> usize {
     core::hint::black_box(0)
+}
+
+/// ADR 0055's driver row: `waymaker-drive`'s loop, its boundary and its effect typestate.
+///
+/// A workflow, a world and a set of clocks live here because the driver has none of its
+/// own: it borrows all three. Every one of them answers from `black_box`ed values, for the
+/// reason [`ctx_facade`]'s journal does — a branch the optimiser can prove dead is a branch
+/// the row does not charge for.
+#[cfg(feature = "drive")]
+#[inline(never)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one call per public function, which is what `size-probe-reach` asks for"
+)]
+fn driver() -> usize {
+    use waymaker_core::timer::TimerSpec;
+    use waymaker_core::version::{GateId, VersionRange};
+    use waymaker_core::{ActivityKind, EffectRequest, EffectSeq, Outcome, RunId};
+    use waymaker_drive::{
+        Answered, Boundary, Effect, Handoff, Identity, Progress, Resolution, Suspended, Workflow,
+    };
+    use waymaker_flash::append::Journal;
+    use waymaker_flash::bank::BankLayout;
+    use waymaker_flash::capacity::{Reserve, Reserved};
+    use waymaker_flash::frame::ProgramAlign;
+    use waymaker_flash::integrity::Catalogued;
+    use waymaker_flash::recovery::{JournalRegion, Recovery};
+    use waymaker_flash::storage::Geometry;
+
+    /// A workflow that crosses every method of the boundary once, directly or — in the
+    /// bridge row — through the façade's journal.
+    struct Crossing {
+        bridged: bool,
+    }
+
+    impl Workflow for Crossing {
+        fn identity(&self) -> Identity<'_> {
+            Identity {
+                kind: core::hint::black_box(9),
+                versions: VersionRange::exact(core::hint::black_box(1)),
+                input: core::hint::black_box(b"run".as_slice()),
+            }
+        }
+
+        fn run(&mut self, boundary: &mut dyn Boundary) -> Result<Outcome<'_>, Suspended> {
+            // One workflow type, so the bridge row adds the bridge and not a second copy of
+            // the driver's loop monomorphised for a second workflow.
+            if core::hint::black_box(self.bridged) {
+                return bridged(boundary);
+            }
+            let mut kept = usize::from(boundary.recorded_version());
+            kept = kept.wrapping_add(usize::from(
+                boundary.gate(GateId(core::hint::black_box(1)))?,
+            ));
+            if let Some((kind, ticks)) = boundary.deadline_remaining() {
+                kept = kept
+                    .wrapping_add(usize::from(kind.0))
+                    .wrapping_add(usize::try_from(ticks).unwrap_or(0));
+            }
+            boundary.wait(TimerSpec::AfterBoot {
+                ticks: core::hint::black_box(10),
+            })?;
+            kept = kept.wrapping_add(match boundary.call(ActivityKind(1), b"in")? {
+                Outcome::Completed(bytes) | Outcome::Failed(bytes) => bytes.len(),
+            });
+            let answered = match boundary.schedule(ActivityKind(2), b"in")? {
+                Handoff::Replayed(Outcome::Completed(bytes) | Outcome::Failed(bytes)) => {
+                    bytes.len()
+                }
+                Handoff::Dispatch { id, result_bytes } => {
+                    let seq = usize::try_from(id.seq.0).unwrap_or(0);
+                    let answer = match core::hint::black_box(seq) {
+                        0 => Answered::Completed(b"ok"),
+                        1 => Answered::Failed(b"no"),
+                        _ => Answered::Exhausted,
+                    };
+                    match boundary.resolve(answer)? {
+                        Outcome::Completed(bytes) | Outcome::Failed(bytes) => {
+                            bytes.len().wrapping_add(result_bytes)
+                        }
+                    }
+                }
+            };
+            kept = kept.wrapping_add(answered);
+            match core::hint::black_box(kept) {
+                0 => Err(boundary.continue_as_new(b"next")),
+                1 => Err(Suspended::awaiting_dispatch()),
+                _ => Ok(Outcome::Completed(&[])),
+            }
+        }
+    }
+
+    let Ok(geometry) = Geometry::new(
+        core::hint::black_box(4096),
+        core::hint::black_box(1024),
+        core::hint::black_box(4),
+        core::hint::black_box(1),
+    ) else {
+        return 0;
+    };
+    let Some(align) = ProgramAlign::new(core::hint::black_box(4)) else {
+        return 0;
+    };
+    let Ok(region) = JournalRegion::spanning(geometry, 0, core::hint::black_box(1024), align)
+    else {
+        return 0;
+    };
+    let Ok(layout) = BankLayout::new(geometry) else {
+        return 0;
+    };
+    let Ok(reserve) = Reserve::for_layout(probe_bounds(), layout) else {
+        return 0;
+    };
+
+    let mut media = ProbeMedia { geometry };
+    let mut world = ProbeWorld;
+    let mut page = [0_u8; 64];
+    let mut result = [0_u8; 16];
+    let mut kept = 0_usize;
+
+    // The loop, at a fixed region and at a two-bank layout. `with_integrity` and
+    // `at_bank_with_integrity` are what `new` and `at_bank` call, named here because
+    // `size-probe-reach` reads names.
+    let region_driver = Driver::with_integrity(region, RunId(core::hint::black_box(1)), reserve);
+    let fixed: Driver = Driver::new(region, RunId(core::hint::black_box(1)), reserve);
+    let banked: Driver<Catalogued> = Driver::at_bank_with_integrity(layout, reserve);
+    let swapping: Driver = Driver::at_bank(layout, reserve);
+    for driver in [region_driver, fixed, banked, swapping] {
+        kept = kept
+            .wrapping_add(usize::from(driver.reserve().bounds().terminal_bytes))
+            .wrapping_add(usize::from(driver.region().is_some()))
+            .wrapping_add(
+                driver
+                    .run()
+                    .map_or(0, |run| usize::try_from(run.0).unwrap_or(0)),
+            );
+        let progress = driver.boot(
+            &mut media,
+            &mut world,
+            &mut Crossing { bridged: kept == 5 },
+            Scratch {
+                page: &mut page,
+                result: &mut result,
+            },
+        );
+        kept = kept.wrapping_add(match progress {
+            Ok(Progress::Finished { result_len, .. }) => result_len,
+            Ok(_) => 1,
+            Err(_refused) => 2,
+        });
+    }
+
+    // The effect typestate, by hand: a writer is reachable only from a finished recovery.
+    let mut recovery = Recovery::<_, Catalogued>::with_integrity(region, &mut media);
+    while recovery.next(&mut page).is_some() {}
+    let Some(journal) = Journal::after(recovery) else {
+        return core::hint::black_box(kept);
+    };
+    let Ok(writer) = Reserved::over(journal, reserve) else {
+        return core::hint::black_box(kept);
+    };
+    let effect = Effect::over(RunId(core::hint::black_box(1)), writer);
+    let request = EffectRequest {
+        kind: ActivityKind(core::hint::black_box(1)),
+        input_len: core::hint::black_box(2),
+        input_crc: core::hint::black_box(0),
+    };
+    let effect = if core::hint::black_box(kept) == 3 {
+        Effect::over(RunId(2), effect.into_writer())
+    } else {
+        effect
+    };
+    let Ok(scheduled) = effect.schedule(&mut media, EffectSeq(0), request, &mut page) else {
+        return core::hint::black_box(kept);
+    };
+    kept = kept.wrapping_add(usize::from(scheduled.dispatch.intent().kind().0));
+    let resolution = match scheduled.dispatch.perform(&mut world, b"in", &mut result) {
+        Ok(Performed::Completed(len)) => {
+            Resolution::Completed(result.get(..len).unwrap_or_default())
+        }
+        Ok(Performed::Failed(len)) => Resolution::Failed(result.get(..len).unwrap_or_default()),
+        Ok(Performed::Exhausted | Performed::Pending) | Err(_) => Resolution::Exhausted,
+    };
+    // `resolution` borrows `result`, so the outcome is read before anything else is.
+    let resolved = scheduled
+        .dispatch
+        .resolve(&mut media, resolution, &mut page);
+    kept = kept.wrapping_add(match resolved {
+        Ok(resolved) => match resolved.outcome {
+            Outcome::Completed(bytes) | Outcome::Failed(bytes) => bytes.len(),
+        },
+        Err(_refused) => 4,
+    });
+    core::hint::black_box(kept)
+}
+
+/// What every probe run declares, for §10's reserve.
+#[cfg(feature = "drive")]
+fn probe_bounds() -> waymaker_flash::capacity::Bounds {
+    waymaker_flash::capacity::Bounds {
+        run_input_bytes: core::hint::black_box(8),
+        effect_result_bytes: core::hint::black_box(8),
+        terminal_bytes: core::hint::black_box(8),
+    }
+}
+
+#[cfg(feature = "drive")]
+use waymaker_drive::{Driver, Performed, Scratch};
+
+/// The world the driver rows dispatch into: an activity that answers every way it can, and
+/// two clocks.
+#[cfg(feature = "drive")]
+struct ProbeWorld;
+
+#[cfg(feature = "drive")]
+impl waymaker_drive::Activities for ProbeWorld {
+    fn perform(
+        &mut self,
+        dispatch: waymaker_drive::CheckedDispatch<'_>,
+        out: &mut [u8],
+    ) -> Performed {
+        let intent = dispatch.durable_intent();
+        let id = intent.id();
+        let seq = usize::try_from(id.seq.0).unwrap_or(0);
+        let taken = dispatch.bytes().len().min(out.len());
+        if let (Some(from), Some(into)) = (dispatch.bytes().get(..taken), out.get_mut(..taken)) {
+            into.copy_from_slice(from);
+        }
+        match core::hint::black_box(seq.wrapping_add(usize::from(intent.kind().0))) {
+            0 => Performed::Pending,
+            1 => Performed::Failed(taken),
+            2 => Performed::Exhausted,
+            _ => Performed::Completed(taken),
+        }
+    }
+}
+
+#[cfg(feature = "drive")]
+impl waymaker_drive::Clocks for ProbeWorld {
+    fn capability(&self) -> waymaker_core::timer::ClockCapability {
+        if core::hint::black_box(true) {
+            waymaker_core::timer::ClockCapability::Persistent
+        } else {
+            waymaker_core::timer::ClockCapability::BootOnly
+        }
+    }
+
+    fn now(&mut self, kind: waymaker_core::timer::ClockKind) -> Option<u64> {
+        core::hint::black_box(Some(u64::from(kind.0)))
+    }
+}
+
+/// Nothing, in an image built without the driver.
+#[cfg(not(feature = "drive"))]
+#[inline(never)]
+fn driver() -> usize {
+    core::hint::black_box(0)
+}
+
+/// ADR 0055's bridge row: [`waymaker_bridge::Bridge`] over the driver's boundary.
+///
+/// The bridge is only ever reached from inside a boot, because a `&mut dyn Boundary` is
+/// only ever lent to a running workflow — so [`driver`]'s workflow calls this from its
+/// `run`, and this turns the boundary into the façade's journal and crosses each of its
+/// methods.
+#[cfg(feature = "bridge")]
+#[inline(never)]
+fn bridged(
+    boundary: &mut dyn waymaker_drive::Boundary,
+) -> Result<waymaker_core::Outcome<'static>, waymaker_drive::Suspended> {
+    use waymaker_bridge::Bridge;
+    use waymaker_core::timer::TimerSpec;
+    use waymaker_core::{ActivityKind, Outcome};
+    use waymaker_drive::Suspended;
+    use waymaker_embassy::{Answer, Handoff, Journal};
+
+    let mut bridge = Bridge::over(boundary);
+    let mut kept = bridge
+        .deadline_remaining()
+        .map_or(0, |(kind, _ticks)| usize::from(kind.0));
+    let halted = bridge
+        .wait(TimerSpec::AfterBoot {
+            ticks: core::hint::black_box(10),
+        })
+        .is_err();
+    if !halted {
+        kept = kept.wrapping_add(match bridge.schedule(ActivityKind(1), b"in") {
+            Ok(Handoff::Replayed(Outcome::Completed(bytes) | Outcome::Failed(bytes))) => {
+                bytes.len()
+            }
+            Ok(Handoff::Dispatch { result_bytes, .. }) => {
+                let answer = match core::hint::black_box(result_bytes) {
+                    0 => Answer::Exhausted,
+                    1 => Answer::Failed(b"no"),
+                    _ => Answer::Completed(b"ok"),
+                };
+                match bridge.resolve(answer) {
+                    Ok(Outcome::Completed(bytes) | Outcome::Failed(bytes)) => bytes.len(),
+                    Err(_halted) => 1,
+                }
+            }
+            Err(_halted) => 2,
+        });
+        if core::hint::black_box(kept) == 0 {
+            let _halted = bridge.continue_as_new(b"next");
+        }
+    }
+    match bridge.take_suspended() {
+        Some(suspended) => Err(suspended),
+        None if core::hint::black_box(kept) == 1 => Err(Suspended::awaiting_dispatch()),
+        None => Ok(Outcome::Completed(&[])),
+    }
+}
+
+/// The boundary's own two endings, in an image built without the bridge: the probe's
+/// workflow crosses it directly instead.
+#[cfg(all(feature = "drive", not(feature = "bridge")))]
+#[inline(never)]
+fn bridged(
+    _boundary: &mut dyn waymaker_drive::Boundary,
+) -> Result<waymaker_core::Outcome<'static>, waymaker_drive::Suspended> {
+    if core::hint::black_box(true) {
+        Err(waymaker_drive::Suspended::awaiting_dispatch())
+    } else {
+        Ok(waymaker_core::Outcome::Completed(&[]))
+    }
 }
 
 /// Issue #37's codec bridge, driven over a format the probe supplies.

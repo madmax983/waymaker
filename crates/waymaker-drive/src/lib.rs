@@ -20,13 +20,12 @@
 //!   the only order that compiles, with a kind and an input bound to this effect alone.
 //! * [`Driver`], [`Progress`] and [`DriveError`] — the loop: `waymaker-flash`'s recovery
 //!   scan and two-barrier writer joined to the kernel's transition table.
-//! * [`demo`] — a reference workflow and world, in the library so that the firmware target
-//!   builds them too.
 //!
 //! This crate names no dependency on `waymaker-embassy`, in any table. Issue
 //! [#106](https://github.com/madmax983/waymaker/issues/106):
-//! [`waymaker-facade-demo`](https://docs.rs/waymaker-facade-demo) holds the bridge to
-//! `waymaker-embassy`'s `Ctx` and design document §06's two examples, above this crate.
+//! [`waymaker-bridge`](https://docs.rs/waymaker-bridge) holds the bridge to
+//! `waymaker-embassy`'s `Ctx`, one layer above this crate, and `waymaker-facade-demo` runs
+//! design document §06's two examples and this crate's reference workflow through it.
 //!
 //! # What this crate must not own
 //!
@@ -35,15 +34,18 @@
 //! reinterprets either. The driver reads records only to *feed* the kernel and writes only
 //! records the kernel asked for.
 //!
-//! # Why it is a crate above the layers
+//! # Why it is a layer
 //!
-//! For [`waymaker-rig`](https://docs.rs/waymaker-rig)'s reason and one more. A layer's
-//! public functions must all be reached by the size probe, so a driver listed in
-//! `xtask::policy::LAYERS` would be charged against design document §04's code-flash budget
-//! — and this is not firmware Waymaker ships. It is also not the Embassy façade:
+//! Because it is firmware Waymaker ships. A device that runs a workflow on flash needs
+//! exactly this: the recovery scan, the two-barrier writer and the transition table joined
+//! into one loop. It began as test support above the layers
+//! ([ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md)),
+//! where a board had to copy it to use it;
+//! [ADR 0055](https://github.com/madmax983/waymaker/blob/main/docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md)
+//! promotes it, so every public function here is reached by the size probe and charged
+//! against a code-flash ceiling of its own. It is still not the Embassy façade:
 //! `waymaker-embassy` owns `Ctx` and the futures, and this crate is the protocol they are a
-//! façade over. Driving the protocol here is what makes that falsifiable. See
-//! [ADR 0024](https://github.com/madmax983/waymaker/blob/main/docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md).
+//! façade over. Driving the protocol here is what makes that falsifiable.
 //!
 //! # At-least-once
 //!
@@ -61,37 +63,12 @@
 //! one across the next boundary does not compile; that is a `compile_fail` doctest on the
 //! method rather than a paragraph.
 //!
-//! ```
-//! use waymaker_core::RunId;
-//! use waymaker_drive::demo::{BOUNDS, HASHED, Pipeline, World};
-//! use waymaker_drive::{Conclusion, Driver, Progress, Scratch};
-//! use waymaker_flash::capacity::Reserve;
-//! # use waymaker_fault::Device;
-//! # use waymaker_flash::bank::BankLayout;
-//! # use waymaker_flash::frame::ProgramAlign;
-//! # use waymaker_flash::recovery::JournalRegion;
-//! # use waymaker_flash::storage::Geometry;
-//! # let geometry = Geometry::new(4096, 1024, 4, 1).expect("a legal geometry");
-//! # let align = ProgramAlign::new(4).expect("a legal granularity");
-//! # let region = JournalRegion::spanning(geometry, 0, 1024, align).expect("a legal region");
-//! # let layout = BankLayout::new(geometry).expect("a legal two-bank layout");
-//! // §10 prices the run's two exits before it starts, from what the workflow declares.
-//! let reserve = Reserve::for_layout(BOUNDS, layout).expect("the bounds fit the layout");
-//! let mut device = Device::new(geometry);
-//! let mut workflow = Pipeline::new();
-//! let mut world = World::new();
-//! let mut page = [0_u8; 256];
-//! let mut result = [0_u8; 64];
+//! # Running one
 //!
-//! let progress = Driver::new(region, RunId(1), reserve)
-//!     .boot(&mut device, &mut world, &mut workflow, Scratch { page: &mut page, result: &mut result })
-//!     .expect("the run completes");
-//!
-//! assert_eq!(
-//!     progress,
-//!     Progress::Finished { conclusion: Conclusion::Completed, result_len: HASHED.len() }
-//! );
-//! ```
+//! [`Driver::boot`] takes the device, the world, the workflow and two caller-owned buffers,
+//! and runs the workflow as far as it goes in this boot. `waymaker-facade-demo`'s `demo`
+//! module is the reference workflow and world, and its tests drive them at every crash point
+//! `waymaker-fault` lists; they live there because a layer may not depend on test support.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -99,7 +76,6 @@
 
 mod activity;
 mod boundary;
-pub mod demo;
 mod drive;
 mod effect;
 mod workflow;
