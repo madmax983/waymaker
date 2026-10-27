@@ -271,9 +271,15 @@ pub struct Variant {
 /// rather than measured as zero.
 #[must_use]
 pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
-    if graph.find(PROBE_PACKAGE).is_none() {
+    let Some(probe) = graph.find(PROBE_PACKAGE) else {
         return Vec::new();
-    }
+    };
+    // ADR 0055's two rows exist only where the probe can build them. The
+    // current checkout always can — `gated_row_shortfalls` refuses a report
+    // without them — but `--base` measures an older checkout with this
+    // binary, and asking that probe for a feature it never declared fails
+    // the whole base build, so the diff of every *other* row is lost too.
+    let declares = |feature: &str| probe.features.iter().any(|have| have == feature);
 
     let mut variants = vec![
         Variant {
@@ -300,7 +306,9 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
             measured_against: DEFAULT_ROW.to_owned(),
             gated: true,
         },
-        Variant {
+    ];
+    if declares(DRIVE_FEATURE) {
+        variants.push(Variant {
             // ADR 0055: the driver is a layer, so its row is gated against a ceiling of its
             // own for the façade's reason — §04's number is for "core + flash adapter", and
             // the driver is neither.
@@ -308,8 +316,10 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
             features: vec![PROBE_FEATURE.to_owned(), DRIVE_FEATURE.to_owned()],
             measured_against: DEFAULT_ROW.to_owned(),
             gated: true,
-        },
-        Variant {
+        });
+    }
+    if declares(BRIDGE_FEATURE) {
+        variants.push(Variant {
             // Every layer at once: what a firmware that writes `async fn` workflows and runs
             // them on flash links. Measured against the façade row, so `over base` is what
             // the driver and the bridge add to a firmware that already had the façade.
@@ -317,8 +327,8 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
             features: vec![PROBE_FEATURE.to_owned(), BRIDGE_FEATURE.to_owned()],
             measured_against: FACADE_ROW.to_owned(),
             gated: true,
-        },
-    ];
+        });
+    }
 
     for spec in policy::LAYERS {
         let Some(package) = graph.find(spec.name) else {
@@ -4577,8 +4587,41 @@ mod tests {
             Package::new("waymaker-core").with_features(core_features),
             Package::new("waymaker-flash"),
             Package::new("waymaker-embassy").with_features(embassy_features),
-            Package::new(PROBE_PACKAGE).with_features(&["probe", "engine", "facade"]),
+            Package::new(PROBE_PACKAGE)
+                .with_features(&["probe", "engine", "facade", "drive", "bridge"]),
         ])
+    }
+
+    /// Codex's review of ADR 0055: `--base` measures an older checkout with this binary, and
+    /// a probe from before the driver and the bridge were layers declares neither feature.
+    /// Asking it for them failed the base build and lost the diff of every row.
+    #[test]
+    fn a_probe_from_before_the_driver_rows_is_measured_without_them() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy"),
+            Package::new(PROBE_PACKAGE).with_features(&["probe", "engine", "facade"]),
+        ]);
+        let names: Vec<String> = matrix(&graph).into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["baseline", "default", "facade"]);
+    }
+
+    /// The rows are still compulsory where the gate runs: a report without them cannot be
+    /// gated, whatever the probe declares.
+    #[test]
+    fn a_report_without_the_driver_rows_cannot_be_gated() {
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        let message = rendered(&report.shortfalls());
+        assert!(
+            message.contains(DRIVE_ROW) && message.contains(BRIDGE_ROW),
+            "{message}"
+        );
     }
 
     #[test]
@@ -7579,7 +7622,13 @@ mod tests {
             Package::new("waymaker-flash"),
             Package::new("waymaker-embassy"),
             Package::new(PROBE_PACKAGE)
-                .with_features(&[ENGINE_FEATURE, FACADE_FEATURE, PROBE_FEATURE])
+                .with_features(&[
+                    ENGINE_FEATURE,
+                    FACADE_FEATURE,
+                    DRIVE_FEATURE,
+                    BRIDGE_FEATURE,
+                    PROBE_FEATURE,
+                ])
                 .with_bin(PROBE_PACKAGE, &[PROBE_FEATURE]),
         ])
     }
