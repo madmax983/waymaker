@@ -409,19 +409,95 @@ fn refusal<E>(error: ReservedError<E>) -> DriveError<E> {
 #[cfg(test)]
 mod tests {
     use waymaker_core::{ActivityKind, EffectSeq, RunId};
-    use waymaker_fault::Device;
     use waymaker_flash::append::Journal;
     use waymaker_flash::bank::BankLayout;
     use waymaker_flash::capacity::{Bounds, Reserve, Reserved};
     use waymaker_flash::frame::ProgramAlign;
     use waymaker_flash::recovery::{JournalRegion, Recovery};
-    use waymaker_flash::storage::Geometry;
+    use waymaker_flash::storage::{Geometry, GeometryError, StableStorage};
 
     use super::{Effect, InputMismatch, Resolution};
     use crate::activity::{Activities, Performed};
     use crate::effect::{CheckedDispatch, DurableIntent};
 
     const RUN: RunId = RunId(0x0BAD_F00D_1234_5678);
+
+    /// The device these tests write: [`geometry`]'s 1024 bytes of NOR, erased to `0xFF`.
+    ///
+    /// A layer may not depend on `waymaker-fault` in any table (ADR 0055), so this is the
+    /// smallest honest NOR the effect protocol can be driven against: a program clears bits
+    /// and never sets them, and every access is validated against the geometry first. The
+    /// crash-injected end-to-end runs live in `waymaker-facade-demo`'s tests.
+    const MEDIA_BYTES: usize = 1024;
+
+    /// A RAM-backed NOR that never fails.
+    struct Device {
+        media: [u8; MEDIA_BYTES],
+    }
+
+    impl Device {
+        const fn new(_geometry: Geometry) -> Self {
+            Self {
+                media: [0xFF; MEDIA_BYTES],
+            }
+        }
+
+        const fn image(&self) -> &[u8] {
+            &self.media
+        }
+
+        fn span(offset: u32, len: usize) -> Result<core::ops::Range<usize>, GeometryError> {
+            let start = usize::try_from(offset).map_err(|_| GeometryError::OutOfBounds)?;
+            let end = start.checked_add(len).ok_or(GeometryError::OutOfBounds)?;
+            Ok(start..end)
+        }
+    }
+
+    impl StableStorage for Device {
+        type Error = GeometryError;
+
+        fn geometry(&self) -> Geometry {
+            geometry()
+        }
+
+        fn read(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), GeometryError> {
+            let len = u32::try_from(dst.len()).map_err(|_| GeometryError::OutOfBounds)?;
+            geometry().validate_read(offset, len)?;
+            let from = self
+                .media
+                .get(Self::span(offset, dst.len())?)
+                .ok_or(GeometryError::OutOfBounds)?;
+            dst.copy_from_slice(from);
+            Ok(())
+        }
+
+        fn program(&mut self, offset: u32, src: &[u8]) -> Result<(), GeometryError> {
+            let len = u32::try_from(src.len()).map_err(|_| GeometryError::OutOfBounds)?;
+            geometry().validate_program(offset, len)?;
+            let into = self
+                .media
+                .get_mut(Self::span(offset, src.len())?)
+                .ok_or(GeometryError::OutOfBounds)?;
+            for (cell, wanted) in into.iter_mut().zip(src) {
+                *cell &= *wanted;
+            }
+            Ok(())
+        }
+
+        fn erase(&mut self, offset: u32, len: u32) -> Result<(), GeometryError> {
+            geometry().validate_erase(offset, len)?;
+            let len = usize::try_from(len).map_err(|_| GeometryError::OutOfBounds)?;
+            self.media
+                .get_mut(Self::span(offset, len)?)
+                .ok_or(GeometryError::OutOfBounds)?
+                .fill(0xFF);
+            Ok(())
+        }
+
+        fn barrier(&mut self) -> Result<(), GeometryError> {
+            Ok(())
+        }
+    }
 
     const BOUNDS: Bounds = Bounds {
         run_input_bytes: 4,
@@ -466,7 +542,7 @@ mod tests {
     }
 
     /// `redelivering` is `pub(crate)`, so this is the only place it can be driven directly.
-    /// The end-to-end path is `crates/waymaker-drive/tests/drive.rs`.
+    /// The end-to-end path is `crates/waymaker-facade-demo/tests/drive.rs`.
     #[test]
     fn a_redelivered_intent_writes_nothing_and_keeps_the_committed_identity() {
         let mut device = Device::new(geometry());
@@ -483,7 +559,10 @@ mod tests {
             .dispatch
             .resolve(&mut device, Resolution::Completed(b"ok"), &mut page)
             .expect("the outcome fits");
-        let before = device.image().to_vec();
+        let before = *device
+            .image()
+            .first_chunk::<MEDIA_BYTES>()
+            .expect("the whole device");
 
         let redelivered = resolved.next.redelivering(EffectSeq(0), request);
 

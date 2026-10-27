@@ -126,6 +126,9 @@ jobs:
         with:
           rustflags: ""
 
+      # `default-members` is exactly the layers, so ADR 0055's `waymaker-drive` and
+      # `waymaker-bridge` are built here: issue #28's "no `Future`, no Embassy, no
+      # allocation" is held by this step now.
       - name: Build the firmware crates for the firmware target
         run: cargo build --locked --no-default-features --target thumbv6m-none-eabi
 
@@ -136,17 +139,9 @@ jobs:
       - name: Build the rig for the firmware target
         run: cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
 
-      # `waymaker-drive` is outside `default-members` too, and issue #28's "done when" is a
-      # workflow driven to completion with no `Future`, no Embassy and no allocation. A host
-      # build would never notice an `extern crate alloc` appearing under it. `--lib` because
-      # its tests drive `waymaker-fault`, which models media in a `Vec`.
-      - name: Build the synchronous driver for the firmware target
-        run: cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
-
-      # Issue #106's crate split: the façade bridge and design document §06's two examples
-      # live above `waymaker-drive` rather than inside it, so the step above already builds
-      # the driver with no façade edge at all. This is where `Bridge`, `poll_ota` and
-      # `poll_provisioning` are compiled for the part.
+      # Design document §06's two examples and the driver's reference workflow live above
+      # the layers (ADR 0055). This is where `poll_ota`, `poll_provisioning` and the `demo`
+      # world are compiled for the part.
       - name: Build the façade demo for the firmware target
         run: cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi
 
@@ -160,11 +155,12 @@ jobs:
       # layering gate reports its `#![no_std]`, `#![forbid(unsafe_code)]` and
       # `#![warn(missing_docs)]` present while no compiler has ever acted on them.
       #
-      # `embassy-postcard` is the probe's widest selection and implies `facade`. Under
-      # `facade` alone the codec rows compile to their empty stubs and the bodies the size
-      # job links are linted by nothing.
+      # `bridge` and `embassy-postcard` together are the probe's widest selection: the
+      # first implies the driver and the façade, the second the codec rows. Under `facade`
+      # alone those rows compile to their empty stubs and the bodies the size job links are
+      # linted by nothing.
       - name: Lint the size probe on the firmware target
-        run: cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
+        run: cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,bridge,embassy-postcard --bins -- -D warnings
 
       # The same argument met a second time. The emulated image's binary is behind
       # `required-features` too, so the host lint stage never compiles it and the emulation
@@ -260,7 +256,7 @@ jobs:
       # on the in-memory model and on the rig. Here rather than only in the `check` job's
       # test stage so that a row that stopped holding is legible in the checks list.
       - name: Run the failure matrix
-        run: cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
+        run: cargo test --locked -p waymaker-facade-demo -p waymaker-rig --no-default-features --test matrix
 
       - name: Run the v1 format conformance corpus
         run: cargo test --locked -p waymaker-flash --no-default-features --test corpus

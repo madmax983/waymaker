@@ -9,6 +9,7 @@ members = [
     "crates/waymaker-conformance",
     "crates/waymaker-rig",
     "crates/waymaker-drive",
+    "crates/waymaker-bridge",
     "crates/waymaker-facade-demo",
     "crates/waymaker-size-probe",
     "crates/waymaker-emu",
@@ -21,20 +22,15 @@ members = [
 # firmware target has any use for either.
 # `waymaker-conformance` is excluded too, for a different reason: it is `#![no_std]` and an
 # adapter author is meant to build it for their own target, but *this* workspace's firmware
-# is the three layers and nothing else. Selecting it by default would put an
+# is the layers and nothing else. Selecting it by default would put an
 # `embedded-storage` dependency into the image the code-flash budget is measured against.
 # `waymaker-rig` is excluded for `waymaker-conformance`'s reason and one more: it is
 # `#![no_std]` so that a board can link it, but the board it is written for is not this
 # workspace's firmware, and selecting it by default would build the rig into the image the
 # code-flash budget is measured against.
-# `waymaker-drive` is excluded for `waymaker-rig`'s reason: it is `#![no_std]` so that the
-# claim "no `Future`, no Embassy, no allocation" is a build failure rather than an
-# inspection, but it is a synchronous driver written to prove the kernel boundary rather
-# than firmware this workspace ships, and selecting it by default would build it into the
-# image the code-flash budget is measured against.
-# `waymaker-facade-demo` is excluded for `waymaker-drive`'s reason: it is `#![no_std]` so
-# that its two examples build for the part, but it is a bridge and a demonstration rather
-# than firmware this workspace ships.
+# `waymaker-facade-demo` is excluded for `waymaker-rig`'s reason: it is `#![no_std]` so
+# that design document §06's examples and the driver's reference workflow build for the part,
+# but it is a demonstration rather than firmware this workspace ships.
 # `waymaker-size-probe` is excluded too: its binary is behind `required-features`, so
 # selecting it by default would add a member the firmware build has nothing to build.
 # `waymaker-emu` is excluded for the size probe's reason and one more: it carries
@@ -43,7 +39,9 @@ members = [
 default-members = [
     "crates/waymaker-core",
     "crates/waymaker-flash",
+    "crates/waymaker-drive",
     "crates/waymaker-embassy",
+    "crates/waymaker-bridge",
 ]
 
 [workspace.package]
@@ -68,6 +66,7 @@ waymaker-spec = { path = "crates/waymaker-spec", version = "0.1.0", default-feat
 waymaker-conformance = { path = "crates/waymaker-conformance", version = "0.1.0", default-features = false }
 waymaker-rig = { path = "crates/waymaker-rig", version = "0.1.0", default-features = false }
 waymaker-drive = { path = "crates/waymaker-drive", version = "0.1.0", default-features = false }
+waymaker-bridge = { path = "crates/waymaker-bridge", version = "0.1.0", default-features = false }
 waymaker-facade-demo = { path = "crates/waymaker-facade-demo", version = "0.1.0", default-features = false }
 waymaker-emu = { path = "crates/waymaker-emu", version = "0.1.0", default-features = false }
 # The optional codec helpers of issue #37. `default-features = false` so that neither

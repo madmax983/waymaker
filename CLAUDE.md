@@ -39,14 +39,13 @@ cargo doc --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
-cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
-cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
+cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,bridge,embassy-postcard --bins -- -D warnings
 cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
-cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
+cargo test --locked -p waymaker-facade-demo -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask profile
 cargo --locked xtask emulate
@@ -295,7 +294,7 @@ these rows, and is not one — see
 | --- | --- | --- | --- |
 | `cortex-m0plus` | power-cut and watchdog-reset loops on a Cortex-M0+ board | Not run | a rig log from a board, with the census complete and no breach. `waymaker-rig` is written to link on the target and has never been on one. The census completes on a host now, but against a model: no weak bits, no reset-cause register, no retained RAM, and a watchdog that lands at a call boundary rather than on a timer. |
 | `cortex-m4` | power-cut and watchdog-reset loops on a Cortex-M4 board | Not run | the same log from a second core, because a rig that only ever ran on one part has measured that part rather than the protocol. |
-| `rtc-power-loss` | an AtPersistentTime deadline across a total power cut on a board with a backed RTC | Not run | a board with a battery- or supercapacitor-backed RTC, the supply removed for longer than the interval, and the first replay after it recognising the deadline as elapsed. `waymaker-rig`'s `rtc` and `epoch` modules are written to link on the target and have never been on one. `waymaker-drive/tests/power_loss.rs` drives the scenario on a host, but against a model: no oscillator to drift, no supply to sag, and a continuity flag a test sets rather than a backup domain that failed. |
+| `rtc-power-loss` | an AtPersistentTime deadline across a total power cut on a board with a backed RTC | Not run | a board with a battery- or supercapacitor-backed RTC, the supply removed for longer than the interval, and the first replay after it recognising the deadline as elapsed. `waymaker-rig`'s `rtc` and `epoch` modules are written to link on the target and have never been on one. `waymaker-facade-demo/tests/power_loss.rs` drives the scenario on a host, but against a model: no oscillator to drift, no supply to sag, and a continuity flag a test sets rather than a backup domain that failed. |
 
 Moving a row to `Passed` needs an accepted ADR that carries the attestation marker and the
 id, in the same change. Writing that ADR line without moving the row fails the build too.
@@ -355,7 +354,7 @@ the model's test file, and
 [ADR 0027](docs/adr/0027-the-failure-matrix-is-ten-named-tests-and-a-rig-that-resumes.md)
 stop naming the same set.
 
-The model half is `crates/waymaker-drive/tests/matrix.rs`: one test per row, named after
+The model half is `crates/waymaker-facade-demo/tests/matrix.rs`: one test per row, named after
 it. The rig half is `crates/waymaker-rig/tests/matrix.rs`: one test per swept row, named
 after it with `_on_the_rig`. Two rows — a capacity refusal and a declared-workflow
 mismatch — are driven rather than swept, since neither is a media crash the injector
@@ -401,7 +400,7 @@ the `book` and `hardware-matrix` rules say what it must contain.
 Two decisions about it are worth knowing before you change it.
 
 **A chapter carries no Rust sample of its own.** Every sample is an `{{#include}}` of an
-anchor in [`crates/waymaker-drive/tests/book.rs`](crates/waymaker-drive/tests/book.rs),
+anchor in [`crates/waymaker-facade-demo/tests/book.rs`](crates/waymaker-facade-demo/tests/book.rs),
 named after a real `#[test]` in that file. The bytes the book shows are bytes the `test`
 stage actually compiles and runs, against `waymaker-fault`'s model of NOR, the real
 driver, and the real codec.
@@ -418,13 +417,16 @@ measurement the gate takes on every run. The book cannot say `Passed` where
 [the attestation record](#what-the-boards-still-owe) says `Not run`.
 ## The layering
 
-`waymaker-embassy` → `waymaker-flash` → `waymaker-core`, and never the other way. The table
+`waymaker-embassy` → `waymaker-flash` → `waymaker-core`, and never the other way;
+`waymaker-drive` sits beside the façade on the same two crates and never reaches it, and
+`waymaker-bridge` is above both
+([ADR 0055](docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md)). The table
 is `xtask::policy::LAYERS`; the diagram is
 [here](docs/architecture.md#crate-dependency-flow). Adding a crate to the workspace means
 adding a row to that table — a member no rule covers fails `workspace-membership`.
 
 The "May depend on" column below is `may_depend_on` plus `may_depend_on_external` in
-`policy::LAYERS`. The façade's last five entries are the external half: only a non-default
+`policy::LAYERS`. The façade's and the bridge's last five entries are the external half: only a non-default
 codec feature enables any of them, no default build links one, and `codec-is-optional`
 keeps that true.
 
@@ -432,7 +434,9 @@ keeps that true.
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, timer semantics and the clock-kind vocabulary, the workflow-version range and gate vocabulary, capacity errors | nothing |
 | `waymaker-flash` | Stable wire encoding, the integrity-check trait and its shipped binding, the storage contract and its geometry, CRC and seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, the capacity reserve, the seven-step bank swap and `continue_as_new`, compaction transition | waymaker-core |
+| `waymaker-drive` | The synchronous driver of §06's kernel boundary: the loop joining the recovery scan and the two-barrier writer to the transition table, §07's seven-step effect protocol as a typestate, the boundary, workflow and activity traits | waymaker-core, waymaker-flash |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, the persistent-clock capability, optional typed codec helpers | waymaker-core, waymaker-flash, cobs, postcard, serde, serde_core, thiserror |
+| `waymaker-bridge` | `Bridge`: the driver's boundary as the façade's journal, so an `async fn` workflow over `Ctx` runs on flash | waymaker-core, waymaker-flash, waymaker-drive, waymaker-embassy, cobs, postcard, serde, serde_core, thiserror |
 
 ### The must-not-own table
 
@@ -443,18 +447,21 @@ The `claude-md` rule fails a build in which this table and that one disagree.
 | --- | --- |
 | `waymaker-core` | allocation, serialization framework, CRC, clock, storage driver, executor, logging |
 | `waymaker-flash` | activities, workflow types, timers, Embassy |
+| `waymaker-drive` | on-media authority, the transition table, futures, Embassy, allocation |
 | `waymaker-embassy` | on-media authority or hidden global state |
+| `waymaker-bridge` | on-media authority, workflows, or a dispatcher |
 
-`waymaker-embassy` is the only crate permitted to know Embassy exists. A host or browser
+`waymaker-embassy` is the only crate permitted to know Embassy exists. `waymaker-bridge` may
+depend on the façade crate — that edge is what it is for — and on nothing behind it. A host or browser
 adapter can be written later against the same semantic kernel, but it must not expand the
 firmware traits to accommodate host conveniences.
 
-Nine workspace members are not layers:
+Eight workspace members are not layers:
 
 - **`xtask`** — host tooling, the gate itself. Kept out of firmware builds by
   `default-members`.
 - **`waymaker-size-probe`** — firmware linked only so its section sizes and symbols can be
-  measured. All three layers are *optional* dependencies of it, so a baseline build links
+  measured. Every layer is an *optional* dependency of it, so a baseline build links
   none of them, which is what makes the code-flash budget a delta rather than an absolute.
   Nothing depends on it.
 - **`waymaker-emu`** (`policy::EMULATION_CRATES`) — a linked, executed image, not another
@@ -482,24 +489,15 @@ Nine workspace members are not layers:
   That edge is legal because this crate is not a layer. See
   [ADR 0021](docs/adr/0021-the-rig-is-a-no-std-library-and-its-knowledge-is-durable.md) and
   [ADR 0031](docs/adr/0031-a-persistent-clock-is-two-registers-and-the-board-run-is-a-checked-absence.md).
-- **`waymaker-drive`** (`policy::TEST_SUPPORT_CRATES`) — issue
-  [#28](https://github.com/madmax983/waymaker/issues/28)'s synchronous driver for §06's
-  explicit kernel boundary: the loop that joins `waymaker-flash`'s recovery scan and
-  two-barrier writer to `waymaker-core`'s transition table, §07's seven-step effect
-  protocol, and a reference workflow the firmware target builds. §07 lives here rather than
-  in `waymaker-flash` because step 4 is an activity, and that crate's must-not-own cell
-  names activities. `#![no_std]` and allocation-free, built for `thumbv6m-none-eabi`; it
-  names no dependency on `waymaker-embassy` at all, in any table. See
-  [ADR 0024](docs/adr/0024-the-kernel-boundary-is-driven-synchronously-by-a-crate-above-the-layers.md)
-  and
-  [ADR 0025](docs/adr/0025-the-effect-protocol-is-a-typestate-and-an-exhausted-answer-is-a-record.md).
-- **`waymaker-facade-demo`** (`policy::TEST_SUPPORT_CRATES`) — issue
-  [#106](https://github.com/madmax983/waymaker/issues/106)'s bridge from `waymaker-drive`
-  to `waymaker-embassy`, and design document §06's two example workflows. Holding the edge
-  here rather than inside `waymaker-drive` is what makes `waymaker-drive`'s independence
-  from the façade a fact `cargo metadata` states, not a claim a feature flag argued for.
-  `#![no_std]` and allocation-free, built for `thumbv6m-none-eabi`. See
-  [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md).
+- **`waymaker-facade-demo`** (`policy::TEST_SUPPORT_CRATES`) — design document §06's two
+  example workflows run through `waymaker-bridge`, the driver's reference workflow and world
+  (`demo`), and the tests that drive all of them at every crash point `waymaker-fault`
+  lists, the failure-matrix model half among them. It used to hold the bridge, and the
+  driver used to be test support beside it; ADR 0055 made both layers, and what stayed here
+  is what a layer may not hold — demonstrations, and tests that depend on `waymaker-fault`
+  and `waymaker-rig`. `#![no_std]` and allocation-free, built for `thumbv6m-none-eabi`. See
+  [ADR 0032](docs/adr/0032-the-facade-is-four-futures-over-a-durable-half-it-does-not-own.md)
+  and [ADR 0055](docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md).
 - **`waymaker-spec`** (`policy::TEST_SUPPORT_CRATES`) — the formal specification of the
   recovery invariants: the ghost model of committed history, the journal and bank state
   machines, and the exhaustive search that discharges §14's guarantees over them.
@@ -519,7 +517,9 @@ kept in two places is a budget that eventually disagrees with itself.
 | Kernel state | ≤ 128 B, excluding any page buffer (§04, v0.1) |
 | Context | ≤ 128 B — what kernel state leaves of the 256 B the scratch page leaves of runtime RAM. Not a §04 row: §04 names the context as a runtime-RAM term, and nothing measured it before [ADR 0035](docs/adr/0035-the-facade-row-is-gated-and-runtime-ram-is-composed.md) |
 | Incremental code flash | ≤ 13 KiB for core + flash adapter, on `thumbv6m-none-eabi` (§04 states 8 KiB as a v0.1 target; later rungs raised it as the two-bank lifecycle, the capacity reserve, and workflow versioning were added, and one raise was later withdrawn once the code-flash gate stopped charging the size probe's own arithmetic to the layers) |
-| Incremental code flash, with the façade | ≤ 14 KiB for the three layers on `thumbv6m-none-eabi`. Not a §04 row: the façade has its own ceiling rather than a raise of the kernel's |
+| Incremental code flash, with the façade | ≤ 14 KiB for the engine and the façade on `thumbv6m-none-eabi`. Not a §04 row: the façade has its own ceiling rather than a raise of the kernel's |
+| Incremental code flash, with the driver | ≤ 19 KiB for the engine and `waymaker-drive` on `thumbv6m-none-eabi`: the engine's ceiling plus a 6 KiB share. Not a §04 row, for the façade's reason ([ADR 0055](docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md)) |
+| Incremental code flash, every layer | ≤ 23 KiB for all five layers on `thumbv6m-none-eabi`: the façade's ceiling plus the driver's share plus a 3 KiB share for the bridge. Not a §04 row (ADR 0055) |
 | Persistent flash | two erase blocks minimum (§04, v0.1) |
 
 The code-flash row is the one place this repository and the design document now disagree
@@ -570,7 +570,7 @@ gated crate fails.
 | Every gated crate reached by some workload | all 6, or the run fails naming the gap | all 6 |
 | Instructions executed in engine code | none — §04 states no target | published for comparison across commits, not gated |
 
-The engine is the three layers plus `policy::NO_STD_TEST_SUPPORT_CRATES`, derived from the
+The engine is the layers plus `policy::NO_STD_TEST_SUPPORT_CRATES`, derived from the
 layering table so a crate joining either category is gated automatically.
 `waymaker-fault` is deliberately excluded: it models media in a `Vec`, so any engine code
 that calls `program` on it allocates through the model, not through anything a real driver
@@ -810,7 +810,7 @@ Stated so that nobody mistakes silence for coverage:
   `tests/integrity.rs` are what hold the behaviour; these rules hold what a reviewer can
   check by eye.
 - **`[lints] workspace = true` in `xtask` and the size probe.** The manifest and crate-root
-  rules iterate `policy::checked_members` — the three layers plus the test-support crates —
+  rules iterate `policy::checked_members` — the layers plus the test-support crates —
   so those two are outside them. The size probe has `size-probe` of its own; `xtask` is the
   gate.
 - **A public function added to the recovery reader from another file.** `recovery-surface`
@@ -1142,7 +1142,7 @@ Stated so that nobody mistakes silence for coverage:
   typestate `crates/waymaker-flash/tests/swap.rs` and `crates/waymaker-fault/tests/swap.rs`
   already sweep exhaustively, unmodified — but neither sweep drives it through this driver,
   and this driver's own bank-selection reads happen nowhere in either. What
-  `crates/waymaker-drive/tests/continue_as_new.rs` holds is the fault-free path: a real
+  `crates/waymaker-facade-demo/tests/continue_as_new.rs` holds is the fault-free path: a real
   two-bank device, a real swap, and the next boot reading the installed bank's own bytes
   back. A crash landing inside the reads that pick which bank to boot from, or inside the
   seven steps as this driver sequences them rather than as the two lower sweeps do, is not
@@ -1182,7 +1182,7 @@ Stated so that nobody mistakes silence for coverage:
   pin do: a `Resolve::Replayed` that grew a third field, an `EffectRequest::kind` retyped, or
   a `match` arm that names `Intent::Schedule` and then does the wrong thing are each
   invisible to it. `crates/waymaker-core/tests/transition.rs` holds the kernel's behaviour
-  and `crates/waymaker-drive/tests/` the driver's — a diverging workflow that dispatches
+  and `crates/waymaker-facade-demo/tests/` the driver's — a diverging workflow that dispatches
   nothing, a redelivery that reuses its identity, and the protocol swept at every crash point
   the injector lists. The routing half also pins one file, the way `capacity-reserve`,
   `recovery-surface` and `storage-contract` each do: a decision taken in a sibling module of
@@ -1193,7 +1193,7 @@ Stated so that nobody mistakes silence for coverage:
   `EffectId { run, seq }` written by hand evades it; and the pinned file is the driver, while
   the identity is actually *constructed* one file over, in `effect.rs`, which this rule does
   not read. What holds the behaviour is
-  `crates/waymaker-drive/tests/redelivery.rs::what_redelivery_answers_is_not_what_a_fresh_mint_would`,
+  `crates/waymaker-facade-demo/tests/redelivery.rs::what_redelivery_answers_is_not_what_a_fresh_mint_would`,
   which drives the real driver and compares what it redelivered against what an allocator
   would have minted, and `tests/crash.rs`, which does the same at every crash point of the
   window. The same shape as `kernel-owns-no-encoding`: a rule that makes the wrong thing a
@@ -1208,15 +1208,15 @@ Stated so that nobody mistakes silence for coverage:
   `waymaker-core` is a compile error in them. That is the compiler rather than this rule, and
   saying so is better than a row that reads as though the rule prevented it.
 - **That the synchronous driver is a driver anything is obliged to use.** `waymaker-drive` is
-  above the layers, and the one crate that depends on it is `xtask`, which reads two numbers
-  out of it. So it demonstrates that the boundary is
-  sufficient rather than obliging a future dispatcher to go through it. That is rung 0.4's,
-  and it is the same standing as "nothing obliges a future dispatcher to use the gated
-  writer".
+  a layer since ADR 0055, so its cost is measured and a firmware may link it, but nothing
+  makes a firmware do so: a board can still write its own loop over `waymaker-flash` and
+  `waymaker-core`. It demonstrates that the boundary is sufficient rather than obliging a
+  dispatcher to go through it, which is the same standing as "nothing obliges a future
+  dispatcher to use the gated writer".
 - **What the synchronous driver does after a crash that leaves no append point.** It refuses.
   A torn or unsealed tail has no append offset — ADR 0018's anti-bricking rule — and
   recovering from that is §10's `continue_as_new`, which `waymaker-flash`'s `swap` owns and
-  which this driver does not call. `crates/waymaker-drive/tests/crash.rs` measures how often
+  which this driver does not call. `crates/waymaker-facade-demo/tests/crash.rs` measures how often
   each happens rather than assuming, and requires both a crash image the run carries on from
   and one it cannot.
 - **That a redelivered intent really has a schedule record on media.**
@@ -1224,7 +1224,7 @@ Stated so that nobody mistakes silence for coverage:
   proof is the kernel's `Resolve::Redeliver`, which the driver reads and this module cannot
   see, so it is a precondition on the caller rather than a check — the same standing as
   `Swap::beginning`'s two unverified arguments. What holds it in this workspace is that the
-  one caller is `waymaker-drive`'s own boundary, and `crates/waymaker-drive/tests/drive.rs`
+  one caller is `waymaker-drive`'s own boundary, and `crates/waymaker-facade-demo/tests/drive.rs`
   drives a reboot through it.
 - **That an exhausted effect can be told from an effect that failed with no detail.** Both
   are an `EffectFailed` with an empty payload, because an empty payload is the only payload
@@ -1242,7 +1242,7 @@ Stated so that nobody mistakes silence for coverage:
   a macro-generated `fn`, or a macro-generated construction, invisible to every scan built on
   a parsed `impl` body, and `effect.rs` now refuses any macro invocation at all rather than
   try to enumerate the shapes one could take. `capacity-reserve` records a limit of the same
-  shape for its own pinned file, and `crates/waymaker-drive/tests/crash.rs` is what holds the
+  shape for its own pinned file, and `crates/waymaker-facade-demo/tests/crash.rs` is what holds the
   step-order behaviour.
 - **That the code before a permitted construction site does what it claims.**
   `CHECKED_DISPATCH_CONSTRUCTION` counts where `CheckedDispatch` is built, not what happens
@@ -1320,13 +1320,13 @@ Stated so that nobody mistakes silence for coverage:
   `Activities::perform`, and nothing can check it: the driver never sees the answer the
   activity had.
 - **That the whole-answer crash sweep could fail for a reason this crate owns.**
-  `crates/waymaker-drive/tests/crash.rs`'s
+  `crates/waymaker-facade-demo/tests/crash.rs`'s
   `no_recovered_outcome_holds_part_of_an_answer_at_any_crash_point` is a statement about
   media, and what makes it true is §09's commit seal rather than anything in
   `waymaker-drive`: no change to `effect.rs` or `drive.rs` turns it red. Its falsifier is
   `crates/waymaker-fault/tests/commit_discipline.rs`, whose seal-before-frame writer reaches
   the state it asserts is unreachable. The *exposure* half — that a workflow sees no part of
-  an answer — is `crates/waymaker-drive/tests/effect.rs`, and that one is falsifiable here.
+  an answer — is `crates/waymaker-facade-demo/tests/effect.rs`, and that one is falsifiable here.
 - **That a persistent clock stayed monotonic across a reboot.** `Timer::evaluate` refuses a
   reading below the reading the timer was armed at, and that floor lives in RAM. A power cut
   takes it, so a run that re-arms on the next boot has nothing to compare the new reading
@@ -1607,7 +1607,7 @@ Stated so that nobody mistakes silence for coverage:
   `storage-contract` each say of the one they pin: a `trait TableExt` with a blanket impl in
   `decode.rs` adds a `by_name` with the rule silent — `ctx.rs` is not the example, because `public_functions` counts a trait method as
   callable and `ctx-facade`'s own surface pin would catch it there. And it compares *names*, so that a row's
-  label never reaches media is `crates/waymaker-drive/tests/dispatch.rs`'s, which drives a
+  label never reaches media is `crates/waymaker-facade-demo/tests/dispatch.rs`'s, which drives a
   run and then reads the device image back for the label's bytes. What makes that true is
   §09's `EffectScheduled` — a sequence, a kind, a length and a digest — and
   `effect-scheduled-fields` is the rule holding it.
@@ -1671,7 +1671,7 @@ Stated so that nobody mistakes silence for coverage:
   fact about where a call is written, so no scanner reaches it, and it is the same limit §08
   records about determinism generally. What catches it is the divergence check at the next
   effect boundary, which is terminal —
-  `crates/waymaker-drive/tests/versioning.rs::an_added_effect_with_no_gate_is_a_divergence`
+  `crates/waymaker-facade-demo/tests/versioning.rs::an_added_effect_with_no_gate_is_a_divergence`
   drives `Branching::ImageVersion` and watches it stop the run.
 - **That a version range is one a fleet can actually deploy.** `VersionRange::admits`
   refuses a recorded branch outside the range, and nothing checks the *order* in which a
@@ -1688,7 +1688,7 @@ Stated so that nobody mistakes silence for coverage:
   free one: the record was never durable, so the next boot re-decides the branch — and under
   a *different* image it may decide differently. The window is narrower than §07's effect
   window, because no physical effect follows a gate, and it is why `Boundary::gate` writes
-  before it returns rather than after. `crates/waymaker-drive/tests/versioning.rs` measures
+  before it returns rather than after. `crates/waymaker-facade-demo/tests/versioning.rs` measures
   the durable half; the torn half is a state no test can assert a branch about, because there
   is no branch.
 - **That a corpus file is the byte sequence a v1 device really wrote.** The corpus was
@@ -1771,7 +1771,7 @@ Stated so that nobody mistakes silence for coverage:
   runs and reports how far the paint was disturbed after, gated by `emulate::StackUsage`. What
   that figure is *not* is §04's runtime RAM total — it is the whole image's call-chain depth,
   on one run, on one core, and this image links `waymaker-rig` and `waymaker-conformance`
-  alongside the three layers, so it is not the engine's share alone. Nor is it exact: painting
+  alongside the layers it reaches, so it is not the engine's share alone. Nor is it exact: painting
   the stack and reading back a high-water mark is a lower bound, not a ceiling — a frame can
   reserve bytes it never writes, and a byte like that still reads as the paint pattern
   afterwards, so a run can use more than it reports — by an amount the guard margin does
@@ -1827,7 +1827,7 @@ Stated so that nobody mistakes silence for coverage:
 - **That a book sample is the sample the chapter needed.** The tie is the anchor's *name*: an
   anchor must be a `#[test]` of that name, and the test must be in a file
   `book::BOOK_SAMPLE_FILES` names. Nothing says the test *asserts* what the surrounding
-  paragraph claims — that is `crates/waymaker-drive/tests/book.rs` being read by a person,
+  paragraph claims — that is `crates/waymaker-facade-demo/tests/book.rs` being read by a person,
   the same standing `failure-matrix` records for a row-named test.
 - **That the rendered page shows the right sample.** `cargo xtask book` looks for one
   identifier out of each anchor's body in the page that includes it, and reports the anchor

@@ -394,6 +394,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymaker-bridge"
+version = "0.1.0"
+dependencies = [
+ "waymaker-core",
+ "waymaker-drive",
+ "waymaker-embassy",
+]
+
+[[package]]
 name = "waymaker-conformance"
 version = "0.1.0"
 dependencies = [
@@ -411,9 +420,7 @@ name = "waymaker-drive"
 version = "0.1.0"
 dependencies = [
  "waymaker-core",
- "waymaker-fault",
  "waymaker-flash",
- "waymaker-rig",
 ]
 
 [[package]]
@@ -443,6 +450,7 @@ dependencies = [
 name = "waymaker-facade-demo"
 version = "0.1.0"
 dependencies = [
+ "waymaker-bridge",
  "waymaker-core",
  "waymaker-drive",
  "waymaker-embassy",
@@ -482,7 +490,9 @@ dependencies = [
 name = "waymaker-size-probe"
 version = "0.1.0"
 dependencies = [
+ "waymaker-bridge",
  "waymaker-core",
+ "waymaker-drive",
  "waymaker-embassy",
  "waymaker-flash",
 ]

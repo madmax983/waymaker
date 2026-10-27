@@ -1,10 +1,45 @@
 //! A reference workflow and a reference world.
 //!
-//! Here rather than in `tests/` on purpose. The claim this crate exists to make is that a
-//! workflow runs to completion with no `Future`, no Embassy and no allocation, and a
+//! Here rather than in `tests/` on purpose. The claim `waymaker-drive` exists to make is that
+//! a workflow runs to completion with no `Future`, no Embassy and no allocation, and a
 //! fixture that only ever compiled for the host would leave the last third of that
 //! unchecked. These types are `#![no_std]` and allocation-free like the driver, and the
-//! `drive-firmware` pipeline stage builds them for `thumbv6m-none-eabi`.
+//! `facade-demo-firmware` pipeline stage builds them for `thumbv6m-none-eabi`. They used to
+//! be a module of `waymaker-drive`; ADR 0055 made that crate a layer, whose every public
+//! function the size probe must reach, so the reference world moved up here beside the tests
+//! that drive it.
+//!
+//! ```
+//! use waymaker_core::RunId;
+//! use waymaker_drive::{Conclusion, Driver, Progress, Scratch};
+//! use waymaker_facade_demo::demo::{BOUNDS, HASHED, Pipeline, World};
+//! use waymaker_flash::capacity::Reserve;
+//! # use waymaker_fault::Device;
+//! # use waymaker_flash::bank::BankLayout;
+//! # use waymaker_flash::frame::ProgramAlign;
+//! # use waymaker_flash::recovery::JournalRegion;
+//! # use waymaker_flash::storage::Geometry;
+//! # let geometry = Geometry::new(4096, 1024, 4, 1).expect("a legal geometry");
+//! # let align = ProgramAlign::new(4).expect("a legal granularity");
+//! # let region = JournalRegion::spanning(geometry, 0, 1024, align).expect("a legal region");
+//! # let layout = BankLayout::new(geometry).expect("a legal two-bank layout");
+//! // §10 prices the run's two exits before it starts, from what the workflow declares.
+//! let reserve = Reserve::for_layout(BOUNDS, layout).expect("the bounds fit the layout");
+//! let mut device = Device::new(geometry);
+//! let mut workflow = Pipeline::new();
+//! let mut world = World::new();
+//! let mut page = [0_u8; 256];
+//! let mut result = [0_u8; 64];
+//!
+//! let progress = Driver::new(region, RunId(1), reserve)
+//!     .boot(&mut device, &mut world, &mut workflow, Scratch { page: &mut page, result: &mut result })
+//!     .expect("the run completes");
+//!
+//! assert_eq!(
+//!     progress,
+//!     Progress::Finished { conclusion: Conclusion::Completed, result_len: HASHED.len() }
+//! );
+//! ```
 //!
 //! [`Pipeline`] is also the shape a workflow has to have against a synchronous boundary:
 //! every result is copied into the workflow's own storage before the next call, because the
@@ -18,12 +53,10 @@ use waymaker_core::version::GateId;
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, Outcome};
 
-use crate::effect::CheckedDispatch;
+use waymaker_drive::{
+    Activities, Boundary, CheckedDispatch, Clocks, Identity, Performed, Suspended, Workflow,
+};
 use waymaker_flash::capacity::Bounds;
-
-use crate::activity::{Activities, Clocks, Performed};
-use crate::boundary::{Boundary, Suspended};
-use crate::workflow::{Identity, Workflow};
 
 /// Fetch bytes from somewhere outside the device.
 pub const DOWNLOAD: ActivityKind = ActivityKind(1);
@@ -379,7 +412,7 @@ impl World {
     /// Every effect this world **performed**, in order, up to [`DISPATCH_LOG`].
     ///
     /// An effect answered [`Performed::Pending`] is not one of them: the world was asked and
-    /// declined, and nothing reached the outside. `crates/waymaker-drive/tests/crash.rs`
+    /// declined, and nothing reached the outside. `crates/waymaker-facade-demo/tests/crash.rs`
     /// reads this as the list of effects that really happened, so counting a declined one
     /// would make its durable-intent sweep assert about an effect nobody performed.
     #[must_use]

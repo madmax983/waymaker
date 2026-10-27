@@ -6,7 +6,7 @@
 //! `PersistentClock` and neither decides policy.
 //!
 //! What is tested here is the *refusal*. A deadline's arithmetic is `waymaker-core`'s and
-//! the end-to-end power cut is `waymaker-drive/tests/power_loss.rs`'s. What a driver owes
+//! the end-to-end power cut is `waymaker-facade-demo/tests/power_loss.rs`'s. What a driver owes
 //! is that a reading it cannot vouch for is an error and never a number: a zero fires every
 //! persistent deadline at once, and a maximum fires none of them.
 //!

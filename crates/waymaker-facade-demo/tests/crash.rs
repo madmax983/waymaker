@@ -30,11 +30,11 @@
 use core::cell::RefCell;
 
 use waymaker_core::{EffectId, EffectSeq, RecordRef, RunId};
-use waymaker_drive::demo::{
+use waymaker_drive::{DriveError, Driver, Scratch};
+use waymaker_facade_demo::demo::{
     BOUNDS, DELAYED_BOUNDS, DOWNLOAD, DOWNLOADED, Delayed, HASHED, Pipeline, WORKFLOW_KIND,
     WORKFLOW_VERSION, World,
 };
-use waymaker_drive::{DriveError, Driver, Scratch};
 use waymaker_fault::{Device, FaultError, Harness, Session};
 use waymaker_flash::append::Journal;
 use waymaker_flash::bank::BankLayout;

@@ -13,10 +13,10 @@
 use core::cell::RefCell;
 use core::task::{Context as Task, Poll};
 
+use waymaker_bridge::Bridge;
 use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{ActivityKind, EffectId, EffectSeq, Outcome, RecordRef, RunId};
-use waymaker_drive::demo::{BOUNDS as DEMO_BOUNDS, Pipeline, World as SyncWorld};
 use waymaker_drive::{
     Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
@@ -24,7 +24,7 @@ use waymaker_drive::{
 use waymaker_embassy::ActivityDispatcher;
 use waymaker_embassy::ctx::Ctx;
 use waymaker_embassy::dispatch::Produced;
-use waymaker_facade_demo::Bridge;
+use waymaker_facade_demo::demo::{BOUNDS as DEMO_BOUNDS, Pipeline, World as SyncWorld};
 use waymaker_facade_demo::ota::{
     BOUNDS, CONTEXT_BYTES, DOWNLOAD, Downloader, FLASH_IMAGE, HANDLE, Ota, URL, VERIFY_SIGNATURE,
     WORKFLOW_FUTURES, WORKFLOW_KIND, WORKFLOW_VERSION, poll_ota,

@@ -77,6 +77,12 @@ pub const ENGINE_FEATURE: &str = "engine";
 /// The probe feature that also links the Embassy façade.
 pub const FACADE_FEATURE: &str = "facade";
 
+/// The probe feature that links `waymaker-drive` on top of the engine (ADR 0055).
+pub const DRIVE_FEATURE: &str = "drive";
+
+/// The probe feature that links `waymaker-bridge`, and with it the façade and the driver.
+pub const BRIDGE_FEATURE: &str = "bridge";
+
 /// The probe feature that links ADR 0010's five checksum candidates.
 ///
 /// Independent of every layer: no `dep:` entry, so it needs no mirror and
@@ -192,6 +198,8 @@ pub const PINNED_ROW_FEATURES: &[(&str, &[&str])] = &[
     (BASELINE_ROW, &[PROBE_FEATURE]),
     (DEFAULT_ROW, &[PROBE_FEATURE, ENGINE_FEATURE]),
     (FACADE_ROW, &[PROBE_FEATURE, FACADE_FEATURE]),
+    (DRIVE_ROW, &[PROBE_FEATURE, DRIVE_FEATURE]),
+    (BRIDGE_ROW, &[PROBE_FEATURE, BRIDGE_FEATURE]),
 ];
 
 /// The row that links the façade as well, named after [`FACADE_FEATURE`].
@@ -199,6 +207,12 @@ pub const PINNED_ROW_FEATURES: &[(&str, &[&str])] = &[
 /// An alias rather than a second literal: the row is named after the feature that builds
 /// it, so the two cannot drift apart.
 pub const FACADE_ROW: &str = FACADE_FEATURE;
+
+/// The row that links the driver on the engine, named after [`DRIVE_FEATURE`].
+pub const DRIVE_ROW: &str = DRIVE_FEATURE;
+
+/// The row that links the bridge, the façade and the driver, named after [`BRIDGE_FEATURE`].
+pub const BRIDGE_ROW: &str = BRIDGE_FEATURE;
 
 /// Incremental code-flash budget, from [`waymaker_core::budget`].
 pub const INCREMENTAL_CODE_FLASH_BUDGET_BYTES: u64 =
@@ -219,9 +233,16 @@ pub const RUNTIME_RAM_BUDGET_BYTES: u64 = waymaker_core::budget::RUNTIME_RAM_BYT
 /// The caller-owned scratch page §04 states the runtime RAM budget with.
 pub const SCRATCH_PAGE_BYTES: u64 = waymaker_core::budget::SCRATCH_PAGE_BYTES as u64;
 
-/// The code-flash ceiling for the three layers with the façade linked.
+/// The code-flash ceiling for the engine with the façade linked.
 pub const FACADE_CODE_FLASH_BUDGET_BYTES: u64 =
     waymaker_core::budget::FACADE_CODE_FLASH_BYTES as u64;
+
+/// The code-flash ceiling for the engine with the driver linked.
+pub const DRIVE_CODE_FLASH_BUDGET_BYTES: u64 = waymaker_core::budget::DRIVE_CODE_FLASH_BYTES as u64;
+
+/// The code-flash ceiling for every layer linked at once: engine, driver, façade and bridge.
+pub const BRIDGE_CODE_FLASH_BUDGET_BYTES: u64 =
+    waymaker_core::budget::BRIDGE_CODE_FLASH_BYTES as u64;
 
 /// One image the matrix links.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,9 +271,15 @@ pub struct Variant {
 /// rather than measured as zero.
 #[must_use]
 pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
-    if graph.find(PROBE_PACKAGE).is_none() {
+    let Some(probe) = graph.find(PROBE_PACKAGE) else {
         return Vec::new();
-    }
+    };
+    // ADR 0055's two rows exist only where the probe can build them. The
+    // current checkout always can — `gated_row_shortfalls` refuses a report
+    // without them — but `--base` measures an older checkout with this
+    // binary, and asking that probe for a feature it never declared fails
+    // the whole base build, so the diff of every *other* row is lost too.
+    let declares = |feature: &str| probe.features.iter().any(|have| have == feature);
 
     let mut variants = vec![
         Variant {
@@ -280,6 +307,28 @@ pub fn matrix(graph: &PackageGraph) -> Vec<Variant> {
             gated: true,
         },
     ];
+    if declares(DRIVE_FEATURE) {
+        variants.push(Variant {
+            // ADR 0055: the driver is a layer, so its row is gated against a ceiling of its
+            // own for the façade's reason — §04's number is for "core + flash adapter", and
+            // the driver is neither.
+            name: DRIVE_ROW.to_owned(),
+            features: vec![PROBE_FEATURE.to_owned(), DRIVE_FEATURE.to_owned()],
+            measured_against: DEFAULT_ROW.to_owned(),
+            gated: true,
+        });
+    }
+    if declares(BRIDGE_FEATURE) {
+        variants.push(Variant {
+            // Every layer at once: what a firmware that writes `async fn` workflows and runs
+            // them on flash links. Measured against the façade row, so `over base` is what
+            // the driver and the bridge add to a firmware that already had the façade.
+            name: BRIDGE_ROW.to_owned(),
+            features: vec![PROBE_FEATURE.to_owned(), BRIDGE_FEATURE.to_owned()],
+            measured_against: FACADE_ROW.to_owned(),
+            gated: true,
+        });
+    }
 
     for spec in policy::LAYERS {
         let Some(package) = graph.find(spec.name) else {
@@ -1015,12 +1064,20 @@ pub enum Budget {
     EngineStatics,
     /// `waymaker-core` state only, no page buffer.
     KernelState,
-    /// The code-flash ceiling for the three layers with the façade linked.
+    /// The code-flash ceiling for the engine with the façade linked.
     ///
     /// Its own number rather than the engine's, because design document §04 states the
     /// engine's for "core + flash adapter" and the façade is a third crate. See
     /// `waymaker_core::budget::FACADE_CODE_FLASH_BYTES`.
     FacadeCodeFlash,
+    /// The code-flash ceiling for the engine with the driver linked (ADR 0055).
+    ///
+    /// See `waymaker_core::budget::DRIVE_CODE_FLASH_BYTES`.
+    DriveCodeFlash,
+    /// The code-flash ceiling for every layer at once (ADR 0055).
+    ///
+    /// See `waymaker_core::budget::BRIDGE_CODE_FLASH_BYTES`.
+    BridgeCodeFlash,
     /// What the context may occupy of what the scratch page leaves.
     ContextRam,
     /// §04's whole runtime RAM sentence: scratch page, kernel state, context and statics.
@@ -1039,6 +1096,8 @@ impl Budget {
             Self::EngineStatics => ENGINE_RAM_BUDGET_BYTES,
             Self::KernelState => KERNEL_STATE_BUDGET_BYTES,
             Self::FacadeCodeFlash => FACADE_CODE_FLASH_BUDGET_BYTES,
+            Self::DriveCodeFlash => DRIVE_CODE_FLASH_BUDGET_BYTES,
+            Self::BridgeCodeFlash => BRIDGE_CODE_FLASH_BUDGET_BYTES,
             Self::ContextRam => CONTEXT_RAM_BUDGET_BYTES,
             Self::RuntimeRam => RUNTIME_RAM_BUDGET_BYTES,
         }
@@ -1052,6 +1111,8 @@ impl Budget {
             Self::EngineStatics => "engine statics (.data + .bss)",
             Self::KernelState => "kernel state",
             Self::FacadeCodeFlash => "incremental code flash with the facade",
+            Self::DriveCodeFlash => "incremental code flash with the driver",
+            Self::BridgeCodeFlash => "incremental code flash with every layer",
             Self::ContextRam => "context",
             Self::RuntimeRam => "runtime RAM",
         }
@@ -1066,10 +1127,11 @@ impl Budget {
 /// early rather than passing under the wider one.
 #[must_use]
 pub fn code_flash_budget_for(row: &str) -> Budget {
-    if row == FACADE_ROW {
-        Budget::FacadeCodeFlash
-    } else {
-        Budget::IncrementalCodeFlash
+    match row {
+        FACADE_ROW => Budget::FacadeCodeFlash,
+        DRIVE_ROW => Budget::DriveCodeFlash,
+        BRIDGE_ROW => Budget::BridgeCodeFlash,
+        _ => Budget::IncrementalCodeFlash,
     }
 }
 
@@ -1677,6 +1739,14 @@ impl SizeReport {
                 FACADE_ROW,
                 "the configuration rung 0.4 ships, which is what issue #39 asks the budgets to be paid on",
             ),
+            (
+                DRIVE_ROW,
+                "the driver ADR 0055 made a layer, which has a ceiling of its own",
+            ),
+            (
+                BRIDGE_ROW,
+                "every layer at once, which is what a firmware running `async fn` workflows on flash links",
+            ),
         ] {
             if !self.rows.iter().any(|have| have.name == row && have.gated) {
                 shortfalls.push(BudgetShortfall::Unmeasurable {
@@ -1868,7 +1938,7 @@ impl SizeReport {
         }
 
         table.push(format!(
-            "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B on `{DEFAULT_ROW}` and {FACADE_CODE_FLASH_BUDGET_BYTES} B on `{FACADE_ROW}`; runtime RAM {RUNTIME_RAM_BUDGET_BYTES} B, which is the one gated as a whole. Its sub-caps overlap rather than partition it and are read one at a time: engine statics {ENGINE_RAM_BUDGET_BYTES} B, context {CONTEXT_RAM_BUDGET_BYTES} B, kernel state {KERNEL_STATE_BUDGET_BYTES} B, after a {SCRATCH_PAGE_BYTES} B caller-owned scratch page\n"
+            "\nbudgets: incremental code flash {INCREMENTAL_CODE_FLASH_BUDGET_BYTES} B on `{DEFAULT_ROW}`, {FACADE_CODE_FLASH_BUDGET_BYTES} B on `{FACADE_ROW}`, {DRIVE_CODE_FLASH_BUDGET_BYTES} B on `{DRIVE_ROW}` and {BRIDGE_CODE_FLASH_BUDGET_BYTES} B on `{BRIDGE_ROW}`; runtime RAM {RUNTIME_RAM_BUDGET_BYTES} B, which is the one gated as a whole. Its sub-caps overlap rather than partition it and are read one at a time: engine statics {ENGINE_RAM_BUDGET_BYTES} B, context {CONTEXT_RAM_BUDGET_BYTES} B, kernel state {KERNEL_STATE_BUDGET_BYTES} B, after a {SCRATCH_PAGE_BYTES} B caller-owned scratch page\n"
         ));
         table.push(format!(
             "code flash: `layers` is what is gated. `\u{394}flash` is the whole image delta and `probe` is the part of it the symbol table names as {PROBE_PACKAGE}'s own arithmetic, which exists only to keep the layers' code alive past --gc-sections. Both are deltas against the baseline image, whose own probe symbols are {} B. `probe` keeps its sign — a probe that shrank reads negative — so that `probe` + `layers` reconciles with `\u{394}flash`. Every byte no symbol attributes to the probe stays in `layers`.\n",
@@ -2049,6 +2119,14 @@ impl SizeReport {
         budgets.insert(
             "facade_code_flash".to_owned(),
             Value::from(FACADE_CODE_FLASH_BUDGET_BYTES),
+        );
+        budgets.insert(
+            "drive_code_flash".to_owned(),
+            Value::from(DRIVE_CODE_FLASH_BUDGET_BYTES),
+        );
+        budgets.insert(
+            "bridge_code_flash".to_owned(),
+            Value::from(BRIDGE_CODE_FLASH_BUDGET_BYTES),
         );
         budgets.insert(
             "context_ram".to_owned(),
@@ -4509,15 +4587,48 @@ mod tests {
             Package::new("waymaker-core").with_features(core_features),
             Package::new("waymaker-flash"),
             Package::new("waymaker-embassy").with_features(embassy_features),
-            Package::new(PROBE_PACKAGE).with_features(&["probe", "engine", "facade"]),
+            Package::new(PROBE_PACKAGE)
+                .with_features(&["probe", "engine", "facade", "drive", "bridge"]),
         ])
+    }
+
+    /// Codex's review of ADR 0055: `--base` measures an older checkout with this binary, and
+    /// a probe from before the driver and the bridge were layers declares neither feature.
+    /// Asking it for them failed the base build and lost the diff of every row.
+    #[test]
+    fn a_probe_from_before_the_driver_rows_is_measured_without_them() {
+        let graph = PackageGraph::new(vec![
+            Package::new("waymaker-core"),
+            Package::new("waymaker-flash"),
+            Package::new("waymaker-embassy"),
+            Package::new(PROBE_PACKAGE).with_features(&["probe", "engine", "facade"]),
+        ]);
+        let names: Vec<String> = matrix(&graph).into_iter().map(|v| v.name).collect();
+        assert_eq!(names, ["baseline", "default", "facade"]);
+    }
+
+    /// The rows are still compulsory where the gate runs: a report without them cannot be
+    /// gated, whatever the probe declares.
+    #[test]
+    fn a_report_without_the_driver_rows_cannot_be_gated() {
+        let report = SizeReport::new(
+            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            Some(fixture_kernel_state()),
+            Some(fixture_runtime()),
+        )
+        .with_checksum_candidates(Some(fixture_checksum_candidates()));
+        let message = rendered(&report.shortfalls());
+        assert!(
+            message.contains(DRIVE_ROW) && message.contains(BRIDGE_ROW),
+            "{message}"
+        );
     }
 
     #[test]
     fn the_matrix_always_starts_with_a_baseline_and_the_default_engine() {
         let variants = matrix(&workspace(&[], &[]));
         let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(names, ["baseline", "default", "facade"]);
+        assert_eq!(names, ["baseline", "default", "facade", "drive", "bridge"]);
 
         let baseline = variants.first().expect("a baseline row");
         assert_eq!(baseline.features, [PROBE_FEATURE]);
@@ -4541,6 +4652,8 @@ mod tests {
                 "baseline",
                 "default",
                 "facade",
+                "drive",
+                "bridge",
                 "waymaker-core/crc-soft",
                 "waymaker-core/postcard",
                 "waymaker-core/serde",
@@ -4825,6 +4938,44 @@ mod tests {
         )
     }
 
+    /// A `drive` row: the engine plus the driver, gated against its own ceiling (ADR 0055).
+    fn drive_row(flash_over_baseline: u64, ram_over_baseline: u64) -> Row {
+        let base = baseline_sizes();
+        Row::new(
+            DRIVE_ROW,
+            &[PROBE_FEATURE, DRIVE_FEATURE],
+            DEFAULT_ROW,
+            SectionSizes {
+                text: base.text + flash_over_baseline,
+                flash: base.flash + flash_over_baseline,
+                bss: ram_over_baseline,
+                ram: ram_over_baseline,
+                ..base
+            },
+            BASELINE_PROBE_FLASH,
+            true,
+        )
+    }
+
+    /// A `bridge` row: every layer at once, gated against its own ceiling (ADR 0055).
+    fn bridge_row(flash_over_baseline: u64, ram_over_baseline: u64) -> Row {
+        let base = baseline_sizes();
+        Row::new(
+            BRIDGE_ROW,
+            &[PROBE_FEATURE, BRIDGE_FEATURE],
+            FACADE_ROW,
+            SectionSizes {
+                text: base.text + flash_over_baseline,
+                flash: base.flash + flash_over_baseline,
+                bss: ram_over_baseline,
+                ram: ram_over_baseline,
+                ..base
+            },
+            BASELINE_PROBE_FLASH,
+            true,
+        )
+    }
+
     /// A kernel-state registry of known contents.
     ///
     /// Fixed rather than `KernelState::measured()`. These tests are about the gate's
@@ -4859,6 +5010,8 @@ mod tests {
                 baseline_row(),
                 default_row(default_flash, default_ram),
                 facade_row(facade_flash, facade_ram),
+                drive_row(facade_flash, facade_ram),
+                bridge_row(facade_flash, facade_ram),
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
@@ -4869,7 +5022,13 @@ mod tests {
     /// A report within every budget whose one workflow future is `bytes` wide.
     fn with_future(bytes: u64) -> SizeReport {
         SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: 24,
@@ -5113,6 +5272,8 @@ mod tests {
                     BASELINE_PROBE_FLASH + 200,
                 ),
                 facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
             ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
@@ -5456,7 +5617,14 @@ mod tests {
             RUNTIME_RAM_BUDGET_BYTES + 1_000,
         );
         let report = SizeReport::new(
-            vec![baseline_row(), default, facade_row(1_024, 0), huge],
+            vec![
+                baseline_row(),
+                default,
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+                huge,
+            ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         );
@@ -5491,7 +5659,13 @@ mod tests {
             "{expected:?}"
         );
 
-        let complete = vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)];
+        let complete = vec![
+            baseline_row(),
+            default_row(1_024, 0),
+            facade_row(1_024, 0),
+            drive_row(1_024, 0),
+            bridge_row(1_024, 0),
+        ];
         let rows: Vec<Row> = expected
             .iter()
             .filter(|variant| !complete.iter().any(|row| row.name == variant.name))
@@ -5545,7 +5719,13 @@ mod tests {
         // was really measured against.
         let graph = PackageGraph::new(vec![Package::new("waymaker-core")]);
         assert!(matrix(&graph).is_empty());
-        let rows = vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)];
+        let rows = vec![
+            baseline_row(),
+            default_row(1_024, 0),
+            facade_row(1_024, 0),
+            drive_row(1_024, 0),
+            bridge_row(1_024, 0),
+        ];
         let shortfalls = missing_rows(&matrix(&graph), &rows);
         assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
         assert!(
@@ -5589,7 +5769,13 @@ mod tests {
     #[test]
     fn a_context_over_its_share_names_the_context_budget() {
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: CONTEXT_RAM_BUDGET_BYTES + 1,
@@ -5607,7 +5793,13 @@ mod tests {
     #[test]
     fn a_report_with_no_runtime_ram_section_is_not_a_pass() {
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             None,
         );
@@ -5622,7 +5814,13 @@ mod tests {
         // is a measurement that did not happen, and reading it as "no futures" is how the
         // one thing the report was asked to make visible disappears.
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: 24,
@@ -5636,7 +5834,13 @@ mod tests {
     #[test]
     fn a_context_that_measures_nothing_is_not_a_pass() {
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: 0,
@@ -5653,7 +5857,13 @@ mod tests {
         // term missing is a smaller number than the truth. The fourth of the four fail-closed
         // cases, and the one a base-branch-shaped artifact would land on.
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             None,
             Some(fixture_runtime()),
         );
@@ -5664,7 +5874,13 @@ mod tests {
     #[test]
     fn two_workflow_futures_under_one_name_are_not_a_pass() {
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(RuntimeRam {
                 context: 56,
@@ -5683,7 +5899,13 @@ mod tests {
         let mut seeded = baseline_row();
         seeded.features = vec![PROBE_FEATURE.to_owned(), ENGINE_FEATURE.to_owned()];
         let report = SizeReport::new(
-            vec![seeded, default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                seeded,
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         );
@@ -5718,7 +5940,13 @@ mod tests {
         let mut mislabelled = default_row(1_024, 0);
         mislabelled.features = vec![PROBE_FEATURE.to_owned(), FACADE_FEATURE.to_owned()];
         let report = SizeReport::new(
-            vec![baseline_row(), mislabelled, facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                mislabelled,
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         );
@@ -6099,7 +6327,13 @@ mod tests {
         // in `xtask/tests/size_budgets.rs`) or a stripped one, and both are refused
         // alike.
         let report = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         );
@@ -6260,7 +6494,13 @@ mod tests {
     #[test]
     fn a_report_with_no_checksum_candidates_renders_no_section_for_them() {
         let table = SizeReport::new(
-            vec![baseline_row(), default_row(1_024, 0), facade_row(1_024, 0)],
+            vec![
+                baseline_row(),
+                default_row(1_024, 0),
+                facade_row(1_024, 0),
+                drive_row(1_024, 0),
+                bridge_row(1_024, 0),
+            ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         )
@@ -6703,6 +6943,8 @@ mod tests {
                 baseline_row(),
                 default.clone(),
                 facade_row(20, 0),
+                drive_row(20, 0),
+                bridge_row(20, 0),
                 feature_row(
                     "waymaker-core/serde",
                     &default,
@@ -7138,8 +7380,32 @@ mod tests {
             BASELINE_PROBE_FLASH,
             true,
         );
+        let shifted = |name: &str, features: &[&str], against: &str| {
+            Row::new(
+                name,
+                features,
+                against,
+                SectionSizes {
+                    flash: bigger_baseline.sizes.flash + 500,
+                    text: bigger_baseline.sizes.text + 500,
+                    bss: 16,
+                    ram: 16,
+                    ..bigger_baseline.sizes
+                },
+                BASELINE_PROBE_FLASH,
+                true,
+            )
+        };
+        let shifted_drive = shifted(DRIVE_ROW, &[PROBE_FEATURE, DRIVE_FEATURE], DEFAULT_ROW);
+        let shifted_bridge = shifted(BRIDGE_ROW, &[PROBE_FEATURE, BRIDGE_FEATURE], FACADE_ROW);
         let head = SizeReport::new(
-            vec![bigger_baseline, shifted_default, shifted_facade],
+            vec![
+                bigger_baseline,
+                shifted_default,
+                shifted_facade,
+                shifted_drive,
+                shifted_bridge,
+            ],
             Some(fixture_kernel_state()),
             Some(fixture_runtime()),
         );
@@ -7356,7 +7622,13 @@ mod tests {
             Package::new("waymaker-flash"),
             Package::new("waymaker-embassy"),
             Package::new(PROBE_PACKAGE)
-                .with_features(&[ENGINE_FEATURE, FACADE_FEATURE, PROBE_FEATURE])
+                .with_features(&[
+                    ENGINE_FEATURE,
+                    FACADE_FEATURE,
+                    DRIVE_FEATURE,
+                    BRIDGE_FEATURE,
+                    PROBE_FEATURE,
+                ])
                 .with_bin(PROBE_PACKAGE, &[PROBE_FEATURE]),
         ])
     }

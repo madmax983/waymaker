@@ -36,12 +36,12 @@ use waymaker_core::version::VersionRange;
 use waymaker_core::{
     ActivityKind, EffectId, EffectIdAllocator, EffectSeq, KernelError, Outcome, RecordRef, RunId,
 };
-use waymaker_drive::demo::{
-    BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
-};
 use waymaker_drive::{
     Activities, Boundary, Clocks, Conclusion, DriveError, Driver, Identity, Progress, Scratch,
     Suspended, Workflow,
+};
+use waymaker_facade_demo::demo::{
+    BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;

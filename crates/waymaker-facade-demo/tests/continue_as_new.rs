@@ -1,7 +1,7 @@
 //! Issue [#110](https://github.com/madmax983/waymaker/issues/110)'s `continue_as_new` join:
 //! a [`Driver::at_bank`] performs design document §10's real swap, over real media.
 //!
-//! `crates/waymaker-drive/tests/ota.rs`'s
+//! `crates/waymaker-facade-demo/tests/ota.rs`'s
 //! `continue_as_new_is_refused_by_a_driver_that_cannot_name_a_bank` is the other half —
 //! [`Driver::new`], pointed at a fixed region, still refuses. This file is the driver that
 //! can.
@@ -433,7 +433,7 @@ fn a_driver_at_a_bank_performs_a_real_swap_and_installs_the_next_run_in_the_othe
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -482,7 +482,7 @@ fn continue_as_new_stamps_the_new_bank_with_the_images_current_version_not_the_r
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut UpgradingContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -499,7 +499,7 @@ fn continue_as_new_stamps_the_new_bank_with_the_images_current_version_not_the_r
     // v1 rather than the v2 this call was actually made under.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStartedAfterUpgrade,
         scratch(&mut page, &mut result),
     );
@@ -532,7 +532,7 @@ fn a_later_image_that_dropped_the_headers_own_version_still_resumes_the_runs_rec
     // v2, still admitting the header's own v1, boots this bank for the first time.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut WaitingAtVersion::new(WORKFLOW_VERSION, WORKFLOW_VERSION + 1),
         scratch(&mut page, &mut result),
     );
@@ -544,7 +544,7 @@ fn a_later_image_that_dropped_the_headers_own_version_still_resumes_the_runs_rec
     // v3, admitting only the version the journal actually recorded and nothing below it.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut WaitingAtVersion::new(WORKFLOW_VERSION + 1, WORKFLOW_VERSION + 1),
         scratch(&mut page, &mut result),
     );
@@ -562,7 +562,7 @@ fn the_next_boot_of_the_same_layout_replays_the_bank_the_swap_installed() {
     let mut result = [0_u8; 16];
     let Ok(Progress::Migrated { run: next_run }) = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     ) else {
@@ -573,7 +573,7 @@ fn the_next_boot_of_the_same_layout_replays_the_bank_the_swap_installed() {
     // authoritative was carried over from the first boot.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: NEXT_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -598,7 +598,7 @@ fn the_next_boot_of_the_same_layout_replays_the_bank_the_swap_installed() {
     // chosen to differ from both.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted {
             input: b"neither-run-ever-declared-this",
         },
@@ -615,7 +615,7 @@ fn a_committed_effect_is_not_forfeited_by_a_live_continue_as_new() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ScheduleThenContinue,
         scratch(&mut page, &mut result),
     );
@@ -645,7 +645,7 @@ fn continue_as_new_refuses_when_this_replay_never_consumed_committed_history() {
     // A previous boot leaves a durable, unresolved schedule record behind.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ScheduleThenContinue,
         scratch(&mut page, &mut result),
     );
@@ -654,7 +654,7 @@ fn continue_as_new_refuses_when_this_replay_never_consumed_committed_history() {
     // This replay's own logic never asks for it before trying to migrate.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -674,7 +674,7 @@ fn an_oversized_next_run_input_is_refused_before_the_device_is_touched() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueWithOversizedInput,
         scratch(&mut page, &mut result),
     );
@@ -711,7 +711,7 @@ fn a_run_id_at_the_ceiling_is_refused_rather_than_reissued() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -729,7 +729,7 @@ fn a_driver_at_a_bank_with_no_sealed_bank_refuses_to_boot() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -755,7 +755,7 @@ fn a_driver_at_a_bank_with_both_banks_sealed_at_one_generation_refuses_ambiguous
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -785,7 +785,7 @@ fn a_stale_bank_is_never_a_candidate_once_a_later_generation_exists() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -844,7 +844,7 @@ fn a_driver_pointed_at_a_region_still_refuses_to_swap() {
 
     let progress = Driver::new(first_region(), RUN, reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -910,7 +910,7 @@ fn a_failed_reclaim_does_not_turn_a_successful_migration_into_a_failure() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut storage,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -928,7 +928,7 @@ fn a_failed_reclaim_does_not_turn_a_successful_migration_into_a_failure() {
     assert!(header_on(&mut device, BankId::A).is_some());
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: NEXT_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -970,7 +970,7 @@ fn a_seal_read_is_aligned_to_the_devices_own_read_unit_not_a_bare_constant() {
 
     let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -1024,7 +1024,7 @@ fn an_undersized_page_refuses_rather_than_reviving_a_retired_bank() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         Scratch {
             page: &mut page,
@@ -1075,7 +1075,7 @@ fn read_bank_uses_the_whole_page_for_the_header_once_the_seal_is_a_scalar() {
 
     let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: &wide_input },
         Scratch {
             page: &mut page,
@@ -1134,7 +1134,7 @@ fn an_unsealed_banks_oversized_header_never_blocks_the_smaller_sealed_authority(
 
     let progress = Driver::at_bank(layout, reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         Scratch {
             page: &mut page,
@@ -1179,7 +1179,7 @@ fn header_read_length_is_rounded_down_to_a_whole_read_unit() {
 
     let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         Scratch {
             page: &mut page,
@@ -1241,7 +1241,7 @@ fn a_retired_banks_oversized_header_never_blocks_the_smaller_authoritative_bank(
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         Scratch {
             page: &mut page,
@@ -1306,7 +1306,7 @@ fn a_page_too_small_for_an_oversized_header_reports_the_actual_size_it_needs() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         Scratch {
             page: &mut page,
@@ -1351,7 +1351,7 @@ fn a_page_too_small_for_even_the_prefix_reports_the_prefix_size_not_the_whole_ba
     let mut result = [0_u8; 16];
     let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         Scratch {
             page: &mut page,
@@ -1408,7 +1408,7 @@ fn the_reported_size_is_rounded_up_so_a_caller_retrying_with_it_exactly_converge
     let mut result = [0_u8; 16];
     let progress = Driver::at_bank(layout, reserve_for(layout)).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted {
             input: &unaligned_input,
         },
@@ -1439,7 +1439,7 @@ fn the_reported_size_is_rounded_up_so_a_caller_retrying_with_it_exactly_converge
     let mut result2 = [0_u8; 16];
     let progress2 = Driver::at_bank(layout, reserve_for(layout)).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted {
             input: &unaligned_input,
         },
@@ -1518,7 +1518,7 @@ fn a_stale_oversized_bank_never_inflates_the_reported_size_the_real_authority_ne
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         Scratch {
             page: &mut page,
@@ -1541,7 +1541,7 @@ fn a_stale_oversized_bank_never_inflates_the_reported_size_the_real_authority_ne
     let mut result2 = [0_u8; 16];
     let progress2 = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         Scratch {
             page: &mut page2,
@@ -1573,7 +1573,7 @@ fn an_empty_banks_header_version_is_admitted_before_a_rolled_back_image_claims_i
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut UpgradingContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -1589,7 +1589,7 @@ fn an_empty_banks_header_version_is_admitted_before_a_rolled_back_image_claims_i
     // authorship of the run the swap already recorded.
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut RolledBackToFirstVersion,
         scratch(&mut page, &mut result),
     );
@@ -1675,7 +1675,7 @@ fn a_reserve_priced_for_another_layout_is_refused_before_the_swap_touches_anythi
 
     let progress = Driver::at_bank(layout(), mismatched).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut ContinueOnce,
         scratch(&mut page, &mut result),
     );
@@ -1758,7 +1758,7 @@ fn a_stale_banks_unreadable_header_never_blocks_the_intact_authoritative_bank() 
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut storage,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -1814,7 +1814,7 @@ fn a_higher_generations_unusable_journal_layout_is_never_ignored_for_a_stale_ban
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -1945,7 +1945,7 @@ fn a_higher_generation_banks_unsupported_format_version_is_never_ignored_for_a_s
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -1974,7 +1974,7 @@ fn a_page_smaller_than_the_seal_itself_reports_page_too_small() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut device,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         Scratch {
             page: &mut page,
@@ -2043,7 +2043,7 @@ fn a_seal_read_error_is_reported_immediately_with_no_bank_to_defer_to() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut storage,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -2116,7 +2116,7 @@ fn two_unreadable_banks_report_the_higher_generations_own_error() {
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut storage,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         scratch(&mut page, &mut result),
     );
@@ -2174,7 +2174,7 @@ fn an_oversized_bank_and_an_unreadable_bank_prefer_the_higher_generations_own_an
 
     let progress = Driver::at_bank(layout(), reserve()).boot(
         &mut storage,
-        &mut waymaker_drive::demo::World::new(),
+        &mut waymaker_facade_demo::demo::World::new(),
         &mut JustStarted { input: FIRST_INPUT },
         Scratch {
             page: &mut page,
@@ -2245,7 +2245,7 @@ const fn small_header(run: RunId, layout: BankLayout) -> BankHeader<'static> {
 /// small enough that the second effect's own schedule is the one that meets §10's reserve,
 /// with the first already committed.
 ///
-/// Neither activity kind is one [`waymaker_drive::demo::World`] treats specially, so both
+/// Neither activity kind is one [`waymaker_facade_demo::demo::World`] treats specially, so both
 /// answer its four-byte default and never [`waymaker_core::activity::Performed::Exhausted`].
 struct TwoEffectsNoRollover;
 
@@ -2268,7 +2268,7 @@ impl Workflow for TwoEffectsNoRollover {
 /// A layout, reserve and freshly booted bank A small enough that
 /// [`TwoEffectsNoRollover`]'s second effect is the one Codex's round 12 finding is about —
 /// searched for rather than written down, so the number comes from the reserve's own
-/// arithmetic over real records, the way `crates/waymaker-drive/tests/matrix.rs`'s own
+/// arithmetic over real records, the way `crates/waymaker-facade-demo/tests/matrix.rs`'s own
 /// `near_capacity` is.
 fn near_capacity() -> (BankLayout, Reserve) {
     for blocks_per_bank in 1_u32..=8 {
@@ -2286,7 +2286,7 @@ fn near_capacity() -> (BankLayout, Reserve) {
         );
         let mut page = [0_u8; 512];
         let mut result = [0_u8; 16];
-        let mut world = waymaker_drive::demo::World::new();
+        let mut world = waymaker_facade_demo::demo::World::new();
         let progress = Driver::at_bank(layout, reserve).boot(
             &mut device,
             &mut world,
@@ -2341,7 +2341,7 @@ fn a_near_capacity_refusal_is_still_a_live_rollover_exit_in_the_same_boot() {
     );
     let mut page = [0_u8; 512];
     let mut result = [0_u8; 16];
-    let mut world = waymaker_drive::demo::World::new();
+    let mut world = waymaker_facade_demo::demo::World::new();
 
     let progress = Driver::at_bank(layout, reserve).boot(
         &mut device,

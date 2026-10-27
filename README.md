@@ -54,13 +54,17 @@ moves forward.
 | --- | --- | --- |
 | `waymaker-core` | Borrowed record views, effect identity, replay cursor, transition rules, timer semantics and the clock-kind vocabulary, capacity errors | Allocation, serialization framework, CRC, clock, storage driver, executor, logging |
 | `waymaker-flash` | Stable wire encoding, the storage contract and its geometry, CRC/seals, the commit seal and the two-barrier write discipline, the two-bank layout, bank selection, append scanning, storage-backed recovery and the append offset, compaction transition | Activities, workflow types, timers, Embassy |
+| `waymaker-drive` | The synchronous driver of the kernel boundary: the recovery scan and two-barrier writer joined to the transition table, the seven-step effect protocol, the boundary, workflow and activity traits | On-media authority, the transition table, futures, Embassy, allocation |
 | `waymaker-embassy` | `Ctx`, activity futures, dispatcher, wakeups, the persistent-clock capability, optional typed codec helpers | On-media authority or hidden global state |
+| `waymaker-bridge` | `Bridge`: the driver's boundary as the façade's journal, so an `async fn` workflow over `Ctx` runs on flash | On-media authority, workflows, or a dispatcher |
 
 Dependency direction is strict, in one line: `waymaker-embassy` → `waymaker-flash` →
-`waymaker-core`. The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI
+`waymaker-core`, with `waymaker-drive` beside the façade on the same two crates and never
+reaching it, and `waymaker-bridge` above both
+([ADR 0055](docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md)). The kernel is `no_std`, `no_alloc`, and dependency-free. This is a CI
 gate, not a convention — see [Development](#development).
 
-Nine further workspace members are not layers, and no layer may depend on any of them:
+Eight further workspace members are not layers, and no layer may depend on any of them:
 `xtask` is the gate itself; `waymaker-size-probe` is firmware linked only so its section
 sizes can be measured; `waymaker-emu` is firmware linked and *run*, on two emulated
 cores, so the rig below executes real instructions rather than only compiling; `waymaker-fault`
@@ -68,10 +72,9 @@ is the crash harness; `waymaker-spec` is the formal specification of the recover
 invariants; `waymaker-conformance` is the storage-contract suite and the
 `embedded-storage` port; `waymaker-rig` is the power-cut and watchdog-reset rig and the
 two board clocks (an RTC in a backed-up domain, and an epoch a network restores);
-`waymaker-drive` is the synchronous driver that runs a workflow to completion through
-the kernel boundary; and `waymaker-facade-demo` is the bridge from `waymaker-drive` to
-`waymaker-embassy`, kept in its own crate so `waymaker-drive` names no dependency on the
-façade at all. Every one of these except `xtask` and the size probe is `#![no_std]` and
+and `waymaker-facade-demo` holds design document §06's two examples run through
+`waymaker-bridge`, the driver's reference workflow, and the tests that drive them at every
+crash point the fault harness lists. Every one of these except `xtask` and the size probe is `#![no_std]` and
 allocation-free, because each exists to run *on* the part, not just to be built for it.
 None of them is in the image the code-flash budget is measured against.
 
@@ -135,14 +138,13 @@ cargo doc    --locked --workspace --no-deps --no-default-features
 cargo --locked xtask coverage
 cargo build --locked --no-default-features --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-rig --no-default-features --lib --target thumbv6m-none-eabi
-cargo build --locked -p waymaker-drive --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-facade-demo --no-default-features --lib --target thumbv6m-none-eabi
 cargo build --locked -p waymaker-embassy --no-default-features --features postcard --lib --target thumbv6m-none-eabi
-cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,embassy-postcard --bins -- -D warnings
+cargo clippy --locked -p waymaker-size-probe --target thumbv6m-none-eabi --features probe,bridge,embassy-postcard --bins -- -D warnings
 cargo clippy --locked -p waymaker-emu --target thumbv6m-none-eabi --features emu --bins -- -D warnings
 cargo --locked xtask size
 cargo test --locked -p waymaker-spec --no-default-features
-cargo test --locked -p waymaker-drive -p waymaker-rig --no-default-features --test matrix
+cargo test --locked -p waymaker-facade-demo -p waymaker-rig --no-default-features --test matrix
 cargo test --locked -p waymaker-flash --no-default-features --test corpus
 cargo --locked xtask profile
 cargo --locked xtask emulate
@@ -165,7 +167,7 @@ reaches it anyway, since `cargo test` cross-compiles the workspace and a deliber
 broken copy of it.
 
 The firmware build takes no `--workspace` and no `-p` flags: `default-members` in the
-workspace manifest is exactly the three firmware crates, so a crate added to the
+workspace manifest is exactly the firmware layers, so a crate added to the
 layering is built for `thumbv6m-none-eabi` without anyone remembering a flag.
 
 ### Coverage

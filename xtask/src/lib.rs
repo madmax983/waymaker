@@ -1620,19 +1620,26 @@ mod tests {
           "dependencies": [{ "name": "waymaker-core", "kind": null },
                            { "name": "waymaker-flash", "kind": null }],
           "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/drive/src/lib.rs" }] },
+        { "id": "bridge", "name": "waymaker-bridge", "source": null,
+          "manifest_path": "/w/bridge/Cargo.toml",
+          "dependencies": [{ "name": "waymaker-core", "kind": null },
+                           { "name": "waymaker-drive", "kind": null },
+                           { "name": "waymaker-embassy", "kind": null }],
+          "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/bridge/src/lib.rs" }] },
         { "id": "facade-demo", "name": "waymaker-facade-demo", "source": null,
           "manifest_path": "/w/facade-demo/Cargo.toml",
           "dependencies": [{ "name": "waymaker-core", "kind": null },
                            { "name": "waymaker-flash", "kind": null },
                            { "name": "waymaker-drive", "kind": null },
-                           { "name": "waymaker-embassy", "kind": null }],
+                           { "name": "waymaker-embassy", "kind": null },
+                           { "name": "waymaker-bridge", "kind": null }],
           "features": {}, "targets": [{ "kind": ["lib"], "src_path": "/w/facade-demo/src/lib.rs" }] },
         { "id": "embedded-storage", "name": "embedded-storage",
           "source": "registry+https://github.com/rust-lang/crates.io-index",
           "dependencies": [], "features": {},
           "targets": [{ "kind": ["lib"], "src_path": "/r/embedded-storage/src/lib.rs" }] }
       ],
-      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig", "drive", "facade-demo"],
+      "workspace_members": ["core", "flash", "embassy", "probe", "fault", "spec", "conformance", "rig", "drive", "bridge", "facade-demo"],
       "resolve": { "nodes": [
         { "id": "core", "deps": [] },
         { "id": "flash", "deps": [{ "pkg": "core" }] },
@@ -1643,7 +1650,8 @@ mod tests {
         { "id": "conformance", "deps": [{ "pkg": "flash" }, { "pkg": "embedded-storage" }] },
         { "id": "rig", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
         { "id": "drive", "deps": [{ "pkg": "core" }, { "pkg": "flash" }] },
-        { "id": "facade-demo", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "drive" }, { "pkg": "embassy" }] },
+        { "id": "bridge", "deps": [{ "pkg": "core" }, { "pkg": "drive" }, { "pkg": "embassy" }] },
+        { "id": "facade-demo", "deps": [{ "pkg": "core" }, { "pkg": "flash" }, { "pkg": "drive" }, { "pkg": "embassy" }, { "pkg": "bridge" }] },
         { "id": "embedded-storage", "deps": [] }
       ] }
     }"#;

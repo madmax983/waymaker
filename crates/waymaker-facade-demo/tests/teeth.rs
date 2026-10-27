@@ -9,12 +9,12 @@
 use waymaker_core::timer::{ClockCapability, ClockKind};
 use waymaker_core::version::VersionRange;
 use waymaker_core::{EffectId, EffectSeq, KernelError, Outcome, RunId};
-use waymaker_drive::demo::{
-    BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
-};
 use waymaker_drive::{
     Activities, Boundary, CheckedDispatch, Clocks, Conclusion, DriveError, Driver, Identity,
     Performed, Progress, Scratch, Suspended, Workflow,
+};
+use waymaker_facade_demo::demo::{
+    BOUNDS, DOWNLOAD, DOWNLOADED, HASH, Pipeline, WORKFLOW_KIND, WORKFLOW_VERSION, World,
 };
 use waymaker_fault::{Device, FaultError};
 use waymaker_flash::bank::BankLayout;

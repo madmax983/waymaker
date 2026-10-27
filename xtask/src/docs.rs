@@ -2999,7 +2999,7 @@ pub const HARDWARE_TARGETS: &[HardwareTarget] = &[
                    for longer than the interval, and the first replay after it recognising \
                    the deadline as elapsed. `waymaker-rig`'s `rtc` and `epoch` modules are \
                    written to link on the target and have never been on one. \
-                   `waymaker-drive/tests/power_loss.rs` drives the scenario on a host, but \
+                   `waymaker-facade-demo/tests/power_loss.rs` drives the scenario on a host, but \
                    against a model: no oscillator to drift, no supply to sag, and a \
                    continuity flag a test sets rather than a backup domain that failed",
     },
@@ -3204,7 +3204,7 @@ pub const FAILURE_MATRIX_ADR: &str =
 pub const FAILURE_ROWS_PATH: &str = "crates/waymaker-rig/src/matrix.rs";
 
 /// Where the model half lives: one named test per row.
-pub const FAILURE_MODEL_TESTS_PATH: &str = "crates/waymaker-drive/tests/matrix.rs";
+pub const FAILURE_MODEL_TESTS_PATH: &str = "crates/waymaker-facade-demo/tests/matrix.rs";
 
 /// Where the rig half lives.
 pub const FAILURE_RIG_TESTS_PATH: &str = "crates/waymaker-rig/tests/matrix.rs";

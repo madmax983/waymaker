@@ -20,7 +20,7 @@
 //! concrete. The firmware build monomorphises this workflow's future, [`Bridge`], and two
 //! façade futures this example adds: `TimerFuture` and `TerminalFuture`'s failure arm.
 //!
-//! [`Bridge`]: crate::Bridge
+//! [`Bridge`]: waymaker_bridge::Bridge
 
 use core::future::Future;
 use core::pin::pin;
@@ -36,7 +36,7 @@ use waymaker_embassy::dispatch::Produced;
 use waymaker_embassy::{ActivityDispatcher, Alarm, Decode, Journal, NoAlarm};
 use waymaker_flash::capacity::Bounds;
 
-use crate::facade::Bridge;
+use waymaker_bridge::Bridge;
 
 /// Register this device with the fleet.
 pub const REGISTER: ActivityKind = ActivityKind(14);

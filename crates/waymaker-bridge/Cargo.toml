@@ -1,0 +1,24 @@
+[package]
+name = "waymaker-bridge"
+description = "The bridge from waymaker-drive's synchronous kernel boundary to waymaker-embassy's Journal, so an async Ctx workflow runs on flash."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+categories = ["embedded", "no-std", "asynchronous"]
+keywords = ["durable", "workflow", "embassy", "no-std"]
+
+[dependencies]
+# `ActivityKind`, `Outcome` and `TimerSpec`, which both halves already speak.
+waymaker-core.workspace = true
+# The durable half: `Boundary`, `Handoff`, `Answered` and `Suspended`.
+waymaker-drive.workspace = true
+# The async half: `Journal`, `Answer`, `Halted`. This is the one layer allowed to name both
+# `waymaker-drive` and `waymaker-embassy` — see ADR 0055.
+waymaker-embassy.workspace = true
+
+[lints]
+workspace = true

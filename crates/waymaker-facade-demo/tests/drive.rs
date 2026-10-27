@@ -6,8 +6,8 @@
 //! really writes rather than a fixture that agrees with it.
 
 use waymaker_core::{EffectId, EffectSeq, RecordKind, RecordRef, RunId};
-use waymaker_drive::demo::{BOUNDS, DOWNLOAD, DOWNLOADED, HASH, HASHED, Pipeline, World};
 use waymaker_drive::{Conclusion, DriveError, Driver, Progress, Scratch};
+use waymaker_facade_demo::demo::{BOUNDS, DOWNLOAD, DOWNLOADED, HASH, HASHED, Pipeline, World};
 use waymaker_fault::Device;
 use waymaker_flash::bank::BankLayout;
 use waymaker_flash::capacity::Reserve;

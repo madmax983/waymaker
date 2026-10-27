@@ -92,7 +92,7 @@ pub const CONTEXT_RAM_BYTES: usize = ENGINE_RAM_BYTES.saturating_sub(KERNEL_STAT
 /// rather than in the gate so that there is one place to change.
 pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 13 * 1024;
 
-/// Incremental code-flash budget in bytes for the three layers with the façade linked.
+/// Incremental code-flash budget in bytes for the engine with the façade linked.
 ///
 /// [`INCREMENTAL_CODE_FLASH_BYTES`] is design document §04's number and §04 states it for
 /// "core + flash adapter". The Embassy façade is a third crate, so it gets a ceiling of its
@@ -105,6 +105,45 @@ pub const INCREMENTAL_CODE_FLASH_BYTES: usize = 13 * 1024;
 ///
 /// It is a gate: `cargo xtask size` fails a build over the `facade` row.
 pub const FACADE_CODE_FLASH_BYTES: usize = INCREMENTAL_CODE_FLASH_BYTES + 1024;
+
+/// Incremental code-flash budget in bytes for the engine with the driver linked.
+///
+/// [ADR 0055](https://github.com/madmax983/waymaker/blob/main/docs/adr/0055-the-driver-and-the-bridge-are-layers-firmware-ships.md)
+/// made `waymaker-drive` a layer, firmware Waymaker ships. It gets a ceiling of its own for
+/// the façade's reason: §04 states [`INCREMENTAL_CODE_FLASH_BYTES`] for "core + flash
+/// adapter", and widening that number to pay for a driver above both would widen the
+/// kernel's budget for a cost the kernel does not carry.
+///
+/// It is a gate: `cargo xtask size` fails a build over the `drive` row.
+pub const DRIVE_CODE_FLASH_BYTES: usize = INCREMENTAL_CODE_FLASH_BYTES + DRIVE_SHARE_BYTES;
+
+/// Incremental code-flash budget in bytes with every layer linked: the engine, the driver,
+/// the façade and the bridge between the last two.
+///
+/// The façade's share and the driver's share on the engine's ceiling, plus the bridge's own
+/// [`BRIDGE_SHARE_BYTES`]. A sum of shares rather than a number of its own, so that the
+/// ceiling for everything cannot drift from the ceilings for its parts.
+///
+/// It is a gate: `cargo xtask size` fails a build over the `bridge` row.
+pub const BRIDGE_CODE_FLASH_BYTES: usize =
+    FACADE_CODE_FLASH_BYTES + DRIVE_SHARE_BYTES + BRIDGE_SHARE_BYTES;
+
+/// What the driver may add to the engine's ceiling. See [`DRIVE_CODE_FLASH_BYTES`].
+///
+/// The driver measured 5204 B of layers over the `default` row when ADR 0055 promoted it
+/// (18368 B against the engine's 13164 B), so 6 KiB leaves about 1 KiB for the rest of the
+/// rung, the same room the façade's share was given.
+pub const DRIVE_SHARE_BYTES: usize = 6 * 1024;
+
+/// What the bridge may add once the driver and the façade are both linked. See
+/// [`BRIDGE_CODE_FLASH_BYTES`].
+///
+/// Measured rather than guessed: the `bridge` row read 22316 B of layers when ADR 0055
+/// introduced it, 8758 B over the `facade` row, of which 5204 B is the driver's. The other
+/// 3554 B is what joining the two costs: the bridge itself, and the façade and driver paths
+/// a bridged workflow reaches that neither row reaches alone. 3 KiB on top of the driver's
+/// share leaves the row about 1.2 KiB.
+pub const BRIDGE_SHARE_BYTES: usize = 3 * 1024;
 
 /// One type that is part of the kernel's live state, and the space it occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +312,13 @@ const _: () = assert!(
     "the kernel state and the context partition what the scratch page leaves of runtime \
      RAM; a literal that broke the partition is two budgets that can both pass while their \
      sum fails",
+);
+const _: () = assert!(
+    DRIVE_CODE_FLASH_BYTES > INCREMENTAL_CODE_FLASH_BYTES
+        && BRIDGE_CODE_FLASH_BYTES > FACADE_CODE_FLASH_BYTES
+        && BRIDGE_CODE_FLASH_BYTES > DRIVE_CODE_FLASH_BYTES,
+    "every layer at once must be allowed more than any subset of them, or the row that links \
+     the most code is held to the tightest ceiling",
 );
 const _: () = assert!(
     FACADE_CODE_FLASH_BYTES >= INCREMENTAL_CODE_FLASH_BYTES,

@@ -6,7 +6,7 @@
 //! [#111](https://github.com/madmax983/waymaker/issues/111): that stop writes no record. A
 //! firmware update that adds the row can still complete the run.
 //!
-//! The end-to-end run over real media is `crates/waymaker-drive/tests/dispatch.rs`.
+//! The end-to-end run over real media is `crates/waymaker-facade-demo/tests/dispatch.rs`.
 
 use core::future::Future;
 use core::pin::pin;
